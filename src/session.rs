@@ -983,6 +983,28 @@ fn store(slot: &Mutex<Arc<Grid>>, grid: Grid) {
     *slot.lock().unwrap_or_else(PoisonError::into_inner) = Arc::new(grid);
 }
 
+/// Applies resizes at frame rate, so a live drag can't flood the program with SIGWINCH.
+struct ResizeThrottle {
+    pending: Option<Surface>,
+    next: Instant,
+}
+
+impl ResizeThrottle {
+    fn wait(&self, now: Instant) -> Option<Duration> {
+        self.pending
+            .map(|_| self.next.saturating_duration_since(now))
+    }
+
+    fn take_due(&mut self, now: Instant) -> Option<Surface> {
+        if now < self.next {
+            return None;
+        }
+        let surface = self.pending.take()?;
+        self.next = now + FRAME;
+        Some(surface)
+    }
+}
+
 struct Actor {
     cols: u16,
     rows: u16,
@@ -1051,12 +1073,16 @@ impl Actor {
         })?;
 
         let mut input = TerminalInput::new()?;
-        let mut pending_resize = None;
+        let mut resize = ResizeThrottle {
+            pending: None,
+            next: Instant::now(),
+        };
         let mut dirty = true;
         loop {
             let now = Instant::now();
             let wait = publisher.borrow().wait(dirty, now);
             let wait = input.autoscroll_wait(now).map_or(wait, |due| wait.min(due));
+            let wait = resize.wait(now).map_or(wait, |due| wait.min(due));
             select! {
                 recv(self.output) -> bytes => match bytes {
                     Ok(bytes) => { terminal.vt_write(&bytes); dirty = true; }
@@ -1131,9 +1157,8 @@ impl Actor {
                             Err(error) => eprintln!("agentd: paste: {error:#}"),
                         }
                     }
-                    // Applied at frame rate, so a live drag can't flood the program with SIGWINCH.
                     Ok(Msg::Resize(surface)) => {
-                        pending_resize = Some(surface);
+                        resize.pending = Some(surface);
                         dirty = true;
                     }
                     Err(_) => return Ok(()),
@@ -1150,9 +1175,7 @@ impl Actor {
                 Ok(false) => {}
                 Err(error) => eprintln!("agentd: autoscroll selection: {error:#}"),
             }
-            if Instant::now() >= publisher.next_frame
-                && let Some(surface) = pending_resize.take()
-            {
+            if let Some(surface) = resize.take_due(Instant::now()) {
                 self.apply_resize(&mut terminal, surface);
                 input.surface = Some(surface);
                 publisher.metrics = surface.metrics;
@@ -1723,6 +1746,20 @@ mod tests {
             assert!(Instant::now() < deadline, "cols: {}", session.grid().cols);
             thread::sleep(Duration::from_millis(10));
         }
+    }
+
+    #[test]
+    fn a_second_resize_waits_a_frame_even_when_nothing_publishes() {
+        let now = Instant::now();
+        let mut throttle = ResizeThrottle {
+            pending: Some(TEST_SURFACE),
+            next: now,
+        };
+        assert_eq!(throttle.take_due(now), Some(TEST_SURFACE));
+        throttle.pending = Some(TEST_SURFACE);
+        assert_eq!(throttle.take_due(now), None);
+        assert_eq!(throttle.wait(now), Some(FRAME));
+        assert_eq!(throttle.take_due(now + FRAME), Some(TEST_SURFACE));
     }
 
     #[test]

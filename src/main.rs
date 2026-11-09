@@ -109,7 +109,7 @@ fn view(state: &State, cx: &mut Cx<State>) -> El {
     let mut overlays = Vec::new();
     if let Some([x, y, width, height]) = state.caret {
         // winit routes Option through the input method while one is active, which eats Alt chords.
-        if !state.option_held {
+        if !state.option_held || !state.preedit.is_empty() {
             overlays.push(
                 el().key("caret")
                     .absolute(x, y)
@@ -414,6 +414,17 @@ mod tests {
             ..State::default()
         });
         assert!(held.find("caret").is_none());
+    }
+
+    #[test]
+    fn holding_option_keeps_the_caret_during_a_composition() {
+        let composing = runtime_with(State {
+            caret: Some([1.0, 1.0, 8.0, 16.0]),
+            option_held: true,
+            preedit: "に".to_owned(),
+            ..State::default()
+        });
+        assert!(composing.find("caret").is_some());
     }
 
     #[test]
