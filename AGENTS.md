@@ -32,8 +32,10 @@ shell <-> PTY --reader thread--> bounded channel --> actor thread (owns Terminal
 - **Back-pressure**: PTY output goes through a bounded channel and publishing is capped by `FRAME`, so output floods can't stall the UI. Publishing also respects libghostty's render hold (`on_render_hold`).
 - **Spawning**: `openpty` plus `login_tty` in `pre_exec`. Only async-signal-safe calls may run between fork and exec, because the app is multi-threaded.
 - **`render.rs`**: a Rune `Compositor` that draws into the `effect(TERMINAL_MARK)` slot declared in `view` with a custom wgpu pass (`cell.wgsl`). Glyphs live in a shared atlas and quads are instanced; a `Slot` per effect mark rebuilds only when generation, rect, atlas epoch or blend mode changes. The compositor also derives cols and rows from the slot size and sends `Session::resize`.
-- **`font.rs`**: CoreText rasterisation into whole-cell coverage bitmaps, in device pixels. The atlas resets when the scale changes.
+- **`font.rs`**: CoreText shaping and fallback through `CTLine`, rasterised into whole-cell premultiplied RGBA bitmaps in device pixels. A glyph with any `rgb != alpha` pixel is treated as colour, so font smoothing must stay off. The atlas resets when the scale changes.
+- **`sprite.rs`**: procedural box drawing, blocks, Powerline glyphs and tiling underlines, so they meet their neighbours with no seams.
 - **`input.rs`**: maps Rune key events to `KeyInput`; the actor encodes them with libghostty's encoder using the terminal's current modes. Returning `None` from `map_key` keeps a key (such as a ⌘ chord) away from the terminal.
+- **Pointer input**: the UI sends raw `Msg::Pointer` and `Msg::Wheel`, and `TerminalInput` on the actor decides between mouse reports, selection, alt-screen arrows and scrollback, because only the actor knows the terminal's modes.
 
 `Grid::from_vt` and `Session::fixture` give a process-free grid for tests and scenes.
 

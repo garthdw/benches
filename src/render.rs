@@ -2,17 +2,24 @@ use std::collections::HashMap;
 use std::mem::size_of;
 
 use bytemuck::{Pod, Zeroable, cast_slice};
+use libghostty_vt::render::CursorVisualStyle;
+use libghostty_vt::style::Underline;
 use rune::color::srgb_decode;
 use rune::compose::{Compositor, DeviceKey, Frame};
 use rune::render::EffectSite;
 
 use crate::State;
-use crate::font::Font;
-use crate::session::Grid;
+use crate::font::{Font, FontStyle, GlyphKind};
+use crate::session::{Cell, Grid, Metrics, Surface};
 
-const FONT_POINTS: f64 = 13.0;
+const FONT_POINTS: f64 = 18.0;
 const PADDING_POINTS: f32 = 6.0;
 const ATLAS_SIZE: u32 = 2048;
+const MODE_SOLID: u32 = 0;
+const MODE_COVERAGE: u32 = 1;
+const MODE_COLOR: u32 = 2;
+/// A colour glyph whose sRGB texels must be decoded for a linear target.
+const MODE_COLOR_LINEAR: u32 = 3;
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -20,6 +27,7 @@ struct Quad {
     rect: [f32; 4],
     uv: [f32; 4],
     color: [f32; 3],
+    mode: u32,
 }
 
 fn color(rgb: [u8; 3], srgb_blend: bool) -> [f32; 3] {
@@ -33,8 +41,29 @@ fn color(rgb: [u8; 3], srgb_blend: bool) -> [f32; 3] {
     })
 }
 
+#[derive(Clone, PartialEq, Eq, Hash)]
+enum GlyphText {
+    Character(char),
+    Cluster(String),
+    Underline(Underline),
+}
+
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct GlyphKey {
+    text: GlyphText,
+    style: FontStyle,
+    cells: u32,
+}
+
+#[derive(Clone, Copy)]
+struct AtlasGlyph {
+    position: [u32; 2],
+    width: u32,
+    kind: GlyphKind,
+}
+
 struct Atlas {
-    slots: HashMap<(char, bool), Option<[u32; 2]>>,
+    slots: HashMap<GlyphKey, Option<AtlasGlyph>>,
     next: [u32; 2],
     epoch: u64,
     scratch: Vec<u8>,
@@ -61,23 +90,43 @@ impl Atlas {
         queue: &wgpu::Queue,
         texture: &wgpu::Texture,
         font: &Font,
-        character: char,
-        bold: bool,
-    ) -> Option<[u32; 2]> {
-        if let Some(slot) = self.slots.get(&(character, bold)) {
+        key: GlyphKey,
+    ) -> Option<AtlasGlyph> {
+        if let Some(slot) = self.slots.get(&key) {
             return *slot;
         }
-        let (width, height) = (font.cell_width, font.cell_height);
+        let (width, height) = (font.cell_width * key.cells, font.cell_height);
         if self.next[0] + width + 1 > ATLAS_SIZE {
             self.next = [1, self.next[1] + height + 1];
         }
         if self.next[1] + height + 1 > ATLAS_SIZE {
             self.reset();
         }
-        let slot = font
-            .rasterize(character, bold, &mut self.scratch)
-            .then_some(self.next);
-        if let Some([x, y]) = slot {
+        let mut utf8 = [0; 4];
+        let kind = match &key.text {
+            GlyphText::Character(character) => font.rasterize(
+                character.encode_utf8(&mut utf8),
+                key.style,
+                key.cells,
+                &mut self.scratch,
+            ),
+            GlyphText::Cluster(cluster) => {
+                font.rasterize(cluster, key.style, key.cells, &mut self.scratch)
+            }
+            GlyphText::Underline(underline) => {
+                font.rasterize_underline(*underline, &mut self.scratch);
+                Some(GlyphKind::Coverage)
+            }
+        };
+        let slot = kind.map(|kind| AtlasGlyph {
+            position: self.next,
+            width,
+            kind,
+        });
+        if let Some(AtlasGlyph {
+            position: [x, y], ..
+        }) = slot
+        {
             queue.write_texture(
                 wgpu::TexelCopyTextureInfo {
                     texture,
@@ -88,7 +137,7 @@ impl Atlas {
                 &self.scratch,
                 wgpu::TexelCopyBufferLayout {
                     offset: 0,
-                    bytes_per_row: Some(width),
+                    bytes_per_row: Some(width * 4),
                     rows_per_image: Some(height),
                 },
                 wgpu::Extent3d {
@@ -99,9 +148,30 @@ impl Atlas {
             );
             self.next[0] += width + 1;
         }
-        self.slots.insert((character, bold), slot);
+        self.slots.insert(key, slot);
         slot
     }
+}
+
+fn faint(cell: &Cell, grid_bg: [u8; 3]) -> [u8; 3] {
+    let bg = cell.bg.unwrap_or(grid_bg);
+    std::array::from_fn(|index| ((u16::from(cell.fg[index]) + u16::from(bg[index])) / 2) as u8)
+}
+
+fn glyph_key(grid: &Grid, cell: &Cell) -> Option<GlyphKey> {
+    let text = match grid.cluster(cell) {
+        Some(cluster) => GlyphText::Cluster(cluster.to_owned()),
+        None if cell.spacer || cell.character == ' ' => return None,
+        None => GlyphText::Character(cell.character),
+    };
+    Some(GlyphKey {
+        text,
+        style: FontStyle {
+            bold: cell.bold,
+            italic: cell.italic,
+        },
+        cells: if cell.wide { 2 } else { 1 },
+    })
 }
 
 fn build_quads(
@@ -111,12 +181,13 @@ fn build_quads(
     font: &Font,
     srgb_blend: bool,
     quads: &mut Vec<Quad>,
-    mut glyph: impl FnMut(char, bool) -> (Option<[u32; 2]>, u64),
+    mut glyph: impl FnMut(GlyphKey) -> (Option<AtlasGlyph>, u64),
 ) {
     let solid = |rect, fill| Quad {
         rect,
         uv: [0.0; 4],
         color: color(fill, srgb_blend),
+        mode: MODE_SOLID,
     };
     let (width, height) = (font.cell_width as f32, font.cell_height as f32);
     let (origin_x, origin_y) = ((rect[0] + padding).round(), (rect[1] + padding).round());
@@ -140,39 +211,111 @@ fn build_quads(
     let cursor = grid
         .cursor
         .map(|(x, y)| usize::from(y) * cols + usize::from(x));
+    let cursor_style = if grid.focused {
+        grid.cursor_style
+    } else {
+        CursorVisualStyle::BlockHollow
+    };
+    let thickness = font.line_thickness as f32;
     if let Some(index) = cursor {
-        quads.push(solid(cell_rect(index), grid.cursor_color));
+        let [left, top, ..] = cell_rect(index);
+        let wide = grid.cells.get(index).is_some_and(|cell| cell.wide);
+        let cursor_width = if wide { 2.0 * width } else { width };
+        let edges: &[[f32; 4]] = match cursor_style {
+            CursorVisualStyle::Bar => &[[left, top, thickness, height]],
+            CursorVisualStyle::Underline => &[[
+                left,
+                top + font.underline_top as f32,
+                cursor_width,
+                thickness,
+            ]],
+            CursorVisualStyle::BlockHollow => &[
+                [left, top, cursor_width, thickness],
+                [left, top + height - thickness, cursor_width, thickness],
+                [left, top, thickness, height],
+                [left + cursor_width - thickness, top, thickness, height],
+            ],
+            _ => &[[left, top, cursor_width, height]],
+        };
+        for edge in edges {
+            quads.push(solid(*edge, grid.cursor_color));
+        }
     }
-    let (atlas_width, atlas_height) = (width / ATLAS_SIZE as f32, height / ATLAS_SIZE as f32);
+    let inverted = cursor.filter(|_| cursor_style == CursorVisualStyle::Block);
     let glyphs_start = quads.len();
+    let underline_top = font.underline_top as f32;
+    let textured = |found: AtlasGlyph, left: f32, top: f32, cells: f32, fg: [u8; 3]| {
+        let [x, y] = found.position;
+        Quad {
+            rect: [left, top, width * cells, height],
+            uv: [
+                x as f32 / ATLAS_SIZE as f32,
+                y as f32 / ATLAS_SIZE as f32,
+                found.width as f32 / ATLAS_SIZE as f32,
+                height / ATLAS_SIZE as f32,
+            ],
+            color: color(fg, srgb_blend),
+            mode: match (found.kind, srgb_blend) {
+                (GlyphKind::Coverage, _) => MODE_COVERAGE,
+                (GlyphKind::Color, true) => MODE_COLOR,
+                (GlyphKind::Color, false) => MODE_COLOR_LINEAR,
+            },
+        }
+    };
     // A reset wipes slots already handed out, so redo the glyphs once against the emptied atlas.
     for _ in 0..2 {
         quads.truncate(glyphs_start);
         let mut first_epoch = None;
         let mut reset = false;
-        for (index, cell) in grid.cells.iter().enumerate() {
-            if cell.character == ' ' {
-                continue;
-            }
-            let (slot, epoch) = glyph(cell.character, cell.bold);
+        let mut lookup = |key| {
+            let (slot, epoch) = glyph(key);
             reset |= *first_epoch.get_or_insert(epoch) != epoch;
-            if let Some([x, y]) = slot {
-                let uv = [
-                    x as f32 / ATLAS_SIZE as f32,
-                    y as f32 / ATLAS_SIZE as f32,
-                    atlas_width,
-                    atlas_height,
-                ];
-                let fg = if cursor == Some(index) {
-                    grid.bg
-                } else {
-                    cell.fg
-                };
-                quads.push(Quad {
-                    rect: cell_rect(index),
-                    uv,
-                    color: color(fg, srgb_blend),
-                });
+            slot
+        };
+        for (index, cell) in grid.cells.iter().enumerate() {
+            let [left, top, ..] = cell_rect(index);
+            let fg = if inverted == Some(index) {
+                cell.bg.unwrap_or(grid.bg)
+            } else if cell.faint {
+                faint(cell, grid.bg)
+            } else {
+                cell.fg
+            };
+            let underline_fill = cell.underline_color.unwrap_or(fg);
+            let line = |y: f32, fill| solid([left, top + y, width, thickness], fill);
+            match cell.underline {
+                Underline::Single => quads.push(line(underline_top, underline_fill)),
+                Underline::Double => {
+                    quads.push(line(underline_top, underline_fill));
+                    quads.push(line(underline_top + 2.0 * thickness, underline_fill));
+                }
+                kind @ (Underline::Curly | Underline::Dotted | Underline::Dashed) => {
+                    let key = GlyphKey {
+                        text: GlyphText::Underline(kind),
+                        style: FontStyle {
+                            bold: false,
+                            italic: false,
+                        },
+                        cells: 1,
+                    };
+                    if let Some(found) = lookup(key) {
+                        quads.push(textured(found, left, top, 1.0, underline_fill));
+                    }
+                }
+                _ => {}
+            }
+            if cell.strikethrough {
+                quads.push(line(font.strike_top as f32, fg));
+            }
+            if cell.overline {
+                quads.push(line(0.0, fg));
+            }
+            let Some(key) = glyph_key(grid, cell) else {
+                continue;
+            };
+            let cells = key.cells as f32;
+            if let Some(found) = lookup(key) {
+                quads.push(textured(found, left, top, cells, fg));
             }
         }
         if !reset {
@@ -214,7 +357,7 @@ impl Gpu {
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::R8Unorm,
+            format: wgpu::TextureFormat::Rgba8Unorm,
             usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
             view_formats: &[],
         });
@@ -284,7 +427,7 @@ impl Gpu {
                 buffers: &[Some(wgpu::VertexBufferLayout {
                     array_stride: size_of::<Quad>() as u64,
                     step_mode: wgpu::VertexStepMode::Instance,
-                    attributes: &wgpu::vertex_attr_array![0 => Float32x4, 1 => Float32x4, 2 => Float32x3],
+                    attributes: &wgpu::vertex_attr_array![0 => Float32x4, 1 => Float32x4, 2 => Float32x3, 3 => Uint32],
                 })],
             },
             primitive: wgpu::PrimitiveState { topology: wgpu::PrimitiveTopology::TriangleStrip, ..Default::default() },
@@ -410,7 +553,16 @@ impl TerminalCompositor {
         if slot.sent_size.replace(size) != Some(size)
             && let Some(session) = &state.session
         {
-            session.resize(cols, rows, font.cell_width as u16, font.cell_height as u16);
+            session.resize(Surface {
+                cols,
+                rows,
+                metrics: Metrics {
+                    cell_width: font.cell_width as u16,
+                    cell_height: font.cell_height as u16,
+                    padding,
+                    scale: site.scale,
+                },
+            });
         }
 
         let grid = state.grid();
@@ -423,8 +575,8 @@ impl TerminalCompositor {
                 font,
                 site.srgb_blend,
                 &mut slot.scratch,
-                |character, bold| {
-                    let slot = atlas.glyph(queue, texture, font, character, bold);
+                |key| {
+                    let slot = atlas.glyph(queue, texture, font, key);
                     (slot, atlas.epoch)
                 },
             );
@@ -490,11 +642,162 @@ mod tests {
     use super::*;
     use std::collections::HashSet;
 
+    fn fake_glyph(position: [u32; 2]) -> AtlasGlyph {
+        AtlasGlyph {
+            position,
+            width: 16,
+            kind: GlyphKind::Coverage,
+        }
+    }
+
+    #[test]
+    fn a_wide_glyph_spans_two_cells_and_its_spacer_draws_nothing() {
+        let grid = Grid::from_vt("世".as_bytes(), 4, 1).unwrap();
+        let font = Font::new(FONT_POINTS, 1.0).unwrap();
+        let mut quads = Vec::new();
+        build_quads(
+            &grid,
+            [0.0, 0.0, 800.0, 600.0],
+            0.0,
+            &font,
+            true,
+            &mut quads,
+            |_| (Some(fake_glyph([0, 0])), 0),
+        );
+        let glyphs: Vec<&Quad> = quads
+            .iter()
+            .filter(|quad| quad.mode == MODE_COVERAGE)
+            .collect();
+        assert_eq!(glyphs.len(), 1);
+        assert_eq!(glyphs[0].rect[2], font.cell_width as f32 * 2.0);
+    }
+
+    fn built_quads(bytes: &[u8]) -> (Vec<Quad>, Font) {
+        let grid = Grid::from_vt(bytes, 4, 1).unwrap();
+        let font = Font::new(FONT_POINTS, 2.0).unwrap();
+        let mut quads = Vec::new();
+        build_quads(
+            &grid,
+            [0.0, 0.0, 800.0, 600.0],
+            0.0,
+            &font,
+            true,
+            &mut quads,
+            |_| (Some(fake_glyph([0, 0])), 0),
+        );
+        (quads, font)
+    }
+
+    fn solid_lines(quads: &[Quad], font: &Font) -> usize {
+        quads
+            .iter()
+            .filter(|quad| quad.mode == MODE_SOLID && quad.rect[3] == font.line_thickness as f32)
+            .count()
+    }
+
+    #[test]
+    fn straight_decorations_are_solid_lines() {
+        let (single, font) = built_quads(b"\x1b[4mx");
+        assert_eq!(solid_lines(&single, &font), 1);
+        let (double, font) = built_quads(b"\x1b[4:2mx");
+        assert_eq!(solid_lines(&double, &font), 2);
+        let (strike_and_over, font) = built_quads(b"\x1b[9;53mx");
+        assert_eq!(solid_lines(&strike_and_over, &font), 2);
+    }
+
+    #[test]
+    fn a_curly_underline_is_a_sprite_below_its_glyph() {
+        let (quads, _) = built_quads(b"\x1b[4:3mx");
+        let glyphs = quads
+            .iter()
+            .filter(|quad| quad.mode == MODE_COVERAGE)
+            .count();
+        assert_eq!(glyphs, 2);
+    }
+
+    #[test]
+    fn a_blank_cell_keeps_its_underline() {
+        let (quads, font) = built_quads(b"\x1b[4m ");
+        assert_eq!(solid_lines(&quads, &font), 1);
+    }
+
+    fn cursor_quads(bytes: &[u8], focused: bool) -> (Vec<Quad>, Font) {
+        let mut grid = Grid::from_vt(bytes, 4, 1).unwrap();
+        grid.focused = focused;
+        let font = Font::new(FONT_POINTS, 2.0).unwrap();
+        let mut quads = Vec::new();
+        build_quads(
+            &grid,
+            [0.0, 0.0, 800.0, 600.0],
+            0.0,
+            &font,
+            true,
+            &mut quads,
+            |_| (Some(fake_glyph([0, 0])), 0),
+        );
+        // The first quad fills the terminal; the rest before the glyph are the cursor.
+        let cursor = quads
+            .iter()
+            .skip(1)
+            .take_while(|quad| quad.mode == MODE_SOLID)
+            .copied()
+            .collect();
+        (cursor, font)
+    }
+
+    #[test]
+    fn each_cursor_style_has_its_own_shape() {
+        let (bar, font) = cursor_quads(b"\x1b[6 q", true);
+        assert_eq!(bar.len(), 1);
+        assert_eq!(bar[0].rect[2], font.line_thickness as f32);
+        let (underline, font) = cursor_quads(b"\x1b[4 q", true);
+        assert_eq!(underline[0].rect[3], font.line_thickness as f32);
+        let (block, font) = cursor_quads(b"", true);
+        assert_eq!(block[0].rect[3], font.cell_height as f32);
+    }
+
+    #[test]
+    fn an_unfocused_cursor_is_a_hollow_outline() {
+        assert_eq!(cursor_quads(b"", false).0.len(), 4);
+    }
+
+    #[test]
+    fn a_block_cursor_covers_both_cells_of_a_wide_glyph() {
+        let (block, font) = cursor_quads("世\x1b[1;1H".as_bytes(), true);
+        assert_eq!(block[0].rect[2], 2.0 * font.cell_width as f32);
+    }
+
+    fn glyph_colour(bytes: &[u8]) -> [f32; 3] {
+        let (quads, _) = built_quads(bytes);
+        quads
+            .iter()
+            .find(|quad| quad.mode == MODE_COVERAGE)
+            .unwrap()
+            .color
+    }
+
+    #[test]
+    fn only_a_block_cursor_recolours_the_glyph_under_it() {
+        let plain = glyph_colour(b"x\x1b[1;3H");
+        assert_ne!(glyph_colour(b"x\x1b[1;1H"), plain);
+        assert_eq!(glyph_colour(b"x\x1b[6 q\x1b[1;1H"), plain);
+    }
+
+    #[test]
+    fn a_faint_cell_is_drawn_between_its_colour_and_the_background() {
+        let cell = Cell {
+            fg: [200, 100, 0],
+            faint: true,
+            ..Cell::default()
+        };
+        assert_eq!(faint(&cell, [0, 100, 200]), [100, 100, 100]);
+    }
+
     #[test]
     fn a_reset_during_a_build_leaves_no_quad_on_a_wiped_slot() {
         let grid = Grid::message("abc");
         let font = Font::new(FONT_POINTS, 1.0).unwrap();
-        let mut slots: HashMap<char, [u32; 2]> = HashMap::new();
+        let mut slots: HashMap<GlyphKey, [u32; 2]> = HashMap::new();
         let mut epoch = 0;
         let mut quads = Vec::new();
         build_quads(
@@ -504,16 +807,16 @@ mod tests {
             &font,
             true,
             &mut quads,
-            |character, _| {
-                if !slots.contains_key(&character) {
+            |key| {
+                if !slots.contains_key(&key) {
                     if slots.len() == 2 && epoch == 0 {
                         slots.clear();
                         epoch = 1;
                     }
-                    let slot = [slots.len() as u32 * 16, 0];
-                    slots.insert(character, slot);
+                    let position = [slots.len() as u32 * 16, 0];
+                    slots.insert(key.clone(), position);
                 }
-                (slots.get(&character).copied(), epoch)
+                (slots.get(&key).copied().map(fake_glyph), epoch)
             },
         );
         let glyph_positions: Vec<[u32; 2]> = quads

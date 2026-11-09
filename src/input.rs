@@ -10,7 +10,7 @@ pub struct KeyInput {
     pub unshifted: char,
 }
 
-fn vt_mods(mods: Mods) -> VtMods {
+pub fn vt_mods(mods: Mods) -> VtMods {
     let mut out = VtMods::empty();
     out.set(VtMods::SHIFT, mods.shift);
     out.set(VtMods::ALT, mods.alt);
@@ -78,9 +78,6 @@ pub fn map_text(text: &str, mods: Mods, physical: Option<Code>, base: Option<cha
     let mut consumed = VtMods::empty();
     if mods.shift && base.is_some() {
         consumed |= VtMods::SHIFT;
-    }
-    if mods.alt && !text.is_ascii() {
-        consumed |= VtMods::ALT;
     }
     KeyInput {
         key: physical.map_or(Vt::Unidentified, vt_key),
@@ -174,6 +171,21 @@ mod tests {
         assert_eq!((input.key, input.unshifted), (Vt::Digit1, '1'));
         assert_eq!(input.text.as_deref(), Some("!"));
         assert!(input.consumed.contains(VtMods::SHIFT));
+    }
+
+    #[test]
+    fn option_stays_a_modifier_rather_than_producing_text() {
+        let input = map_text(
+            "∫",
+            Mods {
+                alt: true,
+                ..Mods::default()
+            },
+            Some(Code::KeyB),
+            Some('b'),
+        );
+        assert!(input.mods.contains(VtMods::ALT));
+        assert!(!input.consumed.contains(VtMods::ALT));
     }
 
     #[test]
