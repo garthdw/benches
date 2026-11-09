@@ -15,3 +15,4 @@ nix = { version = "0.31", features = ["term", "fs", "signal"] }
 objc2-core-foundation = "0.3"
 objc2-core-graphics = "0.3"
 objc2-core-text = "0.3"
+anyhow = "1.0.104"

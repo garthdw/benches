@@ -10,12 +10,12 @@ pub struct KeyInput {
     pub unshifted: char,
 }
 
-fn vt_mods(m: Mods) -> VtMods {
+fn vt_mods(mods: Mods) -> VtMods {
     let mut out = VtMods::empty();
-    out.set(VtMods::SHIFT, m.shift);
-    out.set(VtMods::ALT, m.alt);
-    out.set(VtMods::CTRL, m.ctrl);
-    out.set(VtMods::SUPER, m.logo);
+    out.set(VtMods::SHIFT, mods.shift);
+    out.set(VtMods::ALT, mods.alt);
+    out.set(VtMods::CTRL, mods.ctrl);
+    out.set(VtMods::SUPER, mods.logo);
     out
 }
 
@@ -196,7 +196,7 @@ mod tests {
                 None,
                 None,
             )
-            .map(|i| i.key)
+            .map(|input| input.key)
         };
         assert_eq!(named(Key::Tab), Some(Vt::Tab));
         assert_eq!(named(Key::Escape), Some(Vt::Escape));

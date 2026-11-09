@@ -30,7 +30,7 @@ impl State {
 }
 
 fn view(_: &State, cx: &mut Cx<State>) -> El {
-    let t = tok::theme(true);
+    let theme = tok::theme(true);
     let chrome = el()
         .key("chrome")
         .role("button")
@@ -38,12 +38,12 @@ fn view(_: &State, cx: &mut Cx<State>) -> El {
         .px(10.0)
         .py(4.0)
         .radius(6.0)
-        .fill(t.control_off)
-        .child(text("shell").color(t.text));
+        .fill(theme.control_off)
+        .child(text("shell").color(theme.text));
     col()
         .w_full()
         .h_full()
-        .fill(t.bg)
+        .fill(theme.bg)
         .child(
             row()
                 .w_full()
@@ -65,12 +65,8 @@ fn poll(state: &mut State, _: f64, _: &mut Tx) -> bool {
     if state.session.is_none() {
         let cwd = std::env::var_os("HOME").map_or_else(|| PathBuf::from("/"), PathBuf::from);
         let waker = state.waker.clone().unwrap_or_else(|| Arc::new(|| {}));
-        state.session = Some(Session::spawn(None, &cwd, waker).unwrap_or_else(|err| {
-            Session::fixture(Grid::from_vt(
-                format!("failed to start shell: {err}").as_bytes(),
-                80,
-                24,
-            ))
+        state.session = Some(Session::spawn(None, &cwd, waker).unwrap_or_else(|error| {
+            Session::fixture(Grid::message(&format!("failed to start shell: {error:#}")))
         }));
     }
     let generation = state.grid().generation;
@@ -94,10 +90,13 @@ fn on_key(state: &mut State, event: &KeyEvent, tx: &mut Tx) -> bool {
 
 fn main() {
     let spec = AppSpec::<State> {
-        scenes: &[("fixture", |s| {
-            s.session = Some(Session::fixture(Grid::from_vt(SCENE_FIXTURE, 60, 12)))
+        scenes: &[("fixture", |state| {
+            let grid = Grid::from_vt(SCENE_FIXTURE, 60, 12).unwrap_or_else(|error| {
+                Grid::message(&format!("failed to build fixture: {error:#}"))
+            });
+            state.session = Some(Session::fixture(grid));
         })],
-        setup: Some(|s, waker| s.waker = Some(waker)),
+        setup: Some(|state, waker| state.waker = Some(waker)),
         poll: Some(poll),
         on_key: Some(on_key),
         ..AppSpec::new("agentd", (960.0, 640.0), State::default, view)
@@ -121,29 +120,29 @@ mod tests {
             system_dark: true,
             scale: 2.0,
         };
-        let mut rt = Runtime::new(State::default(), view, (960.0, 640.0), env);
-        rt.on_key = Some(|_, _, _| {
+        let mut runtime = Runtime::new(State::default(), view, (960.0, 640.0), env);
+        runtime.on_key = Some(|_, _, _| {
             WINDOW_KEYS.fetch_add(1, Ordering::SeqCst);
             true
         });
-        rt.frame(0.0);
-        let (x, y) = rt.find("chrome").unwrap();
-        rt.pointer_down(x, y);
-        rt.pointer_up(x, y);
-        rt.frame(1.0 / 60.0);
-        rt.key(KeyEvent {
+        runtime.frame(0.0);
+        let (x, y) = runtime.find("chrome").unwrap();
+        runtime.pointer_down(x, y);
+        runtime.pointer_up(x, y);
+        runtime.frame(1.0 / 60.0);
+        runtime.key(KeyEvent {
             key: Key::Tab,
             mods: Mods::default(),
         });
-        rt.key(KeyEvent {
+        runtime.key(KeyEvent {
             key: Key::Escape,
             mods: Mods::default(),
         });
-        rt.key(KeyEvent {
+        runtime.key(KeyEvent {
             key: Key::Text(" ".into()),
             mods: Mods::default(),
         });
-        rt.frame(1.0 / 60.0);
+        runtime.frame(1.0 / 60.0);
         assert_eq!(WINDOW_KEYS.load(Ordering::SeqCst), 3);
     }
 }

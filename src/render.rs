@@ -23,8 +23,8 @@ struct Quad {
 }
 
 fn color(rgb: [u8; 3], srgb_blend: bool) -> [f32; 3] {
-    rgb.map(|c| {
-        let encoded = f32::from(c) / 255.0;
+    rgb.map(|channel| {
+        let encoded = f32::from(channel) / 255.0;
         if srgb_blend {
             encoded
         } else {
@@ -61,21 +61,21 @@ impl Atlas {
         queue: &wgpu::Queue,
         texture: &wgpu::Texture,
         font: &Font,
-        ch: char,
+        character: char,
         bold: bool,
     ) -> Option<[u32; 2]> {
-        if let Some(slot) = self.slots.get(&(ch, bold)) {
+        if let Some(slot) = self.slots.get(&(character, bold)) {
             return *slot;
         }
-        let (w, h) = (font.cell_w, font.cell_h);
-        if self.next[0] + w + 1 > ATLAS_SIZE {
-            self.next = [1, self.next[1] + h + 1];
+        let (width, height) = (font.cell_width, font.cell_height);
+        if self.next[0] + width + 1 > ATLAS_SIZE {
+            self.next = [1, self.next[1] + height + 1];
         }
-        if self.next[1] + h + 1 > ATLAS_SIZE {
+        if self.next[1] + height + 1 > ATLAS_SIZE {
             self.reset();
         }
         let slot = font
-            .rasterize(ch, bold, &mut self.scratch)
+            .rasterize(character, bold, &mut self.scratch)
             .then_some(self.next);
         if let Some([x, y]) = slot {
             queue.write_texture(
@@ -88,18 +88,18 @@ impl Atlas {
                 &self.scratch,
                 wgpu::TexelCopyBufferLayout {
                     offset: 0,
-                    bytes_per_row: Some(w),
-                    rows_per_image: Some(h),
+                    bytes_per_row: Some(width),
+                    rows_per_image: Some(height),
                 },
                 wgpu::Extent3d {
-                    width: w,
-                    height: h,
+                    width,
+                    height,
                     depth_or_array_layers: 1,
                 },
             );
-            self.next[0] += w + 1;
+            self.next[0] += width + 1;
         }
-        self.slots.insert((ch, bold), slot);
+        self.slots.insert((character, bold), slot);
         slot
     }
 }
@@ -113,51 +113,55 @@ fn build_quads(
     quads: &mut Vec<Quad>,
     mut glyph: impl FnMut(char, bool) -> Option<[u32; 2]>,
 ) {
-    let solid = |rect, c| Quad {
+    let solid = |rect, fill| Quad {
         rect,
         uv: [0.0; 4],
-        color: color(c, srgb_blend),
+        color: color(fill, srgb_blend),
     };
-    let (w, h) = (font.cell_w as f32, font.cell_h as f32);
+    let (width, height) = (font.cell_width as f32, font.cell_height as f32);
     let (origin_x, origin_y) = ((rect[0] + padding).round(), (rect[1] + padding).round());
     let cols = usize::from(grid.cols);
-    let cell_rect = |i: usize| {
+    let cell_rect = |index: usize| {
         [
-            origin_x + (i % cols) as f32 * w,
-            origin_y + (i / cols) as f32 * h,
-            w,
-            h,
+            origin_x + (index % cols) as f32 * width,
+            origin_y + (index / cols) as f32 * height,
+            width,
+            height,
         ]
     };
 
     quads.clear();
     quads.push(solid(rect, grid.bg));
-    for (i, cell) in grid.cells.iter().enumerate() {
+    for (index, cell) in grid.cells.iter().enumerate() {
         if let Some(cell_bg) = cell.bg {
-            quads.push(solid(cell_rect(i), cell_bg));
+            quads.push(solid(cell_rect(index), cell_bg));
         }
     }
     let cursor = grid
         .cursor
         .map(|(x, y)| usize::from(y) * cols + usize::from(x));
-    if let Some(i) = cursor {
-        quads.push(solid(cell_rect(i), grid.cursor_color));
+    if let Some(index) = cursor {
+        quads.push(solid(cell_rect(index), grid.cursor_color));
     }
-    let (atlas_w, atlas_h) = (w / ATLAS_SIZE as f32, h / ATLAS_SIZE as f32);
-    for (i, cell) in grid.cells.iter().enumerate() {
-        if cell.ch == ' ' {
+    let (atlas_width, atlas_height) = (width / ATLAS_SIZE as f32, height / ATLAS_SIZE as f32);
+    for (index, cell) in grid.cells.iter().enumerate() {
+        if cell.character == ' ' {
             continue;
         }
-        if let Some([x, y]) = glyph(cell.ch, cell.bold) {
+        if let Some([x, y]) = glyph(cell.character, cell.bold) {
             let uv = [
                 x as f32 / ATLAS_SIZE as f32,
                 y as f32 / ATLAS_SIZE as f32,
-                atlas_w,
-                atlas_h,
+                atlas_width,
+                atlas_height,
             ];
-            let fg = if cursor == Some(i) { grid.bg } else { cell.fg };
+            let fg = if cursor == Some(index) {
+                grid.bg
+            } else {
+                cell.fg
+            };
             quads.push(Quad {
-                rect: cell_rect(i),
+                rect: cell_rect(index),
                 uv,
                 color: color(fg, srgb_blend),
             });
@@ -250,7 +254,7 @@ impl Gpu {
     }
 
     fn ensure_pipeline(&mut self, device: &wgpu::Device, format: wgpu::TextureFormat) {
-        if self.pipelines.iter().any(|(f, _)| *f == format) {
+        if self.pipelines.iter().any(|(built, _)| *built == format) {
             return;
         }
         let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -355,7 +359,9 @@ impl TerminalCompositor {
         pass: &mut wgpu::RenderPass<'_>,
         site: &EffectSite<'_>,
     ) {
-        let gpu = self.gpu.as_mut().expect("gpu is built before drawing");
+        let Some(gpu) = self.gpu.as_mut() else {
+            return;
+        };
         if self
             .font
             .as_ref()
@@ -363,10 +369,21 @@ impl TerminalCompositor {
         {
             self.font = None;
         }
-        let (_, font) = self.font.get_or_insert_with(|| {
-            gpu.atlas.reset();
-            (site.scale, Font::new(FONT_POINTS, site.scale))
-        });
+        if self.font.is_none() {
+            match Font::new(FONT_POINTS, site.scale) {
+                Ok(font) => {
+                    gpu.atlas.reset();
+                    self.font = Some((site.scale, font));
+                }
+                Err(error) => {
+                    eprintln!("agentd: load font: {error:#}");
+                    return;
+                }
+            }
+        }
+        let Some((_, font)) = &self.font else {
+            return;
+        };
         gpu.ensure_pipeline(device, site.format);
         let slot = gpu
             .slots
@@ -375,13 +392,13 @@ impl TerminalCompositor {
 
         let rect = site.instance.rect;
         let padding = PADDING_POINTS * site.scale;
-        let cols = (((rect[2] - 2.0 * padding) / font.cell_w as f32) as u16).max(1);
-        let rows = (((rect[3] - 2.0 * padding) / font.cell_h as f32) as u16).max(1);
-        let size = (cols, rows, font.cell_w, font.cell_h);
+        let cols = (((rect[2] - 2.0 * padding) / font.cell_width as f32) as u16).max(1);
+        let rows = (((rect[3] - 2.0 * padding) / font.cell_height as f32) as u16).max(1);
+        let size = (cols, rows, font.cell_width, font.cell_height);
         if slot.sent_size.replace(size) != Some(size)
             && let Some(session) = &state.session
         {
-            session.resize(cols, rows, font.cell_w as u16, font.cell_h as u16);
+            session.resize(cols, rows, font.cell_width as u16, font.cell_height as u16);
         }
 
         let grid = state.grid();
@@ -395,7 +412,7 @@ impl TerminalCompositor {
                 font,
                 site.srgb_blend,
                 &mut slot.scratch,
-                |ch, bold| atlas.glyph(queue, texture, font, ch, bold),
+                |character, bold| atlas.glyph(queue, texture, font, character, bold),
             );
             let bytes: &[u8] = cast_slice(&slot.scratch);
             if bytes.len() as u64 > slot.quads.size() {
@@ -411,12 +428,13 @@ impl TerminalCompositor {
             site.size[1] as f32,
         ];
         queue.write_buffer(&slot.uniforms, 0, cast_slice(&frame));
-        let pipeline = &gpu
+        let Some((_, pipeline)) = gpu
             .pipelines
             .iter()
-            .find(|(f, _)| *f == site.format)
-            .expect("pipeline was just built")
-            .1;
+            .find(|(built, _)| *built == site.format)
+        else {
+            return;
+        };
         pass.set_pipeline(pipeline);
         pass.set_bind_group(0, &slot.bind_group, &[]);
         pass.set_vertex_buffer(0, slot.quads.slice(..));
@@ -425,16 +443,29 @@ impl TerminalCompositor {
 }
 
 impl Compositor<State> for TerminalCompositor {
-    fn render(&mut self, f: &mut Frame<'_, State>) {
-        let key = f.device_key();
+    fn render(&mut self, frame: &mut Frame<'_, State>) {
+        let key = frame.device_key();
         if self.gpu.as_ref().is_none_or(|gpu| gpu.key != key) {
-            self.gpu = Some(Gpu::new(f.device, key));
+            self.gpu = Some(Gpu::new(frame.device, key));
         }
-        let (device, queue, size, clear) = (f.device, f.queue, f.size, f.rt.clear_color());
-        f.ui.prepare(device, queue, &mut f.rt.text.atlas, &f.rt.instances, size);
-        let state = &f.rt.state;
-        f.ui.draw_with(f.encoder, f.target, clear, &mut |pass, site| {
-            self.draw(device, queue, state, pass, site)
-        });
+        let (device, queue, size, clear) = (
+            frame.device,
+            frame.queue,
+            frame.size,
+            frame.rt.clear_color(),
+        );
+        frame.ui.prepare(
+            device,
+            queue,
+            &mut frame.rt.text.atlas,
+            &frame.rt.instances,
+            size,
+        );
+        let state = &frame.rt.state;
+        frame
+            .ui
+            .draw_with(frame.encoder, frame.target, clear, &mut |pass, site| {
+                self.draw(device, queue, state, pass, site)
+            });
     }
 }
