@@ -15,6 +15,7 @@ use anyhow::{Context, Result};
 use crossbeam_channel::{Receiver, Sender, bounded, never, select, unbounded};
 use libghostty_vt::render::{CellIterator, Dirty, RowIterator};
 use libghostty_vt::style::RgbColor;
+use libghostty_vt::terminal::Mode;
 use libghostty_vt::{RenderState, Terminal, key};
 use nix::errno::Errno;
 use nix::pty::{Winsize, openpty};
@@ -25,6 +26,7 @@ use rune::Waker;
 use crate::input::KeyInput;
 
 const FRAME: Duration = Duration::from_millis(8);
+const HOLD_TIMEOUT: Duration = Duration::from_secs(1);
 const MESSAGE_COLS: u16 = 80;
 const DEFAULT_FG: RgbColor = RgbColor {
     r: 0xd8,
@@ -377,7 +379,7 @@ impl Actor {
             waker: self.waker.clone(),
             generation: 0,
             next_frame: Instant::now(),
-            held: false,
+            hold_started: None,
         }));
 
         let pty_input = self.input.clone();
@@ -387,7 +389,7 @@ impl Actor {
         let hold_publisher = publisher.clone();
         terminal.on_render_hold(move |terminal, held| {
             let mut publisher = hold_publisher.borrow_mut();
-            publisher.held = held;
+            publisher.hold_started = held.then(Instant::now);
             // Keep the finished frame from before the hold, or a program that redraws constantly looks frozen.
             if held && Instant::now() >= publisher.next_frame {
                 publisher.publish(terminal).log_err("publish held frame");
@@ -398,14 +400,7 @@ impl Actor {
         let mut event = key::Event::new()?;
         let mut dirty = true;
         loop {
-            let wait = if dirty {
-                publisher
-                    .borrow()
-                    .next_frame
-                    .saturating_duration_since(Instant::now())
-            } else {
-                Duration::from_secs(3600)
-            };
+            let wait = publisher.borrow().wait(dirty, Instant::now());
             select! {
                 recv(self.output) -> bytes => match bytes {
                     Ok(bytes) => { terminal.vt_write(&bytes); dirty = true; }
@@ -455,7 +450,17 @@ impl Actor {
                 default(wait) => {}
             }
             let mut publisher = publisher.borrow_mut();
-            if dirty && !publisher.held && Instant::now() >= publisher.next_frame {
+            if publisher
+                .hold_started
+                .is_some_and(|started| started.elapsed() >= HOLD_TIMEOUT)
+            {
+                // Doesn't invoke the hold callback, so the publisher is released by hand.
+                terminal
+                    .set_mode(Mode::SYNC_OUTPUT, false)
+                    .log_err("end expired render hold");
+                publisher.hold_started = None;
+            }
+            if dirty && publisher.hold_started.is_none() && Instant::now() >= publisher.next_frame {
                 publisher.publish(&terminal)?;
                 dirty = false;
             }
@@ -469,10 +474,18 @@ struct Publisher {
     waker: Waker,
     generation: u64,
     next_frame: Instant,
-    held: bool,
+    hold_started: Option<Instant>,
 }
 
 impl Publisher {
+    fn wait(&self, dirty: bool, now: Instant) -> Duration {
+        match self.hold_started {
+            Some(started) => (started + HOLD_TIMEOUT).saturating_duration_since(now),
+            None if dirty => self.next_frame.saturating_duration_since(now),
+            None => Duration::from_secs(3600),
+        }
+    }
+
     fn publish(&mut self, terminal: &Terminal<'static, '_>) -> Result<()> {
         self.next_frame = Instant::now() + FRAME;
         if let Some(grid) = self.builder.build(terminal, self.generation + 1)? {
@@ -581,6 +594,30 @@ mod tests {
             );
             thread::sleep(Duration::from_millis(20));
         }
+    }
+
+    #[test]
+    fn a_held_frame_sleeps_until_the_hold_deadline() {
+        let now = Instant::now();
+        let publisher = Publisher {
+            builder: GridBuilder::new().unwrap(),
+            slot: Arc::default(),
+            waker: Arc::new(|| {}),
+            generation: 0,
+            next_frame: now,
+            hold_started: Some(now),
+        };
+        assert_eq!(publisher.wait(true, now), HOLD_TIMEOUT);
+    }
+
+    #[test]
+    fn output_after_a_hold_that_never_ends_still_appears() {
+        let session = Session::spawn(None, Path::new("/tmp"), Arc::new(|| {})).unwrap();
+        type_line(
+            &session,
+            "printf '\\033[?2026h'; echo held-$((1+1)); sleep 30",
+        );
+        wait_for_line(&session, "held-2");
     }
 
     #[test]
