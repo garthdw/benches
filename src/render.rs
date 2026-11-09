@@ -111,7 +111,7 @@ fn build_quads(
     font: &Font,
     srgb_blend: bool,
     quads: &mut Vec<Quad>,
-    mut glyph: impl FnMut(char, bool) -> Option<[u32; 2]>,
+    mut glyph: impl FnMut(char, bool) -> (Option<[u32; 2]>, u64),
 ) {
     let solid = |rect, fill| Quad {
         rect,
@@ -144,27 +144,39 @@ fn build_quads(
         quads.push(solid(cell_rect(index), grid.cursor_color));
     }
     let (atlas_width, atlas_height) = (width / ATLAS_SIZE as f32, height / ATLAS_SIZE as f32);
-    for (index, cell) in grid.cells.iter().enumerate() {
-        if cell.character == ' ' {
-            continue;
+    let glyphs_start = quads.len();
+    // A reset wipes slots already handed out, so redo the glyphs once against the emptied atlas.
+    for _ in 0..2 {
+        quads.truncate(glyphs_start);
+        let mut first_epoch = None;
+        let mut reset = false;
+        for (index, cell) in grid.cells.iter().enumerate() {
+            if cell.character == ' ' {
+                continue;
+            }
+            let (slot, epoch) = glyph(cell.character, cell.bold);
+            reset |= *first_epoch.get_or_insert(epoch) != epoch;
+            if let Some([x, y]) = slot {
+                let uv = [
+                    x as f32 / ATLAS_SIZE as f32,
+                    y as f32 / ATLAS_SIZE as f32,
+                    atlas_width,
+                    atlas_height,
+                ];
+                let fg = if cursor == Some(index) {
+                    grid.bg
+                } else {
+                    cell.fg
+                };
+                quads.push(Quad {
+                    rect: cell_rect(index),
+                    uv,
+                    color: color(fg, srgb_blend),
+                });
+            }
         }
-        if let Some([x, y]) = glyph(cell.character, cell.bold) {
-            let uv = [
-                x as f32 / ATLAS_SIZE as f32,
-                y as f32 / ATLAS_SIZE as f32,
-                atlas_width,
-                atlas_height,
-            ];
-            let fg = if cursor == Some(index) {
-                grid.bg
-            } else {
-                cell.fg
-            };
-            quads.push(Quad {
-                rect: cell_rect(index),
-                uv,
-                color: color(fg, srgb_blend),
-            });
+        if !reset {
+            break;
         }
     }
 }
@@ -402,8 +414,7 @@ impl TerminalCompositor {
         }
 
         let grid = state.grid();
-        let key = (grid.generation, rect, gpu.atlas.epoch, site.srgb_blend);
-        if slot.built.replace(key) != Some(key) {
+        if slot.built != Some((grid.generation, rect, gpu.atlas.epoch, site.srgb_blend)) {
             let (atlas, texture) = (&mut gpu.atlas, &gpu.texture);
             build_quads(
                 &grid,
@@ -412,13 +423,17 @@ impl TerminalCompositor {
                 font,
                 site.srgb_blend,
                 &mut slot.scratch,
-                |character, bold| atlas.glyph(queue, texture, font, character, bold),
+                |character, bold| {
+                    let slot = atlas.glyph(queue, texture, font, character, bold);
+                    (slot, atlas.epoch)
+                },
             );
             let bytes: &[u8] = cast_slice(&slot.scratch);
             if bytes.len() as u64 > slot.quads.size() {
                 slot.quads = quad_buffer(device, (bytes.len() as u64).next_power_of_two());
             }
             queue.write_buffer(&slot.quads, 0, bytes);
+            slot.built = Some((grid.generation, rect, gpu.atlas.epoch, site.srgb_blend));
         }
 
         let frame = [
@@ -467,5 +482,46 @@ impl Compositor<State> for TerminalCompositor {
             .draw_with(frame.encoder, frame.target, clear, &mut |pass, site| {
                 self.draw(device, queue, state, pass, site)
             });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    #[test]
+    fn a_reset_during_a_build_leaves_no_quad_on_a_wiped_slot() {
+        let grid = Grid::message("abc");
+        let font = Font::new(FONT_POINTS, 1.0).unwrap();
+        let mut slots: HashMap<char, [u32; 2]> = HashMap::new();
+        let mut epoch = 0;
+        let mut quads = Vec::new();
+        build_quads(
+            &grid,
+            [0.0, 0.0, 800.0, 600.0],
+            0.0,
+            &font,
+            true,
+            &mut quads,
+            |character, _| {
+                if !slots.contains_key(&character) {
+                    if slots.len() == 2 && epoch == 0 {
+                        slots.clear();
+                        epoch = 1;
+                    }
+                    let slot = [slots.len() as u32 * 16, 0];
+                    slots.insert(character, slot);
+                }
+                (slots.get(&character).copied(), epoch)
+            },
+        );
+        let glyph_positions: Vec<[u32; 2]> = quads
+            .iter()
+            .filter(|quad| quad.uv[2] != 0.0)
+            .map(|quad| [quad.uv[0].to_bits(), quad.uv[1].to_bits()])
+            .collect();
+        assert_eq!(glyph_positions.len(), 3);
+        assert_eq!(glyph_positions.iter().collect::<HashSet<_>>().len(), 3);
     }
 }
