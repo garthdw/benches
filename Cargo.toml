@@ -1,0 +1,17 @@
+[package]
+name = "agentd"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+rune = { git = "https://github.com/anomalyco/rune", rev = "268ac7cb3db94610b3a6dd7173bc2b056f85f7bd" }
+libghostty-vt = { git = "https://github.com/Uzaaft/libghostty-rs", rev = "768add93c54ccdba3f5c4d8763789ab6416f3151" }
+wgpu = { version = "~30.0.1", default-features = false }
+bytemuck = { version = "1", features = ["derive"] }
+crossbeam-channel = "0.5"
+libc = "0.2"
+nix = { version = "0.31", features = ["term", "fs", "signal"] }
+objc2-core-foundation = "0.3"
+objc2-core-graphics = "0.3"
+objc2-core-text = "0.3"
