@@ -1,9 +1,9 @@
 use std::ptr::NonNull;
 
-use anyhow::{Context, Result};
+use anyhow::{Result, ensure};
 use libghostty_vt::style::Underline;
 use objc2_core_foundation::{
-    CFAttributedString, CFDictionary, CFRetained, CFString, CFType, CGPoint, kCFBooleanTrue,
+    CFAttributedString, CFDictionary, CFRetained, CFString, CFType, kCFBooleanTrue,
 };
 use objc2_core_graphics::{
     CGBitmapContextCreate, CGColorSpace, CGContext, CGImageAlphaInfo, CGImageByteOrderInfo,
@@ -15,7 +15,7 @@ use objc2_core_text::{
 
 use crate::sprite;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct FontStyle {
     pub bold: bool,
     pub italic: bool,
@@ -43,21 +43,6 @@ pub struct Font {
 fn face(name: &str, pixels: f64) -> CFRetained<CTFont> {
     // SAFETY: a null matrix means identity.
     unsafe { CTFont::with_name(&CFString::from_str(name), pixels, std::ptr::null()) }
-}
-
-fn glyph_for(font: &CTFont, character: char) -> Option<u16> {
-    let mut utf16 = [0u16; 2];
-    let length = character.encode_utf16(&mut utf16).len();
-    let mut glyphs = [0u16; 2];
-    // SAFETY: both buffers hold `length` elements.
-    let found = unsafe {
-        font.glyphs_for_characters(
-            NonNull::from(&mut utf16).cast(),
-            NonNull::from(&mut glyphs).cast(),
-            length as isize,
-        )
-    };
-    found.then_some(glyphs[0])
 }
 
 fn is_private_use(character: char) -> bool {
@@ -100,7 +85,17 @@ impl Font {
             face("MonaspaceNeon-BoldItalic", pixels),
         ];
         let regular = &faces[0];
-        let mut glyph = glyph_for(regular, 'M').context("the terminal font has no glyph for M")?;
+        let mut character = u16::from(b'M');
+        let mut glyph = 0u16;
+        // SAFETY: both pointers are to one element, matching the count.
+        let found = unsafe {
+            regular.glyphs_for_characters(
+                NonNull::from(&mut character),
+                NonNull::from(&mut glyph),
+                1,
+            )
+        };
+        ensure!(found, "the terminal font has no glyph for M");
         // SAFETY: one glyph, and a null advances buffer is allowed when only the total is needed.
         let advance = unsafe {
             regular.advances_for_glyphs(
@@ -190,12 +185,9 @@ impl Font {
             )
         };
         let available = f64::from(width);
-        let origin = CGPoint {
-            // Fallback faces such as CJK are narrower than two terminal cells.
-            x: ((available - line_width) / 2.0).max(0.0),
-            y: self.baseline,
-        };
-        CGContext::translate_ctm(Some(&context), origin.x, origin.y);
+        // Fallback faces such as CJK are narrower than two terminal cells.
+        let centred = ((available - line_width) / 2.0).max(0.0);
+        CGContext::translate_ctm(Some(&context), centred, self.baseline);
         if line_width > available {
             let shrink = available / line_width;
             CGContext::scale_ctm(Some(&context), shrink, shrink);

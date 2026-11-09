@@ -58,7 +58,6 @@ struct GlyphKey {
 #[derive(Clone, Copy)]
 struct AtlasGlyph {
     position: [u32; 2],
-    width: u32,
     kind: GlyphKind,
 }
 
@@ -120,7 +119,6 @@ impl Atlas {
         };
         let slot = kind.map(|kind| AtlasGlyph {
             position: self.next,
-            width,
             kind,
         });
         if let Some(AtlasGlyph {
@@ -151,11 +149,6 @@ impl Atlas {
         self.slots.insert(key, slot);
         slot
     }
-}
-
-fn faint(cell: &Cell, grid_bg: [u8; 3]) -> [u8; 3] {
-    let bg = cell.bg.unwrap_or(grid_bg);
-    std::array::from_fn(|index| ((u16::from(cell.fg[index]) + u16::from(bg[index])) / 2) as u8)
 }
 
 fn glyph_key(grid: &Grid, cell: &Cell) -> Option<GlyphKey> {
@@ -211,17 +204,12 @@ fn build_quads(
     let cursor = grid
         .cursor
         .map(|(x, y)| usize::from(y) * cols + usize::from(x));
-    let cursor_style = if grid.focused {
-        grid.cursor_style
-    } else {
-        CursorVisualStyle::BlockHollow
-    };
     let thickness = font.line_thickness as f32;
     if let Some(index) = cursor {
         let [left, top, ..] = cell_rect(index);
         let wide = grid.cells.get(index).is_some_and(|cell| cell.wide);
         let cursor_width = if wide { 2.0 * width } else { width };
-        let edges: &[[f32; 4]] = match cursor_style {
+        let edges: &[[f32; 4]] = match grid.cursor_style {
             CursorVisualStyle::Bar => &[[left, top, thickness, height]],
             CursorVisualStyle::Underline => &[[
                 left,
@@ -241,7 +229,7 @@ fn build_quads(
             quads.push(solid(*edge, grid.cursor_color));
         }
     }
-    let inverted = cursor.filter(|_| cursor_style == CursorVisualStyle::Block);
+    let inverted = cursor.filter(|_| grid.cursor_style == CursorVisualStyle::Block);
     let glyphs_start = quads.len();
     let underline_top = font.underline_top as f32;
     let textured = |found: AtlasGlyph, left: f32, top: f32, cells: f32, fg: [u8; 3]| {
@@ -251,7 +239,7 @@ fn build_quads(
             uv: [
                 x as f32 / ATLAS_SIZE as f32,
                 y as f32 / ATLAS_SIZE as f32,
-                found.width as f32 / ATLAS_SIZE as f32,
+                width * cells / ATLAS_SIZE as f32,
                 height / ATLAS_SIZE as f32,
             ],
             color: color(fg, srgb_blend),
@@ -276,8 +264,6 @@ fn build_quads(
             let [left, top, ..] = cell_rect(index);
             let fg = if inverted == Some(index) {
                 cell.bg.unwrap_or(grid.bg)
-            } else if cell.faint {
-                faint(cell, grid.bg)
             } else {
                 cell.fg
             };
@@ -292,10 +278,7 @@ fn build_quads(
                 kind @ (Underline::Curly | Underline::Dotted | Underline::Dashed) => {
                     let key = GlyphKey {
                         text: GlyphText::Underline(kind),
-                        style: FontStyle {
-                            bold: false,
-                            italic: false,
-                        },
+                        style: FontStyle::default(),
                         cells: 1,
                     };
                     if let Some(found) = lookup(key) {
@@ -645,18 +628,15 @@ mod tests {
     fn fake_glyph(position: [u32; 2]) -> AtlasGlyph {
         AtlasGlyph {
             position,
-            width: 16,
             kind: GlyphKind::Coverage,
         }
     }
 
-    #[test]
-    fn a_wide_glyph_spans_two_cells_and_its_spacer_draws_nothing() {
-        let grid = Grid::from_vt("世".as_bytes(), 4, 1).unwrap();
-        let font = Font::new(FONT_POINTS, 1.0).unwrap();
+    fn quads_for(grid: &Grid, scale: f32) -> (Vec<Quad>, Font) {
+        let font = Font::new(FONT_POINTS, scale).unwrap();
         let mut quads = Vec::new();
         build_quads(
-            &grid,
+            grid,
             [0.0, 0.0, 800.0, 600.0],
             0.0,
             &font,
@@ -664,6 +644,13 @@ mod tests {
             &mut quads,
             |_| (Some(fake_glyph([0, 0])), 0),
         );
+        (quads, font)
+    }
+
+    #[test]
+    fn a_wide_glyph_spans_two_cells_and_its_spacer_draws_nothing() {
+        let grid = Grid::from_vt("世".as_bytes(), 4, 1).unwrap();
+        let (quads, font) = quads_for(&grid, 1.0);
         let glyphs: Vec<&Quad> = quads
             .iter()
             .filter(|quad| quad.mode == MODE_COVERAGE)
@@ -673,19 +660,7 @@ mod tests {
     }
 
     fn built_quads(bytes: &[u8]) -> (Vec<Quad>, Font) {
-        let grid = Grid::from_vt(bytes, 4, 1).unwrap();
-        let font = Font::new(FONT_POINTS, 2.0).unwrap();
-        let mut quads = Vec::new();
-        build_quads(
-            &grid,
-            [0.0, 0.0, 800.0, 600.0],
-            0.0,
-            &font,
-            true,
-            &mut quads,
-            |_| (Some(fake_glyph([0, 0])), 0),
-        );
-        (quads, font)
+        quads_for(&Grid::from_vt(bytes, 4, 1).unwrap(), 2.0)
     }
 
     fn solid_lines(quads: &[Quad], font: &Font) -> usize {
@@ -721,20 +696,8 @@ mod tests {
         assert_eq!(solid_lines(&quads, &font), 1);
     }
 
-    fn cursor_quads(bytes: &[u8], focused: bool) -> (Vec<Quad>, Font) {
-        let mut grid = Grid::from_vt(bytes, 4, 1).unwrap();
-        grid.focused = focused;
-        let font = Font::new(FONT_POINTS, 2.0).unwrap();
-        let mut quads = Vec::new();
-        build_quads(
-            &grid,
-            [0.0, 0.0, 800.0, 600.0],
-            0.0,
-            &font,
-            true,
-            &mut quads,
-            |_| (Some(fake_glyph([0, 0])), 0),
-        );
+    fn cursor_quads(grid: &Grid) -> (Vec<Quad>, Font) {
+        let (quads, font) = quads_for(grid, 2.0);
         // The first quad fills the terminal; the rest before the glyph are the cursor.
         let cursor = quads
             .iter()
@@ -747,23 +710,27 @@ mod tests {
 
     #[test]
     fn each_cursor_style_has_its_own_shape() {
-        let (bar, font) = cursor_quads(b"\x1b[6 q", true);
+        let shape = |bytes| cursor_quads(&Grid::from_vt(bytes, 4, 1).unwrap());
+        let (bar, font) = shape(b"\x1b[6 q");
         assert_eq!(bar.len(), 1);
         assert_eq!(bar[0].rect[2], font.line_thickness as f32);
-        let (underline, font) = cursor_quads(b"\x1b[4 q", true);
+        let (underline, font) = shape(b"\x1b[4 q");
         assert_eq!(underline[0].rect[3], font.line_thickness as f32);
-        let (block, font) = cursor_quads(b"", true);
+        let (block, font) = shape(b"");
         assert_eq!(block[0].rect[3], font.cell_height as f32);
     }
 
     #[test]
-    fn an_unfocused_cursor_is_a_hollow_outline() {
-        assert_eq!(cursor_quads(b"", false).0.len(), 4);
+    fn a_hollow_cursor_is_an_outline() {
+        let mut grid = Grid::from_vt(b"", 4, 1).unwrap();
+        grid.cursor_style = CursorVisualStyle::BlockHollow;
+        assert_eq!(cursor_quads(&grid).0.len(), 4);
     }
 
     #[test]
     fn a_block_cursor_covers_both_cells_of_a_wide_glyph() {
-        let (block, font) = cursor_quads("世\x1b[1;1H".as_bytes(), true);
+        let grid = Grid::from_vt("世\x1b[1;1H".as_bytes(), 4, 1).unwrap();
+        let (block, font) = cursor_quads(&grid);
         assert_eq!(block[0].rect[2], 2.0 * font.cell_width as f32);
     }
 
@@ -781,16 +748,6 @@ mod tests {
         let plain = glyph_colour(b"x\x1b[1;3H");
         assert_ne!(glyph_colour(b"x\x1b[1;1H"), plain);
         assert_eq!(glyph_colour(b"x\x1b[6 q\x1b[1;1H"), plain);
-    }
-
-    #[test]
-    fn a_faint_cell_is_drawn_between_its_colour_and_the_background() {
-        let cell = Cell {
-            fg: [200, 100, 0],
-            faint: true,
-            ..Cell::default()
-        };
-        assert_eq!(faint(&cell, [0, 100, 200]), [100, 100, 100]);
     }
 
     #[test]

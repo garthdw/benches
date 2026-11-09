@@ -14,7 +14,7 @@ use rune::{
     PointerButton, PointerEvent, Tx, Waker, WheelEvent, col, effect, el, row, text,
 };
 
-use session::{Grid, PointerInput, PointerPhase, Session, WheelInput};
+use session::{Event, Grid, PointerInput, PointerPhase, Session, WheelInput};
 
 const TERMINAL_MARK: u32 = 1;
 const SCENE_FIXTURE: &[u8] = b"\x1b[1;32magentd\x1b[0m fixture\r\n\x1b[31mred\x1b[0m \x1b[42;30m on green \x1b[0m \x1b[7minverse\x1b[0m\r\n$ ";
@@ -189,6 +189,7 @@ fn view(state: &State, cx: &mut Cx<State>) -> El {
                         _ => mouse::Button::Left,
                     };
                     send_pointer(state, phase, Some(button), drag.x, drag.y, tx.mods());
+                    tx.live_only();
                 })
                 .on_secondary_press_local(|state: &mut State, event: PointerEvent, tx: &mut Tx| {
                     // Rune reports the right button once, with no separate release.
@@ -201,7 +202,7 @@ fn view(state: &State, cx: &mut Cx<State>) -> El {
                     send_pointer(state, PointerPhase::Move, None, event.x, event.y, tx.mods());
                     tx.live_only();
                 })
-                .on_wheel(|state: &mut State, event: WheelEvent, _: &mut Tx| {
+                .on_wheel(|state: &mut State, event: WheelEvent, tx: &mut Tx| {
                     if let Some(session) = &state.session {
                         session.wheel(WheelInput {
                             dy: event.dy,
@@ -210,6 +211,7 @@ fn view(state: &State, cx: &mut Cx<State>) -> El {
                             mods: input::vt_mods(event.mods),
                         });
                     }
+                    tx.live_only();
                     true
                 })
                 .children(overlays),
@@ -226,12 +228,14 @@ fn poll(state: &mut State, _: f64, tx: &mut Tx) -> bool {
     }
     let mut changed = false;
     if let Some(session) = &state.session {
-        if let Some(text) = session.take_copied() {
-            tx.copy(text);
-        }
-        if let Some(text) = session.take_rejected_paste() {
-            state.pending_paste = Some(text);
-            changed = true;
+        while let Some(event) = session.next_event() {
+            match event {
+                Event::Copied(text) => tx.copy(text),
+                Event::PasteRejected(text) => {
+                    state.pending_paste = Some(text);
+                    changed = true;
+                }
+            }
         }
     }
     let grid = state.grid();
@@ -441,16 +445,11 @@ mod tests {
 
     #[test]
     fn tab_and_escape_reach_the_window_after_clicking_chrome() {
-        let env = Env {
-            system_dark: true,
-            scale: 2.0,
-        };
-        let mut runtime = Runtime::new(State::default(), view, (960.0, 640.0), env);
+        let mut runtime = runtime_with(State::default());
         runtime.on_key = Some(|_, _, _| {
             WINDOW_KEYS.fetch_add(1, Ordering::SeqCst);
             true
         });
-        runtime.frame(0.0);
         let (x, y) = runtime.find("chrome").unwrap();
         runtime.pointer_down(x, y);
         runtime.pointer_up(x, y);

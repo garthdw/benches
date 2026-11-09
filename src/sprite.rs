@@ -309,50 +309,32 @@ pub fn draw(character: char, width: u32, height: u32, light: u32, out: &mut [u8]
         height,
         pixels: out,
     };
-    let lines = |canvas: &mut Canvas<'_>, table, index| match arms(table, index) {
-        Some(weights) => {
+    let lines = |canvas: &mut Canvas<'_>, table, index| {
+        if let Some(weights) = arms(table, index) {
             canvas.lines(weights, light);
-            true
         }
-        None => false,
     };
     match code {
         0x2504..=0x250B => {
             let offset = code - 0x2504;
             let thickness = light * (1 + (offset & 1));
             canvas.dashes(offset & 2 != 0, if offset < 4 { 3 } else { 4 }, thickness);
-            true
         }
         0x254C..=0x254F => {
             let offset = code - 0x254C;
             canvas.dashes(offset >= 2, 2, light * (1 + (offset & 1)));
-            true
         }
         0x2500..=0x254B => lines(&mut canvas, LIGHT_HEAVY_ARMS, code - 0x2500),
         0x2550..=0x256C => lines(&mut canvas, DOUBLE_ARMS, code - 0x2550),
         0x2574..=0x257F => lines(&mut canvas, SHORT_ARMS, code - 0x2574),
-        0x256D..=0x2570 => {
-            canvas.arc(code, light);
-            true
-        }
-        0x2571..=0x2573 => {
-            canvas.diagonals(code, light);
-            true
-        }
-        0x2580..=0x2595 => {
-            canvas.block(code);
-            true
-        }
-        0x2596..=0x259F => {
-            canvas.quadrants(QUADRANTS[(code - 0x2596) as usize]);
-            true
-        }
-        0xE0B0..=0xE0B3 => {
-            canvas.powerline(code, light);
-            true
-        }
-        _ => false,
+        0x256D..=0x2570 => canvas.arc(code, light),
+        0x2571..=0x2573 => canvas.diagonals(code, light),
+        0x2580..=0x2595 => canvas.block(code),
+        0x2596..=0x259F => canvas.quadrants(QUADRANTS[(code - 0x2596) as usize]),
+        0xE0B0..=0xE0B3 => canvas.powerline(code, light),
+        _ => return false,
     }
+    true
 }
 
 /// An underline that tiles across cells. Straight underlines are plain quads instead.

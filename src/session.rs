@@ -48,16 +48,26 @@ const DEFAULT_BG: RgbColor = RgbColor {
     b: 0x17,
 };
 
-trait LogErr {
-    fn log_err(self, context: &str);
+trait LogErr<T> {
+    fn log_err(self, context: &str) -> Option<T>;
 }
 
-impl<T, E: Display> LogErr for std::result::Result<T, E> {
-    fn log_err(self, context: &str) {
-        if let Err(error) = self {
-            eprintln!("agentd: {context}: {error}");
+impl<T, E: Display> LogErr<T> for std::result::Result<T, E> {
+    fn log_err(self, context: &str) -> Option<T> {
+        match self {
+            Ok(value) => Some(value),
+            Err(error) => {
+                eprintln!("agentd: {context}: {error:#}");
+                None
+            }
         }
     }
+}
+
+/// Sent from the actor for the UI to pick up in `poll`.
+pub enum Event {
+    Copied(String),
+    PasteRejected(String),
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -108,7 +118,6 @@ pub struct Cell {
     pub bg: Option<[u8; 3]>,
     pub bold: bool,
     pub italic: bool,
-    pub faint: bool,
     pub strikethrough: bool,
     pub overline: bool,
     pub underline: Underline,
@@ -127,7 +136,6 @@ impl Default for Cell {
             bg: None,
             bold: false,
             italic: false,
-            faint: false,
             strikethrough: false,
             overline: false,
             underline: Underline::None,
@@ -148,7 +156,6 @@ pub struct Grid {
     pub cursor_style: CursorVisualStyle,
     pub cursor_blinking: bool,
     pub cursor_color: [u8; 3],
-    pub focused: bool,
     pub metrics: Metrics,
     pub bg: [u8; 3],
 }
@@ -164,7 +171,6 @@ impl Default for Grid {
             cursor_style: CursorVisualStyle::Block,
             cursor_blinking: false,
             cursor_color: [0; 3],
-            focused: true,
             metrics: Metrics::default(),
             bg: rgb(DEFAULT_BG),
         }
@@ -241,12 +247,17 @@ fn rgb(color: RgbColor) -> [u8; 3] {
     [color.r, color.g, color.b]
 }
 
+fn faint(color: [u8; 3], background: [u8; 3]) -> [u8; 3] {
+    std::array::from_fn(|index| {
+        ((u16::from(color[index]) + u16::from(background[index])) / 2) as u8
+    })
+}
+
 /// What the actor knows that the terminal doesn't.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq)]
 struct Presentation {
     focused: bool,
     cursor_on: bool,
-    force: bool,
     metrics: Metrics,
 }
 
@@ -255,7 +266,6 @@ impl Default for Presentation {
         Self {
             focused: true,
             cursor_on: true,
-            force: false,
             metrics: Metrics::default(),
         }
     }
@@ -265,7 +275,7 @@ struct GridBuilder {
     state: RenderState<'static>,
     rows: RowIterator<'static>,
     cells: CellIterator<'static>,
-    last_cursor: Option<(CursorVisualStyle, bool)>,
+    last_shown: Option<(CursorVisualStyle, bool, Presentation)>,
 }
 
 impl GridBuilder {
@@ -274,8 +284,13 @@ impl GridBuilder {
             state: RenderState::new()?,
             rows: RowIterator::new()?,
             cells: CellIterator::new()?,
-            last_cursor: None,
+            last_shown: None,
         })
+    }
+
+    /// libghostty isn't known to mark the render state dirty when only the selection moves.
+    fn selection_changed(&mut self) {
+        self.last_shown = None;
     }
 
     fn build(
@@ -285,12 +300,16 @@ impl GridBuilder {
         presentation: Presentation,
     ) -> Result<Option<Grid>> {
         let snapshot = self.state.update(terminal)?;
-        let cursor_style = snapshot.cursor_visual_style()?;
-        let cursor_blinking = snapshot.cursor_blinking()?;
+        let cursor_style = if presentation.focused {
+            snapshot.cursor_visual_style()?
+        } else {
+            CursorVisualStyle::BlockHollow
+        };
+        let cursor_blinking = snapshot.cursor_blinking()? && snapshot.cursor_visible()?;
+        let shown = (cursor_style, cursor_blinking, presentation);
         // libghostty leaves the render state clean when only the cursor's style changes.
-        let cursor_changed = self.last_cursor.replace((cursor_style, cursor_blinking))
-            != Some((cursor_style, cursor_blinking));
-        if matches!(snapshot.dirty()?, Dirty::Clean) && !presentation.force && !cursor_changed {
+        let unchanged = self.last_shown.replace(shown) == Some(shown);
+        if matches!(snapshot.dirty()?, Dirty::Clean) && unchanged {
             return Ok(None);
         }
         let colors = snapshot.colors()?;
@@ -305,11 +324,13 @@ impl GridBuilder {
                 let mut bg = cell.bg_color()?;
                 let mut output = Cell::default();
                 let mut invisible = false;
+                let mut is_faint = false;
+                let mut inverted = cell.is_selected()?;
                 if cell.has_styling()? {
                     let style = cell.style()?;
                     output.bold = style.bold;
                     output.italic = style.italic;
-                    output.faint = style.faint;
+                    is_faint = style.faint;
                     output.strikethrough = style.strikethrough;
                     output.overline = style.overline;
                     output.underline = style.underline;
@@ -321,13 +342,9 @@ impl GridBuilder {
                         }
                     };
                     invisible = style.invisible;
-                    if style.inverse {
-                        let old_fg = fg;
-                        fg = bg.unwrap_or(colors.background);
-                        bg = Some(old_fg);
-                    }
+                    inverted ^= style.inverse;
                 }
-                if cell.is_selected()? {
+                if inverted {
                     let old_fg = fg;
                     fg = bg.unwrap_or(colors.background);
                     bg = Some(old_fg);
@@ -335,22 +352,26 @@ impl GridBuilder {
                 let width = cell.raw_cell()?.wide()?;
                 output.wide = width == CellWide::Wide;
                 output.spacer = matches!(width, CellWide::SpacerTail | CellWide::SpacerHead);
-                output.fg = rgb(fg);
+                output.fg = if is_faint {
+                    faint(rgb(fg), rgb(bg.unwrap_or(colors.background)))
+                } else {
+                    rgb(fg)
+                };
                 output.bg = bg.map(rgb);
                 if !invisible {
                     let mut character = [' '];
                     match cell.graphemes_buf(&mut character) {
+                        Ok(()) => {}
                         // The buffer holds the base codepoint even when the grapheme is longer.
-                        Ok(()) | Err(libghostty_vt::Error::OutOfSpace { .. }) => {}
+                        Err(libghostty_vt::Error::OutOfSpace { .. }) => {
+                            let mut cluster = String::new();
+                            cell.graphemes_utf8(&mut cluster)?;
+                            output.cluster = Some(u32::try_from(clusters.len())?);
+                            clusters.push(cluster);
+                        }
                         Err(error) => return Err(error.into()),
                     }
                     output.character = character[0];
-                    if cell.graphemes_len()? > 1 {
-                        let mut cluster = String::new();
-                        cell.graphemes_utf8(&mut cluster)?;
-                        output.cluster = Some(u32::try_from(clusters.len())?);
-                        clusters.push(cluster);
-                    }
                 }
                 cells.push(output);
             }
@@ -373,7 +394,6 @@ impl GridBuilder {
             cursor_style,
             cursor_blinking,
             cursor_color: rgb(colors.cursor.unwrap_or(colors.foreground)),
-            focused: presentation.focused,
             metrics: presentation.metrics,
             bg: rgb(colors.background),
         }))
@@ -402,23 +422,6 @@ fn whole_lines(remainder: &mut f32, delta: f32) -> i32 {
     let lines = remainder.trunc();
     *remainder -= lines;
     lines as i32
-}
-
-#[derive(Debug, PartialEq, Eq)]
-enum WheelRoute {
-    MouseButtons,
-    ArrowKeys,
-    Viewport,
-}
-
-fn wheel_route(terminal: &Terminal<'static, '_>) -> Result<WheelRoute> {
-    Ok(if terminal.is_mouse_tracking()? {
-        WheelRoute::MouseButtons
-    } else if terminal.active_screen()? == Screen::Alternate && terminal.mode(Mode::ALT_SCROLL)? {
-        WheelRoute::ArrowKeys
-    } else {
-        WheelRoute::Viewport
-    })
 }
 
 /// False if libghostty refused the text because it could run commands.
@@ -553,19 +556,20 @@ impl TerminalInput {
         button: Option<mouse::Button>,
         mods: key::Mods,
     ) -> Result<Vec<u8>> {
-        let metrics = surface.metrics;
-        let padding = metrics.padding.round() as u32;
-        let (cell_width, cell_height) = (
-            u32::from(metrics.cell_width),
-            u32::from(metrics.cell_height),
-        );
+        let Geometry {
+            columns,
+            cell_width,
+            padding_left: padding,
+            screen_height,
+            ..
+        } = Self::geometry(surface);
         self.mouse_encoder
             .set_options_from_terminal(terminal)
             .set_size(mouse::EncoderSize {
-                screen_width: u32::from(surface.cols) * cell_width + 2 * padding,
-                screen_height: u32::from(surface.rows) * cell_height + 2 * padding,
+                screen_width: columns * cell_width + 2 * padding,
+                screen_height,
                 cell_width,
-                cell_height,
+                cell_height: surface.metrics.cell_height.into(),
                 padding_top: padding,
                 padding_bottom: padding,
                 padding_right: padding,
@@ -604,10 +608,7 @@ impl TerminalInput {
         terminal: &Terminal<'static, '_>,
         input: PointerInput,
     ) -> Result<PointerOutcome> {
-        let Some(surface) = self
-            .surface
-            .filter(|surface| surface.metrics.cell_width > 0)
-        else {
+        let Some(surface) = self.surface else {
             return Ok(PointerOutcome::default());
         };
         let scale = surface.metrics.scale;
@@ -616,16 +617,12 @@ impl TerminalInput {
             bytes: Vec::new(),
             selection_changed: true,
         };
-        let reported = |bytes| PointerOutcome {
-            bytes,
-            selection_changed: false,
-        };
         let grid_ref_point = Point::Viewport(Self::viewport_point(surface, self.position));
-        match input.phase {
+        let to_report = match input.phase {
             PointerPhase::Press => {
-                let report =
+                let reporting =
                     terminal.is_mouse_tracking()? && !input.mods.contains(key::Mods::SHIFT);
-                self.selecting = !report && input.button == Some(mouse::Button::Left);
+                self.selecting = !reporting && input.button == Some(mouse::Button::Left);
                 if self.selecting {
                     let grid_ref = terminal.grid_ref(grid_ref_point)?;
                     let selection = self
@@ -637,16 +634,11 @@ impl TerminalInput {
                     terminal.set_selection(selection.as_ref())?;
                     return Ok(selection_changed);
                 }
-                if report {
+                if reporting {
                     self.pressed = input.button;
-                    let bytes = self.report(
-                        terminal,
-                        surface,
-                        mouse::Action::Press,
-                        input.button,
-                        input.mods,
-                    )?;
-                    return Ok(reported(bytes));
+                    Some((mouse::Action::Press, input.button))
+                } else {
+                    None
                 }
             }
             PointerPhase::Drag if self.selecting => {
@@ -666,45 +658,30 @@ impl TerminalInput {
                 return Ok(selection_changed);
             }
             PointerPhase::Drag if self.pressed.is_some() => {
-                let bytes = self.report(
-                    terminal,
-                    surface,
-                    mouse::Action::Motion,
-                    self.pressed,
-                    input.mods,
-                )?;
-                return Ok(reported(bytes));
+                Some((mouse::Action::Motion, self.pressed))
             }
             PointerPhase::Release if self.selecting => {
                 let grid_ref = terminal.grid_ref(grid_ref_point).ok();
                 self.release.apply(&mut self.gesture, terminal, grid_ref)?;
                 self.selecting = false;
                 self.next_autoscroll = None;
+                None
             }
             PointerPhase::Release if self.pressed.is_some() => {
-                let button = self.pressed.take();
-                let bytes = self.report(
-                    terminal,
-                    surface,
-                    mouse::Action::Release,
-                    button,
-                    input.mods,
-                )?;
-                return Ok(reported(bytes));
+                Some((mouse::Action::Release, self.pressed.take()))
             }
             PointerPhase::Move if terminal.is_mouse_tracking()? => {
-                let bytes =
-                    self.report(terminal, surface, mouse::Action::Motion, None, input.mods)?;
-                return Ok(reported(bytes));
+                Some((mouse::Action::Motion, None))
             }
-            _ => {}
-        }
-        Ok(PointerOutcome::default())
-    }
-
-    fn autoscroll_wait(&self, now: Instant) -> Option<Duration> {
-        self.next_autoscroll
-            .map(|due| due.saturating_duration_since(now))
+            _ => None,
+        };
+        let Some((action, button)) = to_report else {
+            return Ok(PointerOutcome::default());
+        };
+        Ok(PointerOutcome {
+            bytes: self.report(terminal, surface, action, button, input.mods)?,
+            selection_changed: false,
+        })
     }
 
     /// Scrolls one line while a selection drag is held past the edge. True if anything moved.
@@ -736,10 +713,7 @@ impl TerminalInput {
         terminal: &mut Terminal<'static, '_>,
         input: WheelInput,
     ) -> Result<Vec<u8>> {
-        let Some(surface) = self
-            .surface
-            .filter(|surface| surface.metrics.cell_height > 0)
-        else {
+        let Some(surface) = self.surface else {
             return Ok(Vec::new());
         };
         let line_height = f32::from(surface.metrics.cell_height) / surface.metrics.scale;
@@ -749,45 +723,43 @@ impl TerminalInput {
             return Ok(bytes);
         }
         let toward_history = lines > 0;
-        match wheel_route(terminal)? {
-            WheelRoute::MouseButtons => {
-                self.position = (
-                    input.x * surface.metrics.scale,
-                    input.y * surface.metrics.scale,
-                );
-                let button = Some(if toward_history {
-                    mouse::Button::Four
-                } else {
-                    mouse::Button::Five
-                });
-                for _ in 0..lines.unsigned_abs() {
-                    for action in [mouse::Action::Press, mouse::Action::Release] {
-                        bytes.extend(self.report(terminal, surface, action, button, input.mods)?);
-                    }
+        if terminal.is_mouse_tracking()? {
+            self.position = (
+                input.x * surface.metrics.scale,
+                input.y * surface.metrics.scale,
+            );
+            let button = Some(if toward_history {
+                mouse::Button::Four
+            } else {
+                mouse::Button::Five
+            });
+            for _ in 0..lines.unsigned_abs() {
+                for action in [mouse::Action::Press, mouse::Action::Release] {
+                    bytes.extend(self.report(terminal, surface, action, button, input.mods)?);
                 }
             }
-            WheelRoute::ArrowKeys => {
-                let arrow = if toward_history {
-                    key::Key::ArrowUp
-                } else {
-                    key::Key::ArrowDown
-                };
-                for _ in 0..lines.unsigned_abs() {
-                    bytes.extend(self.encode_key(
-                        terminal,
-                        KeyInput {
-                            key: arrow,
-                            mods: key::Mods::empty(),
-                            consumed: key::Mods::empty(),
-                            text: None,
-                            unshifted: '\0',
-                        },
-                    )?);
-                }
+        } else if terminal.active_screen()? == Screen::Alternate
+            && terminal.mode(Mode::ALT_SCROLL)?
+        {
+            let arrow = if toward_history {
+                key::Key::ArrowUp
+            } else {
+                key::Key::ArrowDown
+            };
+            for _ in 0..lines.unsigned_abs() {
+                bytes.extend(self.encode_key(
+                    terminal,
+                    KeyInput {
+                        key: arrow,
+                        mods: key::Mods::empty(),
+                        consumed: key::Mods::empty(),
+                        text: None,
+                        unshifted: '\0',
+                    },
+                )?);
             }
-            WheelRoute::Viewport => {
-                terminal.scroll_viewport(ScrollViewport::Delta(-(lines as isize)));
-            }
+        } else {
+            terminal.scroll_viewport(ScrollViewport::Delta(-(lines as isize)));
         }
         Ok(bytes)
     }
@@ -797,8 +769,7 @@ impl TerminalInput {
 pub struct Session {
     commands: Option<Sender<Msg>>,
     grid: Arc<Mutex<Arc<Grid>>>,
-    copied: Arc<Mutex<Option<String>>>,
-    rejected_paste: Arc<Mutex<Option<String>>>,
+    events: Receiver<Event>,
 }
 
 impl Session {
@@ -860,8 +831,7 @@ impl Session {
 
         let (commands, commands_rx) = unbounded();
         let grid = Arc::new(Mutex::new(Arc::new(Grid::default())));
-        let copied = Arc::new(Mutex::new(None));
-        let rejected_paste = Arc::new(Mutex::new(None));
+        let (events_tx, events) = unbounded();
         let mut actor = Actor {
             cols,
             rows,
@@ -871,8 +841,7 @@ impl Session {
             child,
             master,
             slot: grid.clone(),
-            copied: copied.clone(),
-            rejected_paste: rejected_paste.clone(),
+            events: events_tx,
             waker,
         };
         thread::spawn(move || {
@@ -888,8 +857,7 @@ impl Session {
         Ok(Self {
             commands: Some(commands),
             grid,
-            copied,
-            rejected_paste,
+            events,
         })
     }
 
@@ -898,8 +866,7 @@ impl Session {
         Self {
             commands: None,
             grid: Arc::new(Mutex::new(Arc::new(grid))),
-            copied: Arc::default(),
-            rejected_paste: Arc::default(),
+            events: unbounded().1,
         }
     }
 
@@ -930,22 +897,12 @@ impl Session {
         self.send(Msg::Copy);
     }
 
-    pub fn take_copied(&self) -> Option<String> {
-        self.copied
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .take()
-    }
-
     pub fn paste(&self, text: String, allow_unsafe: bool) {
         self.send(Msg::Paste { text, allow_unsafe });
     }
 
-    pub fn take_rejected_paste(&self) -> Option<String> {
-        self.rejected_paste
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .take()
+    pub fn next_event(&self) -> Option<Event> {
+        self.events.try_recv().ok()
     }
 
     pub fn resize(&self, surface: Surface) {
@@ -1014,8 +971,7 @@ struct Actor {
     child: Child,
     master: OwnedFd,
     slot: Arc<Mutex<Arc<Grid>>>,
-    copied: Arc<Mutex<Option<String>>>,
-    rejected_paste: Arc<Mutex<Option<String>>>,
+    events: Sender<Event>,
     waker: Waker,
 }
 
@@ -1051,11 +1007,8 @@ impl Actor {
             generation: 0,
             next_frame: Instant::now(),
             hold_started: None,
-            focused: true,
-            cursor_on: true,
+            presentation: Presentation::default(),
             next_blink: None,
-            force: false,
-            metrics: Metrics::default(),
         }));
 
         let pty_input = self.input.clone();
@@ -1081,7 +1034,9 @@ impl Actor {
         loop {
             let now = Instant::now();
             let wait = publisher.borrow().wait(dirty, now);
-            let wait = input.autoscroll_wait(now).map_or(wait, |due| wait.min(due));
+            let wait = input
+                .next_autoscroll
+                .map_or(wait, |due| wait.min(due.saturating_duration_since(now)));
             let wait = resize.wait(now).map_or(wait, |due| wait.min(due));
             select! {
                 recv(self.output) -> bytes => match bytes {
@@ -1094,67 +1049,60 @@ impl Actor {
                     }
                 },
                 recv(self.commands) -> command => match command {
-                    Ok(Msg::Key(key)) => match input.key(&mut terminal, key) {
-                        Ok(encoded) if !encoded.is_empty() => {
+                    Ok(Msg::Key(key)) => {
+                        if let Some(encoded) = input.key(&mut terminal, key).log_err("encode key")
+                            && !encoded.is_empty()
+                        {
                             self.input.send(encoded).log_err("queue key input");
                             publisher.borrow_mut().restart_blink(Instant::now());
                             dirty = true;
                         }
-                        Ok(_) => {}
-                        Err(error) => eprintln!("agentd: encode key: {error:#}"),
-                    },
-                    Ok(Msg::Pointer(pointer)) => match input.pointer(&terminal, pointer) {
-                        Ok(outcome) => {
+                    }
+                    Ok(Msg::Pointer(pointer)) => {
+                        if let Some(outcome) = input.pointer(&terminal, pointer).log_err("handle pointer") {
                             if !outcome.bytes.is_empty() {
                                 self.input.send(outcome.bytes).log_err("queue mouse report");
                             }
                             if outcome.selection_changed {
-                                publisher.borrow_mut().force = true;
+                                publisher.borrow_mut().builder.selection_changed();
                                 dirty = true;
                             }
                         }
-                        Err(error) => eprintln!("agentd: handle pointer: {error:#}"),
-                    },
-                    Ok(Msg::Wheel(wheel)) => match input.wheel(&mut terminal, wheel) {
-                        Ok(bytes) => {
+                    }
+                    Ok(Msg::Wheel(wheel)) => {
+                        if let Some(bytes) = input.wheel(&mut terminal, wheel).log_err("handle wheel") {
                             if !bytes.is_empty() {
                                 self.input.send(bytes).log_err("queue wheel input");
                             }
                             dirty = true;
                         }
-                        Err(error) => eprintln!("agentd: handle wheel: {error:#}"),
-                    },
-                    Ok(Msg::Copy) => match selection_text(&terminal) {
-                        Ok(Some(text)) => {
-                            *self.copied.lock().unwrap_or_else(PoisonError::into_inner) = Some(text);
+                    }
+                    Ok(Msg::Copy) => {
+                        if let Some(Some(text)) = selection_text(&terminal).log_err("copy selection") {
+                            self.events.send(Event::Copied(text)).log_err("queue copied text");
                             (self.waker)();
                         }
-                        Ok(None) => {}
-                        Err(error) => eprintln!("agentd: copy selection: {error:#}"),
-                    },
+                    }
                     Ok(Msg::Focus(focused)) => {
-                        publisher.borrow_mut().set_focused(focused, Instant::now());
+                        let mut publisher = publisher.borrow_mut();
+                        publisher.presentation.focused = focused;
+                        publisher.restart_blink(Instant::now());
                         dirty = true;
-                        match focus_report(&terminal, focused) {
-                            Ok(Some(report)) => self.input.send(report).log_err("queue focus report"),
-                            Ok(None) => {}
-                            Err(error) => eprintln!("agentd: encode focus report: {error:#}"),
+                        if let Some(Some(report)) = focus_report(&terminal, focused).log_err("encode focus report") {
+                            self.input.send(report).log_err("queue focus report");
                         }
                     }
                     Ok(Msg::Paste { text, allow_unsafe }) => {
-                        match paste_text(&mut terminal, &text, allow_unsafe) {
-                            Ok(true) => {
+                        match paste_text(&mut terminal, &text, allow_unsafe).log_err("paste") {
+                            Some(true) => {
                                 publisher.borrow_mut().restart_blink(Instant::now());
                                 dirty = true;
                             }
-                            Ok(false) => {
-                                *self
-                                    .rejected_paste
-                                    .lock()
-                                    .unwrap_or_else(PoisonError::into_inner) = Some(text);
+                            Some(false) => {
+                                self.events.send(Event::PasteRejected(text)).log_err("queue rejected paste");
                                 (self.waker)();
                             }
-                            Err(error) => eprintln!("agentd: paste: {error:#}"),
+                            None => {}
                         }
                     }
                     Ok(Msg::Resize(surface)) => {
@@ -1167,18 +1115,18 @@ impl Actor {
             }
             let mut publisher = publisher.borrow_mut();
             dirty |= publisher.tick_blink(Instant::now());
-            match input.tick_autoscroll(&terminal, Instant::now()) {
-                Ok(true) => {
-                    publisher.force = true;
-                    dirty = true;
-                }
-                Ok(false) => {}
-                Err(error) => eprintln!("agentd: autoscroll selection: {error:#}"),
+            if input
+                .tick_autoscroll(&terminal, Instant::now())
+                .log_err("autoscroll selection")
+                == Some(true)
+            {
+                publisher.builder.selection_changed();
+                dirty = true;
             }
             if let Some(surface) = resize.take_due(Instant::now()) {
                 self.apply_resize(&mut terminal, surface);
                 input.surface = Some(surface);
-                publisher.metrics = surface.metrics;
+                publisher.presentation.metrics = surface.metrics;
             }
             if publisher
                 .hold_started
@@ -1207,11 +1155,8 @@ struct Publisher {
     generation: u64,
     next_frame: Instant,
     hold_started: Option<Instant>,
-    focused: bool,
-    cursor_on: bool,
+    presentation: Presentation,
     next_blink: Option<Instant>,
-    force: bool,
-    metrics: Metrics,
 }
 
 impl Publisher {
@@ -1230,46 +1175,31 @@ impl Publisher {
         if !self.next_blink.is_some_and(|blink| now >= blink) {
             return false;
         }
-        self.cursor_on = !self.cursor_on;
+        self.presentation.cursor_on = !self.presentation.cursor_on;
         self.next_blink = Some(now + BLINK);
-        self.force = true;
         true
     }
 
     /// Keeps the cursor solid while the user is typing.
     fn restart_blink(&mut self, now: Instant) {
         if self.next_blink.is_some() {
-            self.cursor_on = true;
+            self.presentation.cursor_on = true;
             self.next_blink = Some(now + BLINK);
-            self.force = true;
         }
-    }
-
-    fn set_focused(&mut self, focused: bool, now: Instant) {
-        self.focused = focused;
-        self.force = true;
-        self.restart_blink(now);
     }
 
     fn publish(&mut self, terminal: &Terminal<'static, '_>) -> Result<()> {
         let now = Instant::now();
         self.next_frame = now + FRAME;
-        let presentation = Presentation {
-            focused: self.focused,
-            cursor_on: self.cursor_on,
-            force: self.force,
-            metrics: self.metrics,
-        };
         if let Some(grid) = self
             .builder
-            .build(terminal, self.generation + 1, presentation)?
+            .build(terminal, self.generation + 1, self.presentation)?
         {
-            self.force = false;
-            if grid.cursor_blinking && self.focused {
+            if grid.cursor_blinking && self.presentation.focused {
                 self.next_blink.get_or_insert(now + BLINK);
             } else {
                 self.next_blink = None;
-                self.cursor_on = true;
+                self.presentation.cursor_on = true;
             }
             self.generation = grid.generation;
             store(&self.slot, grid);
@@ -1350,8 +1280,14 @@ mod tests {
     fn text_styles_reach_the_cell() {
         let grid = Grid::from_vt(b"\x1b[3;2;9;53mx", 4, 1).unwrap();
         let cell = grid.cells[0];
-        assert!(cell.italic && cell.faint && cell.strikethrough && cell.overline);
+        assert!(cell.italic && cell.strikethrough && cell.overline);
         assert_eq!(cell.underline, Underline::None);
+        assert_eq!(cell.fg, faint(rgb(DEFAULT_FG), rgb(DEFAULT_BG)));
+    }
+
+    #[test]
+    fn faint_is_halfway_between_the_colour_and_the_background() {
+        assert_eq!(faint([200, 100, 0], [0, 100, 200]), [100, 100, 100]);
     }
 
     #[test]
@@ -1425,21 +1361,33 @@ mod tests {
         );
     }
 
-    fn wait_for_line(session: &Session, want: &str) {
-        let deadline = Instant::now() + Duration::from_secs(15);
-        while !session
-            .grid()
-            .lines()
-            .iter()
-            .any(|line| line.trim_end() == want)
-        {
-            assert!(
-                Instant::now() < deadline,
-                "{want} never arrived: {:#?}",
-                session.grid().lines()
-            );
-            thread::sleep(Duration::from_millis(20));
+    fn wait_until<T>(
+        timeout: Duration,
+        describe: impl Fn() -> String,
+        mut found: impl FnMut() -> Option<T>,
+    ) -> T {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if let Some(value) = found() {
+                return value;
+            }
+            assert!(Instant::now() < deadline, "{}", describe());
+            thread::sleep(Duration::from_millis(10));
         }
+    }
+
+    fn wait_for_line(session: &Session, want: &str) {
+        wait_until(
+            Duration::from_secs(15),
+            || format!("{want} never arrived: {:#?}", session.grid().lines()),
+            || {
+                let lines = session.grid().lines();
+                lines
+                    .iter()
+                    .any(|line| line.trim_end() == want)
+                    .then_some(())
+            },
+        );
     }
 
     fn idle_publisher(now: Instant) -> Publisher {
@@ -1450,11 +1398,8 @@ mod tests {
             generation: 0,
             next_frame: now,
             hold_started: None,
-            focused: true,
-            cursor_on: true,
+            presentation: Presentation::default(),
             next_blink: None,
-            force: false,
-            metrics: Metrics::default(),
         }
     }
 
@@ -1573,11 +1518,11 @@ mod tests {
             .build(&terminal, 1, Presentation::default())
             .unwrap();
         select_hello(&terminal, &mut input_for_test());
-        let forced = Presentation {
-            force: true,
-            ..Presentation::default()
-        };
-        let grid = builder.build(&terminal, 2, forced).unwrap().unwrap();
+        builder.selection_changed();
+        let grid = builder
+            .build(&terminal, 2, Presentation::default())
+            .unwrap()
+            .unwrap();
         assert_eq!(grid.cells[0].bg, Some(rgb(DEFAULT_FG)));
         assert_eq!(grid.cells[0].fg, rgb(DEFAULT_BG));
         assert_eq!(grid.cells[6].bg, None);
@@ -1626,7 +1571,6 @@ mod tests {
     fn the_wheel_sends_arrows_on_the_alternate_screen() {
         let mut terminal = new_terminal(20, 5).unwrap();
         terminal.vt_write(b"\x1b[?1049h");
-        assert_eq!(wheel_route(&terminal).unwrap(), WheelRoute::ArrowKeys);
         let bytes = input_for_test()
             .wheel(&mut terminal, wheel_by(40.0))
             .unwrap();
@@ -1711,14 +1655,14 @@ mod tests {
         // Refused either way, as the shell may not have enabled bracketed paste yet.
         let text = "x\n\x1b[201~y";
         session.paste(text.to_owned(), false);
-        let deadline = Instant::now() + Duration::from_secs(5);
-        let refused = loop {
-            if let Some(text) = session.take_rejected_paste() {
-                break text;
-            }
-            assert!(Instant::now() < deadline, "the paste was never refused");
-            thread::sleep(Duration::from_millis(10));
-        };
+        let refused = wait_until(
+            Duration::from_secs(5),
+            || "the paste was never refused".to_owned(),
+            || match session.next_event() {
+                Some(Event::PasteRejected(text)) => Some(text),
+                _ => None,
+            },
+        );
         assert_eq!(refused, text);
     }
 
@@ -1741,11 +1685,11 @@ mod tests {
                 ..TEST_SURFACE
             });
         }
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while session.grid().cols != 59 {
-            assert!(Instant::now() < deadline, "cols: {}", session.grid().cols);
-            thread::sleep(Duration::from_millis(10));
-        }
+        wait_until(
+            Duration::from_secs(5),
+            || format!("cols: {}", session.grid().cols),
+            || (session.grid().cols == 59).then_some(()),
+        );
     }
 
     #[test]
@@ -1791,19 +1735,22 @@ mod tests {
         };
         assert!(!publisher.tick_blink(now));
         assert!(publisher.tick_blink(now + BLINK));
-        assert!(!publisher.cursor_on && publisher.force);
+        assert!(!publisher.presentation.cursor_on);
     }
 
     #[test]
     fn typing_turns_a_blinking_cursor_back_on() {
         let now = Instant::now();
         let mut publisher = Publisher {
-            cursor_on: false,
+            presentation: Presentation {
+                cursor_on: false,
+                ..Presentation::default()
+            },
             next_blink: Some(now),
             ..idle_publisher(now)
         };
         publisher.restart_blink(now);
-        assert!(publisher.cursor_on);
+        assert!(publisher.presentation.cursor_on);
         assert_eq!(publisher.next_blink, Some(now + BLINK));
     }
 
@@ -1847,17 +1794,34 @@ mod tests {
     }
 
     #[test]
-    fn a_forced_build_republishes_an_unchanged_terminal() {
-        let forced = Presentation {
-            force: true,
-            ..Presentation::default()
-        };
+    fn a_selection_change_republishes_an_unchanged_terminal() {
+        let shown = Presentation::default();
         let mut builder = GridBuilder::new().unwrap();
         let terminal = new_terminal(10, 2).unwrap();
-        builder
-            .build(&terminal, 1, Presentation::default())
-            .unwrap();
-        assert!(builder.build(&terminal, 2, forced).unwrap().is_some());
+        builder.build(&terminal, 1, shown).unwrap();
+        builder.selection_changed();
+        assert!(builder.build(&terminal, 2, shown).unwrap().is_some());
+    }
+
+    #[test]
+    fn a_presentation_change_alone_publishes_a_new_grid() {
+        let shown = Presentation::default();
+        let mut builder = GridBuilder::new().unwrap();
+        let terminal = new_terminal(10, 2).unwrap();
+        builder.build(&terminal, 1, shown).unwrap();
+        assert!(builder.build(&terminal, 2, shown).unwrap().is_none());
+        let blurred = Presentation {
+            focused: false,
+            ..shown
+        };
+        let grid = builder.build(&terminal, 3, blurred).unwrap().unwrap();
+        assert_eq!(grid.cursor_style, CursorVisualStyle::BlockHollow);
+    }
+
+    #[test]
+    fn a_hidden_cursor_does_not_blink() {
+        let grid = Grid::from_vt(b"\x1b[1 q\x1b[?25l", 8, 1).unwrap();
+        assert!(!grid.cursor_blinking);
     }
 
     #[test]
