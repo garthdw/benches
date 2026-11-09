@@ -22,8 +22,16 @@ use rune::Waker;
 use crate::input::KeyInput;
 
 const FRAME: Duration = Duration::from_millis(8);
-const DEFAULT_FG: RgbColor = RgbColor { r: 0xd8, g: 0xd9, b: 0xda };
-const DEFAULT_BG: RgbColor = RgbColor { r: 0x14, g: 0x15, b: 0x17 };
+const DEFAULT_FG: RgbColor = RgbColor {
+    r: 0xd8,
+    g: 0xd9,
+    b: 0xda,
+};
+const DEFAULT_BG: RgbColor = RgbColor {
+    r: 0x14,
+    g: 0x15,
+    b: 0x17,
+};
 
 #[derive(Clone, Copy)]
 pub struct Cell {
@@ -44,7 +52,14 @@ pub struct Grid {
 
 impl Default for Grid {
     fn default() -> Self {
-        Self { generation: 0, cols: 0, cells: Vec::new(), cursor: None, cursor_color: [0; 3], bg: rgb(DEFAULT_BG) }
+        Self {
+            generation: 0,
+            cols: 0,
+            cells: Vec::new(),
+            cursor: None,
+            cursor_color: [0; 3],
+            bg: rgb(DEFAULT_BG),
+        }
     }
 }
 
@@ -53,22 +68,31 @@ impl Grid {
     pub fn from_vt(bytes: &[u8], cols: u16, rows: u16) -> Self {
         let mut terminal = new_terminal(cols, rows);
         terminal.vt_write(bytes);
-        GridBuilder::new().build(&terminal, 1).expect("a new terminal is dirty")
+        GridBuilder::new()
+            .build(&terminal, 1)
+            .expect("a new terminal is dirty")
     }
 
     #[cfg(test)]
     pub fn lines(&self) -> Vec<String> {
-        self.cells.chunks(usize::from(self.cols).max(1)).map(|row| row.iter().map(|c| c.ch).collect()).collect()
+        self.cells
+            .chunks(usize::from(self.cols).max(1))
+            .map(|row| row.iter().map(|c| c.ch).collect())
+            .collect()
     }
 }
 
 fn new_terminal<'cb>(cols: u16, rows: u16) -> Terminal<'static, 'cb> {
     let mut terminal = Terminal::new(cols, rows).expect("create terminal");
     terminal
-        .set_scrollback_max_lines(Some(10_000)).expect("scrollback")
-        .set_terminfo_name("xterm-256color").expect("terminfo")
-        .set_default_fg_color(Some(DEFAULT_FG)).expect("fg")
-        .set_default_bg_color(Some(DEFAULT_BG)).expect("bg");
+        .set_scrollback_max_lines(Some(10_000))
+        .expect("scrollback")
+        .set_terminfo_name("xterm-256color")
+        .expect("terminfo")
+        .set_default_fg_color(Some(DEFAULT_FG))
+        .expect("fg")
+        .set_default_bg_color(Some(DEFAULT_BG))
+        .expect("bg");
     terminal
 }
 
@@ -97,7 +121,10 @@ impl GridBuilder {
             return None;
         }
         let colors = snapshot.colors().expect("colors");
-        let (cols, rows) = (snapshot.cols().expect("cols"), snapshot.rows().expect("rows"));
+        let (cols, rows) = (
+            snapshot.cols().expect("cols"),
+            snapshot.rows().expect("rows"),
+        );
         let mut cells = Vec::with_capacity(usize::from(cols) * usize::from(rows));
         let mut row_it = self.rows.update(&snapshot).expect("rows");
         while let Some(row) = row_it.next() {
@@ -118,11 +145,19 @@ impl GridBuilder {
                 let mut ch = [' '];
                 // Fills the buffer with the base codepoint even when the grapheme is longer.
                 let _ = cell.graphemes_buf(&mut ch);
-                cells.push(Cell { ch: ch[0], fg: rgb(fg), bg: bg.map(rgb), bold });
+                cells.push(Cell {
+                    ch: ch[0],
+                    fg: rgb(fg),
+                    bg: bg.map(rgb),
+                    bold,
+                });
             }
         }
         let cursor = if snapshot.cursor_visible().expect("cursor") {
-            snapshot.cursor_viewport().expect("cursor").map(|c| (c.x, c.y))
+            snapshot
+                .cursor_viewport()
+                .expect("cursor")
+                .map(|c| (c.x, c.y))
         } else {
             None
         };
@@ -140,7 +175,12 @@ impl GridBuilder {
 
 enum Msg {
     Key(KeyInput),
-    Resize { cols: u16, rows: u16, cell_w: u16, cell_h: u16 },
+    Resize {
+        cols: u16,
+        rows: u16,
+        cell_w: u16,
+        cell_h: u16,
+    },
 }
 
 /// A process on a PTY. Its `Terminal` lives on an actor thread, as libghostty types are `!Send`.
@@ -152,7 +192,12 @@ pub struct Session {
 impl Session {
     pub fn spawn(command: Option<&str>, cwd: &Path, waker: Waker) -> std::io::Result<Self> {
         let (cols, rows) = (80, 24);
-        let size = Winsize { ws_col: cols, ws_row: rows, ws_xpixel: 0, ws_ypixel: 0 };
+        let size = Winsize {
+            ws_col: cols,
+            ws_row: rows,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
         let pty = openpty(Some(&size), None).map_err(std::io::Error::from)?;
         set_cloexec(&pty.master)?;
         set_cloexec(&pty.slave)?;
@@ -216,16 +261,22 @@ impl Session {
             }));
 
             let pty_input = input_tx.clone();
-            terminal.on_pty_write(move |_, data| { let _ = pty_input.send(data.to_vec()); }).expect("pty write");
+            terminal
+                .on_pty_write(move |_, data| {
+                    let _ = pty_input.send(data.to_vec());
+                })
+                .expect("pty write");
             let hold_publisher = publisher.clone();
-            terminal.on_render_hold(move |term, held| {
-                let mut publisher = hold_publisher.borrow_mut();
-                publisher.held = held;
-                // Keep the finished frame from before the hold, or a program that redraws constantly looks frozen.
-                if held && Instant::now() >= publisher.next_frame {
-                    publisher.publish(term);
-                }
-            }).expect("render hold");
+            terminal
+                .on_render_hold(move |term, held| {
+                    let mut publisher = hold_publisher.borrow_mut();
+                    publisher.held = held;
+                    // Keep the finished frame from before the hold, or a program that redraws constantly looks frozen.
+                    if held && Instant::now() >= publisher.next_frame {
+                        publisher.publish(term);
+                    }
+                })
+                .expect("render hold");
 
             let mut encoder = key::Encoder::new().expect("key encoder");
             let mut event = key::Event::new().expect("key event");
@@ -233,7 +284,10 @@ impl Session {
             let mut exited = false;
             loop {
                 let wait = if dirty {
-                    publisher.borrow().next_frame.saturating_duration_since(Instant::now())
+                    publisher
+                        .borrow()
+                        .next_frame
+                        .saturating_duration_since(Instant::now())
                 } else {
                     Duration::from_secs(3600)
                 };
@@ -295,7 +349,10 @@ impl Session {
 
     /// A session with no process, showing `grid`. Input and resizes go nowhere.
     pub fn fixture(grid: Grid) -> Self {
-        Self { commands: unbounded().0, grid: Arc::new(Mutex::new(Arc::new(grid))) }
+        Self {
+            commands: unbounded().0,
+            grid: Arc::new(Mutex::new(Arc::new(grid))),
+        }
     }
 
     pub fn grid(&self) -> Arc<Grid> {
@@ -307,7 +364,12 @@ impl Session {
     }
 
     pub fn resize(&self, cols: u16, rows: u16, cell_w: u16, cell_h: u16) {
-        let _ = self.commands.send(Msg::Resize { cols, rows, cell_w, cell_h });
+        let _ = self.commands.send(Msg::Resize {
+            cols,
+            rows,
+            cell_w,
+            cell_h,
+        });
     }
 }
 
@@ -377,15 +439,39 @@ mod tests {
 
     fn type_line(session: &Session, line: &str) {
         for c in line.chars() {
-            session.key(crate::input::map_text(&c.to_string(), rune::Mods::default(), None, None));
+            session.key(crate::input::map_text(
+                &c.to_string(),
+                rune::Mods::default(),
+                None,
+                None,
+            ));
         }
-        session.key(crate::input::map_key(&rune::KeyEvent { key: rune::Key::Enter, mods: rune::Mods::default() }, None, None).unwrap());
+        session.key(
+            crate::input::map_key(
+                &rune::KeyEvent {
+                    key: rune::Key::Enter,
+                    mods: rune::Mods::default(),
+                },
+                None,
+                None,
+            )
+            .unwrap(),
+        );
     }
 
     fn wait_for_line(session: &Session, want: &str) {
         let deadline = Instant::now() + Duration::from_secs(15);
-        while !session.grid().lines().iter().any(|line| line.trim_end() == want) {
-            assert!(Instant::now() < deadline, "{want} never arrived: {:#?}", session.grid().lines());
+        while !session
+            .grid()
+            .lines()
+            .iter()
+            .any(|line| line.trim_end() == want)
+        {
+            assert!(
+                Instant::now() < deadline,
+                "{want} never arrived: {:#?}",
+                session.grid().lines()
+            );
             thread::sleep(Duration::from_millis(20));
         }
     }
@@ -402,10 +488,24 @@ mod tests {
         let session = Session::spawn(None, Path::new("/tmp"), Arc::new(|| {})).unwrap();
         type_line(&session, "sleep 30; echo slept; echo marker-$((1+1))");
         thread::sleep(Duration::from_millis(1500));
-        let ctrl = rune::Mods { ctrl: true, ..rune::Mods::default() };
-        session.key(crate::input::map_text("c", ctrl, Some(rune::PhysicalKeyCode::KeyC), Some('c')));
+        let ctrl = rune::Mods {
+            ctrl: true,
+            ..rune::Mods::default()
+        };
+        session.key(crate::input::map_text(
+            "c",
+            ctrl,
+            Some(rune::PhysicalKeyCode::KeyC),
+            Some('c'),
+        ));
         type_line(&session, "echo after-$((2+2))");
         wait_for_line(&session, "after-4");
-        assert!(!session.grid().lines().iter().any(|line| line.trim_end() == "slept"));
+        assert!(
+            !session
+                .grid()
+                .lines()
+                .iter()
+                .any(|line| line.trim_end() == "slept")
+        );
     }
 }

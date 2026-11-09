@@ -23,18 +23,42 @@ pub struct State {
 
 impl State {
     fn grid(&self) -> Arc<Grid> {
-        self.session.as_ref().map_or_else(Arc::default, Session::grid)
+        self.session
+            .as_ref()
+            .map_or_else(Arc::default, Session::grid)
     }
 }
 
 fn view(_: &State, cx: &mut Cx<State>) -> El {
     let t = tok::theme(true);
-    let chrome = el().key("chrome").role("button").label("shell").px(10.0).py(4.0).radius(6.0)
+    let chrome = el()
+        .key("chrome")
+        .role("button")
+        .label("shell")
+        .px(10.0)
+        .py(4.0)
+        .radius(6.0)
         .fill(t.control_off)
         .child(text("shell").color(t.text));
-    col().w_full().h_full().fill(t.bg)
-        .child(row().w_full().pl(cx.titlebar_inset() + 8.0).pr(8.0).py(6.0).child(chrome))
-        .child(effect(TERMINAL_MARK).key("terminal").w_full().grow(1.0).min_h(0.0))
+    col()
+        .w_full()
+        .h_full()
+        .fill(t.bg)
+        .child(
+            row()
+                .w_full()
+                .pl(cx.titlebar_inset() + 8.0)
+                .pr(8.0)
+                .py(6.0)
+                .child(chrome),
+        )
+        .child(
+            effect(TERMINAL_MARK)
+                .key("terminal")
+                .w_full()
+                .grow(1.0)
+                .min_h(0.0),
+        )
 }
 
 fn poll(state: &mut State, _: f64, _: &mut Tx) -> bool {
@@ -42,7 +66,11 @@ fn poll(state: &mut State, _: f64, _: &mut Tx) -> bool {
         let cwd = std::env::var_os("HOME").map_or_else(|| PathBuf::from("/"), PathBuf::from);
         let waker = state.waker.clone().unwrap_or_else(|| Arc::new(|| {}));
         state.session = Some(Session::spawn(None, &cwd, waker).unwrap_or_else(|err| {
-            Session::fixture(Grid::from_vt(format!("failed to start shell: {err}").as_bytes(), 80, 24))
+            Session::fixture(Grid::from_vt(
+                format!("failed to start shell: {err}").as_bytes(),
+                80,
+                24,
+            ))
         }));
     }
     let generation = state.grid().generation;
@@ -52,7 +80,10 @@ fn poll(state: &mut State, _: f64, _: &mut Tx) -> bool {
 }
 
 fn on_key(state: &mut State, event: &KeyEvent, tx: &mut Tx) -> bool {
-    match (&state.session, input::map_key(event, tx.physical_key(), tx.key_base())) {
+    match (
+        &state.session,
+        input::map_key(event, tx.physical_key(), tx.key_base()),
+    ) {
         (Some(session), Some(key)) => {
             session.key(key);
             true
@@ -63,13 +94,17 @@ fn on_key(state: &mut State, event: &KeyEvent, tx: &mut Tx) -> bool {
 
 fn main() {
     let spec = AppSpec::<State> {
-        scenes: &[("fixture", |s| s.session = Some(Session::fixture(Grid::from_vt(SCENE_FIXTURE, 60, 12))))],
+        scenes: &[("fixture", |s| {
+            s.session = Some(Session::fixture(Grid::from_vt(SCENE_FIXTURE, 60, 12)))
+        })],
         setup: Some(|s, waker| s.waker = Some(waker)),
         poll: Some(poll),
         on_key: Some(on_key),
         ..AppSpec::new("agentd", (960.0, 640.0), State::default, view)
     };
-    App::new(spec).compositor(render::TerminalCompositor::default()).run();
+    App::new(spec)
+        .compositor(render::TerminalCompositor::default())
+        .run();
 }
 
 #[cfg(test)]
@@ -82,7 +117,10 @@ mod tests {
 
     #[test]
     fn tab_and_escape_reach_the_window_after_clicking_chrome() {
-        let env = Env { system_dark: true, scale: 2.0 };
+        let env = Env {
+            system_dark: true,
+            scale: 2.0,
+        };
         let mut rt = Runtime::new(State::default(), view, (960.0, 640.0), env);
         rt.on_key = Some(|_, _, _| {
             WINDOW_KEYS.fetch_add(1, Ordering::SeqCst);
@@ -93,9 +131,18 @@ mod tests {
         rt.pointer_down(x, y);
         rt.pointer_up(x, y);
         rt.frame(1.0 / 60.0);
-        rt.key(KeyEvent { key: Key::Tab, mods: Mods::default() });
-        rt.key(KeyEvent { key: Key::Escape, mods: Mods::default() });
-        rt.key(KeyEvent { key: Key::Text(" ".into()), mods: Mods::default() });
+        rt.key(KeyEvent {
+            key: Key::Tab,
+            mods: Mods::default(),
+        });
+        rt.key(KeyEvent {
+            key: Key::Escape,
+            mods: Mods::default(),
+        });
+        rt.key(KeyEvent {
+            key: Key::Text(" ".into()),
+            mods: Mods::default(),
+        });
         rt.frame(1.0 / 60.0);
         assert_eq!(WINDOW_KEYS.load(Ordering::SeqCst), 3);
     }

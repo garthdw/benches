@@ -25,7 +25,11 @@ struct Quad {
 fn color(rgb: [u8; 3], srgb_blend: bool) -> [f32; 3] {
     rgb.map(|c| {
         let encoded = f32::from(c) / 255.0;
-        if srgb_blend { encoded } else { srgb_decode(encoded) }
+        if srgb_blend {
+            encoded
+        } else {
+            srgb_decode(encoded)
+        }
     })
 }
 
@@ -38,7 +42,12 @@ struct Atlas {
 
 impl Atlas {
     fn new() -> Self {
-        Self { slots: HashMap::new(), next: [1, 1], epoch: 0, scratch: Vec::new() }
+        Self {
+            slots: HashMap::new(),
+            next: [1, 1],
+            epoch: 0,
+            scratch: Vec::new(),
+        }
     }
 
     fn reset(&mut self) {
@@ -47,7 +56,14 @@ impl Atlas {
         self.epoch += 1;
     }
 
-    fn glyph(&mut self, queue: &wgpu::Queue, texture: &wgpu::Texture, font: &Font, ch: char, bold: bool) -> Option<[u32; 2]> {
+    fn glyph(
+        &mut self,
+        queue: &wgpu::Queue,
+        texture: &wgpu::Texture,
+        font: &Font,
+        ch: char,
+        bold: bool,
+    ) -> Option<[u32; 2]> {
         if let Some(slot) = self.slots.get(&(ch, bold)) {
             return *slot;
         }
@@ -58,7 +74,9 @@ impl Atlas {
         if self.next[1] + h + 1 > ATLAS_SIZE {
             self.reset();
         }
-        let slot = font.rasterize(ch, bold, &mut self.scratch).then_some(self.next);
+        let slot = font
+            .rasterize(ch, bold, &mut self.scratch)
+            .then_some(self.next);
         if let Some([x, y]) = slot {
             queue.write_texture(
                 wgpu::TexelCopyTextureInfo {
@@ -68,8 +86,16 @@ impl Atlas {
                     aspect: wgpu::TextureAspect::All,
                 },
                 &self.scratch,
-                wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(w), rows_per_image: Some(h) },
-                wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(w),
+                    rows_per_image: Some(h),
+                },
+                wgpu::Extent3d {
+                    width: w,
+                    height: h,
+                    depth_or_array_layers: 1,
+                },
             );
             self.next[0] += w + 1;
         }
@@ -87,11 +113,22 @@ fn build_quads(
     quads: &mut Vec<Quad>,
     mut glyph: impl FnMut(char, bool) -> Option<[u32; 2]>,
 ) {
-    let solid = |rect, c| Quad { rect, uv: [0.0; 4], color: color(c, srgb_blend) };
+    let solid = |rect, c| Quad {
+        rect,
+        uv: [0.0; 4],
+        color: color(c, srgb_blend),
+    };
     let (w, h) = (font.cell_w as f32, font.cell_h as f32);
     let (origin_x, origin_y) = ((rect[0] + padding).round(), (rect[1] + padding).round());
     let cols = usize::from(grid.cols);
-    let cell_rect = |i: usize| [origin_x + (i % cols) as f32 * w, origin_y + (i / cols) as f32 * h, w, h];
+    let cell_rect = |i: usize| {
+        [
+            origin_x + (i % cols) as f32 * w,
+            origin_y + (i / cols) as f32 * h,
+            w,
+            h,
+        ]
+    };
 
     quads.clear();
     quads.push(solid(rect, grid.bg));
@@ -100,7 +137,9 @@ fn build_quads(
             quads.push(solid(cell_rect(i), cell_bg));
         }
     }
-    let cursor = grid.cursor.map(|(x, y)| usize::from(y) * cols + usize::from(x));
+    let cursor = grid
+        .cursor
+        .map(|(x, y)| usize::from(y) * cols + usize::from(x));
     if let Some(i) = cursor {
         quads.push(solid(cell_rect(i), grid.cursor_color));
     }
@@ -110,9 +149,18 @@ fn build_quads(
             continue;
         }
         if let Some([x, y]) = glyph(cell.ch, cell.bold) {
-            let uv = [x as f32 / ATLAS_SIZE as f32, y as f32 / ATLAS_SIZE as f32, atlas_w, atlas_h];
+            let uv = [
+                x as f32 / ATLAS_SIZE as f32,
+                y as f32 / ATLAS_SIZE as f32,
+                atlas_w,
+                atlas_h,
+            ];
             let fg = if cursor == Some(i) { grid.bg } else { cell.fg };
-            quads.push(Quad { rect: cell_rect(i), uv, color: color(fg, srgb_blend) });
+            quads.push(Quad {
+                rect: cell_rect(i),
+                uv,
+                color: color(fg, srgb_blend),
+            });
         }
     }
 }
@@ -142,7 +190,11 @@ impl Gpu {
     fn new(device: &wgpu::Device, key: DeviceKey) -> Self {
         let texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("terminal atlas"),
-            size: wgpu::Extent3d { width: ATLAS_SIZE, height: ATLAS_SIZE, depth_or_array_layers: 1 },
+            size: wgpu::Extent3d {
+                width: ATLAS_SIZE,
+                height: ATLAS_SIZE,
+                depth_or_array_layers: 1,
+            },
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
@@ -159,13 +211,26 @@ impl Gpu {
         let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: None,
             entries: &[
-                entry(0, wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None }),
-                entry(1, wgpu::BindingType::Texture {
-                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                    view_dimension: wgpu::TextureViewDimension::D2,
-                    multisampled: false,
-                }),
-                entry(2, wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering)),
+                entry(
+                    0,
+                    wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                ),
+                entry(
+                    1,
+                    wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                ),
+                entry(
+                    2,
+                    wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                ),
             ],
         });
         Self {
@@ -226,7 +291,12 @@ impl Gpu {
     }
 }
 
-fn new_slot(device: &wgpu::Device, layout: &wgpu::BindGroupLayout, view: &wgpu::TextureView, sampler: &wgpu::Sampler) -> Slot {
+fn new_slot(
+    device: &wgpu::Device,
+    layout: &wgpu::BindGroupLayout,
+    view: &wgpu::TextureView,
+    sampler: &wgpu::Sampler,
+) -> Slot {
     let uniforms = device.create_buffer(&wgpu::BufferDescriptor {
         label: None,
         size: 16,
@@ -237,9 +307,18 @@ fn new_slot(device: &wgpu::Device, layout: &wgpu::BindGroupLayout, view: &wgpu::
         label: None,
         layout,
         entries: &[
-            wgpu::BindGroupEntry { binding: 0, resource: uniforms.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(view) },
-            wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(sampler) },
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: uniforms.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::TextureView(view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: wgpu::BindingResource::Sampler(sampler),
+            },
         ],
     });
     Slot {
@@ -268,9 +347,20 @@ pub struct TerminalCompositor {
 }
 
 impl TerminalCompositor {
-    fn draw(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, state: &State, pass: &mut wgpu::RenderPass<'_>, site: &EffectSite<'_>) {
+    fn draw(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        state: &State,
+        pass: &mut wgpu::RenderPass<'_>,
+        site: &EffectSite<'_>,
+    ) {
         let gpu = self.gpu.as_mut().expect("gpu is built before drawing");
-        if self.font.as_ref().is_some_and(|(scale, _)| *scale != site.scale) {
+        if self
+            .font
+            .as_ref()
+            .is_some_and(|(scale, _)| *scale != site.scale)
+        {
             self.font = None;
         }
         let (_, font) = self.font.get_or_insert_with(|| {
@@ -278,7 +368,10 @@ impl TerminalCompositor {
             (site.scale, Font::new(FONT_POINTS, site.scale))
         });
         gpu.ensure_pipeline(device, site.format);
-        let slot = gpu.slots.entry(site.mark).or_insert_with(|| new_slot(device, &gpu.layout, &gpu.view, &gpu.sampler));
+        let slot = gpu
+            .slots
+            .entry(site.mark)
+            .or_insert_with(|| new_slot(device, &gpu.layout, &gpu.view, &gpu.sampler));
 
         let rect = site.instance.rect;
         let padding = PADDING_POINTS * site.scale;
@@ -295,7 +388,15 @@ impl TerminalCompositor {
         let key = (grid.generation, rect, gpu.atlas.epoch, site.srgb_blend);
         if slot.built.replace(key) != Some(key) {
             let (atlas, texture) = (&mut gpu.atlas, &gpu.texture);
-            build_quads(&grid, rect, padding, font, site.srgb_blend, &mut slot.scratch, |ch, bold| atlas.glyph(queue, texture, font, ch, bold));
+            build_quads(
+                &grid,
+                rect,
+                padding,
+                font,
+                site.srgb_blend,
+                &mut slot.scratch,
+                |ch, bold| atlas.glyph(queue, texture, font, ch, bold),
+            );
             let bytes: &[u8] = cast_slice(&slot.scratch);
             if bytes.len() as u64 > slot.quads.size() {
                 slot.quads = quad_buffer(device, (bytes.len() as u64).next_power_of_two());
@@ -303,9 +404,19 @@ impl TerminalCompositor {
             queue.write_buffer(&slot.quads, 0, bytes);
         }
 
-        let frame = [site.origin[0], site.origin[1], site.size[0] as f32, site.size[1] as f32];
+        let frame = [
+            site.origin[0],
+            site.origin[1],
+            site.size[0] as f32,
+            site.size[1] as f32,
+        ];
         queue.write_buffer(&slot.uniforms, 0, cast_slice(&frame));
-        let pipeline = &gpu.pipelines.iter().find(|(f, _)| *f == site.format).expect("pipeline was just built").1;
+        let pipeline = &gpu
+            .pipelines
+            .iter()
+            .find(|(f, _)| *f == site.format)
+            .expect("pipeline was just built")
+            .1;
         pass.set_pipeline(pipeline);
         pass.set_bind_group(0, &slot.bind_group, &[]);
         pass.set_vertex_buffer(0, slot.quads.slice(..));
@@ -322,6 +433,8 @@ impl Compositor<State> for TerminalCompositor {
         let (device, queue, size, clear) = (f.device, f.queue, f.size, f.rt.clear_color());
         f.ui.prepare(device, queue, &mut f.rt.text.atlas, &f.rt.instances, size);
         let state = &f.rt.state;
-        f.ui.draw_with(f.encoder, f.target, clear, &mut |pass, site| self.draw(device, queue, state, pass, site));
+        f.ui.draw_with(f.encoder, f.target, clear, &mut |pass, site| {
+            self.draw(device, queue, state, pass, site)
+        });
     }
 }
