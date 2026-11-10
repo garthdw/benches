@@ -817,6 +817,14 @@ impl TerminalInput {
 }
 
 /// A process on a PTY. Its `Terminal` lives on an actor thread, as libghostty types are `!Send`.
+/// Apps launched from Finder get no locale, which leaves children in the C locale and mangles UTF-8.
+fn missing_locale(var: impl Fn(&str) -> Option<std::ffi::OsString>) -> Option<&'static str> {
+    let has_locale = ["LANG", "LC_ALL", "LC_CTYPE"]
+        .into_iter()
+        .any(|name| var(name).is_some_and(|value| !value.is_empty()));
+    (!has_locale).then_some("en_US.UTF-8")
+}
+
 pub struct Session {
     id: u64,
     /// Cleared by the actor before it reaps the process, after which the pid may be reused.
@@ -855,6 +863,9 @@ impl Session {
             .env("TERM_PROGRAM", "agentd")
             .env("SHELL", &config.shell)
             .stdin(Stdio::from(pty.slave));
+        if let Some(locale) = missing_locale(|name| std::env::var_os(name)) {
+            process.env("LANG", locale);
+        }
         // SAFETY: only async-signal-safe calls run between fork and exec.
         unsafe {
             process.pre_exec(|| {
@@ -2437,6 +2448,15 @@ mod tests {
             .output()
             .unwrap();
         assert_eq!(String::from_utf8_lossy(&survivors.stdout), "");
+    }
+
+    #[test]
+    fn children_get_a_utf8_locale_only_when_the_app_has_none() {
+        assert_eq!(missing_locale(|_| None), Some("en_US.UTF-8"));
+        for set in ["LANG", "LC_ALL", "LC_CTYPE"] {
+            let lookup = |name: &str| (name == set).then(|| "de_DE.UTF-8".into());
+            assert_eq!(missing_locale(lookup), None, "{set} is set");
+        }
     }
 
     #[test]
