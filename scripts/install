@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# Builds a release and installs ~/Applications/agentd.app with the pinned Rune's installer,
-# which quits a running copy, swaps the bundle atomically and rolls back if the new one fails.
-# Set MAC_APP_SIGN to a codesigning identity; without it the bundle is signed ad hoc.
+# Bundles a release with scripts/bundle and installs it to ~/Applications/agentd.app with the
+# pinned Rune's installer, which quits a running copy, swaps the bundle atomically and rolls
+# back if the new one fails.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-cargo build --release --locked
+app=$(scripts/bundle)
 rune=$(cargo metadata --format-version 1 --locked | python3 -c '
 import json, pathlib, sys
 packages = json.load(sys.stdin)["packages"]
@@ -17,7 +17,7 @@ print(next(pathlib.Path(p["manifest_path"]).parents[2] for p in packages if p["n
 # must not coerce the missing locale to C.UTF-8.
 python=$(python3 -c 'import sys; print(sys.executable)')
 exec env -i HOME="$HOME" USER="$USER" LOGNAME="${LOGNAME:-$USER}" TMPDIR="$TMPDIR" \
-  ${SSH_AUTH_SOCK:+SSH_AUTH_SOCK="$SSH_AUTH_SOCK"} ${MAC_APP_SIGN:+MAC_APP_SIGN="$MAC_APP_SIGN"} \
+  ${SSH_AUTH_SOCK:+SSH_AUTH_SOCK="$SSH_AUTH_SOCK"} \
   PATH=/usr/bin:/bin:/usr/sbin:/sbin PYTHONCOERCECLOCALE=0 \
   "$python" "$rune/scripts/mac_app_install.py" --name agentd --id dev.dewet.agentd --exe agentd \
-  --bin target/release/agentd --icon assets/agentd.icns "$@"
+  --bundle "$app" "$@"
