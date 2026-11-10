@@ -33,6 +33,7 @@ pub struct Font {
     /// Indexed by `bold + 2 * italic`.
     faces: [CFRetained<CTFont>; 4],
     symbols: CFRetained<CTFont>,
+    color_space: Option<CFRetained<CGColorSpace>>,
     pub cell_width: u32,
     pub cell_height: u32,
     pub line_thickness: u32,
@@ -156,6 +157,7 @@ impl Font {
             baseline,
             faces,
             symbols: face("CaskaydiaMonoNFM-Regular", pixels),
+            color_space: CGColorSpace::new_device_rgb(),
         })
     }
 
@@ -183,7 +185,6 @@ impl Font {
             return Some(GlyphKind::Coverage);
         }
         let line = shaped_line(font, text)?;
-        let color_space = CGColorSpace::new_device_rgb();
         // SAFETY: `out` holds `4 * width * cell_height` bytes and outlives the context.
         let context = unsafe {
             CGBitmapContextCreate(
@@ -192,7 +193,7 @@ impl Font {
                 self.cell_height as usize,
                 8,
                 width as usize * 4,
-                color_space.as_deref(),
+                self.color_space.as_deref(),
                 CGImageAlphaInfo::PremultipliedLast.0 | CGImageByteOrderInfo::Order32Big.0,
             )
         }?;

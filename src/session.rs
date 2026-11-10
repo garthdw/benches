@@ -260,7 +260,7 @@ impl Grid {
 }
 
 /// The thumb never shrinks below this, in points, so it stays easy to grab.
-pub const MIN_THUMB_POINTS: f32 = 24.0;
+const MIN_THUMB_POINTS: f32 = 24.0;
 
 /// Where the viewport sits in the scrollback, in rows, and how the thumb looks.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -287,6 +287,11 @@ impl Scrollbar {
             len: bar.len,
             ..Self::default()
         }))
+    }
+
+    /// The track's length and the thumb's minimum, in pixels, beside `rows` rows; for `thumb` and `row_at`.
+    pub fn track(rows: usize, cell_height: f32, scale: f32) -> (f32, f32) {
+        (rows as f32 * cell_height, MIN_THUMB_POINTS * scale)
     }
 
     /// The thumb's top and height within a track `track` pixels tall.
@@ -813,8 +818,11 @@ impl TerminalInput {
             return Ok(());
         };
         let metrics = surface.metrics;
-        let track = f32::from(surface.rows) * f32::from(metrics.cell_height);
-        let min = MIN_THUMB_POINTS * metrics.scale;
+        let (track, min) = Scrollbar::track(
+            surface.rows.into(),
+            metrics.cell_height.into(),
+            metrics.scale,
+        );
         let y = y * metrics.scale - metrics.padding;
         let grab = match (phase, self.scrollbar_grab) {
             (PointerPhase::Drag, Some(grab)) => grab,

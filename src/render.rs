@@ -10,7 +10,7 @@ use rune::render::EffectSite;
 
 use crate::State;
 use crate::font::{Font, FontStyle, GlyphKind};
-use crate::session::{Cell, Grid, MIN_THUMB_POINTS, Metrics, Session, Surface};
+use crate::session::{Cell, Grid, Metrics, Scrollbar, Session, Surface};
 
 /// Also the width of the scrollbar's strip, which takes the right padding.
 pub const PADDING_POINTS: f32 = 6.0;
@@ -169,6 +169,15 @@ fn glyph_key(grid: &Grid, cell: &Cell) -> Option<GlyphKey> {
     })
 }
 
+fn solid(rect: [f32; 4], fill: [u8; 3], srgb_blend: bool) -> Quad {
+    Quad {
+        rect,
+        uv: [0.0; 4],
+        color: color(fill, srgb_blend),
+        mode: MODE_SOLID,
+    }
+}
+
 fn build_quads(
     grid: &Grid,
     rect: [f32; 4],
@@ -178,12 +187,7 @@ fn build_quads(
     quads: &mut Vec<Quad>,
     mut glyph: impl FnMut(GlyphKey) -> (Option<AtlasGlyph>, u64),
 ) {
-    let solid = |rect, fill| Quad {
-        rect,
-        uv: [0.0; 4],
-        color: color(fill, srgb_blend),
-        mode: MODE_SOLID,
-    };
+    let solid = |rect, fill| solid(rect, fill, srgb_blend);
     let (width, height) = (font.cell_width as f32, font.cell_height as f32);
     let (origin_x, origin_y) = ((rect[0] + padding).round(), (rect[1] + padding).round());
     let cols = usize::from(grid.cols);
@@ -319,8 +323,8 @@ fn scrollbar_thumb(
 ) -> Option<[f32; 4]> {
     let scrollbar = grid.scrollbar.filter(|scrollbar| scrollbar.opacity > 0.0)?;
     let rows = grid.cells.len() / usize::from(grid.cols).max(1);
-    let track = rows as f32 * cell_height;
-    let (top, height) = scrollbar.thumb(track, MIN_THUMB_POINTS * scale);
+    let (track, min) = Scrollbar::track(rows, cell_height, scale);
+    let (top, height) = scrollbar.thumb(track, min);
     let points = if scrollbar.wide {
         WIDE_SCROLLBAR_POINTS
     } else {
@@ -538,11 +542,8 @@ impl TerminalCompositor {
         if self
             .font
             .as_ref()
-            .is_some_and(|(scale, config, _)| (*scale, config) != wanted)
+            .is_none_or(|(scale, config, _)| (*scale, config) != wanted)
         {
-            self.font = None;
-        }
-        if self.font.is_none() {
             let config = &state.config.font;
             match Font::new(&config.family, config.size, site.scale) {
                 Ok(font) => {
@@ -622,12 +623,11 @@ impl TerminalCompositor {
                 && let Some(thumb) =
                     scrollbar_thumb(&grid, rect, padding, site.scale, font.cell_height as f32)
             {
-                slot.scratch.push(Quad {
-                    rect: thumb,
-                    uv: [0.0; 4],
-                    color: color(thumb_color(grid.bg, scrollbar.opacity), site.srgb_blend),
-                    mode: MODE_SOLID,
-                });
+                slot.scratch.push(solid(
+                    thumb,
+                    thumb_color(grid.bg, scrollbar.opacity),
+                    site.srgb_blend,
+                ));
             }
             let bytes: &[u8] = cast_slice(&slot.scratch);
             if bytes.len() as u64 > slot.quads.size() {
