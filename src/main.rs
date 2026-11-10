@@ -218,8 +218,9 @@ fn shortcut(state: &mut State, event: &KeyEvent, tx: &mut Tx) -> bool {
             };
             if mods.shift {
                 state.workspace.select_project(index);
-            } else {
-                state.workspace.select_tab(index);
+            } else if let Some(project) = state.workspace.project() {
+                let last = project.tabs.len().saturating_sub(1);
+                state.workspace.select_tab(index.min(last));
             }
         }
         _ => return false,
@@ -846,6 +847,13 @@ mod tests {
         let workspace = &runtime.state.workspace;
         assert_eq!(workspace.active, 1);
         assert_eq!(workspace.projects[1].active_tab, 1);
+    }
+
+    #[test]
+    fn a_command_digit_past_the_last_tab_selects_the_last_tab() {
+        let mut runtime = workspace_runtime();
+        press(&mut runtime, Key::Command('9'), command());
+        assert_eq!(runtime.state.workspace.projects[0].active_tab, 2);
     }
 
     #[test]
