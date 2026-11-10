@@ -73,6 +73,12 @@ pub enum Event {
     Exited(ExitStatus),
     /// Sent while not shown, once for each level raised since the session was last shown.
     Attention(Attention),
+    /// A bell or desktop notification while not shown with keys, once until it next is.
+    /// A bell has an empty title and body; OSC 9 has no title.
+    Notify {
+        title: String,
+        body: String,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
@@ -1239,15 +1245,24 @@ impl Actor {
             move |_| title_changed.set(true)
         })?;
         let alerted = Rc::new(std::cell::Cell::new(false));
+        let notice = Rc::new(RefCell::new(None));
         terminal.on_bell({
             let alerted = alerted.clone();
             move |_| alerted.set(true)
         })?;
         terminal.on_desktop_notification({
             let alerted = alerted.clone();
-            move |_, _| alerted.set(true)
+            let notice = notice.clone();
+            move |_, notification| {
+                alerted.set(true);
+                *notice.borrow_mut() = Some((
+                    String::from_utf8_lossy(notification.title()).into_owned(),
+                    String::from_utf8_lossy(notification.body()).into_owned(),
+                ));
+            }
         })?;
         let mut attention = Attention::None;
+        let mut notified = false;
 
         let mut input = TerminalInput::new()?;
         let mut resize = ResizeThrottle {
@@ -1276,10 +1291,19 @@ impl Actor {
                     Ok(bytes) => {
                         terminal.vt_write(&bytes);
                         dirty = true;
-                        let level = if alerted.replace(false) { Attention::Alert } else { Attention::Activity };
+                        let alerted = alerted.replace(false);
+                        let notice = notice.borrow_mut().take();
+                        let level = if alerted { Attention::Alert } else { Attention::Activity };
                         if titles.visibility != Visibility::Shown && level > attention {
                             attention = level;
                             self.events.send(Event::Attention(level)).log_err("queue attention");
+                            (self.waker)();
+                        }
+                        let seen = titles.visibility == Visibility::Shown && publisher.borrow().presentation.focused;
+                        if alerted && !seen && !notified {
+                            notified = true;
+                            let (title, body) = notice.unwrap_or_default();
+                            self.events.send(Event::Notify { title, body }).log_err("queue notification");
                             (self.waker)();
                         }
                     }
@@ -1330,6 +1354,9 @@ impl Actor {
                         }
                     }
                     Ok(Msg::Focus(focused)) => {
+                        if focused && titles.visibility == Visibility::Shown {
+                            notified = false;
+                        }
                         let mut publisher = publisher.borrow_mut();
                         publisher.presentation.focused = focused;
                         publisher.restart_blink(Instant::now());
@@ -2429,6 +2456,38 @@ mod tests {
         type_line(&session, "printf '\\a'");
         thread::sleep(Duration::from_millis(1000));
         assert!(attention_events(&session).contains(&Attention::Alert));
+    }
+
+    fn notify_events(session: &Session) -> Vec<(String, String)> {
+        std::iter::from_fn(|| session.next_event())
+            .filter_map(|event| match event {
+                Event::Notify { title, body } => Some((title, body)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_session_without_keys_notifies_once_until_it_has_them() {
+        let session = spawn_shell();
+        session.focus(false);
+        type_line(
+            &session,
+            "printf '\\033]777;notify;Done;Built\\a\\a'; echo one",
+        );
+        wait_for_line(&session, "one");
+        assert_eq!(notify_events(&session), [("Done".into(), "Built".into())]);
+        type_line(&session, "printf '\\a'; echo two");
+        wait_for_line(&session, "two");
+        assert_eq!(notify_events(&session), []);
+        session.focus(true);
+        type_line(&session, "printf '\\a'; echo three");
+        wait_for_line(&session, "three");
+        assert_eq!(notify_events(&session), []);
+        session.focus(false);
+        type_line(&session, "printf '\\a'; echo four");
+        wait_for_line(&session, "four");
+        assert_eq!(notify_events(&session), [(String::new(), String::new())]);
     }
 
     #[test]

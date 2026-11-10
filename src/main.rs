@@ -1,6 +1,7 @@
 mod config;
 mod font;
 mod input;
+mod notify;
 mod render;
 mod session;
 mod sprite;
@@ -1002,6 +1003,7 @@ fn poll(state: &mut State, _: f64, tx: &mut Tx) -> bool {
     }
     state.focused = active.unwrap_or(0);
     let mut restarts = Vec::new();
+    let mut notices = Vec::new();
     for tab in state.workspace.tabs_mut() {
         while let Some(event) = tab.session.next_event() {
             match event {
@@ -1028,12 +1030,25 @@ fn poll(state: &mut State, _: f64, tx: &mut Tx) -> bool {
                     tab.attention = tab.attention.max(attention);
                     changed = true;
                 }
+                Event::Notify { title, body } => notices.push((tab.session.id(), title, body)),
             }
         }
     }
+    for (session, title, body) in notices {
+        if let Some((project, slot)) = state.workspace.locate(session)
+            && let Some(project) = state.workspace.projects.get(project)
+            && let Some(tab) = match slot {
+                Slot::Tab(index) => project.tabs.get(index),
+                Slot::Tray(index) => project.tray.get(index),
+            }
+        {
+            let notification = notify::Notification::new(&project.name, tab.label(), title, body);
+            notify::post(session, &notification);
+        }
+    }
     for session in restarts {
-        if let Some((project, index)) = state.workspace.find_tray(session) {
-            respawn(state, project, Slot::Tray(index));
+        if let Some((project, slot @ Slot::Tray(_))) = state.workspace.locate(session) {
+            respawn(state, project, slot);
         }
     }
     // Kept while programs hide the cursor, as dropping the caret cancels a composition.
@@ -1231,7 +1246,7 @@ fn main() {
         on_key: Some(on_key),
         ..AppSpec::new("agentd", (960.0, 640.0), State::default, view)
     };
-    App::new(spec)
+    let app = App::new(spec)
         .init(|| {
             let paths = config::Paths::from_home();
             State {
@@ -1244,8 +1259,15 @@ fn main() {
         .on_ime(on_ime)
         .on_modifiers(|state, mods, _| state.option_held = mods.alt)
         .on_quit(on_quit)
-        .on_focus(|state, focused, _| state.workspace.set_window_focused(focused))
-        .run();
+        .on_focus(|state, focused, _| state.workspace.set_window_focused(focused));
+    let handle = app.handle();
+    notify::start(move |session| {
+        if let Some(session) = session {
+            handle.update(move |state, _| state.workspace.reveal(session));
+        }
+        handle.open();
+    });
+    app.run();
 }
 
 #[cfg(test)]
