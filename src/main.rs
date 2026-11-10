@@ -24,6 +24,9 @@ const TERMINAL_MARK: u32 = 1;
 const SIDEBAR_WIDTH: f32 = 200.0;
 /// The sidebar's top padding too, so the traffic lights clear the first project.
 const TAB_STRIP_HEIGHT: f32 = 36.0;
+const TAB_MAX_WIDTH: f32 = 220.0;
+const PALETTE_WIDTH: f32 = 520.0;
+const PALETTE_TOP: f32 = 96.0;
 /// Title and command of each tab a new project opens with; `None` runs the launch shell.
 const PROJECT_TABS: [(&str, Option<&str>); 2] = [("claude", Some("claude")), ("shell", None)];
 const SCENE_FIXTURE: &[u8] = b"\x1b[1;32magentd\x1b[0m fixture\r\n\x1b[31mred\x1b[0m \x1b[42;30m on green \x1b[0m \x1b[7minverse\x1b[0m\r\n$ ";
@@ -50,8 +53,9 @@ pub struct State {
     preedit: String,
     option_held: bool,
     caret: Option<[f32; 4]>,
-    command: TextEdit,
-    command_open: bool,
+    palette: TextEdit,
+    palette_open: bool,
+    palette_selected: usize,
 }
 
 impl State {
@@ -70,10 +74,7 @@ impl State {
                 "failed to start {title}: {error:#}"
             )))
         });
-        Tab {
-            title: title.to_owned(),
-            session,
-        }
+        Tab::new(title, session)
     }
 }
 
@@ -117,21 +118,82 @@ fn pick_new_tab(state: &mut State, picked: Option<&str>, tx: &mut Tx) {
     match picked {
         Some("shell") => open_tab(state, "shell", None),
         Some("lazygit") => open_tab(state, "lazygit", Some("lazygit")),
-        Some("custom") => {
-            state.command = TextEdit::new("");
-            state.command_open = true;
-            tx.focus("command", false);
-        }
+        Some("palette") => open_palette(state, tx),
         _ => {}
     }
 }
 
-fn submit_command(state: &mut State) {
-    state.command_open = false;
-    let command = state.command.text.trim().to_owned();
-    if !command.is_empty() {
-        open_tab(state, &command, Some(&command));
+/// What the command centre can do.
+#[derive(Clone, Debug, PartialEq)]
+enum Action {
+    Shell,
+    Lazygit,
+    OpenProject,
+    Run(String),
+}
+
+impl Action {
+    fn label(&self) -> String {
+        match self {
+            Action::Shell => "New shell tab".to_owned(),
+            Action::Lazygit => "New lazygit tab".to_owned(),
+            Action::OpenProject => "Open project…".to_owned(),
+            Action::Run(command) => format!("Run “{command}” in a new tab"),
+        }
     }
+}
+
+/// The fixed actions whose labels contain the query's letters in order, then running the query.
+fn palette_actions(query: &str) -> Vec<Action> {
+    let query = query.trim();
+    let needle = query.to_lowercase();
+    let mut actions: Vec<Action> = [Action::Shell, Action::Lazygit, Action::OpenProject]
+        .into_iter()
+        .filter(|action| {
+            let label = action.label().to_lowercase();
+            let mut letters = label.chars();
+            needle
+                .chars()
+                .all(|wanted| letters.any(|letter| letter == wanted))
+        })
+        .collect();
+    if !query.is_empty() {
+        actions.push(Action::Run(query.to_owned()));
+    }
+    actions
+}
+
+fn open_palette(state: &mut State, tx: &mut Tx) {
+    state.palette = TextEdit::new("");
+    state.palette_open = true;
+    state.palette_selected = 0;
+    tx.focus("palette-input", false);
+}
+
+fn run_palette(state: &mut State, index: usize, tx: &mut Tx) {
+    let actions = palette_actions(&state.palette.text);
+    let Some(action) = actions.get(index.min(actions.len().saturating_sub(1))) else {
+        return;
+    };
+    state.palette_open = false;
+    match action {
+        Action::Shell => open_tab(state, "shell", None),
+        Action::Lazygit => open_tab(state, "lazygit", Some("lazygit")),
+        Action::OpenProject => pick_folder(tx),
+        Action::Run(command) => open_tab(state, command, Some(command)),
+    }
+}
+
+fn palette_key(state: &mut State, event: &KeyEvent, tx: &mut Tx) -> bool {
+    let last = palette_actions(&state.palette.text).len().saturating_sub(1);
+    match event.key {
+        Key::Escape => state.palette_open = false,
+        Key::Up => state.palette_selected = state.palette_selected.min(last).saturating_sub(1),
+        Key::Down => state.palette_selected = (state.palette_selected + 1).min(last),
+        Key::Enter => run_palette(state, state.palette_selected, tx),
+        _ => return false,
+    }
+    true
 }
 
 /// Workspace shortcuts. These keys never reach the terminal.
@@ -141,6 +203,7 @@ fn shortcut(state: &mut State, event: &KeyEvent, tx: &mut Tx) -> bool {
     let digit_index = |digit: char| digit.to_digit(10).map(|digit| digit as usize - 1);
     match &event.key {
         Key::Command('n') if plain_command => pick_folder(tx),
+        Key::Command('p') if plain_command => open_palette(state, tx),
         Key::Command('t') if plain_command => open_tab(state, "shell", None),
         Key::Command('w') if plain_command => state.workspace.close_tab(),
         Key::Command(digit @ '1'..='9') if plain_command => {
@@ -256,50 +319,31 @@ fn view(state: &State, _: &mut Cx<State>) -> El {
             .map(|(index, tab)| {
                 pill(
                     format!("tab-{index}"),
-                    &tab.title,
+                    tab.label(),
                     index == project.active_tab,
                 )
+                .max_w(TAB_MAX_WIDTH)
                 .on_press(move |state: &mut State| state.workspace.select_tab(index))
             })
             .collect()
     });
-    let new_tab =
+    let new_tab = state.workspace.project().map(|_| {
         pill("new-tab".to_owned(), "+", false).on_press_tx(|_: &mut State, tx: &mut Tx| {
             let menu = PopupMenu::new()
                 .item(PopupItem::new("shell", "Shell"))
                 .item(PopupItem::new("lazygit", "lazygit"))
-                .item(PopupItem::new("custom", "Custom command…"));
+                .item(PopupItem::new("palette", "Command centre…"));
             tx.popup_menu(menu, "new-tab", pick_new_tab);
-        });
+        })
+    });
     let mut overlays = Vec::new();
-    if state.command_open {
+    if state.workspace.projects.is_empty() {
         overlays.push(
-            row()
-                .key("command-bar")
-                .absolute(12.0, 12.0)
-                .gap(8.0)
-                .items_center()
-                .px(10.0)
-                .py(6.0)
-                .radius(6.0)
-                .fill(theme.control_off)
-                .child(text("Run").color(theme.text))
-                .child(
-                    text_input(&state.command, tok::type_::BODY)
-                        .key("command")
-                        .single_line()
-                        .w(320.0)
-                        .color(theme.text)
-                        .on_edit(|state: &mut State| &mut state.command)
-                        .on_submit(|state: &mut State, _: &mut Tx| submit_command(state))
-                        .on_input_key(|state: &mut State, event: &KeyEvent, _: &mut Tx| {
-                            let escape = event.key == Key::Escape;
-                            if escape {
-                                state.command_open = false;
-                            }
-                            escape
-                        }),
-                ),
+            col()
+                .key("empty-hint")
+                .pin(Some(0.0), Some(0.0), Some(0.0), Some(0.0))
+                .center()
+                .child(text("Open a folder with ⌘N, or drop one here").color(theme.text_secondary)),
         );
     }
     if let Some([x, y, width, height]) = state.caret {
@@ -366,7 +410,7 @@ fn view(state: &State, _: &mut Cx<State>) -> El {
                 .px(8.0)
                 .items_center()
                 .children(tabs)
-                .child(new_tab),
+                .children(new_tab),
         )
         .child(
             effect(TERMINAL_MARK)
@@ -414,6 +458,52 @@ fn view(state: &State, _: &mut Cx<State>) -> El {
                 })
                 .children(overlays),
         );
+    let palette = state.palette_open.then(|| {
+        let actions = palette_actions(&state.palette.text);
+        let selected = state.palette_selected.min(actions.len().saturating_sub(1));
+        let rows = actions.iter().enumerate().map(|(index, action)| {
+            pill(
+                format!("palette-{index}"),
+                &action.label(),
+                index == selected,
+            )
+            .w_full()
+            .on_press_tx(move |state: &mut State, tx: &mut Tx| run_palette(state, index, tx))
+        });
+        col()
+            .key("palette-layer")
+            .pin(Some(0.0), Some(0.0), Some(0.0), Some(0.0))
+            .items_center()
+            .pt(PALETTE_TOP)
+            .on_press(|state: &mut State| state.palette_open = false)
+            .child(
+                col()
+                    .key("palette")
+                    .w(PALETTE_WIDTH)
+                    .padding(8.0)
+                    .gap(4.0)
+                    .radius(10.0)
+                    .fill(theme.card)
+                    .border(1.0, theme.card_border)
+                    // Keeps clicks between rows from reaching the layer, which closes it.
+                    .on_press(|_: &mut State| {})
+                    .child(
+                        text_input(&state.palette, tok::type_::BODY)
+                            .key("palette-input")
+                            .label("Command")
+                            .single_line()
+                            .w_full()
+                            .px(10.0)
+                            .py(6.0)
+                            .radius(6.0)
+                            .fill(theme.control_track)
+                            .color(theme.text)
+                            .on_edit(|state: &mut State| &mut state.palette)
+                            .on_input_key(palette_key),
+                    )
+                    .children(rows),
+            )
+    });
     row()
         .w_full()
         .h_full()
@@ -425,6 +515,7 @@ fn view(state: &State, _: &mut Cx<State>) -> El {
         })
         .child(sidebar)
         .child(terminal)
+        .children(palette)
 }
 
 fn poll(state: &mut State, _: f64, tx: &mut Tx) -> bool {
@@ -438,15 +529,24 @@ fn poll(state: &mut State, _: f64, tx: &mut Tx) -> bool {
     }
     let active = state.session().map(Session::id);
     let mut changed = false;
-    for session in state.workspace.sessions() {
-        while let Some(event) = session.next_event() {
+    // A paste is confirmed for the session that refused it, so a switch away dismisses it.
+    if state.drawn.0 != 0 && Some(state.drawn.0) != active && state.pending_paste.is_some() {
+        state.pending_paste = None;
+        changed = true;
+    }
+    for tab in state.workspace.tabs_mut() {
+        while let Some(event) = tab.session.next_event() {
             match event {
                 Event::Copied(text) => tx.copy(text),
-                Event::PasteRejected(text) if Some(session.id()) == active => {
+                Event::PasteRejected(text) if Some(tab.session.id()) == active => {
                     state.pending_paste = Some(text);
                     changed = true;
                 }
                 Event::PasteRejected(_) => {}
+                Event::Title(title) => {
+                    tab.program_title = Some(title).filter(|title| !title.is_empty());
+                    changed = true;
+                }
             }
         }
     }
@@ -469,7 +569,7 @@ fn on_key(state: &mut State, event: &KeyEvent, tx: &mut Tx) -> bool {
     if shortcut(state, event, tx) {
         return true;
     }
-    // A focused field, such as the command bar, keeps the keys its editor didn't take.
+    // A focused field, such as the command centre's, keeps the keys its editor didn't take.
     if tx.focused().is_some() {
         return false;
     }
@@ -527,10 +627,7 @@ fn on_ime(state: &mut State, ime: &Ime, _: &mut Tx) -> bool {
 fn fixture_tab(title: &str, bytes: &[u8]) -> Tab {
     let grid = Grid::from_vt(bytes, 60, 12)
         .unwrap_or_else(|error| Grid::message(&format!("failed to build fixture: {error:#}")));
-    Tab {
-        title: title.to_owned(),
-        session: Session::fixture(grid),
-    }
+    Tab::new(title, Session::fixture(grid))
 }
 
 fn show_scene(state: &mut State, bytes: &[u8]) {
@@ -541,9 +638,11 @@ fn show_scene(state: &mut State, bytes: &[u8]) {
 }
 
 fn show_workspace_scene(state: &mut State) {
+    let mut titled = fixture_tab("shell", b"$ ");
+    titled.program_title = Some("vim ~/dev/agentd/src/workspace.rs and a long tail".to_owned());
     let agentd = vec![
         fixture_tab("claude", SCENE_FIXTURE),
-        fixture_tab("shell", b"$ "),
+        titled,
         fixture_tab("lazygit", b""),
     ];
     state
@@ -564,6 +663,12 @@ fn main() {
                 show_scene(state, SCENE_UNICODE.as_bytes())
             }),
             ("workspace", show_workspace_scene),
+            ("palette", |state| {
+                show_workspace_scene(state);
+                state.palette = TextEdit::new("lz");
+                state.palette_open = true;
+            }),
+            ("empty", |state| state.started = true),
         ],
         setup: Some(|state, waker| state.waker = Some(waker)),
         poll: Some(poll),
@@ -780,26 +885,81 @@ mod tests {
         assert_eq!(workspace.active, 1);
     }
 
-    #[test]
-    fn escape_closes_the_command_bar() {
-        let mut runtime = runtime_with(State {
-            command_open: true,
-            ..workspace_state()
-        });
-        runtime.on_key = Some(on_key);
-        click(&mut runtime, "command");
-        press(&mut runtime, Key::Escape, Mods::default());
+    fn palette_runtime() -> Runtime<State> {
+        let mut runtime = workspace_runtime();
+        press(&mut runtime, Key::Command('p'), command());
         runtime.frame(2.0 / 60.0);
-        assert!(runtime.find("command-bar").is_none());
+        runtime
     }
 
     #[test]
-    fn an_empty_command_opens_no_tab() {
-        let mut state = workspace_state();
-        state.command_open = true;
-        submit_command(&mut state);
-        assert!(!state.command_open);
-        assert_eq!(state.workspace.projects[0].tabs.len(), 3);
+    fn command_p_opens_the_command_centre_and_escape_closes_it() {
+        let mut runtime = palette_runtime();
+        assert!(runtime.find("palette").is_some());
+        press(&mut runtime, Key::Escape, Mods::default());
+        runtime.frame(3.0 / 60.0);
+        assert!(runtime.find("palette").is_none());
+    }
+
+    #[test]
+    fn clicking_outside_the_command_centre_closes_it() {
+        let mut runtime = palette_runtime();
+        runtime.pointer_down(4.0, 600.0);
+        runtime.pointer_up(4.0, 600.0);
+        runtime.frame(3.0 / 60.0);
+        runtime.frame(4.0 / 60.0);
+        assert!(!runtime.state.palette_open);
+    }
+
+    #[test]
+    fn typing_in_the_command_centre_stays_out_of_the_terminal() {
+        let mut runtime = palette_runtime();
+        press(&mut runtime, Key::Text("x".into()), Mods::default());
+        assert_eq!(runtime.state.palette.text, "x");
+    }
+
+    #[test]
+    fn the_command_centre_filters_by_letters_in_order() {
+        assert_eq!(
+            palette_actions("lzg"),
+            [Action::Lazygit, Action::Run("lzg".to_owned())]
+        );
+        assert_eq!(
+            palette_actions(""),
+            [Action::Shell, Action::Lazygit, Action::OpenProject]
+        );
+    }
+
+    #[test]
+    fn arrows_move_the_command_centre_selection_within_bounds() {
+        let mut runtime = palette_runtime();
+        press(&mut runtime, Key::Up, Mods::default());
+        assert_eq!(runtime.state.palette_selected, 0);
+        for _ in 0..5 {
+            press(&mut runtime, Key::Down, Mods::default());
+        }
+        assert_eq!(runtime.state.palette_selected, 2);
+    }
+
+    #[test]
+    fn an_empty_workspace_shows_a_hint() {
+        let runtime = runtime_with(State::default());
+        assert!(runtime.find("empty-hint").is_some());
+    }
+
+    #[test]
+    fn switching_tabs_dismisses_a_pending_paste() {
+        let mut runtime = runtime_with(State {
+            pending_paste: Some("rm -rf x\n".to_owned()),
+            ..workspace_state()
+        });
+        runtime.poll = Some(poll);
+        runtime.frame(1.0 / 60.0);
+        assert!(runtime.find("paste-confirm").is_some());
+        click(&mut runtime, "tab-1");
+        runtime.frame(2.0 / 60.0);
+        assert!(runtime.state.pending_paste.is_none());
+        assert!(runtime.find("paste-confirm").is_none());
     }
 
     #[test]

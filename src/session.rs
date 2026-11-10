@@ -69,6 +69,8 @@ impl<T, E: Display> LogErr<T> for std::result::Result<T, E> {
 pub enum Event {
     Copied(String),
     PasteRejected(String),
+    /// The program's title (OSC 0 or 2); empty when it clears it.
+    Title(String),
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -1045,6 +1047,12 @@ impl Actor {
             }
         })?;
 
+        let title_changed = Rc::new(std::cell::Cell::new(false));
+        terminal.on_title_changed({
+            let title_changed = title_changed.clone();
+            move |_| title_changed.set(true)
+        })?;
+
         let mut input = TerminalInput::new()?;
         let mut resize = ResizeThrottle {
             pending: None,
@@ -1060,7 +1068,18 @@ impl Actor {
             let wait = resize.wait(now).map_or(wait, |due| wait.min(due));
             select! {
                 recv(self.output) -> bytes => match bytes {
-                    Ok(bytes) => { terminal.vt_write(&bytes); dirty = true; }
+                    Ok(bytes) => {
+                        terminal.vt_write(&bytes);
+                        dirty = true;
+                        // libghostty only exposes the new title once the write returns.
+                        if title_changed.take()
+                            && let Some(title) = terminal.title().log_err("read title")
+                        {
+                            let title = String::from_utf8_lossy(title).into_owned();
+                            self.events.send(Event::Title(title)).log_err("queue title");
+                            (self.waker)();
+                        }
+                    }
                     Err(_) => {
                         self.output = never();
                         self.child.wait().log_err("wait for process");
@@ -1900,6 +1919,20 @@ mod tests {
         type_line(&typing, "echo still-responsive");
         wait_for_line(&typing, "still-responsive");
         assert_eq!(flood.grid().generation, generation);
+    }
+
+    #[test]
+    fn a_program_title_comes_back_to_the_ui() {
+        let session = Session::spawn(None, Path::new("/tmp"), Arc::new(|| {})).unwrap();
+        type_line(&session, "printf '\\033]2;agentd-title\\007'; sleep 5");
+        wait_until(
+            Duration::from_secs(15),
+            || "the title never arrived".to_owned(),
+            || match session.next_event() {
+                Some(Event::Title(title)) if title == "agentd-title" => Some(()),
+                _ => None,
+            },
+        );
     }
 
     #[test]

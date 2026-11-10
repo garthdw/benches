@@ -3,8 +3,24 @@ use std::path::PathBuf;
 use crate::session::Session;
 
 pub struct Tab {
+    /// What the tab runs, shown until the program sets a title of its own.
     pub title: String,
+    pub program_title: Option<String>,
     pub session: Session,
+}
+
+impl Tab {
+    pub fn new(title: &str, session: Session) -> Self {
+        Self {
+            title: title.to_owned(),
+            program_title: None,
+            session,
+        }
+    }
+
+    pub fn label(&self) -> &str {
+        self.program_title.as_deref().unwrap_or(&self.title)
+    }
 }
 
 pub struct Project {
@@ -55,6 +71,12 @@ impl Workspace {
             .iter()
             .flat_map(|project| project.tabs.iter().chain(&project.tray))
             .map(|tab| &tab.session)
+    }
+
+    pub fn tabs_mut(&mut self) -> impl Iterator<Item = &mut Tab> {
+        self.projects
+            .iter_mut()
+            .flat_map(|project| project.tabs.iter_mut().chain(&mut project.tray))
     }
 
     pub fn project_index(&self, root: &std::path::Path) -> Option<usize> {
@@ -169,10 +191,7 @@ mod tests {
     use crate::session::Grid;
 
     fn tab(title: &str) -> Tab {
-        Tab {
-            title: title.to_owned(),
-            session: Session::fixture(Grid::default()),
-        }
+        Tab::new(title, Session::fixture(Grid::default()))
     }
 
     fn workspace() -> Workspace {
@@ -238,6 +257,15 @@ mod tests {
         workspace.select_tab(1);
         workspace.close_tab();
         assert_eq!(active_title(&workspace), Some("claude"));
+    }
+
+    #[test]
+    fn a_program_title_replaces_the_command_name_until_cleared() {
+        let mut tab = tab("shell");
+        tab.program_title = Some("vim notes.md".to_owned());
+        assert_eq!(tab.label(), "vim notes.md");
+        tab.program_title = None;
+        assert_eq!(tab.label(), "shell");
     }
 
     #[test]
