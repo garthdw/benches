@@ -17,8 +17,10 @@ use rune::{
     Tx, Waker, WheelEvent, col, effect, el, icon, row, text, text_input,
 };
 
+use anyhow::Context;
+use session::LogErr;
 use session::{Attention, Event, Grid, PointerInput, PointerPhase, Session, WheelInput};
-use workspace::{Project, Status, Tab, Workspace};
+use workspace::{Project, SavedWorkspace, Slot, Status, Tab, Workspace};
 
 const TERMINAL_MARK: u32 = 1;
 const DRAWER_MARK: u32 = 2;
@@ -72,6 +74,8 @@ pub struct State {
     palette_selected: usize,
     sidebar_hidden: bool,
     config: config::Config,
+    /// Unset in tests and scenes, which then read and write no files.
+    paths: Option<config::Paths>,
 }
 
 impl State {
@@ -126,20 +130,76 @@ fn restart_tray(state: &mut State, index: usize) {
         tab.restart = true;
         tab.stop();
     } else {
-        respawn_tray(state, state.workspace.active, index);
+        respawn(state, state.workspace.active, Slot::Tray(index));
     }
 }
 
-fn respawn_tray(state: &mut State, project: usize, index: usize) {
+/// Starts the tab or tray process at `slot` afresh, with the command and folder it had.
+fn respawn(state: &mut State, project: usize, slot: Slot) {
     let Some(project_ref) = state.workspace.projects.get(project) else {
         return;
     };
-    let Some(old) = project_ref.tray.get(index) else {
+    let old = match slot {
+        Slot::Tab(index) => project_ref.tabs.get(index),
+        Slot::Tray(index) => project_ref.tray.get(index),
+    };
+    let Some(old) = old else {
         return;
     };
     let cwd = old.cwd.clone().unwrap_or_else(|| project_ref.root.clone());
     let tab = state.spawn_tab(&old.title, old.command.as_deref(), &cwd);
-    state.workspace.replace_tray(project, index, tab);
+    state.workspace.replace(project, slot, tab);
+}
+
+/// Starts a restored project's tabs once it is first shown; its tray waits for Restart.
+fn launch_active(state: &mut State) {
+    let active = state.workspace.active;
+    let Some(project) = state.workspace.projects.get_mut(active) else {
+        return;
+    };
+    if project.launched {
+        return;
+    }
+    project.launched = true;
+    for index in 0..project.tabs.len() {
+        respawn(state, active, Slot::Tab(index));
+    }
+}
+
+fn load_layout(state: &mut State) {
+    let Some(paths) = &state.paths else {
+        return;
+    };
+    let path = paths.state();
+    let saved = match std::fs::read_to_string(&path) {
+        Ok(json) => serde_json::from_str::<SavedWorkspace>(&json)
+            .with_context(|| format!("parse {}", path.display())),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
+        Err(error) => Err(error).with_context(|| format!("read {}", path.display())),
+    };
+    if let Some(saved) = saved.log_err("restore layout") {
+        state.sidebar_hidden = saved.sidebar_hidden;
+        state.workspace = Workspace::restore(saved);
+    }
+}
+
+/// Written to a temporary file and renamed into place, so a crash never leaves half a file.
+fn save_layout(state: &State) -> anyhow::Result<()> {
+    let Some(paths) = &state.paths else {
+        return Ok(());
+    };
+    let path = paths.state();
+    let json = serde_json::to_string_pretty(&state.workspace.snapshot(state.sidebar_hidden))?;
+    std::fs::create_dir_all(&paths.dir)
+        .with_context(|| format!("create {}", paths.dir.display()))?;
+    let temporary = path.with_extension("json.tmp");
+    std::fs::write(&temporary, json).with_context(|| format!("write {}", temporary.display()))?;
+    std::fs::rename(&temporary, &path).with_context(|| format!("replace {}", path.display()))?;
+    Ok(())
+}
+
+fn on_quit(state: &mut State, _: &mut Tx) {
+    save_layout(state).log_err("save layout");
 }
 
 fn tray_action(state: &mut State, index: usize, picked: Option<&str>) {
@@ -848,12 +908,14 @@ fn view(state: &State, cx: &mut Cx<State>) -> El {
 fn poll(state: &mut State, _: f64, tx: &mut Tx) -> bool {
     if !state.started {
         state.started = true;
+        load_layout(state);
         if state.workspace.projects.is_empty() {
             let home = std::env::var_os("HOME").map_or_else(|| PathBuf::from("/"), PathBuf::from);
             let tab = state.spawn_tab("shell", None, &home);
             state.workspace.add_project(Project::new(home, vec![tab]));
         }
     }
+    launch_active(state);
     let active = state.session().map(Session::id);
     let shown = state.workspace.active_session().map(Session::id);
     let mut changed = false;
@@ -895,7 +957,7 @@ fn poll(state: &mut State, _: f64, tx: &mut Tx) -> bool {
     }
     for session in restarts {
         if let Some((project, index)) = state.workspace.find_tray(session) {
-            respawn_tray(state, project, index);
+            respawn(state, project, Slot::Tray(index));
         }
     }
     // Kept while programs hide the cursor, as dropping the caret cancels a composition.
@@ -1055,12 +1117,14 @@ fn main() {
             let paths = config::Paths::from_home();
             State {
                 config: paths.as_ref().map(config::Config::load).unwrap_or_default(),
+                paths,
                 ..State::default()
             }
         })
         .compositor(render::TerminalCompositor::default())
         .on_ime(on_ime)
         .on_modifiers(|state, mods, _| state.option_held = mods.alt)
+        .on_quit(on_quit)
         .on_focus(|state, focused, _| state.workspace.set_window_focused(focused))
         .run();
 }
@@ -1650,5 +1714,76 @@ mod tests {
         });
         runtime.frame(1.0 / 60.0);
         assert_eq!(WINDOW_KEYS.load(Ordering::SeqCst), 3);
+    }
+
+    fn saved_project(root: &str) -> workspace::SavedProject {
+        workspace::SavedProject {
+            root: root.into(),
+            active_tab: 0,
+            tabs: vec![workspace::SavedTab {
+                title: "sleep".to_owned(),
+                command: Some("sleep 100".to_owned()),
+                cwd: None,
+            }],
+            tray: vec![],
+        }
+    }
+
+    #[test]
+    fn a_restored_project_starts_its_tabs_when_first_shown() {
+        let tmp = std::env::temp_dir().canonicalize().unwrap();
+        let saved = SavedWorkspace {
+            active: 0,
+            sidebar_hidden: false,
+            projects: vec![saved_project("/"), saved_project(tmp.to_str().unwrap())],
+        };
+        let mut runtime = runtime_with(State {
+            workspace: Workspace::restore(saved),
+            started: true,
+            ..State::default()
+        });
+        runtime.poll = Some(poll);
+        runtime.frame(1.0 / 60.0);
+        let launched = |runtime: &Runtime<State>| -> Vec<bool> {
+            let projects = &runtime.state.workspace.projects;
+            projects.iter().map(|project| project.launched).collect()
+        };
+        assert_eq!(launched(&runtime), [true, false]);
+        let tab = &runtime.state.workspace.projects[0].tabs[0];
+        assert_eq!(tab.command.as_deref(), Some("sleep 100"));
+        assert_eq!(tab.cwd, Some("/".into()));
+        assert!(tab.session.cwd().is_some(), "a real process runs");
+        runtime.state.workspace.select_project(1);
+        runtime.frame(2.0 / 60.0);
+        assert_eq!(launched(&runtime), [true, true]);
+    }
+
+    #[test]
+    fn the_layout_saves_and_loads_back() {
+        let directory = tempfile::tempdir().unwrap();
+        let paths = || config::Paths {
+            dir: directory.path().join("agentd"),
+            ghostty_dir: directory.path().join("ghostty"),
+        };
+        let mut state = State::default();
+        for root in ["/", "/usr"] {
+            let tabs = vec![fixture_tab("shell", b"$ "), fixture_tab("claude", b"")];
+            state.workspace.add_project(Project::new(root.into(), tabs));
+        }
+        state.workspace.select_tab(1);
+        state.workspace.add_tray(fixture_tab("pnpm dev", b""));
+        state.sidebar_hidden = true;
+        state.paths = Some(paths());
+        save_layout(&state).unwrap();
+        let mut loaded = State {
+            paths: Some(paths()),
+            ..State::default()
+        };
+        load_layout(&mut loaded);
+        assert!(loaded.sidebar_hidden);
+        assert_eq!(
+            loaded.workspace.snapshot(true),
+            state.workspace.snapshot(true)
+        );
     }
 }

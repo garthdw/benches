@@ -112,6 +112,10 @@ impl Paths {
             ghostty_dir: home.join(".config/ghostty"),
         })
     }
+
+    pub fn state(&self) -> PathBuf {
+        self.dir.join("state.json")
+    }
 }
 
 impl Config {

@@ -2,7 +2,9 @@ use std::os::unix::process::ExitStatusExt;
 use std::path::PathBuf;
 use std::process::ExitStatus;
 
-use crate::session::{Attention, Session, Visibility};
+use serde::{Deserialize, Serialize};
+
+use crate::session::{Attention, Grid, Session, Visibility};
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Status {
@@ -81,6 +83,8 @@ pub struct Project {
     pub drawer: usize,
     pub drawer_open: bool,
     pub drawer_focused: bool,
+    /// False for a restored project until it is first shown, when its tabs start.
+    pub launched: bool,
 }
 
 impl Project {
@@ -99,6 +103,7 @@ impl Project {
             drawer: 0,
             drawer_open: false,
             drawer_focused: false,
+            launched: true,
         }
     }
 
@@ -295,13 +300,16 @@ impl Workspace {
         self.projects.get_mut(self.active)?.tray.get_mut(index)
     }
 
-    /// Replaces `project`'s tray process `index` with `tab`; dropping the old session ends its process.
-    pub fn replace_tray(&mut self, project: usize, index: usize, tab: Tab) {
+    /// Replaces `project`'s tab or tray process at `slot` with `tab`; dropping the old session ends its process.
+    pub fn replace(&mut self, project: usize, slot: Slot, tab: Tab) {
         self.focus_active(false);
         if let Some(old) = self
             .projects
             .get_mut(project)
-            .and_then(|project| project.tray.get_mut(index))
+            .and_then(|project| match slot {
+                Slot::Tab(index) => project.tabs.get_mut(index),
+                Slot::Tray(index) => project.tray.get_mut(index),
+            })
         {
             *old = tab;
         }
@@ -385,6 +393,99 @@ impl Workspace {
             }
         }
         self.focus_active(true);
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Slot {
+    Tab(usize),
+    Tray(usize),
+}
+
+/// The layout `state.json` keeps between launches.
+#[derive(Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct SavedWorkspace {
+    pub active: usize,
+    pub sidebar_hidden: bool,
+    pub projects: Vec<SavedProject>,
+}
+
+#[derive(Debug, PartialEq, Serialize, Deserialize)]
+pub struct SavedProject {
+    pub root: PathBuf,
+    pub active_tab: usize,
+    pub tabs: Vec<SavedTab>,
+    pub tray: Vec<SavedTab>,
+}
+
+#[derive(Debug, PartialEq, Serialize, Deserialize)]
+pub struct SavedTab {
+    pub title: String,
+    pub command: Option<String>,
+    pub cwd: Option<PathBuf>,
+}
+
+impl SavedTab {
+    /// A shell is saved where it has `cd`ed to, so it comes back there.
+    fn new(tab: &Tab) -> Self {
+        let live_cwd = tab.command.is_none().then(|| tab.session.cwd()).flatten();
+        Self {
+            title: tab.title.clone(),
+            command: tab.command.clone(),
+            cwd: live_cwd.or_else(|| tab.cwd.clone()),
+        }
+    }
+
+    /// A placeholder with no process, holding what starts it.
+    fn restore(self, status: Status) -> Tab {
+        let mut tab = Tab::new(&self.title, Session::fixture(Grid::default()));
+        tab.command = self.command;
+        tab.cwd = self.cwd;
+        tab.status = status;
+        tab
+    }
+}
+
+impl Workspace {
+    pub fn snapshot(&self, sidebar_hidden: bool) -> SavedWorkspace {
+        let tabs = |tabs: &[Tab]| tabs.iter().map(SavedTab::new).collect();
+        SavedWorkspace {
+            active: self.active,
+            sidebar_hidden,
+            projects: self
+                .projects
+                .iter()
+                .map(|project| SavedProject {
+                    root: project.root.clone(),
+                    active_tab: project.active_tab,
+                    tabs: tabs(&project.tabs),
+                    tray: tabs(&project.tray),
+                })
+                .collect(),
+        }
+    }
+
+    /// Projects come back unlaunched and their tray processes stopped. Missing folders are dropped.
+    pub fn restore(saved: SavedWorkspace) -> Self {
+        let mut workspace = Workspace::default();
+        for saved_project in saved.projects {
+            if saved_project.tabs.is_empty() || !saved_project.root.is_dir() {
+                continue;
+            }
+            let tabs = saved_project.tabs.into_iter();
+            let mut project = Project::new(
+                saved_project.root,
+                tabs.map(|tab| tab.restore(Status::Running)).collect(),
+            );
+            project.active_tab = saved_project.active_tab.min(project.tabs.len() - 1);
+            let tray = saved_project.tray.into_iter();
+            project.tray = tray.map(|tab| tab.restore(Status::Stopped)).collect();
+            project.launched = false;
+            workspace.projects.push(project);
+        }
+        workspace.active = saved.active.min(workspace.projects.len().saturating_sub(1));
+        workspace.show_active();
+        workspace
     }
 }
 
@@ -595,7 +696,7 @@ mod tests {
         let id = fresh.session.id();
         let old = workspace.projects[1].tray[0].session.id();
         assert_eq!(workspace.find_tray(old), Some((1, 0)));
-        workspace.replace_tray(1, 0, fresh);
+        workspace.replace(1, Slot::Tray(0), fresh);
         assert_eq!(workspace.drawer_session().map(Session::id), Some(id));
         assert_eq!(tray_visibilities(&workspace)[0], Visibility::Shown);
         workspace.toggle_drawer(0);
@@ -623,6 +724,91 @@ mod tests {
     #[test]
     fn sessions_cover_every_tab() {
         assert_eq!(workspace().sessions().count(), 3);
+    }
+
+    #[test]
+    fn a_snapshot_round_trips_through_json() {
+        let mut workspace = tray_workspace();
+        workspace.projects[1].tray[0].command = Some("pnpm dev".to_owned());
+        workspace.projects[0].tabs[0].cwd = Some("/tmp".into());
+        let saved = workspace.snapshot(true);
+        let json = serde_json::to_string(&saved).unwrap();
+        assert_eq!(
+            serde_json::from_str::<SavedWorkspace>(&json).unwrap(),
+            saved
+        );
+        assert!(saved.sidebar_hidden);
+        assert_eq!(saved.active, 1);
+        assert_eq!(saved.projects[0].tabs[0].cwd, Some("/tmp".into()));
+        assert_eq!(
+            saved.projects[1].tray[0].command.as_deref(),
+            Some("pnpm dev")
+        );
+    }
+
+    fn saved_tab(title: &str) -> SavedTab {
+        SavedTab {
+            title: title.to_owned(),
+            command: Some(title.to_owned()),
+            cwd: None,
+        }
+    }
+
+    fn saved_project(root: &str, active_tab: usize) -> SavedProject {
+        SavedProject {
+            root: root.into(),
+            active_tab,
+            tabs: vec![saved_tab("claude"), saved_tab("shell")],
+            tray: vec![saved_tab("pnpm dev")],
+        }
+    }
+
+    #[test]
+    fn a_restored_workspace_waits_to_launch_with_its_tray_stopped() {
+        let saved = SavedWorkspace {
+            active: 1,
+            sidebar_hidden: false,
+            projects: vec![saved_project("/", 1), saved_project("/tmp", 0)],
+        };
+        let workspace = Workspace::restore(saved);
+        assert_eq!(workspace.active, 1);
+        assert_eq!(workspace.projects[0].active_tab, 1);
+        assert!(workspace.projects.iter().all(|project| !project.launched));
+        let tray = &workspace.projects[1].tray[0];
+        assert_eq!(tray.status, Status::Stopped);
+        assert_eq!(tray.command.as_deref(), Some("pnpm dev"));
+    }
+
+    #[test]
+    fn restoring_skips_missing_folders_and_empty_projects_and_clamps_indices() {
+        let mut empty = saved_project("/tmp", 0);
+        empty.tabs.clear();
+        let saved = SavedWorkspace {
+            active: 7,
+            sidebar_hidden: false,
+            projects: vec![
+                saved_project("/no/such/folder", 0),
+                empty,
+                saved_project("/", 9),
+            ],
+        };
+        let workspace = Workspace::restore(saved);
+        assert_eq!(workspace.projects.len(), 1);
+        assert_eq!(workspace.active, 0);
+        assert_eq!(workspace.projects[0].active_tab, 1);
+    }
+
+    #[test]
+    fn launching_replaces_a_tab_and_keeps_it_shown() {
+        let mut workspace = workspace();
+        let fresh = tab("vim");
+        let id = fresh.session.id();
+        workspace.replace(1, Slot::Tab(0), fresh);
+        assert_eq!(workspace.active_session().map(Session::id), Some(id));
+        assert_eq!(
+            workspace.projects[1].tabs[0].session.visibility(),
+            Visibility::Shown
+        );
     }
 
     #[test]
