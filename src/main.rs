@@ -217,7 +217,8 @@ fn shortcut(state: &mut State, event: &KeyEvent, tx: &mut Tx) -> bool {
                 return false;
             };
             if mods.shift {
-                state.workspace.select_project(index);
+                let last = state.workspace.projects.len().saturating_sub(1);
+                state.workspace.select_project(index.min(last));
             } else if let Some(project) = state.workspace.project() {
                 let last = project.tabs.len().saturating_sub(1);
                 state.workspace.select_tab(index.min(last));
@@ -854,6 +855,17 @@ mod tests {
         let mut runtime = workspace_runtime();
         press(&mut runtime, Key::Command('9'), command());
         assert_eq!(runtime.state.workspace.projects[0].active_tab, 2);
+    }
+
+    #[test]
+    fn a_command_shift_digit_past_the_last_project_selects_the_last_project() {
+        let mut runtime = workspace_runtime();
+        let shifted = Mods {
+            shift: true,
+            ..command()
+        };
+        press(&mut runtime, Key::Command('9'), shifted);
+        assert_eq!(runtime.state.workspace.active, 1);
     }
 
     #[test]
