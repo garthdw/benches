@@ -18,6 +18,9 @@ pub struct Config {
     pub theme: Theme,
     /// The tabs a new project opens with.
     pub tabs: Vec<TabSpec>,
+    /// `jump-command`: a command such as `j` or `zoxide query` that the command centre runs
+    /// through `shell` with the query to find a folder to open as a project.
+    pub jump_command: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -76,6 +79,7 @@ impl Default for Config {
                     command: None,
                 },
             ],
+            jump_command: None,
         }
     }
 }
@@ -88,6 +92,8 @@ struct File {
     #[serde(default)]
     font: FontFile,
     tabs: Option<Vec<TabSpec>>,
+    #[serde(rename = "jump-command")]
+    jump_command: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -168,6 +174,7 @@ impl Config {
             },
             theme,
             tabs: file.tabs.unwrap_or(defaults.tabs),
+            jump_command: file.jump_command,
         }
     }
 }
@@ -322,13 +329,14 @@ mod tests {
 
     #[test]
     fn config_toml_overrides_ghostty_key_by_key() {
-        let config = "shell = \"/bin/zsh\"\n[font]\nsize = 12\n[[tabs]]\ntitle = \"shell\"\n";
+        let config = "shell = \"/bin/zsh\"\njump-command = \"j\"\n[font]\nsize = 12\n[[tabs]]\ntitle = \"shell\"\n";
         let (_root, paths) = paths(
             Some(config),
             Some("font-size = 14\nfont-family = Iosevka\n"),
         );
         let config = Config::load(&paths);
         assert_eq!(config.shell, PathBuf::from("/bin/zsh"));
+        assert_eq!(config.jump_command.as_deref(), Some("j"));
         assert_eq!(
             config.font,
             FontConfig {
