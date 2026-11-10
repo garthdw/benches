@@ -681,6 +681,14 @@ impl TerminalInput {
         })
     }
 
+    /// Ends any press, drag or selection, whose release would go to whichever session is shown next.
+    fn cancel_pointer(&mut self) {
+        self.selecting = false;
+        self.pressed = None;
+        self.next_autoscroll = None;
+        self.scrollbar_grab = None;
+    }
+
     fn select(
         &mut self,
         terminal: &Terminal<'static, '_>,
@@ -1577,8 +1585,11 @@ impl Actor {
                         if visibility == Visibility::Shown {
                             attention = Attention::None;
                         }
-                        // The UI's hover moves to whichever session takes this one's place.
-                        scrollbar_hovered &= visibility == Visibility::Shown;
+                        // The UI's hover and pointer move to whichever session takes this one's place.
+                        if visibility != Visibility::Shown {
+                            scrollbar_hovered = false;
+                            input.cancel_pointer();
+                        }
                         publisher.borrow_mut().visibility = visibility;
                         dirty = true;
                     }
@@ -2781,6 +2792,16 @@ mod tests {
     fn hiding_a_session_releases_its_scrollbar_hover() {
         let session = shell_with_history();
         session.hover_scrollbar(true);
+        wait_for_scrollbar(&session, "widened", |bar| bar.wide);
+        session.set_visibility(Visibility::Listed);
+        session.set_visibility(Visibility::Shown);
+        wait_for_scrollbar(&session, "narrowed", |bar| !bar.wide);
+    }
+
+    #[test]
+    fn hiding_a_session_ends_its_scrollbar_drag() {
+        let session = shell_with_history();
+        session.drag_scrollbar(PointerPhase::Press, 10.0);
         wait_for_scrollbar(&session, "widened", |bar| bar.wide);
         session.set_visibility(Visibility::Listed);
         session.set_visibility(Visibility::Shown);
