@@ -313,6 +313,10 @@ struct ScrollbarFade {
 }
 
 impl ScrollbarFade {
+    fn show(&mut self, now: Instant) {
+        self.until = Some(now + SCROLLBAR_HOLD);
+    }
+
     fn follow(&mut self, terminal: &Terminal<'static, '_>) {
         self.offset = terminal
             .scrollbar()
@@ -330,7 +334,7 @@ impl ScrollbarFade {
         let scrolled = offset != self.offset;
         self.offset = offset;
         if scrolled || held || self.held {
-            self.until = Some(now + SCROLLBAR_HOLD);
+            self.show(now);
         }
         self.held = held;
         let Some(until) = self.until else {
@@ -919,19 +923,20 @@ impl TerminalInput {
         Ok(true)
     }
 
+    /// Bytes for the program, or `None` when the wheel scrolled the viewport.
     fn wheel(
         &mut self,
         terminal: &mut Terminal<'static, '_>,
         input: WheelInput,
-    ) -> Result<Vec<u8>> {
+    ) -> Result<Option<Vec<u8>>> {
         let Some(surface) = self.surface else {
-            return Ok(Vec::new());
+            return Ok(Some(Vec::new()));
         };
         let line_height = f32::from(surface.metrics.cell_height) / surface.metrics.scale;
         let lines = whole_lines(&mut self.wheel_remainder, input.dy / line_height);
         let mut bytes = Vec::new();
         if lines == 0 {
-            return Ok(bytes);
+            return Ok(Some(bytes));
         }
         let toward_history = lines > 0;
         if terminal.is_mouse_tracking()? {
@@ -971,8 +976,9 @@ impl TerminalInput {
             }
         } else {
             terminal.scroll_viewport(ScrollViewport::Delta(-(lines as isize)));
+            return Ok(None);
         }
-        Ok(bytes)
+        Ok(Some(bytes))
     }
 }
 
@@ -1492,12 +1498,15 @@ impl Actor {
                         }
                     }
                     Ok(Msg::Wheel(wheel)) => {
-                        if let Some(bytes) = input.wheel(&mut terminal, wheel).log_err("handle wheel") {
-                            if !bytes.is_empty() {
+                        match input.wheel(&mut terminal, wheel).log_err("handle wheel") {
+                            Some(Some(bytes)) if !bytes.is_empty() => {
                                 self.input.send(bytes).log_err("queue wheel input");
                             }
-                            dirty = true;
+                            // Shown even when the viewport is already at an end, as macOS does.
+                            Some(None) => fade.show(Instant::now()),
+                            _ => {}
                         }
+                        dirty = true;
                     }
                     Ok(Msg::Scrollbar { phase, y }) => {
                         input.drag_scrollbar(&mut terminal, phase, y).log_err("drag scrollbar");
@@ -1542,6 +1551,8 @@ impl Actor {
                             attention = Attention::None;
                         }
                         titles.visibility = visibility;
+                        // The UI's hover moves to whichever session takes this one's place.
+                        scrollbar_hovered &= visibility == Visibility::Shown;
                         publisher.borrow_mut().visible = visibility == Visibility::Shown;
                         dirty = true;
                     }
@@ -2279,7 +2290,7 @@ mod tests {
         let bytes = input_for_test()
             .wheel(&mut terminal, wheel_by(60.0))
             .unwrap();
-        assert!(bytes.is_empty());
+        assert_eq!(bytes, None);
         assert_ne!(top_line(&terminal), before);
     }
 
@@ -2289,6 +2300,7 @@ mod tests {
         terminal.vt_write(b"\x1b[?1049h");
         let bytes = input_for_test()
             .wheel(&mut terminal, wheel_by(40.0))
+            .unwrap()
             .unwrap();
         assert_eq!(bytes, b"\x1b[A\x1b[A");
     }
@@ -2299,6 +2311,7 @@ mod tests {
         terminal.vt_write(b"\x1b[?1000h\x1b[?1006h");
         let bytes = input_for_test()
             .wheel(&mut terminal, wheel_by(20.0))
+            .unwrap()
             .unwrap();
         assert!(bytes.starts_with(b"\x1b[<64;1;1M"), "{bytes:?}");
     }
@@ -2603,6 +2616,39 @@ mod tests {
         assert!(!lines.iter().any(|line| line.trim_end() == "hidden-ok"));
         session.set_visibility(Visibility::Shown);
         wait_for_line(&session, "hidden-ok");
+    }
+
+    fn shell_with_history() -> Session {
+        let session = spawn_shell();
+        session.resize(TEST_SURFACE);
+        type_line(&session, "seq 100");
+        wait_for_line(&session, "100");
+        session
+    }
+
+    fn wait_for_scrollbar(session: &Session, want: &str, shown: impl Fn(Scrollbar) -> bool) {
+        wait_until(
+            Duration::from_secs(5),
+            || format!("scrollbar never {want}: {:?}", session.grid().scrollbar),
+            || session.grid().scrollbar.filter(|bar| shown(*bar)),
+        );
+    }
+
+    #[test]
+    fn hiding_a_session_releases_its_scrollbar_hover() {
+        let session = shell_with_history();
+        session.hover_scrollbar(true);
+        wait_for_scrollbar(&session, "widened", |bar| bar.wide);
+        session.set_visibility(Visibility::Listed);
+        session.set_visibility(Visibility::Shown);
+        wait_for_scrollbar(&session, "narrowed", |bar| !bar.wide);
+    }
+
+    #[test]
+    fn a_wheel_past_the_bottom_still_flashes_the_scrollbar() {
+        let session = shell_with_history();
+        session.wheel(wheel_by(-60.0));
+        wait_for_scrollbar(&session, "shown", |bar| bar.opacity > 0.0);
     }
 
     #[test]

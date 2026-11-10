@@ -489,8 +489,22 @@ fn pointer_phase(phase: Phase) -> PointerPhase {
     }
 }
 
+/// Pressing the drawer's terminal gives it the keys, and pressing the tab's takes them back.
+fn focus_on_press(state: &mut State, drawer: bool, phase: PointerPhase, tx: &mut Tx) {
+    let focus_moves = phase == PointerPhase::Press
+        && state
+            .workspace
+            .project()
+            .is_some_and(|project| project.drawer_focused != drawer);
+    if focus_moves {
+        state.workspace.focus_drawer(drawer);
+    } else {
+        tx.live_only();
+    }
+}
+
 /// The right padding, where the thumb is drawn, while there is history to scroll.
-fn scrollbar_strip(key: &str, pick: fn(&Workspace) -> Option<&Session>) -> El {
+fn scrollbar_strip(key: &str, drawer: bool, pick: fn(&Workspace) -> Option<&Session>) -> El {
     el().key(format!("{key}-scrollbar"))
         .pin(None, Some(0.0), Some(0.0), Some(0.0))
         .w(render::PADDING_POINTS)
@@ -502,10 +516,11 @@ fn scrollbar_strip(key: &str, pick: fn(&Workspace) -> Option<&Session>) -> El {
             tx.live_only();
         })
         .on_drag(move |state: &mut State, drag: &mut Drag, tx: &mut Tx| {
+            let phase = pointer_phase(drag.phase);
+            focus_on_press(state, drawer, phase, tx);
             if let Some(session) = pick(&state.workspace) {
-                session.drag_scrollbar(pointer_phase(drag.phase), drag.y);
+                session.drag_scrollbar(phase, drag.y);
             }
-            tx.live_only();
         })
 }
 
@@ -521,23 +536,14 @@ fn terminal_surface(
         .key(key)
         .cursor(Cursor::Text)
         .pointer_buttons([PointerButton::Middle])
-        .children(scrollable.then(|| scrollbar_strip(key, pick)))
+        .children(scrollable.then(|| scrollbar_strip(key, drawer, pick)))
         .on_drag(move |state: &mut State, drag: &mut Drag, tx: &mut Tx| {
             let phase = pointer_phase(drag.phase);
             let button = match tx.button() {
                 PointerButton::Middle => mouse::Button::Middle,
                 _ => mouse::Button::Left,
             };
-            let focus_moves = phase == PointerPhase::Press
-                && state
-                    .workspace
-                    .project()
-                    .is_some_and(|project| project.drawer_focused != drawer);
-            if focus_moves {
-                state.workspace.focus_drawer(drawer);
-            } else {
-                tx.live_only();
-            }
+            focus_on_press(state, drawer, phase, tx);
             let session = pick(&state.workspace);
             send_pointer(session, phase, Some(button), drag.x, drag.y, tx.mods());
         })
@@ -1187,15 +1193,19 @@ fn show_scene(state: &mut State, bytes: &[u8]) {
 }
 
 /// History with the scrollbar as it shows just after scrolling, or while `hovered`.
-fn show_scrollback_scene(state: &mut State, hovered: bool) {
-    isolate_scene(state);
+fn scrollback_tab(hovered: bool) -> Tab {
     let lines: String = (1..=40).map(|line| format!("{line}\r\n")).collect();
     let mut grid = Grid::from_vt(lines.as_bytes(), 60, 12)
         .unwrap_or_else(|error| Grid::message(&format!("failed to build fixture: {error:#}")));
     if let Some(scrollbar) = &mut grid.scrollbar {
         (scrollbar.opacity, scrollbar.wide) = (1.0, hovered);
     }
-    let tabs = vec![Tab::new("shell", Session::fixture(grid))];
+    Tab::new("shell", Session::fixture(grid))
+}
+
+fn show_scrollback_scene(state: &mut State, hovered: bool) {
+    isolate_scene(state);
+    let tabs = vec![scrollback_tab(hovered)];
     state
         .workspace
         .add_project(Project::new("/fixture".into(), tabs));
@@ -1355,6 +1365,29 @@ mod tests {
         runtime.pointer_move(x, y);
         runtime.frame(2.0 / 60.0);
         assert_eq!(runtime.cursor(), Cursor::Text);
+    }
+
+    #[test]
+    fn pressing_a_scrollbar_moves_keys_to_its_terminal() {
+        let mut state = State::default();
+        show_scrollback_scene(&mut state, false);
+        state.workspace.add_tray(scrollback_tab(false));
+        state.workspace.toggle_drawer(0);
+        let mut runtime = runtime_with(state);
+        runtime.frame(1.0);
+        let drawer_focused =
+            |runtime: &Runtime<State>| runtime.state.workspace.projects[0].drawer_focused;
+        assert!(drawer_focused(&runtime));
+        for (strip, focused) in [
+            ("terminal-scrollbar", false),
+            ("drawer-terminal-scrollbar", true),
+        ] {
+            let (x, y) = runtime.find(strip).unwrap();
+            runtime.pointer_down(x, y);
+            runtime.pointer_up(x, y);
+            runtime.frame(2.0);
+            assert_eq!(drawer_focused(&runtime), focused, "{strip}");
+        }
     }
 
     #[test]
