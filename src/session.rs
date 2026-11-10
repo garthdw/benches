@@ -729,7 +729,10 @@ impl TerminalInput {
             PointerPhase::Release if self.pressed.is_some() => {
                 Some((mouse::Action::Release, self.pressed.take()))
             }
-            PointerPhase::Move if terminal.is_mouse_tracking()? => {
+            // Rune also sends hover moves during a drag, which would read as the button lifting.
+            PointerPhase::Move
+                if self.pressed.is_none() && !self.selecting && terminal.is_mouse_tracking()? =>
+            {
                 Some((mouse::Action::Motion, None))
             }
             _ => None,
@@ -1818,6 +1821,47 @@ mod tests {
             .pointer(&terminal, pointer_at(PointerPhase::Release, 2, 1))
             .unwrap();
         assert_eq!(release.bytes, b"\x1b[<0;3;2m");
+    }
+
+    /// Rune reports a hover move alongside every drag move, and `main.rs` forwards both.
+    fn report_drag(
+        terminal: &Terminal<'static, '_>,
+        input: &mut TerminalInput,
+        mods: key::Mods,
+    ) -> Vec<u8> {
+        let events = [
+            (PointerPhase::Press, 2),
+            (PointerPhase::Move, 3),
+            (PointerPhase::Drag, 3),
+            (PointerPhase::Move, 3),
+            (PointerPhase::Release, 3),
+        ];
+        let mut bytes = Vec::new();
+        for (phase, column) in events {
+            let mut pointer = pointer_at(phase, column, 1);
+            pointer.mods = mods;
+            if phase == PointerPhase::Move {
+                pointer.button = None;
+            }
+            bytes.extend(input.pointer(terminal, pointer).unwrap().bytes);
+        }
+        bytes
+    }
+
+    #[test]
+    fn a_drag_reports_no_buttonless_motion_to_any_motion_tracking() {
+        let mut terminal = new_terminal(20, 5).unwrap();
+        terminal.vt_write(b"\x1b[?1003h\x1b[?1006h");
+        let bytes = report_drag(&terminal, &mut input_for_test(), key::Mods::empty());
+        assert_eq!(bytes, b"\x1b[<0;3;2M\x1b[<32;4;2M\x1b[<0;4;2m");
+    }
+
+    #[test]
+    fn a_shift_drag_selects_without_reporting_motion() {
+        let mut terminal = new_terminal(20, 5).unwrap();
+        terminal.vt_write(b"\x1b[?1003h\x1b[?1006h");
+        let bytes = report_drag(&terminal, &mut input_for_test(), key::Mods::SHIFT);
+        assert_eq!(bytes, b"");
     }
 
     #[test]
