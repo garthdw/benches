@@ -1156,6 +1156,12 @@ impl Actor {
                 },
                 default(wait) => {}
             }
+            // Before borrowing the publisher: a resize ends any render hold through its callback.
+            if let Some(surface) = resize.take_due(Instant::now()) {
+                self.apply_resize(&mut terminal, surface);
+                input.surface = Some(surface);
+                publisher.borrow_mut().presentation.metrics = surface.metrics;
+            }
             let mut publisher = publisher.borrow_mut();
             dirty |= publisher.tick_blink(Instant::now());
             if input
@@ -1165,11 +1171,6 @@ impl Actor {
             {
                 publisher.builder.selection_changed();
                 dirty = true;
-            }
-            if let Some(surface) = resize.take_due(Instant::now()) {
-                self.apply_resize(&mut terminal, surface);
-                input.surface = Some(surface);
-                publisher.presentation.metrics = surface.metrics;
             }
             if publisher
                 .hold_started
@@ -1932,6 +1933,27 @@ mod tests {
                 Some(Event::Title(title)) if title == "agentd-title" => Some(()),
                 _ => None,
             },
+        );
+    }
+
+    #[test]
+    fn resizing_during_a_render_hold_survives() {
+        let session = Session::spawn(None, Path::new("/tmp"), Arc::new(|| {})).unwrap();
+        // The hold starts after the line shows, and the resize lands before it times out.
+        type_line(
+            &session,
+            "echo held-resize; sleep 0.3; printf '\\033[?2026h'; sleep 30",
+        );
+        wait_for_line(&session, "held-resize");
+        thread::sleep(Duration::from_millis(600));
+        session.resize(Surface {
+            cols: 33,
+            ..TEST_SURFACE
+        });
+        wait_until(
+            Duration::from_secs(5),
+            || format!("cols: {}", session.grid().cols),
+            || (session.grid().cols == 33).then_some(()),
         );
     }
 
