@@ -965,6 +965,29 @@ impl Session {
         Some(PathBuf::from(std::ffi::OsStr::from_bytes(path.to_bytes())))
     }
 
+    /// True while a program other than the shell holds the terminal's foreground.
+    pub fn busy(&self) -> bool {
+        // Held through the lookup so the actor can't reap the process, freeing its pid, meanwhile.
+        let pid = self.pid.lock().unwrap_or_else(PoisonError::into_inner);
+        let Some(pid) = *pid else {
+            return false;
+        };
+        let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::zeroed();
+        let size = std::mem::size_of::<libc::proc_bsdinfo>() as i32;
+        // SAFETY: `info` is a writable buffer of `size` bytes.
+        let written = unsafe {
+            libc::proc_pidinfo(
+                pid,
+                libc::PROC_PIDTBSDINFO,
+                0,
+                info.as_mut_ptr().cast(),
+                size,
+            )
+        };
+        // SAFETY: the kernel filled the whole struct, and zeroed bytes are valid for it anyway.
+        written == size && unsafe { info.assume_init() }.e_tpgid != pid as u32
+    }
+
     pub fn id(&self) -> u64 {
         self.id
     }
@@ -2359,6 +2382,16 @@ mod tests {
         let first = Session::fixture(Grid::default());
         let second = Session::fixture(Grid::default());
         assert_ne!(first.id(), second.id());
+    }
+
+    #[test]
+    fn a_shell_is_busy_only_while_a_program_runs_in_the_foreground() {
+        let session = spawn_shell();
+        let idle = || (!session.busy()).then_some(());
+        wait_until(Duration::from_secs(15), || "never idle".to_owned(), idle);
+        type_line(&session, "sleep 5");
+        let busy = || session.busy().then_some(());
+        wait_until(Duration::from_secs(15), || "never busy".to_owned(), busy);
     }
 
     #[test]

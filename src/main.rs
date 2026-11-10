@@ -66,6 +66,8 @@ pub struct State {
     /// The session keys went to at the last poll.
     focused: u64,
     pending_paste: Option<String>,
+    /// The session whose close waits for confirmation; dismissed when keys move elsewhere.
+    pending_close: Option<u64>,
     preedit: String,
     option_held: bool,
     caret: Option<[f32; 4]>,
@@ -210,8 +212,46 @@ fn tray_action(state: &mut State, index: usize, picked: Option<&str>) {
                 tab.stop();
             }
         }
-        Some("remove") => state.workspace.remove_tray(index),
+        Some("remove") => {
+            let open = state
+                .workspace
+                .project()
+                .is_some_and(|project| project.drawer_open && project.drawer == index);
+            if !open {
+                state.workspace.toggle_drawer(index);
+            }
+            state.workspace.focus_drawer(true);
+            request_close(state);
+        }
         _ => {}
+    }
+}
+
+/// Closes the focused tab or drawer process, first asking if a program is running in it.
+fn request_close(state: &mut State) {
+    let Some((_, tab)) = state.workspace.focused_tab() else {
+        return;
+    };
+    let running = tab.status == Status::Running;
+    if running && (tab.command.is_some() || tab.session.busy()) {
+        state.pending_close = Some(tab.session.id());
+    } else {
+        close_focused(state);
+    }
+}
+
+fn close_focused(state: &mut State) {
+    match state.workspace.focused_tab() {
+        Some((Slot::Tab(_), _)) => state.workspace.close_tab(),
+        Some((Slot::Tray(index), _)) => state.workspace.remove_tray(index),
+        None => {}
+    }
+}
+
+fn resolve_close(state: &mut State, confirmed: bool) {
+    let pending = state.pending_close.take();
+    if confirmed && pending == state.session().map(Session::id) {
+        close_focused(state);
     }
 }
 
@@ -362,13 +402,7 @@ fn shortcut(state: &mut State, event: &KeyEvent, tx: &mut Tx) -> bool {
     } else if pressed("mod+t") {
         run_action(state, &Action::Shell, tx);
     } else if pressed("mod+w") {
-        match state.workspace.project() {
-            Some(project) if project.drawer_focused => {
-                let index = project.drawer;
-                state.workspace.remove_tray(index);
-            }
-            _ => state.workspace.close_tab(),
-        }
+        request_close(state);
     } else if pressed("mod+shift+[") {
         state.workspace.cycle_tab(-1);
     } else if pressed("mod+shift+]") {
@@ -677,8 +711,11 @@ fn view(state: &State, cx: &mut Cx<State>) -> El {
             );
         }
     }
-    if state.pending_paste.is_some() {
-        let button = |key: &'static str, label: &'static str| {
+    let confirm_bar = |key: &'static str,
+                       message: &'static str,
+                       action: &'static str,
+                       resolve: fn(&mut State, bool)| {
+        let button = |key: String, label: &'static str| {
             el().key(key)
                 .role("button")
                 .label(label)
@@ -688,26 +725,40 @@ fn view(state: &State, cx: &mut Cx<State>) -> El {
                 .fill(theme.bg)
                 .child(text(label).color(theme.text))
         };
-        focus_overlays.push(
-            row()
-                .key("paste-confirm")
-                .absolute(12.0, 12.0)
-                .gap(8.0)
-                .items_center()
-                .px(10.0)
-                .py(6.0)
-                .radius(6.0)
-                .fill(theme.control_off)
-                .child(text("This paste could run commands").color(theme.text))
-                .child(
-                    button("paste-confirm-yes", "Paste")
-                        .on_press(|state: &mut State| resolve_paste(state, true)),
-                )
-                .child(
-                    button("paste-confirm-no", "Cancel")
-                        .on_press(|state: &mut State| resolve_paste(state, false)),
-                ),
-        );
+        row()
+            .key(key)
+            .absolute(12.0, 12.0)
+            .gap(8.0)
+            .items_center()
+            .px(10.0)
+            .py(6.0)
+            .radius(6.0)
+            .fill(theme.control_off)
+            .child(text(message).color(theme.text))
+            .child(
+                button(format!("{key}-yes"), action)
+                    .on_press(move |state: &mut State| resolve(state, true)),
+            )
+            .child(
+                button(format!("{key}-no"), "Cancel")
+                    .on_press(move |state: &mut State| resolve(state, false)),
+            )
+    };
+    if state.pending_paste.is_some() {
+        focus_overlays.push(confirm_bar(
+            "paste-confirm",
+            "This paste could run commands",
+            "Paste",
+            resolve_paste,
+        ));
+    }
+    if state.pending_close.is_some() {
+        focus_overlays.push(confirm_bar(
+            "close-confirm",
+            "A program is still running here",
+            "Close",
+            resolve_close,
+        ));
     }
     if let Some((_, tab)) = state.workspace.focused_tab()
         && tab.status != Status::Running
@@ -941,6 +992,10 @@ fn poll(state: &mut State, _: f64, tx: &mut Tx) -> bool {
         state.pending_paste = None;
         changed = true;
     }
+    if state.pending_close.is_some() && state.pending_close != active {
+        state.pending_close = None;
+        changed = true;
+    }
     state.focused = active.unwrap_or(0);
     let mut restarts = Vec::new();
     for tab in state.workspace.tabs_mut() {
@@ -997,6 +1052,10 @@ fn poll(state: &mut State, _: f64, tx: &mut Tx) -> bool {
 fn on_key(state: &mut State, event: &KeyEvent, tx: &mut Tx) -> bool {
     if state.pending_paste.is_some() && matches!(event.key, Key::Enter | Key::Escape) {
         resolve_paste(state, event.key == Key::Enter);
+        return true;
+    }
+    if state.pending_close.is_some() && matches!(event.key, Key::Enter | Key::Escape) {
+        resolve_close(state, event.key == Key::Enter);
         return true;
     }
     if shortcut(state, event, tx) {
@@ -1406,6 +1465,49 @@ mod tests {
             .map(|tab| tab.title.as_str())
             .collect();
         assert_eq!(titles, ["shell", "lazygit"]);
+    }
+
+    fn command_tab_runtime() -> Runtime<State> {
+        let mut state = workspace_state();
+        state.workspace.projects[0].tabs[0].command = Some("claude".to_owned());
+        let mut runtime = runtime_with(state);
+        runtime.on_key = Some(on_key);
+        runtime
+    }
+
+    fn tab_titles(runtime: &Runtime<State>) -> Vec<&str> {
+        let tabs = &runtime.state.workspace.projects[0].tabs;
+        tabs.iter().map(|tab| tab.title.as_str()).collect()
+    }
+
+    #[test]
+    fn command_w_on_a_running_command_asks_and_escape_keeps_it() {
+        let mut runtime = command_tab_runtime();
+        press(&mut runtime, Key::Command('w'), command());
+        assert!(runtime.find("close-confirm").is_some());
+        press(&mut runtime, Key::Escape, Mods::default());
+        assert!(runtime.find("close-confirm").is_none());
+        assert_eq!(tab_titles(&runtime), ["claude", "shell", "lazygit"]);
+    }
+
+    #[test]
+    fn enter_confirms_closing_a_running_command() {
+        let mut runtime = command_tab_runtime();
+        press(&mut runtime, Key::Command('w'), command());
+        press(&mut runtime, Key::Enter, Mods::default());
+        assert_eq!(tab_titles(&runtime), ["shell", "lazygit"]);
+    }
+
+    #[test]
+    fn removing_a_running_tray_process_opens_its_drawer_and_asks() {
+        let mut runtime = tray_runtime();
+        runtime.state.workspace.projects[0].tray[0].command = Some("pnpm dev".to_owned());
+        runtime.update(|state, _| tray_action(state, 0, Some("remove")));
+        runtime.frame(1.0);
+        assert!(runtime.find("close-confirm").is_some());
+        assert_eq!(runtime.state.workspace.projects[0].tray.len(), 3);
+        press(&mut runtime, Key::Enter, Mods::default());
+        assert_eq!(runtime.state.workspace.projects[0].tray.len(), 2);
     }
 
     #[test]
