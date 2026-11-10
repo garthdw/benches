@@ -71,9 +71,8 @@ pub struct State {
     started: bool,
     /// Session id and generation last drawn for the tab and the drawer.
     drawn: [(u64, u64); 2],
-    /// The session keys went to at the last poll.
-    focused: u64,
-    pending_paste: Option<String>,
+    /// The session that refused a paste, and the text; dismissed when keys move elsewhere.
+    pending_paste: Option<(u64, String)>,
     /// The session whose close waits for confirmation; dismissed when keys move elsewhere.
     pending_close: Option<u64>,
     preedit: String,
@@ -552,9 +551,10 @@ fn caret_rect(grid: &Grid) -> Option<[f32; 4]> {
 }
 
 fn resolve_paste(state: &mut State, confirmed: bool) {
-    if let Some(text) = state.pending_paste.take()
+    if let Some((pending, text)) = state.pending_paste.take()
         && confirmed
         && let Some(session) = state.session()
+        && session.id() == pending
     {
         session.paste(text, true);
     }
@@ -1123,8 +1123,11 @@ fn poll(state: &mut State, now: f64, tx: &mut Tx) -> bool {
     let active = state.session().map(Session::id);
     let shown = state.workspace.active_session().map(Session::id);
     let mut changed = poll_jump(state, now, tx);
-    // A paste is confirmed for the session that refused it, so a switch away dismisses it.
-    if state.focused != 0 && Some(state.focused) != active && state.pending_paste.is_some() {
+    if state
+        .pending_paste
+        .as_ref()
+        .is_some_and(|(pending, _)| Some(*pending) != active)
+    {
         state.pending_paste = None;
         changed = true;
     }
@@ -1132,7 +1135,6 @@ fn poll(state: &mut State, now: f64, tx: &mut Tx) -> bool {
         state.pending_close = None;
         changed = true;
     }
-    state.focused = active.unwrap_or(0);
     let mut restarts = Vec::new();
     let mut notices = Vec::new();
     for tab in state.workspace.tabs_mut() {
@@ -1140,7 +1142,7 @@ fn poll(state: &mut State, now: f64, tx: &mut Tx) -> bool {
             match event {
                 Event::Copied(text) => tx.copy(text),
                 Event::PasteRejected(text) if Some(tab.session.id()) == active => {
-                    state.pending_paste = Some(text);
+                    state.pending_paste = Some((tab.session.id(), text));
                     changed = true;
                 }
                 Event::PasteRejected(_) => {}
@@ -1514,7 +1516,7 @@ mod tests {
 
     fn with_pending_paste() -> Runtime<State> {
         runtime_with(State {
-            pending_paste: Some("rm -rf x\n".to_owned()),
+            pending_paste: Some((0, "rm -rf x\n".to_owned())),
             ..State::default()
         })
     }
@@ -2102,10 +2104,10 @@ mod tests {
 
     #[test]
     fn switching_tabs_dismisses_a_pending_paste() {
-        let mut runtime = runtime_with(State {
-            pending_paste: Some("rm -rf x\n".to_owned()),
-            ..workspace_state()
-        });
+        let mut state = workspace_state();
+        let session = state.session().map(Session::id).unwrap();
+        state.pending_paste = Some((session, "rm -rf x\n".to_owned()));
+        let mut runtime = runtime_with(state);
         runtime.poll = Some(poll);
         runtime.frame(1.0 / 60.0);
         assert!(runtime.find("paste-confirm").is_some());
