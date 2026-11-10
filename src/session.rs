@@ -38,6 +38,8 @@ const HOLD_TIMEOUT: Duration = Duration::from_secs(1);
 const BLINK: Duration = Duration::from_millis(530);
 const AUTOSCROLL: Duration = Duration::from_millis(50);
 const MULTI_CLICK: Duration = Duration::from_millis(500);
+const SCROLLBAR_HOLD: Duration = Duration::from_secs(1);
+const SCROLLBAR_FADE: Duration = Duration::from_millis(200);
 const MESSAGE_COLS: u16 = 80;
 pub const DEFAULT_FG: RgbColor = RgbColor {
     r: 0xd8,
@@ -181,6 +183,7 @@ pub struct Grid {
     pub cursor_color: [u8; 3],
     pub metrics: Metrics,
     pub bg: [u8; 3],
+    pub scrollbar: Option<Scrollbar>,
 }
 
 impl Default for Grid {
@@ -196,6 +199,7 @@ impl Default for Grid {
             cursor_color: [0; 3],
             metrics: Metrics::default(),
             bg: rgb(DEFAULT_BG),
+            scrollbar: None,
         }
     }
 }
@@ -255,6 +259,110 @@ impl Grid {
     }
 }
 
+/// The thumb never shrinks below this, in points, so it stays easy to grab.
+pub const MIN_THUMB_POINTS: f32 = 24.0;
+
+/// Where the viewport sits in the scrollback, in rows, and how the thumb looks.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Scrollbar {
+    total: u64,
+    offset: u64,
+    len: u64,
+    /// Zero while hidden; the thumb fades out after scrolling stops.
+    pub opacity: f32,
+    /// While hovered or dragged.
+    pub wide: bool,
+}
+
+impl Scrollbar {
+    /// `None` when there is nothing to scroll, including on the alternate screen, which has no scrollback.
+    fn of(terminal: &Terminal<'static, '_>) -> Result<Option<Self>> {
+        if terminal.active_screen()? == Screen::Alternate {
+            return Ok(None);
+        }
+        let bar = terminal.scrollbar()?;
+        Ok((bar.total > bar.len).then_some(Self {
+            total: bar.total,
+            offset: bar.offset,
+            len: bar.len,
+            ..Self::default()
+        }))
+    }
+
+    /// The thumb's top and height within a track `track` pixels tall.
+    pub fn thumb(self, track: f32, min: f32) -> (f32, f32) {
+        let height = (track * self.len as f32 / self.total as f32)
+            .max(min)
+            .min(track);
+        let travel = self.total.saturating_sub(self.len).max(1);
+        let top = (track - height) * self.offset.min(travel) as f32 / travel as f32;
+        (top, height)
+    }
+
+    /// The scrollback row that puts the thumb's top at `top`.
+    fn row_at(self, top: f32, track: f32, min: f32) -> usize {
+        let (_, height) = self.thumb(track, min);
+        let travel = track - height;
+        if travel <= 0.0 {
+            return 0;
+        }
+        let rows = self.total.saturating_sub(self.len) as f32;
+        ((top / travel).clamp(0.0, 1.0) * rows).round() as usize
+    }
+}
+
+/// Shows the scrollbar while the viewport scrolls or the pointer holds it, then fades it out.
+#[derive(Default)]
+struct ScrollbarFade {
+    until: Option<Instant>,
+    held: bool,
+    /// The viewport offset that output or a resize last left, so only other moves count as scrolls.
+    offset: Option<u64>,
+}
+
+impl ScrollbarFade {
+    fn show(&mut self, now: Instant) {
+        self.until = Some(now + SCROLLBAR_HOLD);
+    }
+
+    fn follow(&mut self, terminal: &Terminal<'static, '_>) {
+        self.offset = terminal
+            .scrollbar()
+            .log_err("read scrollbar")
+            .map(|bar| bar.offset);
+    }
+
+    /// The thumb's opacity at `now`, showing it if the viewport moved since the last call or
+    /// `follow`, or the pointer holds it or just let it go.
+    fn opacity(&mut self, terminal: &Terminal<'static, '_>, held: bool, now: Instant) -> f32 {
+        let offset = terminal
+            .scrollbar()
+            .log_err("read scrollbar")
+            .map(|bar| bar.offset);
+        let scrolled = offset != self.offset;
+        self.offset = offset;
+        if scrolled || held || self.held {
+            self.show(now);
+        }
+        self.held = held;
+        let Some(until) = self.until else {
+            return 0.0;
+        };
+        let fading = now.saturating_duration_since(until).as_secs_f32();
+        (1.0 - fading / SCROLLBAR_FADE.as_secs_f32()).max(0.0)
+    }
+
+    /// When the opacity next changes by itself.
+    fn next_change(&self, now: Instant) -> Option<Instant> {
+        let until = self.until.filter(|_| !self.held)?;
+        if now < until {
+            Some(until)
+        } else {
+            (now < until + SCROLLBAR_FADE).then_some(now + FRAME)
+        }
+    }
+}
+
 fn new_terminal<'cb>(cols: u16, rows: u16) -> Result<Terminal<'static, 'cb>> {
     let mut terminal = Terminal::new(cols, rows)?;
     terminal
@@ -295,6 +403,8 @@ struct Presentation {
     focused: bool,
     cursor_on: bool,
     metrics: Metrics,
+    scrollbar_opacity: f32,
+    scrollbar_wide: bool,
 }
 
 impl Default for Presentation {
@@ -303,6 +413,8 @@ impl Default for Presentation {
             focused: true,
             cursor_on: true,
             metrics: Metrics::default(),
+            scrollbar_opacity: 0.0,
+            scrollbar_wide: false,
         }
     }
 }
@@ -311,7 +423,7 @@ struct GridBuilder {
     state: RenderState<'static>,
     rows: RowIterator<'static>,
     cells: CellIterator<'static>,
-    last_shown: Option<(CursorVisualStyle, bool, Presentation)>,
+    last_shown: Option<(CursorVisualStyle, bool, Presentation, Option<Scrollbar>)>,
     /// From the theme; without a background, selected cells swap their colours.
     selection_background: Option<RgbColor>,
     selection_foreground: Option<RgbColor>,
@@ -347,8 +459,13 @@ impl GridBuilder {
             CursorVisualStyle::BlockHollow
         };
         let cursor_blinking = snapshot.cursor_blinking()? && snapshot.cursor_visible()?;
-        let shown = (cursor_style, cursor_blinking, presentation);
-        // libghostty leaves the render state clean when only the cursor's style changes.
+        let scrollbar = Scrollbar::of(terminal)?.map(|scrollbar| Scrollbar {
+            opacity: presentation.scrollbar_opacity,
+            wide: presentation.scrollbar_wide,
+            ..scrollbar
+        });
+        let shown = (cursor_style, cursor_blinking, presentation, scrollbar);
+        // libghostty leaves the render state clean when only the cursor's style or the scrollback length changes.
         let unchanged = self.last_shown.replace(shown) == Some(shown);
         if matches!(snapshot.dirty()?, Dirty::Clean) && unchanged {
             return Ok(None);
@@ -442,6 +559,7 @@ impl GridBuilder {
             cursor_color: rgb(colors.cursor.unwrap_or(colors.foreground)),
             metrics: presentation.metrics,
             bg: rgb(colors.background),
+            scrollbar,
         }))
     }
 }
@@ -451,6 +569,8 @@ enum Msg {
     Focus(bool),
     Pointer(PointerInput),
     Wheel(WheelInput),
+    Scrollbar { phase: PointerPhase, y: f32 },
+    ScrollbarHover(bool),
     Copy,
     Paste { text: String, allow_unsafe: bool },
     Resize(Surface),
@@ -530,6 +650,8 @@ struct TerminalInput {
     position: (f32, f32),
     next_autoscroll: Option<Instant>,
     wheel_remainder: f32,
+    /// How far below the thumb's top the pointer holds it, while dragging the scrollbar.
+    scrollbar_grab: Option<f32>,
 }
 
 impl TerminalInput {
@@ -553,6 +675,7 @@ impl TerminalInput {
             position: (0.0, 0.0),
             next_autoscroll: None,
             wheel_remainder: 0.0,
+            scrollbar_grab: None,
         })
     }
 
@@ -662,6 +785,47 @@ impl TerminalInput {
         Ok(())
     }
 
+    /// Drags the thumb, or on a press off it, centres the thumb under the pointer as macOS does.
+    /// `y` is in points from the top of the terminal surface.
+    fn drag_scrollbar(
+        &mut self,
+        terminal: &mut Terminal<'static, '_>,
+        phase: PointerPhase,
+        y: f32,
+    ) -> Result<()> {
+        if phase == PointerPhase::Release {
+            self.scrollbar_grab = None;
+        }
+        let Some(surface) = self.surface else {
+            return Ok(());
+        };
+        if !matches!(phase, PointerPhase::Press | PointerPhase::Drag) {
+            return Ok(());
+        }
+        let Some(scrollbar) = Scrollbar::of(terminal)? else {
+            return Ok(());
+        };
+        let metrics = surface.metrics;
+        let track = f32::from(surface.rows) * f32::from(metrics.cell_height);
+        let min = MIN_THUMB_POINTS * metrics.scale;
+        let y = y * metrics.scale - metrics.padding;
+        let grab = match (phase, self.scrollbar_grab) {
+            (PointerPhase::Drag, Some(grab)) => grab,
+            (PointerPhase::Drag, None) => return Ok(()),
+            _ => {
+                let (top, height) = scrollbar.thumb(track, min);
+                if (top..top + height).contains(&y) {
+                    y - top
+                } else {
+                    height / 2.0
+                }
+            }
+        };
+        self.scrollbar_grab = Some(grab);
+        terminal.scroll_viewport(ScrollViewport::Row(scrollbar.row_at(y - grab, track, min)));
+        Ok(())
+    }
+
     fn pointer(
         &mut self,
         terminal: &Terminal<'static, '_>,
@@ -673,8 +837,8 @@ impl TerminalInput {
         let scale = surface.metrics.scale;
         self.position = (input.x * scale, input.y * scale);
         let selection_changed = PointerOutcome {
-            bytes: Vec::new(),
             selection_changed: true,
+            ..PointerOutcome::default()
         };
         let grid_ref_point = Point::Viewport(Self::viewport_point(surface, self.position));
         let to_report = match input.phase {
@@ -742,7 +906,7 @@ impl TerminalInput {
         };
         Ok(PointerOutcome {
             bytes: self.report(terminal, surface, action, button, input.mods)?,
-            selection_changed: false,
+            ..PointerOutcome::default()
         })
     }
 
@@ -770,19 +934,20 @@ impl TerminalInput {
         Ok(true)
     }
 
+    /// Bytes for the program, or `None` when the wheel scrolled the viewport.
     fn wheel(
         &mut self,
         terminal: &mut Terminal<'static, '_>,
         input: WheelInput,
-    ) -> Result<Vec<u8>> {
+    ) -> Result<Option<Vec<u8>>> {
         let Some(surface) = self.surface else {
-            return Ok(Vec::new());
+            return Ok(Some(Vec::new()));
         };
         let line_height = f32::from(surface.metrics.cell_height) / surface.metrics.scale;
         let lines = whole_lines(&mut self.wheel_remainder, input.dy / line_height);
         let mut bytes = Vec::new();
         if lines == 0 {
-            return Ok(bytes);
+            return Ok(Some(bytes));
         }
         let toward_history = lines > 0;
         if terminal.is_mouse_tracking()? {
@@ -822,8 +987,9 @@ impl TerminalInput {
             }
         } else {
             terminal.scroll_viewport(ScrollViewport::Delta(-(lines as isize)));
+            return Ok(None);
         }
-        Ok(bytes)
+        Ok(Some(bytes))
     }
 }
 
@@ -1080,6 +1246,15 @@ impl Session {
         self.send(Msg::Wheel(input));
     }
 
+    /// `y` is in points from the top of the terminal surface.
+    pub fn drag_scrollbar(&self, phase: PointerPhase, y: f32) {
+        self.send(Msg::Scrollbar { phase, y });
+    }
+
+    pub fn hover_scrollbar(&self, hovered: bool) {
+        self.send(Msg::ScrollbarHover(hovered));
+    }
+
     pub fn copy(&self) {
         self.send(Msg::Copy);
     }
@@ -1280,6 +1455,9 @@ impl Actor {
         let mut notified = false;
 
         let mut input = TerminalInput::new()?;
+        let mut fade = ScrollbarFade::default();
+        fade.follow(&terminal);
+        let mut scrollbar_hovered = false;
         let mut resize = ResizeDebounce::default();
         let mut dirty = true;
         let mut titles = Titles {
@@ -1294,6 +1472,9 @@ impl Actor {
                 .next_autoscroll
                 .map_or(wait, |due| wait.min(due.saturating_duration_since(now)));
             let wait = resize.wait(now).map_or(wait, |due| wait.min(due));
+            let wait = fade
+                .next_change(now)
+                .map_or(wait, |due| wait.min(due.saturating_duration_since(now)));
             let wait = titles
                 .due()
                 .filter(|_| title_changed.get())
@@ -1302,6 +1483,7 @@ impl Actor {
                 recv(self.output) -> bytes => match bytes {
                     Ok(bytes) => {
                         terminal.vt_write(&bytes);
+                        fade.follow(&terminal);
                         dirty = true;
                         let alerted = alerted.replace(false);
                         let notice = notice.borrow_mut().take();
@@ -1352,13 +1534,21 @@ impl Actor {
                         }
                     }
                     Ok(Msg::Wheel(wheel)) => {
-                        if let Some(bytes) = input.wheel(&mut terminal, wheel).log_err("handle wheel") {
-                            if !bytes.is_empty() {
+                        match input.wheel(&mut terminal, wheel).log_err("handle wheel") {
+                            Some(Some(bytes)) if !bytes.is_empty() => {
                                 self.input.send(bytes).log_err("queue wheel input");
                             }
-                            dirty = true;
+                            // Shown even when the viewport is already at an end, as macOS does.
+                            Some(None) => fade.show(Instant::now()),
+                            _ => {}
                         }
+                        dirty = true;
                     }
+                    Ok(Msg::Scrollbar { phase, y }) => {
+                        input.drag_scrollbar(&mut terminal, phase, y).log_err("drag scrollbar");
+                        dirty = true;
+                    }
+                    Ok(Msg::ScrollbarHover(hovered)) => scrollbar_hovered = hovered,
                     Ok(Msg::Copy) => {
                         if let Some(Some(text)) = selection_text(&terminal).log_err("copy selection") {
                             self.events.send(Event::Copied(text)).log_err("queue copied text");
@@ -1399,6 +1589,8 @@ impl Actor {
                             attention = Attention::None;
                         }
                         titles.visibility = visibility;
+                        // The UI's hover moves to whichever session takes this one's place.
+                        scrollbar_hovered &= visibility == Visibility::Shown;
                         publisher.borrow_mut().visible = visibility == Visibility::Shown;
                         dirty = true;
                     }
@@ -1419,12 +1611,19 @@ impl Actor {
             // Before borrowing the publisher: a resize ends any render hold through its callback.
             if let Some(surface) = resize.take_due(Instant::now()) {
                 self.apply_resize(&mut terminal, surface);
+                fade.follow(&terminal);
                 input.surface = Some(surface);
                 publisher.borrow_mut().presentation.metrics = surface.metrics;
                 dirty = true;
             }
             let mut publisher = publisher.borrow_mut();
             dirty |= publisher.tick_blink(Instant::now());
+            let held = scrollbar_hovered || input.scrollbar_grab.is_some();
+            let opacity = fade.opacity(&terminal, held, Instant::now());
+            let presentation = &mut publisher.presentation;
+            dirty |=
+                (presentation.scrollbar_opacity, presentation.scrollbar_wide) != (opacity, held);
+            (presentation.scrollbar_opacity, presentation.scrollbar_wide) = (opacity, held);
             if input
                 .tick_autoscroll(&terminal, Instant::now())
                 .log_err("autoscroll selection")
@@ -1991,6 +2190,172 @@ mod tests {
     }
 
     #[test]
+    fn the_thumb_shows_the_viewport_share_and_position() {
+        let scrollbar = Scrollbar {
+            total: 100,
+            offset: 75,
+            len: 25,
+            ..Scrollbar::default()
+        };
+        assert_eq!(scrollbar.thumb(200.0, 10.0), (150.0, 50.0));
+        let top = Scrollbar {
+            offset: 0,
+            ..scrollbar
+        };
+        assert_eq!(top.thumb(200.0, 10.0), (0.0, 50.0));
+        let long = Scrollbar {
+            total: 10_000,
+            ..top
+        };
+        assert_eq!(long.thumb(200.0, 10.0).1, 10.0);
+    }
+
+    #[test]
+    fn a_thumb_position_maps_back_to_its_row() {
+        let scrollbar = Scrollbar {
+            total: 100,
+            offset: 30,
+            len: 25,
+            ..Scrollbar::default()
+        };
+        let (top, _) = scrollbar.thumb(200.0, 10.0);
+        assert_eq!(scrollbar.row_at(top, 200.0, 10.0), 30);
+        assert_eq!(scrollbar.row_at(-50.0, 200.0, 10.0), 0);
+        assert_eq!(scrollbar.row_at(500.0, 200.0, 10.0), 75);
+    }
+
+    #[test]
+    fn only_a_primary_screen_with_history_has_a_scrollbar() {
+        assert_eq!(Grid::from_vt(b"hi", 20, 5).unwrap().scrollbar, None);
+        let mut history = String::new();
+        for line in 0..30 {
+            history.push_str(&format!("line{line}\r\n"));
+        }
+        let grid = Grid::from_vt(history.as_bytes(), 20, 5).unwrap();
+        assert_eq!(
+            grid.scrollbar,
+            Some(Scrollbar {
+                total: 31,
+                offset: 26,
+                len: 5,
+                ..Scrollbar::default()
+            })
+        );
+        history.push_str("\x1b[?1049h");
+        assert_eq!(
+            Grid::from_vt(history.as_bytes(), 20, 5).unwrap().scrollbar,
+            None
+        );
+    }
+
+    #[test]
+    fn output_below_a_scrolled_viewport_publishes_a_new_scrollbar() {
+        let mut terminal = scrolled_terminal();
+        terminal.scroll_viewport(ScrollViewport::Top);
+        let mut builder = GridBuilder::new().unwrap();
+        let shown = Presentation::default();
+        let before = builder.build(&terminal, 1, shown).unwrap().unwrap();
+        terminal.vt_write(b"more\r\n");
+        let after = builder.build(&terminal, 2, shown).unwrap().unwrap();
+        assert_ne!(after.scrollbar, before.scrollbar);
+    }
+
+    #[test]
+    fn pressing_the_track_and_dragging_the_thumb_scrolls() {
+        let mut terminal = scrolled_terminal();
+        let mut input = input_for_test();
+        input
+            .drag_scrollbar(&mut terminal, PointerPhase::Press, 0.0)
+            .unwrap();
+        assert_eq!(top_line(&terminal), "line0");
+        input
+            .drag_scrollbar(&mut terminal, PointerPhase::Drag, 100.0)
+            .unwrap();
+        assert_eq!(top_line(&terminal), "line26");
+        input
+            .drag_scrollbar(&mut terminal, PointerPhase::Release, 100.0)
+            .unwrap();
+        assert_eq!(input.scrollbar_grab, None);
+        input
+            .drag_scrollbar(&mut terminal, PointerPhase::Drag, 0.0)
+            .unwrap();
+        assert_eq!(top_line(&terminal), "line26");
+    }
+
+    fn faded(terminal: &Terminal<'static, '_>) -> (ScrollbarFade, Instant) {
+        let mut fade = ScrollbarFade::default();
+        fade.follow(terminal);
+        (fade, Instant::now())
+    }
+
+    #[test]
+    fn output_alone_leaves_the_scrollbar_hidden() {
+        let mut terminal = scrolled_terminal();
+        let (mut fade, now) = faded(&terminal);
+        terminal.vt_write(b"more\r\n");
+        fade.follow(&terminal);
+        assert_eq!(fade.opacity(&terminal, false, now), 0.0);
+        assert_eq!(fade.next_change(now), None);
+    }
+
+    #[test]
+    fn a_scroll_shows_the_scrollbar_until_it_fades() {
+        let mut terminal = scrolled_terminal();
+        let (mut fade, now) = faded(&terminal);
+        terminal.scroll_viewport(ScrollViewport::Delta(-3));
+        assert_eq!(fade.opacity(&terminal, false, now), 1.0);
+        assert_eq!(fade.next_change(now), Some(now + SCROLLBAR_HOLD));
+        let fading = now + SCROLLBAR_HOLD + SCROLLBAR_FADE / 2;
+        assert_eq!(fade.opacity(&terminal, false, fading), 0.5);
+        assert_eq!(fade.next_change(fading), Some(fading + FRAME));
+        let gone = now + SCROLLBAR_HOLD + SCROLLBAR_FADE;
+        assert_eq!(fade.opacity(&terminal, false, gone), 0.0);
+        assert_eq!(fade.next_change(gone), None);
+    }
+
+    #[test]
+    fn a_held_scrollbar_stays_until_a_while_after_release() {
+        let terminal = scrolled_terminal();
+        let (mut fade, now) = faded(&terminal);
+        assert_eq!(fade.opacity(&terminal, true, now), 1.0);
+        assert_eq!(fade.next_change(now), None);
+        let released = now + 5 * SCROLLBAR_HOLD;
+        assert_eq!(fade.opacity(&terminal, false, released), 1.0);
+        assert_eq!(fade.next_change(released), Some(released + SCROLLBAR_HOLD));
+    }
+
+    #[test]
+    fn a_scrollbar_drag_holds_until_release() {
+        let mut terminal = scrolled_terminal();
+        let mut input = input_for_test();
+        input
+            .drag_scrollbar(&mut terminal, PointerPhase::Press, 50.0)
+            .unwrap();
+        assert!(input.scrollbar_grab.is_some());
+        input
+            .drag_scrollbar(&mut terminal, PointerPhase::Release, 50.0)
+            .unwrap();
+        assert!(input.scrollbar_grab.is_none());
+    }
+
+    #[test]
+    fn the_scrollbar_carries_its_look_from_the_presentation() {
+        let terminal = scrolled_terminal();
+        let shown = Presentation {
+            scrollbar_opacity: 0.5,
+            scrollbar_wide: true,
+            ..Presentation::default()
+        };
+        let grid = GridBuilder::new()
+            .unwrap()
+            .build(&terminal, 1, shown)
+            .unwrap()
+            .unwrap();
+        let scrollbar = grid.scrollbar.unwrap();
+        assert_eq!((scrollbar.opacity, scrollbar.wide), (0.5, true));
+    }
+
+    #[test]
     fn wheel_deltas_keep_their_fraction_between_events() {
         let mut remainder = 0.0;
         assert_eq!(whole_lines(&mut remainder, 0.6), 0);
@@ -2005,7 +2370,7 @@ mod tests {
         let bytes = input_for_test()
             .wheel(&mut terminal, wheel_by(60.0))
             .unwrap();
-        assert!(bytes.is_empty());
+        assert_eq!(bytes, None);
         assert_ne!(top_line(&terminal), before);
     }
 
@@ -2015,6 +2380,7 @@ mod tests {
         terminal.vt_write(b"\x1b[?1049h");
         let bytes = input_for_test()
             .wheel(&mut terminal, wheel_by(40.0))
+            .unwrap()
             .unwrap();
         assert_eq!(bytes, b"\x1b[A\x1b[A");
     }
@@ -2025,6 +2391,7 @@ mod tests {
         terminal.vt_write(b"\x1b[?1000h\x1b[?1006h");
         let bytes = input_for_test()
             .wheel(&mut terminal, wheel_by(20.0))
+            .unwrap()
             .unwrap();
         assert!(bytes.starts_with(b"\x1b[<64;1;1M"), "{bytes:?}");
     }
@@ -2398,6 +2765,59 @@ mod tests {
         assert!(!lines.iter().any(|line| line.trim_end() == "hidden-ok"));
         session.set_visibility(Visibility::Shown);
         wait_for_line(&session, "hidden-ok");
+    }
+
+    fn shell_with_history() -> Session {
+        let session = spawn_shell();
+        session.resize(TEST_SURFACE);
+        type_line(&session, "seq 100");
+        wait_for_line(&session, "100");
+        session
+    }
+
+    fn wait_for_scrollbar(session: &Session, want: &str, shown: impl Fn(Scrollbar) -> bool) {
+        wait_until(
+            Duration::from_secs(5),
+            || format!("scrollbar never {want}: {:?}", session.grid().scrollbar),
+            || session.grid().scrollbar.filter(|bar| shown(*bar)),
+        );
+    }
+
+    #[test]
+    fn hiding_a_session_releases_its_scrollbar_hover() {
+        let session = shell_with_history();
+        session.hover_scrollbar(true);
+        wait_for_scrollbar(&session, "widened", |bar| bar.wide);
+        session.set_visibility(Visibility::Listed);
+        session.set_visibility(Visibility::Shown);
+        wait_for_scrollbar(&session, "narrowed", |bar| !bar.wide);
+    }
+
+    #[test]
+    fn a_settled_resize_leaves_the_scrollbar_hidden() {
+        let session = spawn_shell();
+        session.resize(TEST_SURFACE);
+        // Lines that wrap, so the reflow moves the viewport through the scrollback.
+        type_line(&session, "printf '%060d\\n' $(seq 30)");
+        wait_for_scrollbar(&session, "long", |bar| bar.total > 90);
+        session.resize(Surface {
+            cols: 60,
+            ..TEST_SURFACE
+        });
+        wait_until(
+            Duration::from_secs(5),
+            || "the resize never applied".to_owned(),
+            || (session.grid().cols == 60).then_some(()),
+        );
+        thread::sleep(FRAME * 4);
+        assert_eq!(session.grid().scrollbar.map(|bar| bar.opacity), Some(0.0));
+    }
+
+    #[test]
+    fn a_wheel_past_the_bottom_still_flashes_the_scrollbar() {
+        let session = shell_with_history();
+        session.wheel(wheel_by(-60.0));
+        wait_for_scrollbar(&session, "shown", |bar| bar.opacity > 0.0);
     }
 
     #[test]

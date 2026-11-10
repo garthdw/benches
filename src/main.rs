@@ -570,32 +570,69 @@ fn dot(color: Color) -> El {
 
 /// A terminal drawn into `mark`, taking pointer input for the session `pick` returns.
 /// Pressing it sends keys to it, so the drawer and the tab each take focus by click.
-fn terminal_surface(mark: u32, key: &str, pick: fn(&Workspace) -> Option<&Session>) -> El {
+fn pointer_phase(phase: Phase) -> PointerPhase {
+    match phase {
+        Phase::Down => PointerPhase::Press,
+        Phase::Move => PointerPhase::Drag,
+        Phase::Up => PointerPhase::Release,
+    }
+}
+
+/// Pressing the drawer's terminal gives it the keys, and pressing the tab's takes them back.
+fn focus_on_press(state: &mut State, drawer: bool, phase: PointerPhase, tx: &mut Tx) {
+    let focus_moves = phase == PointerPhase::Press
+        && state
+            .workspace
+            .project()
+            .is_some_and(|project| project.drawer_focused != drawer);
+    if focus_moves {
+        state.workspace.focus_drawer(drawer);
+    } else {
+        tx.live_only();
+    }
+}
+
+/// The right padding, where the thumb is drawn, while there is history to scroll.
+fn scrollbar_strip(key: &str, drawer: bool, pick: fn(&Workspace) -> Option<&Session>) -> El {
+    el().key(format!("{key}-scrollbar"))
+        .pin(None, Some(0.0), Some(0.0), Some(0.0))
+        .w(render::PADDING_POINTS)
+        .cursor(Cursor::Default)
+        .on_hover_change(move |state: &mut State, hovered, tx: &mut Tx| {
+            if let Some(session) = pick(&state.workspace) {
+                session.hover_scrollbar(hovered);
+            }
+            tx.live_only();
+        })
+        .on_drag(move |state: &mut State, drag: &mut Drag, tx: &mut Tx| {
+            let phase = pointer_phase(drag.phase);
+            focus_on_press(state, drawer, phase, tx);
+            if let Some(session) = pick(&state.workspace) {
+                session.drag_scrollbar(phase, drag.y);
+            }
+        })
+}
+
+fn terminal_surface(
+    mark: u32,
+    key: &str,
+    workspace: &Workspace,
+    pick: fn(&Workspace) -> Option<&Session>,
+) -> El {
     let drawer = mark == DRAWER_MARK;
+    let scrollable = pick(workspace).is_some_and(|session| session.grid().scrollbar.is_some());
     effect(mark)
         .key(key)
         .cursor(Cursor::Text)
         .pointer_buttons([PointerButton::Middle])
+        .children(scrollable.then(|| scrollbar_strip(key, drawer, pick)))
         .on_drag(move |state: &mut State, drag: &mut Drag, tx: &mut Tx| {
-            let phase = match drag.phase {
-                Phase::Down => PointerPhase::Press,
-                Phase::Move => PointerPhase::Drag,
-                Phase::Up => PointerPhase::Release,
-            };
+            let phase = pointer_phase(drag.phase);
             let button = match tx.button() {
                 PointerButton::Middle => mouse::Button::Middle,
                 _ => mouse::Button::Left,
             };
-            let focus_moves = phase == PointerPhase::Press
-                && state
-                    .workspace
-                    .project()
-                    .is_some_and(|project| project.drawer_focused != drawer);
-            if focus_moves {
-                state.workspace.focus_drawer(drawer);
-            } else {
-                tx.live_only();
-            }
+            focus_on_press(state, drawer, phase, tx);
             let session = pick(&state.workspace);
             send_pointer(session, phase, Some(button), drag.x, drag.y, tx.mods());
         })
@@ -963,11 +1000,16 @@ fn view(state: &State, cx: &mut Cx<State>) -> El {
                     .border(1.0, theme.card_border)
                     .children(header)
                     .child(
-                        terminal_surface(DRAWER_MARK, "drawer-terminal", Workspace::drawer_session)
-                            .w_full()
-                            .grow(1.0)
-                            .min_h(0.0)
-                            .children(drawer_overlays),
+                        terminal_surface(
+                            DRAWER_MARK,
+                            "drawer-terminal",
+                            &state.workspace,
+                            Workspace::drawer_session,
+                        )
+                        .w_full()
+                        .grow(1.0)
+                        .min_h(0.0)
+                        .children(drawer_overlays),
                     ),
             )
     });
@@ -990,11 +1032,16 @@ fn view(state: &State, cx: &mut Cx<State>) -> El {
                 .children(new_tab),
         )
         .child(
-            terminal_surface(TERMINAL_MARK, "terminal", Workspace::active_session)
-                .w_full()
-                .grow(1.0)
-                .min_h(0.0)
-                .children(overlays),
+            terminal_surface(
+                TERMINAL_MARK,
+                "terminal",
+                &state.workspace,
+                Workspace::active_session,
+            )
+            .w_full()
+            .grow(1.0)
+            .min_h(0.0)
+            .children(overlays),
         )
         .children(tray_bar)
         .children(drawer);
@@ -1234,14 +1281,41 @@ fn fixture_tab(title: &str, bytes: &[u8]) -> Tab {
     Tab::new(title, Session::fixture(grid))
 }
 
+/// Rune applies a scene over the state `init` built, so drop the paths that would load and save the user's layout.
+fn isolate_scene(state: &mut State) {
+    state.started = true;
+    state.paths = None;
+}
+
 fn show_scene(state: &mut State, bytes: &[u8]) {
+    isolate_scene(state);
     let tabs = vec![fixture_tab("shell", bytes)];
     state
         .workspace
         .add_project(Project::new("/fixture".into(), tabs));
 }
 
+/// History with the scrollbar as it shows just after scrolling, or while `hovered`.
+fn scrollback_tab(hovered: bool) -> Tab {
+    let lines: String = (1..=40).map(|line| format!("{line}\r\n")).collect();
+    let mut grid = Grid::from_vt(lines.as_bytes(), 60, 12)
+        .unwrap_or_else(|error| Grid::message(&format!("failed to build fixture: {error:#}")));
+    if let Some(scrollbar) = &mut grid.scrollbar {
+        (scrollbar.opacity, scrollbar.wide) = (1.0, hovered);
+    }
+    Tab::new("shell", Session::fixture(grid))
+}
+
+fn show_scrollback_scene(state: &mut State, hovered: bool) {
+    isolate_scene(state);
+    let tabs = vec![scrollback_tab(hovered)];
+    state
+        .workspace
+        .add_project(Project::new("/fixture".into(), tabs));
+}
+
 fn show_workspace_scene(state: &mut State) {
+    isolate_scene(state);
     let mut titled = fixture_tab("shell", b"$ ");
     titled.program_title = Some("vim ~/dev/agentd/src/workspace.rs and a long tail".to_owned());
     let tabs = vec![
@@ -1308,27 +1382,35 @@ fn log_to_file_in_bundle() -> anyhow::Result<()> {
     Ok(())
 }
 
+type Scene = (&'static str, fn(&mut State));
+
+const SCENES: &[Scene] = &[
+    ("fixture", |state| show_scene(state, SCENE_FIXTURE)),
+    ("unicode", |state| {
+        show_scene(state, SCENE_UNICODE.as_bytes())
+    }),
+    ("scrollback", |state| show_scrollback_scene(state, false)),
+    ("scrollback-hover", |state| {
+        show_scrollback_scene(state, true)
+    }),
+    ("workspace", show_workspace_scene),
+    ("palette", |state| {
+        show_workspace_scene(state);
+        state.palette = TextEdit::new("lz");
+        state.palette_open = true;
+    }),
+    ("tray", show_tray_scene),
+    ("empty", isolate_scene),
+    ("collapsed", |state| {
+        show_workspace_scene(state);
+        state.sidebar_hidden = true;
+    }),
+];
+
 fn main() {
     log_to_file_in_bundle().log_err("log file");
     let spec = AppSpec::<State> {
-        scenes: &[
-            ("fixture", |state| show_scene(state, SCENE_FIXTURE)),
-            ("unicode", |state| {
-                show_scene(state, SCENE_UNICODE.as_bytes())
-            }),
-            ("workspace", show_workspace_scene),
-            ("palette", |state| {
-                show_workspace_scene(state);
-                state.palette = TextEdit::new("lz");
-                state.palette_open = true;
-            }),
-            ("tray", show_tray_scene),
-            ("empty", |state| state.started = true),
-            ("collapsed", |state| {
-                show_workspace_scene(state);
-                state.sidebar_hidden = true;
-            }),
-        ],
+        scenes: SCENES,
         setup: Some(|state, waker| state.waker = Some(waker)),
         poll: Some(poll),
         on_key: Some(on_key),
@@ -1375,6 +1457,47 @@ mod tests {
         let mut runtime = Runtime::new(state, view, (960.0, 640.0), env);
         runtime.frame(0.0);
         runtime
+    }
+
+    #[test]
+    fn the_scrollbar_strip_shows_an_arrow_only_with_history() {
+        let mut state = State::default();
+        show_scene(&mut state, b"$ ");
+        assert_eq!(runtime_with(state).find("terminal-scrollbar"), None);
+        let mut state = State::default();
+        show_scrollback_scene(&mut state, false);
+        let mut runtime = runtime_with(state);
+        let (x, y) = runtime.find("terminal-scrollbar").unwrap();
+        runtime.pointer_move(x, y);
+        runtime.frame(1.0 / 60.0);
+        assert_eq!(runtime.cursor(), Cursor::Default);
+        let (x, y) = runtime.find("terminal").unwrap();
+        runtime.pointer_move(x, y);
+        runtime.frame(2.0 / 60.0);
+        assert_eq!(runtime.cursor(), Cursor::Text);
+    }
+
+    #[test]
+    fn pressing_a_scrollbar_moves_keys_to_its_terminal() {
+        let mut state = State::default();
+        show_scrollback_scene(&mut state, false);
+        state.workspace.add_tray(scrollback_tab(false));
+        state.workspace.toggle_drawer(0);
+        let mut runtime = runtime_with(state);
+        runtime.frame(1.0);
+        let drawer_focused =
+            |runtime: &Runtime<State>| runtime.state.workspace.projects[0].drawer_focused;
+        assert!(drawer_focused(&runtime));
+        for (strip, focused) in [
+            ("terminal-scrollbar", false),
+            ("drawer-terminal-scrollbar", true),
+        ] {
+            let (x, y) = runtime.find(strip).unwrap();
+            runtime.pointer_down(x, y);
+            runtime.pointer_up(x, y);
+            runtime.frame(2.0);
+            assert_eq!(drawer_focused(&runtime), focused, "{strip}");
+        }
     }
 
     #[test]
@@ -2063,6 +2186,18 @@ mod tests {
         runtime.state.workspace.select_project(1);
         runtime.frame(2.0 / 60.0);
         assert_eq!(launched(&runtime), [true, true]);
+    }
+
+    #[test]
+    fn scenes_read_and_write_no_files() {
+        for (name, scene) in SCENES {
+            let mut state = State {
+                paths: config::Paths::from_home(),
+                ..State::default()
+            };
+            scene(&mut state);
+            assert!(state.started && state.paths.is_none(), "{name}");
+        }
     }
 
     #[test]
