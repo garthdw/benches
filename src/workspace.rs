@@ -328,18 +328,40 @@ impl Workspace {
         self.show_active();
     }
 
-    /// The project and tray index of the tray process running `session`.
-    pub fn find_tray(&self, session: u64) -> Option<(usize, usize)> {
+    /// The project and tab or tray slot running `session`.
+    pub fn locate(&self, session: u64) -> Option<(usize, Slot)> {
+        let runs = |tab: &Tab| tab.session.id() == session;
         self.projects
             .iter()
             .enumerate()
             .find_map(|(index, project)| {
-                let tray = project
-                    .tray
-                    .iter()
-                    .position(|tab| tab.session.id() == session)?;
-                Some((index, tray))
+                let slot = project.tabs.iter().position(runs).map(Slot::Tab);
+                let slot = slot.or_else(|| project.tray.iter().position(runs).map(Slot::Tray))?;
+                Some((index, slot))
             })
+    }
+
+    /// Shows the tab or tray process running `session` with keys going to it.
+    pub fn reveal(&mut self, session: u64) {
+        let Some((project, slot)) = self.locate(session) else {
+            return;
+        };
+        self.focus_active(false);
+        self.active = project;
+        if let Some(project) = self.projects.get_mut(project) {
+            match slot {
+                Slot::Tab(index) => {
+                    project.active_tab = index;
+                    project.drawer_focused = false;
+                }
+                Slot::Tray(index) => {
+                    project.drawer = index;
+                    project.drawer_open = true;
+                    project.drawer_focused = true;
+                }
+            }
+        }
+        self.show_active();
     }
 
     /// Dropping the session ends its process.
@@ -724,12 +746,36 @@ mod tests {
         let fresh = tab("pnpm dev");
         let id = fresh.session.id();
         let old = workspace.projects[1].tray[0].session.id();
-        assert_eq!(workspace.find_tray(old), Some((1, 0)));
+        assert_eq!(workspace.locate(old), Some((1, Slot::Tray(0))));
         workspace.replace(1, Slot::Tray(0), fresh);
         assert_eq!(workspace.drawer_session().map(Session::id), Some(id));
         assert_eq!(tray_visibilities(&workspace)[0], Visibility::Shown);
         workspace.toggle_drawer(0);
         assert_eq!(tray_visibilities(&workspace)[0], Visibility::Hidden);
+    }
+
+    #[test]
+    fn revealing_a_session_shows_its_project_and_tab_or_drawer() {
+        let mut workspace = tray_workspace();
+        workspace.toggle_drawer(0);
+        let shell = workspace.projects[0].tabs[1].session.id();
+        workspace.reveal(shell);
+        assert_eq!(workspace.active, 0);
+        assert_eq!(active_title(&workspace), Some("shell"));
+        assert_eq!(workspace.focused_session().map(Session::id), Some(shell));
+        let test = workspace.projects[1].tray[1].session.id();
+        workspace.reveal(test);
+        assert_eq!(workspace.active, 1);
+        assert_eq!(workspace.focused_session().map(Session::id), Some(test));
+        assert_eq!(
+            tray_visibilities(&workspace),
+            [Visibility::Hidden, Visibility::Shown]
+        );
+        let vim = workspace.projects[1].tabs[0].session.id();
+        workspace.reveal(vim);
+        assert_eq!(workspace.focused_session().map(Session::id), Some(vim));
+        workspace.reveal(0);
+        assert_eq!(workspace.focused_session().map(Session::id), Some(vim));
     }
 
     #[test]
