@@ -11,9 +11,9 @@ use std::sync::Arc;
 use libghostty_vt::mouse;
 use rune::tok;
 use rune::{
-    App, AppSpec, ClipboardContent, Color, Cursor, Cx, Drag, El, FileDialogOptions, Ime, Key,
+    App, AppSpec, ClipboardContent, Color, Cursor, Cx, Drag, El, FileDialogOptions, Icon, Ime, Key,
     KeyEvent, Mods, Phase, PointerButton, PointerEvent, PopupItem, PopupMenu, TextEdit, Tx, Waker,
-    WheelEvent, col, effect, el, row, text, text_input,
+    WheelEvent, col, effect, el, icon, row, text, text_input,
 };
 
 use session::{Event, Grid, PointerInput, PointerPhase, Session, WheelInput};
@@ -26,6 +26,11 @@ const SIDEBAR_WIDTH: f32 = 200.0;
 const TAB_STRIP_HEIGHT: f32 = 36.0;
 const TAB_MAX_WIDTH: f32 = 220.0;
 const PALETTE_WIDTH: f32 = 520.0;
+static SIDEBAR_ICON: Icon = Icon {
+    name: "sidebar",
+    view: 24.0,
+    body: r#"<rect x="3" y="4.5" width="18" height="15" rx="3" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="M9.5 4.5v15" stroke="currentColor" stroke-width="1.6"/>"#,
+};
 const PALETTE_TOP: f32 = 96.0;
 /// Title and command of each tab a new project opens with; `None` runs the launch shell.
 const PROJECT_TABS: [(&str, Option<&str>); 2] = [("claude", Some("claude")), ("shell", None)];
@@ -56,6 +61,7 @@ pub struct State {
     palette: TextEdit,
     palette_open: bool,
     palette_selected: usize,
+    sidebar_hidden: bool,
 }
 
 impl State {
@@ -203,6 +209,7 @@ fn shortcut(state: &mut State, event: &KeyEvent, tx: &mut Tx) -> bool {
     match &event.key {
         Key::Command('n') if plain_command => pick_folder(tx),
         Key::Command('p') if plain_command => open_palette(state, tx),
+        Key::Command('b') if plain_command => state.sidebar_hidden = !state.sidebar_hidden,
         Key::Command('t') if plain_command => open_tab(state, "shell", None),
         Key::Command('w') if plain_command => state.workspace.close_tab(),
         Key::Command('[' | '{') if mods.shift => state.workspace.cycle_tab(-1),
@@ -275,7 +282,7 @@ fn resolve_paste(state: &mut State, confirmed: bool) {
     }
 }
 
-fn view(state: &State, _: &mut Cx<State>) -> El {
+fn view(state: &State, cx: &mut Cx<State>) -> El {
     let theme = tok::theme(true);
     let pill = |key: String, label: &str, active: bool| {
         el().key(key)
@@ -330,6 +337,14 @@ fn view(state: &State, _: &mut Cx<State>) -> El {
             })
             .collect()
     });
+    let sidebar_toggle = el()
+        .key("sidebar-toggle")
+        .role("button")
+        .label("Toggle sidebar")
+        .padding(6.0)
+        .radius(6.0)
+        .child(icon(&SIDEBAR_ICON, 16.0).color(theme.text_secondary))
+        .on_press(|state: &mut State| state.sidebar_hidden = !state.sidebar_hidden);
     let new_tab = state.workspace.project().map(|_| {
         pill("new-tab".to_owned(), "+", false).on_press_tx(|_: &mut State, tx: &mut Tx| {
             let menu = PopupMenu::new()
@@ -410,8 +425,15 @@ fn view(state: &State, _: &mut Cx<State>) -> El {
                 .w_full()
                 .h(TAB_STRIP_HEIGHT)
                 .gap(4.0)
-                .px(8.0)
+                // The traffic lights sit over the tab strip once the sidebar is gone.
+                .pl(if state.sidebar_hidden {
+                    cx.titlebar_inset() + 8.0
+                } else {
+                    8.0
+                })
+                .pr(8.0)
                 .items_center()
+                .child(sidebar_toggle)
                 .children(tabs)
                 .children(new_tab),
         )
@@ -516,7 +538,7 @@ fn view(state: &State, _: &mut Cx<State>) -> El {
                 open_project(state, path.clone());
             }
         })
-        .child(sidebar)
+        .children((!state.sidebar_hidden).then_some(sidebar))
         .child(terminal)
         .children(palette)
 }
@@ -672,6 +694,10 @@ fn main() {
                 state.palette_open = true;
             }),
             ("empty", |state| state.started = true),
+            ("collapsed", |state| {
+                show_workspace_scene(state);
+                state.sidebar_hidden = true;
+            }),
         ],
         setup: Some(|state, waker| state.waker = Some(waker)),
         poll: Some(poll),
@@ -866,6 +892,17 @@ mod tests {
         };
         press(&mut runtime, Key::Command('9'), shifted);
         assert_eq!(runtime.state.workspace.active, 1);
+    }
+
+    #[test]
+    fn command_b_and_the_toggle_collapse_and_restore_the_sidebar() {
+        let mut runtime = workspace_runtime();
+        press(&mut runtime, Key::Command('b'), command());
+        runtime.frame(2.0 / 60.0);
+        assert!(runtime.find("sidebar").is_none());
+        click(&mut runtime, "sidebar-toggle");
+        runtime.frame(3.0 / 60.0);
+        assert!(runtime.find("sidebar").is_some());
     }
 
     #[test]
