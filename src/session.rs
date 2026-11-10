@@ -32,6 +32,8 @@ use crate::config::{Config, Theme};
 use crate::input::KeyInput;
 
 const FRAME: Duration = Duration::from_millis(8);
+/// How long the size must hold before the program sees it, as each SIGWINCH makes inline TUIs reprint.
+const RESIZE_SETTLE: Duration = Duration::from_millis(100);
 const HOLD_TIMEOUT: Duration = Duration::from_secs(1);
 const BLINK: Duration = Duration::from_millis(530);
 const AUTOSCROLL: Duration = Duration::from_millis(50);
@@ -75,6 +77,12 @@ pub enum Event {
     Exited(ExitStatus),
     /// Sent while not shown, once for each level raised since the session was last shown.
     Attention(Attention),
+    /// A bell or desktop notification while not shown with keys, once until it next is.
+    /// A bell has an empty title and body; OSC 9 has no title.
+    Notify {
+        title: String,
+        body: String,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
@@ -1316,25 +1324,35 @@ fn store(slot: &Mutex<Arc<Grid>>, grid: Grid) {
     *slot.lock().unwrap_or_else(PoisonError::into_inner) = Arc::new(grid);
 }
 
-/// Applies resizes at frame rate, so a live drag can't flood the program with SIGWINCH.
-struct ResizeThrottle {
+/// Holds a new grid size until it stops changing, so a sidebar slide or window drag sends one SIGWINCH.
+#[derive(Default)]
+struct ResizeDebounce {
     pending: Option<Surface>,
-    next: Instant,
+    applied: Option<Surface>,
+    due: Option<Instant>,
 }
 
-impl ResizeThrottle {
+impl ResizeDebounce {
+    /// The first size, and changes that keep the grid size, apply at once.
+    fn request(&mut self, surface: Surface, now: Instant) {
+        let same_grid = self
+            .applied
+            .is_none_or(|applied| (applied.cols, applied.rows) == (surface.cols, surface.rows));
+        self.pending = Some(surface);
+        self.due = Some(if same_grid { now } else { now + RESIZE_SETTLE });
+    }
+
     fn wait(&self, now: Instant) -> Option<Duration> {
-        self.pending
-            .map(|_| self.next.saturating_duration_since(now))
+        self.due.map(|due| due.saturating_duration_since(now))
     }
 
     fn take_due(&mut self, now: Instant) -> Option<Surface> {
-        if now < self.next {
+        if self.due.is_none_or(|due| now < due) {
             return None;
         }
-        let surface = self.pending.take()?;
-        self.next = now + FRAME;
-        Some(surface)
+        self.due = None;
+        self.applied = self.pending.take();
+        self.applied
     }
 }
 
@@ -1414,24 +1432,30 @@ impl Actor {
             move |_| title_changed.set(true)
         })?;
         let alerted = Rc::new(std::cell::Cell::new(false));
+        let notice = Rc::new(RefCell::new(None));
         terminal.on_bell({
             let alerted = alerted.clone();
             move |_| alerted.set(true)
         })?;
         terminal.on_desktop_notification({
             let alerted = alerted.clone();
-            move |_, _| alerted.set(true)
+            let notice = notice.clone();
+            move |_, notification| {
+                alerted.set(true);
+                *notice.borrow_mut() = Some((
+                    String::from_utf8_lossy(notification.title()).into_owned(),
+                    String::from_utf8_lossy(notification.body()).into_owned(),
+                ));
+            }
         })?;
         let mut attention = Attention::None;
+        let mut notified = false;
 
         let mut input = TerminalInput::new()?;
         let mut fade = ScrollbarFade::default();
         fade.follow(&terminal);
         let mut scrollbar_hovered = false;
-        let mut resize = ResizeThrottle {
-            pending: None,
-            next: Instant::now(),
-        };
+        let mut resize = ResizeDebounce::default();
         let mut dirty = true;
         let mut titles = Titles {
             visibility: Visibility::Shown,
@@ -1458,10 +1482,19 @@ impl Actor {
                         terminal.vt_write(&bytes);
                         fade.follow(&terminal);
                         dirty = true;
-                        let level = if alerted.replace(false) { Attention::Alert } else { Attention::Activity };
+                        let alerted = alerted.replace(false);
+                        let notice = notice.borrow_mut().take();
+                        let level = if alerted { Attention::Alert } else { Attention::Activity };
                         if titles.visibility != Visibility::Shown && level > attention {
                             attention = level;
                             self.events.send(Event::Attention(level)).log_err("queue attention");
+                            (self.waker)();
+                        }
+                        let seen = titles.visibility == Visibility::Shown && publisher.borrow().presentation.focused;
+                        if alerted && !seen && !notified {
+                            notified = true;
+                            let (title, body) = notice.unwrap_or_default();
+                            self.events.send(Event::Notify { title, body }).log_err("queue notification");
                             (self.waker)();
                         }
                     }
@@ -1520,6 +1553,9 @@ impl Actor {
                         }
                     }
                     Ok(Msg::Focus(focused)) => {
+                        if focused && titles.visibility == Visibility::Shown {
+                            notified = false;
+                        }
                         let mut publisher = publisher.borrow_mut();
                         publisher.presentation.focused = focused;
                         publisher.restart_blink(Instant::now());
@@ -1542,8 +1578,7 @@ impl Actor {
                         }
                     }
                     Ok(Msg::Resize(surface)) => {
-                        resize.pending = Some(surface);
-                        dirty = true;
+                        resize.request(surface, Instant::now());
                     }
                     Ok(Msg::Stop) => terminate(&mut self.child, &self.pid),
                     Ok(Msg::Visibility(visibility)) => {
@@ -1576,6 +1611,7 @@ impl Actor {
                 fade.follow(&terminal);
                 input.surface = Some(surface);
                 publisher.borrow_mut().presentation.metrics = surface.metrics;
+                dirty = true;
             }
             let mut publisher = publisher.borrow_mut();
             dirty |= publisher.tick_blink(Instant::now());
@@ -2422,17 +2458,86 @@ mod tests {
     }
 
     #[test]
-    fn a_second_resize_waits_a_frame_even_when_nothing_publishes() {
+    fn a_settled_resize_publishes_without_output() {
+        let session = Session::spawn(
+            Some("cat"),
+            Path::new("/tmp"),
+            &Config::default(),
+            Arc::new(|| {}),
+        )
+        .unwrap();
+        session.resize(TEST_SURFACE);
+        wait_until(
+            Duration::from_secs(5),
+            || format!("cols: {}", session.grid().cols),
+            || (session.grid().cols == TEST_SURFACE.cols).then_some(()),
+        );
+        session.resize(Surface {
+            cols: 30,
+            ..TEST_SURFACE
+        });
+        wait_until(
+            Duration::from_secs(5),
+            || format!("cols: {}", session.grid().cols),
+            || (session.grid().cols == 30).then_some(()),
+        );
+    }
+
+    #[test]
+    fn the_first_resize_applies_at_once() {
         let now = Instant::now();
-        let mut throttle = ResizeThrottle {
-            pending: Some(TEST_SURFACE),
-            next: now,
+        let mut debounce = ResizeDebounce::default();
+        debounce.request(TEST_SURFACE, now);
+        assert_eq!(debounce.take_due(now), Some(TEST_SURFACE));
+        assert_eq!(debounce.wait(now), None);
+    }
+
+    #[test]
+    fn a_burst_of_resizes_applies_once_it_settles() {
+        let now = Instant::now();
+        let mut debounce = ResizeDebounce::default();
+        debounce.request(TEST_SURFACE, now);
+        debounce.take_due(now);
+        let mut at = now;
+        for cols in 21..40 {
+            at += FRAME;
+            debounce.request(
+                Surface {
+                    cols,
+                    ..TEST_SURFACE
+                },
+                at,
+            );
+            assert_eq!(debounce.take_due(at), None);
+        }
+        assert_eq!(debounce.wait(at), Some(RESIZE_SETTLE));
+        assert_eq!(debounce.take_due(at + RESIZE_SETTLE - FRAME), None);
+        let settled = debounce.take_due(at + RESIZE_SETTLE);
+        assert_eq!(
+            settled,
+            Some(Surface {
+                cols: 39,
+                ..TEST_SURFACE
+            })
+        );
+        assert_eq!(debounce.wait(at + RESIZE_SETTLE), None);
+    }
+
+    #[test]
+    fn a_change_of_scale_alone_applies_at_once() {
+        let now = Instant::now();
+        let mut debounce = ResizeDebounce::default();
+        debounce.request(TEST_SURFACE, now);
+        debounce.take_due(now);
+        let rescaled = Surface {
+            metrics: Metrics {
+                scale: 2.0,
+                ..TEST_SURFACE.metrics
+            },
+            ..TEST_SURFACE
         };
-        assert_eq!(throttle.take_due(now), Some(TEST_SURFACE));
-        throttle.pending = Some(TEST_SURFACE);
-        assert_eq!(throttle.take_due(now), None);
-        assert_eq!(throttle.wait(now), Some(FRAME));
-        assert_eq!(throttle.take_due(now + FRAME), Some(TEST_SURFACE));
+        debounce.request(rescaled, now);
+        assert_eq!(debounce.take_due(now), Some(rescaled));
     }
 
     #[test]
@@ -2645,6 +2750,26 @@ mod tests {
     }
 
     #[test]
+    fn a_settled_resize_leaves_the_scrollbar_hidden() {
+        let session = spawn_shell();
+        session.resize(TEST_SURFACE);
+        // Lines that wrap, so the reflow moves the viewport through the scrollback.
+        type_line(&session, "printf '%060d\\n' $(seq 30)");
+        wait_for_scrollbar(&session, "long", |bar| bar.total > 90);
+        session.resize(Surface {
+            cols: 60,
+            ..TEST_SURFACE
+        });
+        wait_until(
+            Duration::from_secs(5),
+            || "the resize never applied".to_owned(),
+            || (session.grid().cols == 60).then_some(()),
+        );
+        thread::sleep(FRAME * 4);
+        assert_eq!(session.grid().scrollbar.map(|bar| bar.opacity), Some(0.0));
+    }
+
+    #[test]
     fn a_wheel_past_the_bottom_still_flashes_the_scrollbar() {
         let session = shell_with_history();
         session.wheel(wheel_by(-60.0));
@@ -2829,6 +2954,38 @@ mod tests {
         type_line(&session, "printf '\\a'");
         thread::sleep(Duration::from_millis(1000));
         assert!(attention_events(&session).contains(&Attention::Alert));
+    }
+
+    fn notify_events(session: &Session) -> Vec<(String, String)> {
+        std::iter::from_fn(|| session.next_event())
+            .filter_map(|event| match event {
+                Event::Notify { title, body } => Some((title, body)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_session_without_keys_notifies_once_until_it_has_them() {
+        let session = spawn_shell();
+        session.focus(false);
+        type_line(
+            &session,
+            "printf '\\033]777;notify;Done;Built\\a\\a'; echo one",
+        );
+        wait_for_line(&session, "one");
+        assert_eq!(notify_events(&session), [("Done".into(), "Built".into())]);
+        type_line(&session, "printf '\\a'; echo two");
+        wait_for_line(&session, "two");
+        assert_eq!(notify_events(&session), []);
+        session.focus(true);
+        type_line(&session, "printf '\\a'; echo three");
+        wait_for_line(&session, "three");
+        assert_eq!(notify_events(&session), []);
+        session.focus(false);
+        type_line(&session, "printf '\\a'; echo four");
+        wait_for_line(&session, "four");
+        assert_eq!(notify_events(&session), [(String::new(), String::new())]);
     }
 
     #[test]
