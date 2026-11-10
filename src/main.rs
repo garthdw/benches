@@ -194,13 +194,12 @@ fn load_layout(state: &mut State) {
         return;
     };
     let path = paths.state();
-    let saved = match std::fs::read_to_string(&path) {
-        Ok(json) => serde_json::from_str::<SavedWorkspace>(&json)
-            .with_context(|| format!("parse {}", path.display())),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
-        Err(error) => Err(error).with_context(|| format!("read {}", path.display())),
-    };
-    if let Some(saved) = saved.log_err("restore layout") {
+    let saved = config::read_optional(&path).and_then(|json| {
+        json.map(|json| serde_json::from_str::<SavedWorkspace>(&json))
+            .transpose()
+            .with_context(|| format!("parse {}", path.display()))
+    });
+    if let Some(Some(saved)) = saved.log_err("restore layout") {
         state.sidebar_hidden = saved.sidebar_hidden;
         state.workspace = Workspace::restore(saved);
     }
@@ -564,8 +563,6 @@ fn dot(color: Color) -> El {
     el().size(DOT, DOT).radius(DOT / 2.0).fill(color)
 }
 
-/// A terminal drawn into `mark`, taking pointer input for the session `pick` returns.
-/// Pressing it sends keys to it, so the drawer and the tab each take focus by click.
 fn pointer_phase(phase: Phase) -> PointerPhase {
     match phase {
         Phase::Down => PointerPhase::Press,
@@ -609,6 +606,8 @@ fn scrollbar_strip(key: &str, drawer: bool, pick: fn(&Workspace) -> Option<&Sess
         })
 }
 
+/// A terminal drawn into `mark`, taking pointer input for the session `pick` returns.
+/// Pressing it sends keys to it, so the drawer and the tab each take focus by click.
 fn terminal_surface(
     mark: u32,
     key: &str,
@@ -1270,10 +1269,13 @@ fn on_ime(state: &mut State, ime: &Ime, _: &mut Tx) -> bool {
     }
 }
 
+fn fixture_grid(bytes: &[u8]) -> Grid {
+    Grid::from_vt(bytes, 60, 12)
+        .unwrap_or_else(|error| Grid::message(&format!("failed to build fixture: {error:#}")))
+}
+
 fn fixture_tab(title: &str, bytes: &[u8]) -> Tab {
-    let grid = Grid::from_vt(bytes, 60, 12)
-        .unwrap_or_else(|error| Grid::message(&format!("failed to build fixture: {error:#}")));
-    Tab::new(title, Session::fixture(grid))
+    Tab::new(title, Session::fixture(fixture_grid(bytes)))
 }
 
 /// Rune applies a scene over the state `init` built, so drop the paths that would load and save the user's layout.
@@ -1282,31 +1284,25 @@ fn isolate_scene(state: &mut State) {
     state.paths = None;
 }
 
-fn show_scene(state: &mut State, bytes: &[u8]) {
+fn show_tab(state: &mut State, tab: Tab) {
     isolate_scene(state);
-    let tabs = vec![fixture_tab("shell", bytes)];
     state
         .workspace
-        .add_project(Project::new("/fixture".into(), tabs));
+        .add_project(Project::new("/fixture".into(), vec![tab]));
+}
+
+fn show_scene(state: &mut State, bytes: &[u8]) {
+    show_tab(state, fixture_tab("shell", bytes));
 }
 
 /// History with the scrollbar as it shows just after scrolling, or while `hovered`.
 fn scrollback_tab(hovered: bool) -> Tab {
     let lines: String = (1..=40).map(|line| format!("{line}\r\n")).collect();
-    let mut grid = Grid::from_vt(lines.as_bytes(), 60, 12)
-        .unwrap_or_else(|error| Grid::message(&format!("failed to build fixture: {error:#}")));
+    let mut grid = fixture_grid(lines.as_bytes());
     if let Some(scrollbar) = &mut grid.scrollbar {
         (scrollbar.opacity, scrollbar.wide) = (1.0, hovered);
     }
     Tab::new("shell", Session::fixture(grid))
-}
-
-fn show_scrollback_scene(state: &mut State, hovered: bool) {
-    isolate_scene(state);
-    let tabs = vec![scrollback_tab(hovered)];
-    state
-        .workspace
-        .add_project(Project::new("/fixture".into(), tabs));
 }
 
 fn show_workspace_scene(state: &mut State) {
@@ -1384,9 +1380,9 @@ const SCENES: &[Scene] = &[
     ("unicode", |state| {
         show_scene(state, SCENE_UNICODE.as_bytes())
     }),
-    ("scrollback", |state| show_scrollback_scene(state, false)),
+    ("scrollback", |state| show_tab(state, scrollback_tab(false))),
     ("scrollback-hover", |state| {
-        show_scrollback_scene(state, true)
+        show_tab(state, scrollback_tab(true))
     }),
     ("workspace", show_workspace_scene),
     ("palette", |state| {
@@ -1460,7 +1456,7 @@ mod tests {
         show_scene(&mut state, b"$ ");
         assert_eq!(runtime_with(state).find("terminal-scrollbar"), None);
         let mut state = State::default();
-        show_scrollback_scene(&mut state, false);
+        show_tab(&mut state, scrollback_tab(false));
         let mut runtime = runtime_with(state);
         let (x, y) = runtime.find("terminal-scrollbar").unwrap();
         runtime.pointer_move(x, y);
@@ -1475,7 +1471,7 @@ mod tests {
     #[test]
     fn pressing_a_scrollbar_moves_keys_to_its_terminal() {
         let mut state = State::default();
-        show_scrollback_scene(&mut state, false);
+        show_tab(&mut state, scrollback_tab(false));
         state.workspace.add_tray(scrollback_tab(false));
         state.workspace.toggle_drawer(0);
         let mut runtime = runtime_with(state);

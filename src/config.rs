@@ -179,7 +179,7 @@ impl Config {
     }
 }
 
-fn read_optional(path: &Path) -> Result<Option<String>> {
+pub fn read_optional(path: &Path) -> Result<Option<String>> {
     match std::fs::read_to_string(path) {
         Ok(text) => Ok(Some(text)),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
