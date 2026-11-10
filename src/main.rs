@@ -1131,7 +1131,14 @@ fn fixture_tab(title: &str, bytes: &[u8]) -> Tab {
     Tab::new(title, Session::fixture(grid))
 }
 
+/// Rune applies a scene over the state `init` built, so drop the paths that would load and save the user's layout.
+fn isolate_scene(state: &mut State) {
+    state.started = true;
+    state.paths = None;
+}
+
 fn show_scene(state: &mut State, bytes: &[u8]) {
+    isolate_scene(state);
     let tabs = vec![fixture_tab("shell", bytes)];
     state
         .workspace
@@ -1139,6 +1146,7 @@ fn show_scene(state: &mut State, bytes: &[u8]) {
 }
 
 fn show_workspace_scene(state: &mut State) {
+    isolate_scene(state);
     let mut titled = fixture_tab("shell", b"$ ");
     titled.program_title = Some("vim ~/dev/agentd/src/workspace.rs and a long tail".to_owned());
     let tabs = vec![
@@ -1205,27 +1213,31 @@ fn log_to_file_in_bundle() -> anyhow::Result<()> {
     Ok(())
 }
 
+type Scene = (&'static str, fn(&mut State));
+
+const SCENES: &[Scene] = &[
+    ("fixture", |state| show_scene(state, SCENE_FIXTURE)),
+    ("unicode", |state| {
+        show_scene(state, SCENE_UNICODE.as_bytes())
+    }),
+    ("workspace", show_workspace_scene),
+    ("palette", |state| {
+        show_workspace_scene(state);
+        state.palette = TextEdit::new("lz");
+        state.palette_open = true;
+    }),
+    ("tray", show_tray_scene),
+    ("empty", isolate_scene),
+    ("collapsed", |state| {
+        show_workspace_scene(state);
+        state.sidebar_hidden = true;
+    }),
+];
+
 fn main() {
     log_to_file_in_bundle().log_err("log file");
     let spec = AppSpec::<State> {
-        scenes: &[
-            ("fixture", |state| show_scene(state, SCENE_FIXTURE)),
-            ("unicode", |state| {
-                show_scene(state, SCENE_UNICODE.as_bytes())
-            }),
-            ("workspace", show_workspace_scene),
-            ("palette", |state| {
-                show_workspace_scene(state);
-                state.palette = TextEdit::new("lz");
-                state.palette_open = true;
-            }),
-            ("tray", show_tray_scene),
-            ("empty", |state| state.started = true),
-            ("collapsed", |state| {
-                show_workspace_scene(state);
-                state.sidebar_hidden = true;
-            }),
-        ],
+        scenes: SCENES,
         setup: Some(|state, waker| state.waker = Some(waker)),
         poll: Some(poll),
         on_key: Some(on_key),
@@ -1918,6 +1930,18 @@ mod tests {
         runtime.state.workspace.select_project(1);
         runtime.frame(2.0 / 60.0);
         assert_eq!(launched(&runtime), [true, true]);
+    }
+
+    #[test]
+    fn scenes_read_and_write_no_files() {
+        for (name, scene) in SCENES {
+            let mut state = State {
+                paths: config::Paths::from_home(),
+                ..State::default()
+            };
+            scene(&mut state);
+            assert!(state.started && state.paths.is_none(), "{name}");
+        }
     }
 
     #[test]
