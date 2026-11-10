@@ -13,9 +13,13 @@ cargo run                                   # open the app with a live shell
 cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test
 cargo test ctrl_c_interrupts                # single test, by name substring; some tests spawn real shells
 cargo run -- --snap out.png --scene fixture --size 620x300   # headless render of fixture VT content
+scripts/install                             # release build into ~/Applications/agentd.app, relaunching a running copy
+scripts/icon                                # regenerate assets/agentd.icns from scripts/icon.swift
 ```
 
 `--snap`, `--scene` and the other headless flags come from Rune. Scenes are registered in `AppSpec::scenes` in `src/main.rs`.
+
+`scripts/install` uses the pinned Rune checkout's installer and launches the app with a Finder-like environment, so nothing from the calling terminal leaks into tabs. It signs with the identity in `MAC_APP_SIGN` (create an Apple Development certificate in Xcode → Settings → Accounts → Manage Certificates; `security find-identity -v -p codesigning` lists it), or ad hoc without one, in which case macOS may ask again for folder access after each install. A bundled app logs to `~/Library/Logs/agentd.log`.
 
 ## Architecture
 

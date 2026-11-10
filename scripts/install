@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+# Builds a release and installs ~/Applications/agentd.app with the pinned Rune's installer,
+# which quits a running copy, swaps the bundle atomically and rolls back if the new one fails.
+# Set MAC_APP_SIGN to a codesigning identity; without it the bundle is signed ad hoc.
+set -euo pipefail
+cd "$(dirname "$0")/.."
+
+cargo build --release --locked
+rune=$(cargo metadata --format-version 1 --locked | python3 -c '
+import json, pathlib, sys
+packages = json.load(sys.stdin)["packages"]
+print(next(pathlib.Path(p["manifest_path"]).parents[2] for p in packages if p["name"] == "rune"))
+')
+# `open` hands the app the installer's environment, which would leak the calling terminal's
+# variables into every tab, so launch it with only what launchd gives a Finder launch. The
+# real interpreter skips Xcode's python3 shim, which adds SDKROOT and friends, and Python
+# must not coerce the missing locale to C.UTF-8.
+python=$(python3 -c 'import sys; print(sys.executable)')
+exec env -i HOME="$HOME" USER="$USER" LOGNAME="${LOGNAME:-$USER}" TMPDIR="$TMPDIR" \
+  ${SSH_AUTH_SOCK:+SSH_AUTH_SOCK="$SSH_AUTH_SOCK"} ${MAC_APP_SIGN:+MAC_APP_SIGN="$MAC_APP_SIGN"} \
+  PATH=/usr/bin:/bin:/usr/sbin:/sbin PYTHONCOERCECLOCALE=0 \
+  "$python" "$rune/scripts/mac_app_install.py" --name agentd --id dev.dewet.agentd --exe agentd \
+  --bin target/release/agentd --icon assets/agentd.icns "$@"
