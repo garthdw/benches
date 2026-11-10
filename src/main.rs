@@ -1176,7 +1176,37 @@ fn show_tray_scene(state: &mut State) {
     state.workspace.toggle_drawer(0);
 }
 
+/// A bundle launched from Finder has its stderr discarded, so send it to a file instead.
+fn log_to_file_in_bundle() -> anyhow::Result<()> {
+    use std::os::fd::AsRawFd;
+
+    let exe = std::env::current_exe()?;
+    if !exe.to_string_lossy().contains(".app/Contents/MacOS/") {
+        return Ok(());
+    }
+    let home = std::env::var_os("HOME").context("HOME is unset")?;
+    let path = PathBuf::from(home).join("Library/Logs/agentd.log");
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .with_context(|| format!("open {}", path.display()))?;
+    // SAFETY: both descriptors are open; dup2 leaves `file` free to close afterwards.
+    if unsafe { libc::dup2(file.as_raw_fd(), libc::STDERR_FILENO) } < 0 {
+        return Err(std::io::Error::last_os_error()).context("redirect stderr");
+    }
+    let started = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?;
+    eprintln!(
+        "agentd {} started at unix time {}, pid {}",
+        env!("CARGO_PKG_VERSION"),
+        started.as_secs(),
+        std::process::id()
+    );
+    Ok(())
+}
+
 fn main() {
+    log_to_file_in_bundle().log_err("log file");
     let spec = AppSpec::<State> {
         scenes: &[
             ("fixture", |state| show_scene(state, SCENE_FIXTURE)),
