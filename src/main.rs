@@ -11,9 +11,9 @@ use std::sync::Arc;
 use libghostty_vt::mouse;
 use rune::tok;
 use rune::{
-    App, AppSpec, ClipboardContent, Color, Cursor, Cx, Drag, El, FileDialogOptions, Icon, Ime, Key,
-    KeyEvent, Mods, Phase, PointerButton, PointerEvent, PopupItem, PopupMenu, TextEdit, Tx, Waker,
-    WheelEvent, col, effect, el, icon, row, text, text_input,
+    App, AppSpec, Chord, ClipboardContent, Color, Cursor, Cx, Drag, El, FileDialogOptions, Icon,
+    Ime, Key, KeyEvent, Mods, Phase, PointerButton, PointerEvent, PopupItem, PopupMenu, TextEdit,
+    Tx, Waker, WheelEvent, col, effect, el, icon, row, text, text_input,
 };
 
 use session::{Event, Grid, PointerInput, PointerPhase, Session, WheelInput};
@@ -108,7 +108,7 @@ fn open_project(state: &mut State, root: PathBuf) {
         .iter()
         .map(|(title, command)| state.spawn_tab(title, *command, &root))
         .collect();
-    state.workspace.add_project(Project::new(root), tabs);
+    state.workspace.add_project(Project::new(root, tabs));
 }
 
 fn pick_folder(tx: &mut Tx) {
@@ -125,14 +125,13 @@ fn pick_folder(tx: &mut Tx) {
 
 fn pick_new_tab(state: &mut State, picked: Option<&str>, tx: &mut Tx) {
     match picked {
-        Some("shell") => open_tab(state, "shell", None),
-        Some("lazygit") => open_tab(state, "lazygit", Some("lazygit")),
+        Some("shell") => run_action(state, &Action::Shell, tx),
+        Some("lazygit") => run_action(state, &Action::Lazygit, tx),
         Some("palette") => open_palette(state, tx),
         _ => {}
     }
 }
 
-/// What the command centre can do.
 #[derive(Clone, Debug, PartialEq)]
 enum Action {
     Shell,
@@ -185,6 +184,10 @@ fn run_palette(state: &mut State, index: usize, tx: &mut Tx) {
         return;
     };
     state.palette_open = false;
+    run_action(state, action, tx);
+}
+
+fn run_action(state: &mut State, action: &Action, tx: &mut Tx) {
     match action {
         Action::Shell => open_tab(state, "shell", None),
         Action::Lazygit => open_tab(state, "lazygit", Some("lazygit")),
@@ -207,36 +210,41 @@ fn palette_key(state: &mut State, event: &KeyEvent, tx: &mut Tx) -> bool {
 
 /// Workspace shortcuts. These keys never reach the terminal.
 fn shortcut(state: &mut State, event: &KeyEvent, tx: &mut Tx) -> bool {
-    let mods = event.mods;
-    let plain_command = !mods.shift && !mods.alt && !mods.ctrl;
-    match &event.key {
-        Key::Command('n') if plain_command => pick_folder(tx),
-        Key::Command('p') if plain_command => open_palette(state, tx),
-        Key::Command('b') if plain_command => state.sidebar_hidden = !state.sidebar_hidden,
-        Key::Command('t') if plain_command => open_tab(state, "shell", None),
-        Key::Command('w') if plain_command => state.workspace.close_tab(),
-        Key::Command('[' | '{') if mods.shift => state.workspace.cycle_tab(-1),
-        Key::Command(']' | '}') if mods.shift => state.workspace.cycle_tab(1),
-        // Shift turns the digit into a symbol, so the unmodified key says which number it was.
-        Key::Command(character) if !mods.alt && !mods.ctrl => {
-            let digit = tx.key_base().unwrap_or(*character).to_digit(10);
-            let Some(index) = digit
-                .filter(|digit| *digit >= 1)
-                .map(|digit| digit as usize - 1)
-            else {
-                return false;
-            };
-            if mods.shift {
-                let last = state.workspace.projects.len().saturating_sub(1);
-                state.workspace.select_project(index.min(last));
-            } else if let Some(project) = state.workspace.project() {
-                let last = project.tabs.len().saturating_sub(1);
-                state.workspace.select_tab(index.min(last));
-            }
+    if !matches!(event.key, Key::Command(_)) {
+        return false;
+    }
+    let pressed = |binding: &str| pressed(binding, event, tx);
+    let digit = |prefix: &str| (1..=9usize).find(|digit| pressed(&format!("{prefix}{digit}")));
+    if pressed("mod+n") {
+        pick_folder(tx);
+    } else if pressed("mod+p") {
+        open_palette(state, tx);
+    } else if pressed("mod+b") {
+        state.sidebar_hidden = !state.sidebar_hidden;
+    } else if pressed("mod+t") {
+        run_action(state, &Action::Shell, tx);
+    } else if pressed("mod+w") {
+        state.workspace.close_tab();
+    } else if pressed("mod+shift+[") {
+        state.workspace.cycle_tab(-1);
+    } else if pressed("mod+shift+]") {
+        state.workspace.cycle_tab(1);
+    } else if let Some(digit) = digit("mod+shift+") {
+        let last = state.workspace.projects.len().saturating_sub(1);
+        state.workspace.select_project((digit - 1).min(last));
+    } else if let Some(digit) = digit("mod+") {
+        if let Some(project) = state.workspace.project() {
+            let last = project.tabs.len().saturating_sub(1);
+            state.workspace.select_tab((digit - 1).min(last));
         }
-        _ => return false,
+    } else {
+        return false;
     }
     true
+}
+
+fn pressed(binding: &str, event: &KeyEvent, tx: &Tx) -> bool {
+    Chord::parse(binding).is_ok_and(|chord| chord.matches_tx(event, tx))
 }
 
 fn send_pointer(
@@ -287,25 +295,25 @@ fn resolve_paste(state: &mut State, confirmed: bool) {
 
 fn view(state: &State, cx: &mut Cx<State>) -> El {
     let theme = tok::theme(true);
+    let button = |key: String, label: &str, active: bool| {
+        el().key(key).role("button").label(label).fill(if active {
+            theme.control_off
+        } else {
+            Color::TRANSPARENT
+        })
+    };
     let pill = |key: String, label: &str, active: bool| {
-        el().key(key)
-            .role("button")
-            .label(label)
+        button(key, label, active)
             .px(10.0)
             .py(4.0)
             .radius(6.0)
-            .fill(if active {
-                theme.control_off
-            } else {
-                Color::TRANSPARENT
-            })
             .child(text(label.to_owned()).color(theme.text).truncate())
     };
     let rail = state.sidebar_hidden && state.workspace.projects.len() > 1;
-    let sidebar_width = match (state.sidebar_hidden, rail) {
-        (false, _) => SIDEBAR_WIDTH,
-        (true, true) => RAIL_WIDTH,
-        (true, false) => 0.0,
+    let (sidebar_width, sidebar_padding) = match (state.sidebar_hidden, rail) {
+        (false, _) => (SIDEBAR_WIDTH, 8.0),
+        (true, true) => (RAIL_WIDTH, 6.0),
+        (true, false) => (0.0, 0.0),
     };
     let projects = state
         .workspace
@@ -324,17 +332,10 @@ fn view(state: &State, cx: &mut Cx<State>) -> El {
                     .flat_map(char::to_uppercase)
                     .chain(initials.next())
                     .collect();
-                el().key(key)
-                    .role("button")
-                    .label(project.name.clone())
+                button(key, &project.name, active)
                     .size(RAIL_TAB, RAIL_TAB)
                     .center()
                     .radius(8.0)
-                    .fill(if active {
-                        theme.control_off
-                    } else {
-                        Color::TRANSPARENT
-                    })
                     .child(text(initials).color(theme.text))
             } else {
                 pill(key, &project.name, active).w_full()
@@ -348,13 +349,7 @@ fn view(state: &State, cx: &mut Cx<State>) -> El {
         .h_full()
         .gap(2.0)
         .pt(TAB_STRIP_HEIGHT)
-        .px(if rail {
-            6.0
-        } else if sidebar_width > 0.0 {
-            8.0
-        } else {
-            0.0
-        })
+        .px(sidebar_padding)
         .clip_rounded(0.0)
         .fill(theme.card)
         .children(projects);
@@ -582,7 +577,7 @@ fn poll(state: &mut State, _: f64, tx: &mut Tx) -> bool {
         if state.workspace.projects.is_empty() {
             let home = std::env::var_os("HOME").map_or_else(|| PathBuf::from("/"), PathBuf::from);
             let tab = state.spawn_tab("shell", None, &home);
-            state.workspace.add_project(Project::new(home), vec![tab]);
+            state.workspace.add_project(Project::new(home, vec![tab]));
         }
     }
     let active = state.session().map(Session::id);
@@ -631,27 +626,23 @@ fn on_key(state: &mut State, event: &KeyEvent, tx: &mut Tx) -> bool {
     if tx.focused().is_some() {
         return false;
     }
-    let plain_command = !event.mods.shift && !event.mods.alt && !event.mods.ctrl;
-    match event.key {
-        Key::Command('c') if plain_command => {
-            if let Some(session) = state.session() {
-                session.copy();
-            }
-            return true;
+    if pressed("mod+c", event, tx) {
+        if let Some(session) = state.session() {
+            session.copy();
         }
-        Key::Command('v') if plain_command => {
-            tx.read_clipboard(
-                |state: &mut State, content: &ClipboardContent, _: &mut Tx| {
-                    if let Some(session) = state.session()
-                        && !content.text().is_empty()
-                    {
-                        session.paste(content.text().to_owned(), false);
-                    }
-                },
-            );
-            return true;
-        }
-        _ => {}
+        return true;
+    }
+    if pressed("mod+v", event, tx) {
+        tx.read_clipboard(
+            |state: &mut State, content: &ClipboardContent, _: &mut Tx| {
+                if let Some(session) = state.session()
+                    && !content.text().is_empty()
+                {
+                    session.paste(content.text().to_owned(), false);
+                }
+            },
+        );
+        return true;
     }
     match (
         state.session(),
@@ -689,27 +680,27 @@ fn fixture_tab(title: &str, bytes: &[u8]) -> Tab {
 }
 
 fn show_scene(state: &mut State, bytes: &[u8]) {
-    let tab = fixture_tab("shell", bytes);
+    let tabs = vec![fixture_tab("shell", bytes)];
     state
         .workspace
-        .add_project(Project::new("/fixture".into()), vec![tab]);
+        .add_project(Project::new("/fixture".into(), tabs));
 }
 
 fn show_workspace_scene(state: &mut State) {
     let mut titled = fixture_tab("shell", b"$ ");
     titled.program_title = Some("vim ~/dev/agentd/src/workspace.rs and a long tail".to_owned());
-    let agentd = vec![
+    let tabs = vec![
         fixture_tab("claude", SCENE_FIXTURE),
         titled,
         fixture_tab("lazygit", b""),
     ];
     state
         .workspace
-        .add_project(Project::new("/dev/agentd".into()), agentd);
-    let site = vec![fixture_tab("claude", b""), fixture_tab("shell", b"$ ")];
+        .add_project(Project::new("/dev/agentd".into(), tabs));
+    let tabs = vec![fixture_tab("claude", b""), fixture_tab("shell", b"$ ")];
     state
         .workspace
-        .add_project(Project::new("/dev/site".into()), site);
+        .add_project(Project::new("/dev/site".into(), tabs));
     state.workspace.select_project(0);
 }
 
@@ -889,6 +880,13 @@ mod tests {
         }
     }
 
+    fn command_shift() -> Mods {
+        Mods {
+            shift: true,
+            ..command()
+        }
+    }
+
     fn workspace_runtime() -> Runtime<State> {
         let mut runtime = runtime_with(workspace_state());
         runtime.on_key = Some(on_key);
@@ -898,11 +896,7 @@ mod tests {
     #[test]
     fn command_shift_digits_pick_projects_and_command_digits_pick_tabs() {
         let mut runtime = workspace_runtime();
-        let shifted = Mods {
-            shift: true,
-            ..command()
-        };
-        press(&mut runtime, Key::Command('2'), shifted);
+        press(&mut runtime, Key::Command('2'), command_shift());
         press(&mut runtime, Key::Command('2'), command());
         let workspace = &runtime.state.workspace;
         assert_eq!(workspace.active, 1);
@@ -919,11 +913,7 @@ mod tests {
     #[test]
     fn a_command_shift_digit_past_the_last_project_selects_the_last_project() {
         let mut runtime = workspace_runtime();
-        let shifted = Mods {
-            shift: true,
-            ..command()
-        };
-        press(&mut runtime, Key::Command('9'), shifted);
+        press(&mut runtime, Key::Command('9'), command_shift());
         assert_eq!(runtime.state.workspace.active, 1);
     }
 
@@ -981,13 +971,9 @@ mod tests {
     #[test]
     fn command_shift_brackets_cycle_tabs() {
         let mut runtime = workspace_runtime();
-        let shifted = Mods {
-            shift: true,
-            ..command()
-        };
-        press(&mut runtime, Key::Command('{'), shifted);
+        press(&mut runtime, Key::Command('{'), command_shift());
         assert_eq!(runtime.state.workspace.projects[0].active_tab, 2);
-        press(&mut runtime, Key::Command(']'), shifted);
+        press(&mut runtime, Key::Command(']'), command_shift());
         assert_eq!(runtime.state.workspace.projects[0].active_tab, 0);
     }
 
@@ -1100,10 +1086,7 @@ mod tests {
             WINDOW_KEYS.fetch_add(1, Ordering::SeqCst);
             true
         });
-        let (x, y) = runtime.find("tab-0").unwrap();
-        runtime.pointer_down(x, y);
-        runtime.pointer_up(x, y);
-        runtime.frame(1.0 / 60.0);
+        click(&mut runtime, "tab-0");
         runtime.key(KeyEvent {
             key: Key::Tab,
             mods: Mods::default(),

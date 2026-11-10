@@ -10,7 +10,7 @@ use rune::render::EffectSite;
 
 use crate::State;
 use crate::font::{Font, FontStyle, GlyphKind};
-use crate::session::{Cell, Grid, Metrics, Surface};
+use crate::session::{Cell, Grid, Metrics, Session, Surface};
 
 const FONT_POINTS: f64 = 18.0;
 const PADDING_POINTS: f32 = 6.0;
@@ -485,8 +485,6 @@ fn quad_buffer(device: &wgpu::Device, size: u64) -> wgpu::Buffer {
 pub struct TerminalCompositor {
     gpu: Option<Gpu>,
     font: Option<(f32, Font)>,
-    /// Last size sent to each session. Hidden tabs share the visible area, so they are sized too.
-    sent_sizes: HashMap<u64, (u16, u16, u32, u32)>,
 }
 
 impl TerminalCompositor {
@@ -533,34 +531,24 @@ impl TerminalCompositor {
         let padding = PADDING_POINTS * site.scale;
         let cols = (((rect[2] - 2.0 * padding) / font.cell_width as f32) as u16).max(1);
         let rows = (((rect[3] - 2.0 * padding) / font.cell_height as f32) as u16).max(1);
-        let size = (cols, rows, font.cell_width, font.cell_height);
+        let surface = Surface {
+            cols,
+            rows,
+            metrics: Metrics {
+                cell_width: font.cell_width as u16,
+                cell_height: font.cell_height as u16,
+                padding,
+                scale: site.scale,
+            },
+        };
+        // Hidden tabs share the visible area, so they are sized too.
         for session in state.workspace.sessions() {
-            if self.sent_sizes.insert(session.id(), size) != Some(size) {
-                session.resize(Surface {
-                    cols,
-                    rows,
-                    metrics: Metrics {
-                        cell_width: font.cell_width as u16,
-                        cell_height: font.cell_height as u16,
-                        padding,
-                        scale: site.scale,
-                    },
-                });
-            }
+            session.resize(surface);
         }
-        self.sent_sizes.retain(|id, _| {
-            state
-                .workspace
-                .sessions()
-                .any(|session| session.id() == *id)
-        });
 
         let grid = state.grid();
         let built = (
-            state
-                .workspace
-                .active_session()
-                .map_or(0, |session| session.id()),
+            state.session().map_or(0, Session::id),
             grid.generation,
             rect,
             gpu.atlas.epoch,
@@ -585,7 +573,7 @@ impl TerminalCompositor {
                 slot.quads = quad_buffer(device, (bytes.len() as u64).next_power_of_two());
             }
             queue.write_buffer(&slot.quads, 0, bytes);
-            slot.built = Some((built.0, built.1, rect, gpu.atlas.epoch, site.srgb_blend));
+            slot.built = Some(built);
         }
 
         let frame = [

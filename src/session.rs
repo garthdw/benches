@@ -411,7 +411,18 @@ enum Msg {
     Copy,
     Paste { text: String, allow_unsafe: bool },
     Resize(Surface),
-    Visible(bool),
+    Visibility(Visibility),
+}
+
+/// How much of a session the UI shows, which decides what it publishes.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Visibility {
+    /// The terminal itself, published every frame.
+    Shown,
+    /// Only its tab label, so titles still come back.
+    Listed,
+    /// Nothing; the latest title waits until it is listed or shown.
+    Hidden,
 }
 
 #[derive(Default)]
@@ -775,6 +786,8 @@ pub struct Session {
     commands: Option<Sender<Msg>>,
     grid: Arc<Mutex<Arc<Grid>>>,
     events: Receiver<Event>,
+    sent_surface: std::cell::Cell<Option<Surface>>,
+    visibility: std::cell::Cell<Visibility>,
 }
 
 impl Session {
@@ -864,6 +877,8 @@ impl Session {
             commands: Some(commands),
             grid,
             events,
+            sent_surface: std::cell::Cell::new(None),
+            visibility: std::cell::Cell::new(Visibility::Shown),
         })
     }
 
@@ -874,6 +889,8 @@ impl Session {
             commands: None,
             grid: Arc::new(Mutex::new(Arc::new(grid))),
             events: unbounded().1,
+            sent_surface: std::cell::Cell::new(None),
+            visibility: std::cell::Cell::new(Visibility::Shown),
         }
     }
 
@@ -916,13 +933,23 @@ impl Session {
         self.events.try_recv().ok()
     }
 
+    /// Sends `surface` unless it was the last one sent, so every tab can be sized each frame.
     pub fn resize(&self, surface: Surface) {
-        self.send(Msg::Resize(surface));
+        if self.sent_surface.replace(Some(surface)) != Some(surface) {
+            self.send(Msg::Resize(surface));
+        }
     }
 
-    /// A hidden session keeps running but stops publishing grids and waking the UI.
-    pub fn set_visible(&self, visible: bool) {
-        self.send(Msg::Visible(visible));
+    /// A session that isn't shown keeps running but stops publishing grids. Sessions start shown.
+    pub fn set_visibility(&self, visibility: Visibility) {
+        if self.visibility.replace(visibility) != visibility {
+            self.send(Msg::Visibility(visibility));
+        }
+    }
+
+    #[cfg(test)]
+    pub fn visibility(&self) -> Visibility {
+        self.visibility.get()
     }
 
     fn send(&self, message: Msg) {
@@ -1059,6 +1086,11 @@ impl Actor {
             next: Instant::now(),
         };
         let mut dirty = true;
+        let mut titles = Titles {
+            visibility: Visibility::Shown,
+            sent: String::new(),
+            next: Instant::now(),
+        };
         loop {
             let now = Instant::now();
             let wait = publisher.borrow().wait(dirty, now);
@@ -1066,20 +1098,13 @@ impl Actor {
                 .next_autoscroll
                 .map_or(wait, |due| wait.min(due.saturating_duration_since(now)));
             let wait = resize.wait(now).map_or(wait, |due| wait.min(due));
+            let wait = titles
+                .due()
+                .filter(|_| title_changed.get())
+                .map_or(wait, |due| wait.min(due.saturating_duration_since(now)));
             select! {
                 recv(self.output) -> bytes => match bytes {
-                    Ok(bytes) => {
-                        terminal.vt_write(&bytes);
-                        dirty = true;
-                        // libghostty only exposes the new title once the write returns.
-                        if title_changed.take()
-                            && let Some(title) = terminal.title().log_err("read title")
-                        {
-                            let title = String::from_utf8_lossy(title).into_owned();
-                            self.events.send(Event::Title(title)).log_err("queue title");
-                            (self.waker)();
-                        }
-                    }
+                    Ok(bytes) => { terminal.vt_write(&bytes); dirty = true; }
                     Err(_) => {
                         self.output = never();
                         self.child.wait().log_err("wait for process");
@@ -1148,13 +1173,24 @@ impl Actor {
                         resize.pending = Some(surface);
                         dirty = true;
                     }
-                    Ok(Msg::Visible(visible)) => {
-                        publisher.borrow_mut().visible = visible;
+                    Ok(Msg::Visibility(visibility)) => {
+                        titles.visibility = visibility;
+                        publisher.borrow_mut().visible = visibility == Visibility::Shown;
                         dirty = true;
                     }
                     Err(_) => return Ok(()),
                 },
                 default(wait) => {}
+            }
+            // libghostty only exposes a new title once the write that set it returns.
+            if title_changed.get() && titles.due().is_some_and(|due| Instant::now() >= due) {
+                title_changed.set(false);
+                if let Some(title) = terminal.title().log_err("read title")
+                    && let Some(title) = titles.send(title, Instant::now())
+                {
+                    self.events.send(Event::Title(title)).log_err("queue title");
+                    (self.waker)();
+                }
             }
             // Before borrowing the publisher: a resize ends any render hold through its callback.
             if let Some(surface) = resize.take_due(Instant::now()) {
@@ -1189,6 +1225,30 @@ impl Actor {
                 dirty = false;
             }
         }
+    }
+}
+
+/// Sends program titles at most once a frame, and none while hidden, as animated titles can change constantly.
+struct Titles {
+    visibility: Visibility,
+    sent: String,
+    next: Instant,
+}
+
+impl Titles {
+    /// When a changed title may next be sent, or `None` while hidden.
+    fn due(&self) -> Option<Instant> {
+        (self.visibility != Visibility::Hidden).then_some(self.next)
+    }
+
+    /// The title to send, unless it is the one sent last, as shells often repeat it on every prompt.
+    fn send(&mut self, title: &[u8], now: Instant) -> Option<String> {
+        if title == self.sent.as_bytes() {
+            return None;
+        }
+        self.sent = String::from_utf8_lossy(title).into_owned();
+        self.next = now + FRAME;
+        Some(self.sent.clone())
     }
 }
 
@@ -1383,6 +1443,10 @@ mod tests {
             builder.build(&terminal, 3, shown).unwrap().unwrap().cursor,
             Some((3, 2))
         );
+    }
+
+    fn spawn_shell() -> Session {
+        Session::spawn(None, Path::new("/tmp"), Arc::new(|| {})).unwrap()
     }
 
     fn type_line(session: &Session, line: &str) {
@@ -1700,7 +1764,7 @@ mod tests {
 
     #[test]
     fn a_paste_reaches_a_real_shell() {
-        let session = Session::spawn(None, Path::new("/tmp"), Arc::new(|| {})).unwrap();
+        let session = spawn_shell();
         session.paste("echo pasted-ok".to_owned(), false);
         type_line(&session, "");
         wait_for_line(&session, "pasted-ok");
@@ -1708,7 +1772,7 @@ mod tests {
 
     #[test]
     fn a_refused_paste_comes_back_to_the_ui() {
-        let session = Session::spawn(None, Path::new("/tmp"), Arc::new(|| {})).unwrap();
+        let session = spawn_shell();
         // Refused either way, as the shell may not have enabled bracketed paste yet.
         let text = "x\n\x1b[201~y";
         session.paste(text.to_owned(), false);
@@ -1735,7 +1799,7 @@ mod tests {
 
     #[test]
     fn a_burst_of_resizes_ends_at_the_last_size() {
-        let session = Session::spawn(None, Path::new("/tmp"), Arc::new(|| {})).unwrap();
+        let session = spawn_shell();
         for cols in 40..60 {
             session.resize(Surface {
                 cols,
@@ -1892,31 +1956,68 @@ mod tests {
 
     #[test]
     fn output_after_a_hold_that_never_ends_still_appears() {
-        let session = Session::spawn(None, Path::new("/tmp"), Arc::new(|| {})).unwrap();
+        let session = spawn_shell();
         type_line(&session, "printf '\\033[?2026h'; echo held-2; sleep 30");
         wait_for_line(&session, "held-2");
     }
 
+    fn next_title(session: &Session) -> Option<String> {
+        std::iter::from_fn(|| session.next_event()).find_map(|event| match event {
+            Event::Title(title) => Some(title),
+            _ => None,
+        })
+    }
+
+    #[test]
+    fn a_hidden_session_holds_its_title_until_listed() {
+        let session = spawn_shell();
+        session.set_visibility(Visibility::Hidden);
+        type_line(&session, "printf '\\033]2;held-title\\007'; sleep 5");
+        thread::sleep(Duration::from_secs(1));
+        assert_eq!(next_title(&session), None);
+        session.set_visibility(Visibility::Listed);
+        wait_until(
+            Duration::from_secs(5),
+            || "the held title never arrived".to_owned(),
+            || next_title(&session).filter(|title| title == "held-title"),
+        );
+    }
+
+    #[test]
+    fn titles_wait_a_frame_between_sends_and_while_hidden() {
+        let now = Instant::now();
+        let mut titles = Titles {
+            visibility: Visibility::Listed,
+            sent: String::new(),
+            next: now,
+        };
+        assert_eq!(titles.send(b"one", now).as_deref(), Some("one"));
+        assert_eq!(titles.due(), Some(now + FRAME));
+        assert_eq!(titles.send(b"one", now + FRAME), None);
+        titles.visibility = Visibility::Hidden;
+        assert_eq!(titles.due(), None);
+    }
+
     #[test]
     fn a_hidden_session_publishes_once_shown() {
-        let session = Session::spawn(None, Path::new("/tmp"), Arc::new(|| {})).unwrap();
-        session.set_visible(false);
+        let session = spawn_shell();
+        session.set_visibility(Visibility::Hidden);
         type_line(&session, "echo hidden-ok");
         thread::sleep(Duration::from_secs(1));
         let lines = session.grid().lines();
         assert!(!lines.iter().any(|line| line.trim_end() == "hidden-ok"));
-        session.set_visible(true);
+        session.set_visibility(Visibility::Shown);
         wait_for_line(&session, "hidden-ok");
     }
 
     #[test]
     fn a_hidden_flood_leaves_another_session_responsive() {
-        let flood = Session::spawn(None, Path::new("/tmp"), Arc::new(|| {})).unwrap();
-        flood.set_visible(false);
+        let flood = spawn_shell();
+        flood.set_visibility(Visibility::Hidden);
         type_line(&flood, "yes");
         thread::sleep(Duration::from_millis(500));
         let generation = flood.grid().generation;
-        let typing = Session::spawn(None, Path::new("/tmp"), Arc::new(|| {})).unwrap();
+        let typing = spawn_shell();
         type_line(&typing, "echo still-responsive");
         wait_for_line(&typing, "still-responsive");
         assert_eq!(flood.grid().generation, generation);
@@ -1924,7 +2025,7 @@ mod tests {
 
     #[test]
     fn a_program_title_comes_back_to_the_ui() {
-        let session = Session::spawn(None, Path::new("/tmp"), Arc::new(|| {})).unwrap();
+        let session = spawn_shell();
         type_line(&session, "printf '\\033]2;agentd-title\\007'; sleep 5");
         wait_until(
             Duration::from_secs(15),
@@ -1937,8 +2038,31 @@ mod tests {
     }
 
     #[test]
+    fn a_repeated_title_is_sent_once() {
+        let session = spawn_shell();
+        type_line(
+            &session,
+            "printf '\\033]2;same\\007'; sleep 0.2; printf '\\033]2;same\\007'; sleep 0.2; printf '\\033]2;done\\007'",
+        );
+        let mut titles = Vec::new();
+        wait_until(
+            Duration::from_secs(15),
+            || "the last title never arrived".to_owned(),
+            || {
+                while let Some(event) = session.next_event() {
+                    if let Event::Title(title) = event {
+                        titles.push(title);
+                    }
+                }
+                titles.contains(&"done".to_owned()).then_some(())
+            },
+        );
+        assert_eq!(titles.iter().filter(|title| *title == "same").count(), 1);
+    }
+
+    #[test]
     fn resizing_during_a_render_hold_survives() {
-        let session = Session::spawn(None, Path::new("/tmp"), Arc::new(|| {})).unwrap();
+        let session = spawn_shell();
         // The hold starts after the line shows, and the resize lands before it times out.
         type_line(
             &session,
@@ -1966,21 +2090,21 @@ mod tests {
 
     #[test]
     fn child_programs_see_the_launch_shell() {
-        let session = Session::spawn(None, Path::new("/tmp"), Arc::new(|| {})).unwrap();
+        let session = spawn_shell();
         type_line(&session, "echo $SHELL");
         wait_for_line(&session, LAUNCH_SHELL);
     }
 
     #[test]
     fn a_real_process_reaches_the_grid_and_takes_keys() {
-        let session = Session::spawn(None, Path::new("/tmp"), Arc::new(|| {})).unwrap();
+        let session = spawn_shell();
         type_line(&session, "echo agentd-42");
         wait_for_line(&session, "agentd-42");
     }
 
     #[test]
     fn ctrl_c_interrupts_the_foreground_process() {
-        let session = Session::spawn(None, Path::new("/tmp"), Arc::new(|| {})).unwrap();
+        let session = spawn_shell();
         type_line(&session, "sleep 30; echo slept; echo marker-2");
         thread::sleep(Duration::from_millis(1500));
         let ctrl = rune::Mods {

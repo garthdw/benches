@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use crate::session::Session;
+use crate::session::{Session, Visibility};
 
 pub struct Tab {
     /// What the tab runs, shown until the program sets a title of its own.
@@ -33,7 +33,8 @@ pub struct Project {
 }
 
 impl Project {
-    pub fn new(root: PathBuf) -> Self {
+    /// A project at `root` with `tabs` in order and the first one active.
+    pub fn new(root: PathBuf, tabs: Vec<Tab>) -> Self {
         let name = root.file_name().map_or_else(
             || root.display().to_string(),
             |name| name.to_string_lossy().into_owned(),
@@ -41,7 +42,7 @@ impl Project {
         Self {
             name,
             root,
-            tabs: Vec::new(),
+            tabs,
             active_tab: 0,
             tray: Vec::new(),
         }
@@ -61,9 +62,13 @@ impl Workspace {
         self.projects.get(self.active)
     }
 
-    pub fn active_session(&self) -> Option<&Session> {
+    pub fn active_tab(&self) -> Option<&Tab> {
         let project = self.project()?;
-        Some(&project.tabs.get(project.active_tab)?.session)
+        project.tabs.get(project.active_tab)
+    }
+
+    pub fn active_session(&self) -> Option<&Session> {
+        self.active_tab().map(|tab| &tab.session)
     }
 
     pub fn sessions(&self) -> impl Iterator<Item = &Session> {
@@ -85,23 +90,15 @@ impl Workspace {
             .position(|project| project.root == root)
     }
 
-    /// Adds `project` and shows it, with `tabs` in order and the first one active.
-    pub fn add_project(&mut self, mut project: Project, tabs: Vec<Tab>) {
-        for tab in &tabs {
-            tab.session.set_visible(false);
-        }
-        project.tabs = tabs;
-        project.active_tab = 0;
-        self.hide_active();
+    pub fn add_project(&mut self, project: Project) {
+        self.focus_active(false);
         self.projects.push(project);
         self.active = self.projects.len() - 1;
         self.show_active();
     }
 
-    /// Adds `tab` to the active project and shows it.
     pub fn add_tab(&mut self, tab: Tab) {
-        tab.session.set_visible(false);
-        self.hide_active();
+        self.focus_active(false);
         if let Some(project) = self.projects.get_mut(self.active) {
             project.tabs.push(tab);
             project.active_tab = project.tabs.len() - 1;
@@ -111,7 +108,7 @@ impl Workspace {
 
     pub fn select_project(&mut self, index: usize) {
         if index < self.projects.len() && index != self.active {
-            self.hide_active();
+            self.focus_active(false);
             self.active = index;
             self.show_active();
         }
@@ -122,7 +119,7 @@ impl Workspace {
             return;
         };
         if index < project.tabs.len() && index != project.active_tab {
-            self.hide_active();
+            self.focus_active(false);
             if let Some(project) = self.projects.get_mut(self.active) {
                 project.active_tab = index;
             }
@@ -166,22 +163,32 @@ impl Workspace {
         }
     }
 
-    fn hide_active(&self) {
-        if let Some(session) = self.active_session() {
-            session.set_visible(false);
-            if self.window_focused {
-                session.focus(false);
-            }
+    fn focus_active(&self, focused: bool) {
+        if self.window_focused
+            && let Some(session) = self.active_session()
+        {
+            session.focus(focused);
         }
     }
 
+    /// Shows the active tab and lists the rest of its project. Other projects' tabs are hidden, so their titles wait.
     fn show_active(&self) {
-        if let Some(session) = self.active_session() {
-            session.set_visible(true);
-            if self.window_focused {
-                session.focus(true);
+        for (index, project) in self.projects.iter().enumerate() {
+            for (tab_index, tab) in project.tabs.iter().enumerate() {
+                let visibility = if index != self.active {
+                    Visibility::Hidden
+                } else if tab_index == project.active_tab {
+                    Visibility::Shown
+                } else {
+                    Visibility::Listed
+                };
+                tab.session.set_visibility(visibility);
+            }
+            for tab in &project.tray {
+                tab.session.set_visibility(Visibility::Hidden);
             }
         }
+        self.focus_active(true);
     }
 }
 
@@ -196,14 +203,13 @@ mod tests {
 
     fn workspace() -> Workspace {
         let mut workspace = Workspace::default();
-        workspace.add_project(Project::new("/a".into()), vec![tab("claude"), tab("shell")]);
-        workspace.add_project(Project::new("/b".into()), vec![tab("vim")]);
+        workspace.add_project(Project::new("/a".into(), vec![tab("claude"), tab("shell")]));
+        workspace.add_project(Project::new("/b".into(), vec![tab("vim")]));
         workspace
     }
 
     fn active_title(workspace: &Workspace) -> Option<&str> {
-        let project = workspace.project()?;
-        Some(&project.tabs.get(project.active_tab)?.title)
+        workspace.active_tab().map(|tab| tab.title.as_str())
     }
 
     #[test]
@@ -266,6 +272,17 @@ mod tests {
         assert_eq!(tab.label(), "vim notes.md");
         tab.program_title = None;
         assert_eq!(tab.label(), "shell");
+    }
+
+    #[test]
+    fn the_active_project_lists_its_other_tabs_and_hides_the_rest() {
+        let mut workspace = workspace();
+        workspace.select_project(0);
+        let visibilities: Vec<_> = workspace.sessions().map(Session::visibility).collect();
+        assert_eq!(
+            visibilities,
+            [Visibility::Shown, Visibility::Listed, Visibility::Hidden]
+        );
     }
 
     #[test]
