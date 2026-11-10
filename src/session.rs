@@ -817,12 +817,43 @@ impl TerminalInput {
 }
 
 /// A process on a PTY. Its `Terminal` lives on an actor thread, as libghostty types are `!Send`.
-/// Apps launched from Finder get no locale, which leaves children in the C locale and mangles UTF-8.
-fn missing_locale(var: impl Fn(&str) -> Option<std::ffi::OsString>) -> Option<&'static str> {
+/// Apps launched from Finder get no locale, which leaves children in the C locale and mangles
+/// UTF-8, so give them the user's macOS locale (`system`, such as `en_GB@rg=zazzzz`) in UTF-8.
+fn missing_locale(
+    var: impl Fn(&str) -> Option<std::ffi::OsString>,
+    system: Option<&str>,
+) -> Option<String> {
     let has_locale = ["LANG", "LC_ALL", "LC_CTYPE"]
         .into_iter()
         .any(|name| var(name).is_some_and(|value| !value.is_empty()));
-    (!has_locale).then_some("en_US.UTF-8")
+    if has_locale {
+        return None;
+    }
+    let candidate = system
+        .and_then(|identifier| identifier.split('@').next())
+        .map(|language| format!("{language}.UTF-8"))
+        .filter(|candidate| locale_exists(candidate));
+    Some(candidate.unwrap_or_else(|| "en_US.UTF-8".to_owned()))
+}
+
+fn locale_exists(name: &str) -> bool {
+    let Ok(name) = std::ffi::CString::new(name) else {
+        return false;
+    };
+    // SAFETY: `name` is a valid C string; a returned locale is freed at once.
+    unsafe {
+        let locale = libc::newlocale(libc::LC_CTYPE_MASK, name.as_ptr(), std::ptr::null_mut());
+        if locale.is_null() {
+            return false;
+        }
+        libc::freelocale(locale);
+    }
+    true
+}
+
+fn system_locale() -> Option<String> {
+    let identifier = objc2_core_foundation::CFLocale::current()?.identifier()?;
+    Some(identifier.to_string())
 }
 
 pub struct Session {
@@ -863,7 +894,9 @@ impl Session {
             .env("TERM_PROGRAM", "agentd")
             .env("SHELL", &config.shell)
             .stdin(Stdio::from(pty.slave));
-        if let Some(locale) = missing_locale(|name| std::env::var_os(name)) {
+        if let Some(locale) =
+            missing_locale(|name| std::env::var_os(name), system_locale().as_deref())
+        {
             process.env("LANG", locale);
         }
         // SAFETY: only async-signal-safe calls run between fork and exec.
@@ -2451,11 +2484,19 @@ mod tests {
     }
 
     #[test]
-    fn children_get_a_utf8_locale_only_when_the_app_has_none() {
-        assert_eq!(missing_locale(|_| None), Some("en_US.UTF-8"));
+    fn children_get_the_users_utf8_locale_only_when_the_app_has_none() {
+        let unset = |_: &str| None;
+        let locale = |system| missing_locale(unset, system);
+        assert_eq!(locale(Some("en_GB")).as_deref(), Some("en_GB.UTF-8"));
+        assert_eq!(
+            locale(Some("en_GB@rg=zazzzz")).as_deref(),
+            Some("en_GB.UTF-8")
+        );
+        assert_eq!(locale(Some("xx_YY")).as_deref(), Some("en_US.UTF-8"));
+        assert_eq!(locale(None).as_deref(), Some("en_US.UTF-8"));
         for set in ["LANG", "LC_ALL", "LC_CTYPE"] {
             let lookup = |name: &str| (name == set).then(|| "de_DE.UTF-8".into());
-            assert_eq!(missing_locale(lookup), None, "{set} is set");
+            assert_eq!(missing_locale(lookup, Some("en_GB")), None, "{set} is set");
         }
     }
 
