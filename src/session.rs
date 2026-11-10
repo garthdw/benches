@@ -173,6 +173,7 @@ pub struct Grid {
     pub cursor_color: [u8; 3],
     pub metrics: Metrics,
     pub bg: [u8; 3],
+    pub scrollbar: Option<Scrollbar>,
 }
 
 impl Default for Grid {
@@ -188,6 +189,7 @@ impl Default for Grid {
             cursor_color: [0; 3],
             metrics: Metrics::default(),
             bg: rgb(DEFAULT_BG),
+            scrollbar: None,
         }
     }
 }
@@ -247,6 +249,53 @@ impl Grid {
     }
 }
 
+/// The thumb never shrinks below this, in points, so it stays easy to grab.
+pub const MIN_THUMB_POINTS: f32 = 24.0;
+
+/// Where the viewport sits in the scrollback, in rows.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Scrollbar {
+    total: u64,
+    offset: u64,
+    len: u64,
+}
+
+impl Scrollbar {
+    /// `None` when there is nothing to scroll, including on the alternate screen, which has no scrollback.
+    fn of(terminal: &Terminal<'static, '_>) -> Result<Option<Self>> {
+        if terminal.active_screen()? == Screen::Alternate {
+            return Ok(None);
+        }
+        let bar = terminal.scrollbar()?;
+        Ok((bar.total > bar.len).then_some(Self {
+            total: bar.total,
+            offset: bar.offset,
+            len: bar.len,
+        }))
+    }
+
+    /// The thumb's top and height within a track `track` pixels tall.
+    pub fn thumb(self, track: f32, min: f32) -> (f32, f32) {
+        let height = (track * self.len as f32 / self.total as f32)
+            .max(min)
+            .min(track);
+        let travel = self.total.saturating_sub(self.len).max(1);
+        let top = (track - height) * self.offset.min(travel) as f32 / travel as f32;
+        (top, height)
+    }
+
+    /// The scrollback row that puts the thumb's top at `top`.
+    fn row_at(self, top: f32, track: f32, min: f32) -> usize {
+        let (_, height) = self.thumb(track, min);
+        let travel = track - height;
+        if travel <= 0.0 {
+            return 0;
+        }
+        let rows = self.total.saturating_sub(self.len) as f32;
+        ((top / travel).clamp(0.0, 1.0) * rows).round() as usize
+    }
+}
+
 fn new_terminal<'cb>(cols: u16, rows: u16) -> Result<Terminal<'static, 'cb>> {
     let mut terminal = Terminal::new(cols, rows)?;
     terminal
@@ -303,7 +352,7 @@ struct GridBuilder {
     state: RenderState<'static>,
     rows: RowIterator<'static>,
     cells: CellIterator<'static>,
-    last_shown: Option<(CursorVisualStyle, bool, Presentation)>,
+    last_shown: Option<(CursorVisualStyle, bool, Presentation, Option<Scrollbar>)>,
     /// From the theme; without a background, selected cells swap their colours.
     selection_background: Option<RgbColor>,
     selection_foreground: Option<RgbColor>,
@@ -339,8 +388,9 @@ impl GridBuilder {
             CursorVisualStyle::BlockHollow
         };
         let cursor_blinking = snapshot.cursor_blinking()? && snapshot.cursor_visible()?;
-        let shown = (cursor_style, cursor_blinking, presentation);
-        // libghostty leaves the render state clean when only the cursor's style changes.
+        let scrollbar = Scrollbar::of(terminal)?;
+        let shown = (cursor_style, cursor_blinking, presentation, scrollbar);
+        // libghostty leaves the render state clean when only the cursor's style or the scrollback length changes.
         let unchanged = self.last_shown.replace(shown) == Some(shown);
         if matches!(snapshot.dirty()?, Dirty::Clean) && unchanged {
             return Ok(None);
@@ -434,6 +484,7 @@ impl GridBuilder {
             cursor_color: rgb(colors.cursor.unwrap_or(colors.foreground)),
             metrics: presentation.metrics,
             bg: rgb(colors.background),
+            scrollbar,
         }))
     }
 }
@@ -465,6 +516,7 @@ pub enum Visibility {
 struct PointerOutcome {
     bytes: Vec<u8>,
     selection_changed: bool,
+    scrolled: bool,
 }
 
 /// Moves whole lines out of `remainder`, keeping the fraction for the next delta.
@@ -522,6 +574,8 @@ struct TerminalInput {
     position: (f32, f32),
     next_autoscroll: Option<Instant>,
     wheel_remainder: f32,
+    /// How far below the thumb's top the pointer holds it, while dragging the scrollbar.
+    scrollbar_grab: Option<f32>,
 }
 
 impl TerminalInput {
@@ -545,6 +599,7 @@ impl TerminalInput {
             position: (0.0, 0.0),
             next_autoscroll: None,
             wheel_remainder: 0.0,
+            scrollbar_grab: None,
         })
     }
 
@@ -654,9 +709,46 @@ impl TerminalInput {
         Ok(())
     }
 
+    /// True if the pointer is on the scrollbar, which takes it ahead of selection and mouse reports.
+    fn drag_scrollbar(
+        &mut self,
+        terminal: &mut Terminal<'static, '_>,
+        surface: Surface,
+        input: PointerInput,
+    ) -> Result<bool> {
+        let metrics = surface.metrics;
+        let right_of_text =
+            metrics.padding + f32::from(surface.cols) * f32::from(metrics.cell_width);
+        match input.phase {
+            PointerPhase::Press
+                if input.button == Some(mouse::Button::Left)
+                    && self.position.0 >= right_of_text => {}
+            PointerPhase::Drag if self.scrollbar_grab.is_some() => {}
+            PointerPhase::Release => return Ok(self.scrollbar_grab.take().is_some()),
+            _ => return Ok(false),
+        }
+        let Some(scrollbar) = Scrollbar::of(terminal)? else {
+            return Ok(false);
+        };
+        let track = f32::from(surface.rows) * f32::from(metrics.cell_height);
+        let min = MIN_THUMB_POINTS * metrics.scale;
+        let y = self.position.1 - metrics.padding;
+        let grab = *self.scrollbar_grab.get_or_insert_with(|| {
+            let (top, height) = scrollbar.thumb(track, min);
+            // A press on the track centres the thumb under the pointer, as macOS does.
+            if (top..top + height).contains(&y) {
+                y - top
+            } else {
+                height / 2.0
+            }
+        });
+        terminal.scroll_viewport(ScrollViewport::Row(scrollbar.row_at(y - grab, track, min)));
+        Ok(true)
+    }
+
     fn pointer(
         &mut self,
-        terminal: &Terminal<'static, '_>,
+        terminal: &mut Terminal<'static, '_>,
         input: PointerInput,
     ) -> Result<PointerOutcome> {
         let Some(surface) = self.surface else {
@@ -664,9 +756,15 @@ impl TerminalInput {
         };
         let scale = surface.metrics.scale;
         self.position = (input.x * scale, input.y * scale);
+        if self.drag_scrollbar(terminal, surface, input)? {
+            return Ok(PointerOutcome {
+                scrolled: true,
+                ..PointerOutcome::default()
+            });
+        }
         let selection_changed = PointerOutcome {
-            bytes: Vec::new(),
             selection_changed: true,
+            ..PointerOutcome::default()
         };
         let grid_ref_point = Point::Viewport(Self::viewport_point(surface, self.position));
         let to_report = match input.phase {
@@ -731,7 +829,7 @@ impl TerminalInput {
         };
         Ok(PointerOutcome {
             bytes: self.report(terminal, surface, action, button, input.mods)?,
-            selection_changed: false,
+            ..PointerOutcome::default()
         })
     }
 
@@ -1305,7 +1403,7 @@ impl Actor {
                         }
                     }
                     Ok(Msg::Pointer(pointer)) => {
-                        if let Some(outcome) = input.pointer(&terminal, pointer).log_err("handle pointer") {
+                        if let Some(outcome) = input.pointer(&mut terminal, pointer).log_err("handle pointer") {
                             if !outcome.bytes.is_empty() {
                                 self.input.send(outcome.bytes).log_err("queue mouse report");
                             }
@@ -1313,6 +1411,7 @@ impl Actor {
                                 publisher.borrow_mut().builder.selection_changed();
                                 dirty = true;
                             }
+                            dirty |= outcome.scrolled;
                         }
                     }
                     Ok(Msg::Wheel(wheel)) => {
@@ -1775,11 +1874,11 @@ mod tests {
         terminal.vt_write(b"\x1b[?1000h\x1b[?1006h");
         let mut input = input_for_test();
         let press = input
-            .pointer(&terminal, pointer_at(PointerPhase::Press, 2, 1))
+            .pointer(&mut terminal, pointer_at(PointerPhase::Press, 2, 1))
             .unwrap();
         assert_eq!(press.bytes, b"\x1b[<0;3;2M");
         let release = input
-            .pointer(&terminal, pointer_at(PointerPhase::Release, 2, 1))
+            .pointer(&mut terminal, pointer_at(PointerPhase::Release, 2, 1))
             .unwrap();
         assert_eq!(release.bytes, b"\x1b[<0;3;2m");
     }
@@ -1791,11 +1890,11 @@ mod tests {
         let mut input = input_for_test();
         let mut press = pointer_at(PointerPhase::Press, 2, 1);
         press.mods = key::Mods::SHIFT;
-        let outcome = input.pointer(&terminal, press).unwrap();
+        let outcome = input.pointer(&mut terminal, press).unwrap();
         assert!(outcome.bytes.is_empty() && outcome.selection_changed);
     }
 
-    fn select_hello(terminal: &Terminal<'static, '_>, input: &mut TerminalInput) {
+    fn select_hello(terminal: &mut Terminal<'static, '_>, input: &mut TerminalInput) {
         input
             .pointer(terminal, pointer_at(PointerPhase::Press, 0, 0))
             .unwrap();
@@ -1812,7 +1911,7 @@ mod tests {
     fn dragging_selects_text_that_can_be_copied() {
         let mut terminal = new_terminal(20, 5).unwrap();
         terminal.vt_write(b"hello world");
-        select_hello(&terminal, &mut input_for_test());
+        select_hello(&mut terminal, &mut input_for_test());
         assert_eq!(selection_text(&terminal).unwrap().as_deref(), Some("hello"));
     }
 
@@ -1830,7 +1929,7 @@ mod tests {
         builder
             .build(&terminal, 1, Presentation::default())
             .unwrap();
-        select_hello(&terminal, &mut input_for_test());
+        select_hello(&mut terminal, &mut input_for_test());
         builder.selection_changed();
         let grid = builder
             .build(&terminal, 2, Presentation::default())
@@ -1880,7 +1979,7 @@ mod tests {
         let mut builder = GridBuilder::new().unwrap();
         builder.selection_background = Some(THEME_RED);
         builder.selection_foreground = Some(THEME_BLUE);
-        select_hello(&terminal, &mut input_for_test());
+        select_hello(&mut terminal, &mut input_for_test());
         let grid = builder
             .build(&terminal, 1, Presentation::default())
             .unwrap()
@@ -1892,15 +1991,15 @@ mod tests {
 
     #[test]
     fn dragging_past_the_top_scrolls_one_line_per_tick() {
-        let terminal = scrolled_terminal();
+        let mut terminal = scrolled_terminal();
         let mut input = input_for_test();
         let before = top_line(&terminal);
         input
-            .pointer(&terminal, pointer_at(PointerPhase::Press, 0, 2))
+            .pointer(&mut terminal, pointer_at(PointerPhase::Press, 0, 2))
             .unwrap();
         let mut drag = pointer_at(PointerPhase::Drag, 0, 0);
         drag.y = -30.0;
-        input.pointer(&terminal, drag).unwrap();
+        input.pointer(&mut terminal, drag).unwrap();
         let due = input
             .next_autoscroll
             .expect("autoscroll should be scheduled");
@@ -1908,6 +2007,118 @@ mod tests {
         assert!(input.tick_autoscroll(&terminal, due).unwrap());
         let number = |line: &str| line.trim_start_matches("line").parse::<u32>().unwrap();
         assert_eq!(number(&before) - number(&top_line(&terminal)), 1);
+    }
+
+    #[test]
+    fn the_thumb_shows_the_viewport_share_and_position() {
+        let scrollbar = Scrollbar {
+            total: 100,
+            offset: 75,
+            len: 25,
+        };
+        assert_eq!(scrollbar.thumb(200.0, 10.0), (150.0, 50.0));
+        let top = Scrollbar {
+            offset: 0,
+            ..scrollbar
+        };
+        assert_eq!(top.thumb(200.0, 10.0), (0.0, 50.0));
+        let long = Scrollbar {
+            total: 10_000,
+            ..top
+        };
+        assert_eq!(long.thumb(200.0, 10.0).1, 10.0);
+    }
+
+    #[test]
+    fn a_thumb_position_maps_back_to_its_row() {
+        let scrollbar = Scrollbar {
+            total: 100,
+            offset: 30,
+            len: 25,
+        };
+        let (top, _) = scrollbar.thumb(200.0, 10.0);
+        assert_eq!(scrollbar.row_at(top, 200.0, 10.0), 30);
+        assert_eq!(scrollbar.row_at(-50.0, 200.0, 10.0), 0);
+        assert_eq!(scrollbar.row_at(500.0, 200.0, 10.0), 75);
+    }
+
+    #[test]
+    fn only_a_primary_screen_with_history_has_a_scrollbar() {
+        assert_eq!(Grid::from_vt(b"hi", 20, 5).unwrap().scrollbar, None);
+        let mut history = String::new();
+        for line in 0..30 {
+            history.push_str(&format!("line{line}\r\n"));
+        }
+        let grid = Grid::from_vt(history.as_bytes(), 20, 5).unwrap();
+        assert_eq!(
+            grid.scrollbar,
+            Some(Scrollbar {
+                total: 31,
+                offset: 26,
+                len: 5
+            })
+        );
+        history.push_str("\x1b[?1049h");
+        assert_eq!(
+            Grid::from_vt(history.as_bytes(), 20, 5).unwrap().scrollbar,
+            None
+        );
+    }
+
+    #[test]
+    fn output_below_a_scrolled_viewport_publishes_a_new_scrollbar() {
+        let mut terminal = scrolled_terminal();
+        terminal.scroll_viewport(ScrollViewport::Top);
+        let mut builder = GridBuilder::new().unwrap();
+        let shown = Presentation::default();
+        let before = builder.build(&terminal, 1, shown).unwrap().unwrap();
+        terminal.vt_write(b"more\r\n");
+        let after = builder.build(&terminal, 2, shown).unwrap().unwrap();
+        assert_ne!(after.scrollbar, before.scrollbar);
+    }
+
+    fn on_scrollbar(phase: PointerPhase, y: f32) -> PointerInput {
+        PointerInput {
+            y,
+            ..pointer_at(phase, 0, 0)
+        }
+    }
+
+    #[test]
+    fn pressing_the_track_and_dragging_the_thumb_scrolls() {
+        let mut terminal = scrolled_terminal();
+        // Mouse reports would otherwise take the press.
+        terminal.vt_write(b"\x1b[?1000h\x1b[?1006h");
+        let mut input = input_for_test();
+        let right_of_text = f32::from(TEST_SURFACE.cols * TEST_SURFACE.metrics.cell_width) + 2.0;
+        let mut at = |terminal: &mut Terminal<'static, '_>, phase, y| {
+            let pointer = PointerInput {
+                x: right_of_text,
+                ..on_scrollbar(phase, y)
+            };
+            input.pointer(terminal, pointer).unwrap()
+        };
+        let press = at(&mut terminal, PointerPhase::Press, 0.0);
+        assert!(press.scrolled && press.bytes.is_empty());
+        assert_eq!(top_line(&terminal), "line0");
+        at(&mut terminal, PointerPhase::Drag, 100.0);
+        assert_eq!(top_line(&terminal), "line26");
+        at(&mut terminal, PointerPhase::Release, 100.0);
+        let elsewhere = at(&mut terminal, PointerPhase::Drag, 0.0);
+        assert!(!elsewhere.scrolled);
+        assert_eq!(top_line(&terminal), "line26");
+    }
+
+    #[test]
+    fn a_press_beside_the_text_without_history_still_selects() {
+        let mut terminal = new_terminal(20, 5).unwrap();
+        let mut input = input_for_test();
+        let press = PointerInput {
+            x: 205.0,
+            ..on_scrollbar(PointerPhase::Press, 10.0)
+        };
+        let outcome = input.pointer(&mut terminal, press).unwrap();
+        assert!(!outcome.scrolled && outcome.selection_changed);
     }
 
     #[test]
@@ -2030,10 +2241,10 @@ mod tests {
 
     #[test]
     fn pointer_input_before_the_first_resize_is_ignored() {
-        let terminal = new_terminal(20, 5).unwrap();
+        let mut terminal = new_terminal(20, 5).unwrap();
         let mut input = TerminalInput::new().unwrap();
         let outcome = input
-            .pointer(&terminal, pointer_at(PointerPhase::Press, 0, 0))
+            .pointer(&mut terminal, pointer_at(PointerPhase::Press, 0, 0))
             .unwrap();
         assert!(outcome.bytes.is_empty() && !outcome.selection_changed);
     }

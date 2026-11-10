@@ -1220,6 +1220,10 @@ const SCENES: &[Scene] = &[
     ("unicode", |state| {
         show_scene(state, SCENE_UNICODE.as_bytes())
     }),
+    ("scrollback", |state| {
+        let lines: String = (1..=40).map(|line| format!("{line}\r\n")).collect();
+        show_scene(state, lines.as_bytes())
+    }),
     ("workspace", show_workspace_scene),
     ("palette", |state| {
         show_workspace_scene(state);
