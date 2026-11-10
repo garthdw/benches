@@ -200,25 +200,26 @@ fn palette_key(state: &mut State, event: &KeyEvent, tx: &mut Tx) -> bool {
 fn shortcut(state: &mut State, event: &KeyEvent, tx: &mut Tx) -> bool {
     let mods = event.mods;
     let plain_command = !mods.shift && !mods.alt && !mods.ctrl;
-    let digit_index = |digit: char| digit.to_digit(10).map(|digit| digit as usize - 1);
     match &event.key {
         Key::Command('n') if plain_command => pick_folder(tx),
         Key::Command('p') if plain_command => open_palette(state, tx),
         Key::Command('t') if plain_command => open_tab(state, "shell", None),
         Key::Command('w') if plain_command => state.workspace.close_tab(),
-        Key::Command(digit @ '1'..='9') if plain_command => {
-            state
-                .workspace
-                .select_project(digit_index(*digit).unwrap_or(0));
-        }
         Key::Command('[' | '{') if mods.shift => state.workspace.cycle_tab(-1),
         Key::Command(']' | '}') if mods.shift => state.workspace.cycle_tab(1),
-        Key::Text(text) if mods.ctrl && !mods.cmd && !mods.alt && !mods.shift => {
-            match tx.key_base().or_else(|| text.chars().next()) {
-                Some(digit @ '1'..='9') => {
-                    state.workspace.select_tab(digit_index(digit).unwrap_or(0));
-                }
-                _ => return false,
+        // Shift turns the digit into a symbol, so the unmodified key says which number it was.
+        Key::Command(character) if !mods.alt && !mods.ctrl => {
+            let digit = tx.key_base().unwrap_or(*character).to_digit(10);
+            let Some(index) = digit
+                .filter(|digit| *digit >= 1)
+                .map(|digit| digit as usize - 1)
+            else {
+                return false;
+            };
+            if mods.shift {
+                state.workspace.select_project(index);
+            } else {
+                state.workspace.select_tab(index);
             }
         }
         _ => return false,
@@ -834,17 +835,28 @@ mod tests {
     }
 
     #[test]
-    fn command_digits_pick_projects_and_control_digits_pick_tabs() {
+    fn command_shift_digits_pick_projects_and_command_digits_pick_tabs() {
         let mut runtime = workspace_runtime();
+        let shifted = Mods {
+            shift: true,
+            ..command()
+        };
+        press(&mut runtime, Key::Command('2'), shifted);
         press(&mut runtime, Key::Command('2'), command());
+        let workspace = &runtime.state.workspace;
+        assert_eq!(workspace.active, 1);
+        assert_eq!(workspace.projects[1].active_tab, 1);
+    }
+
+    #[test]
+    fn control_digits_reach_the_terminal() {
+        let mut runtime = workspace_runtime();
         let control = Mods {
             ctrl: true,
             ..Mods::default()
         };
         press(&mut runtime, Key::Text("2".into()), control);
-        let workspace = &runtime.state.workspace;
-        assert_eq!(workspace.active, 1);
-        assert_eq!(workspace.projects[1].active_tab, 1);
+        assert_eq!(runtime.state.workspace.projects[0].active_tab, 0);
     }
 
     #[test]
