@@ -160,6 +160,18 @@ impl Workspace {
             .or_else(|| self.active_session())
     }
 
+    /// The tab or tray process keys go to, by the same rule as `focused_session`.
+    pub fn focused_tab(&self) -> Option<(Slot, &Tab)> {
+        let project = self.project()?;
+        if project.drawer_focused
+            && let Some(tab) = project.drawer_tab()
+        {
+            return Some((Slot::Tray(project.drawer), tab));
+        }
+        let tab = project.tabs.get(project.active_tab)?;
+        Some((Slot::Tab(project.active_tab), tab))
+    }
+
     #[cfg(test)]
     pub fn sessions(&self) -> impl Iterator<Item = &Session> {
         self.tab_sessions().chain(self.tray_sessions())

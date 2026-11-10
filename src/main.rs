@@ -709,6 +709,23 @@ fn view(state: &State, cx: &mut Cx<State>) -> El {
                 ),
         );
     }
+    if let Some((_, tab)) = state.workspace.focused_tab()
+        && tab.status != Status::Running
+    {
+        focus_overlays.push(
+            row()
+                .key("restart-hint")
+                .absolute(12.0, 12.0)
+                .px(10.0)
+                .py(6.0)
+                .radius(6.0)
+                .fill(theme.control_off)
+                .child(
+                    text(format!("{} · Enter restarts", status_text(&tab.status)))
+                        .color(theme.text),
+                ),
+        );
+    }
     let project = state.workspace.project();
     let drawer_focused = project.is_some_and(|project| project.drawer_focused);
     let mut drawer_overlays = Vec::new();
@@ -983,6 +1000,15 @@ fn on_key(state: &mut State, event: &KeyEvent, tx: &mut Tx) -> bool {
         return true;
     }
     if shortcut(state, event, tx) {
+        return true;
+    }
+    if event.key == Key::Enter
+        && event.mods == Mods::default()
+        && tx.focused().is_none()
+        && let Some((slot, tab)) = state.workspace.focused_tab()
+        && tab.status != Status::Running
+    {
+        respawn(state, state.workspace.active, slot);
         return true;
     }
     // A focused field, such as the command centre's, keeps the keys its editor didn't take.
@@ -1785,5 +1811,35 @@ mod tests {
             loaded.workspace.snapshot(true),
             state.workspace.snapshot(true)
         );
+    }
+
+    #[test]
+    fn enter_restarts_an_exited_tab() {
+        let mut state = State::default();
+        state
+            .workspace
+            .add_project(Project::new("/tmp".into(), vec![]));
+        open_tab(&mut state, "quick", Some("sh -c 'exit 0'"));
+        let mut runtime = runtime_with(state);
+        runtime.poll = Some(poll);
+        runtime.on_key = Some(on_key);
+        let old = runtime.state.workspace.active_session().map(Session::id);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        let mut frame = 1.0;
+        while runtime.find("restart-hint").is_none() {
+            assert!(std::time::Instant::now() < deadline, "timed out");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            frame += 1.0;
+            runtime.frame(frame / 60.0);
+        }
+        runtime.key(KeyEvent {
+            key: Key::Enter,
+            mods: Mods::default(),
+        });
+        runtime.frame((frame + 1.0) / 60.0);
+        let tab = runtime.state.workspace.active_tab().unwrap();
+        assert_ne!(Some(tab.session.id()), old);
+        assert_eq!(tab.status, Status::Running);
+        assert_eq!(tab.command.as_deref(), Some("sh -c 'exit 0'"));
     }
 }
