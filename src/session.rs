@@ -4,8 +4,8 @@ use std::fs::File;
 use std::io::{Read, Write};
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::os::unix::process::CommandExt;
-use std::path::Path;
-use std::process::{Child, Command, Stdio};
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -71,6 +71,19 @@ pub enum Event {
     PasteRejected(String),
     /// The program's title (OSC 0 or 2); empty when it clears it.
     Title(String),
+    Exited(ExitStatus),
+    /// Sent while not shown, once for each level raised since the session was last shown.
+    Attention(Attention),
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Attention {
+    #[default]
+    None,
+    /// New output.
+    Activity,
+    /// A bell or desktop notification (OSC 9 or 777).
+    Alert,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -412,6 +425,7 @@ enum Msg {
     Paste { text: String, allow_unsafe: bool },
     Resize(Surface),
     Visibility(Visibility),
+    Stop,
 }
 
 /// How much of a session the UI shows, which decides what it publishes.
@@ -783,6 +797,8 @@ impl TerminalInput {
 /// A process on a PTY. Its `Terminal` lives on an actor thread, as libghostty types are `!Send`.
 pub struct Session {
     id: u64,
+    /// Cleared by the actor before it reaps the process, after which the pid may be reused.
+    pid: Arc<Mutex<Option<i32>>>,
     commands: Option<Sender<Msg>>,
     grid: Arc<Mutex<Arc<Grid>>>,
     events: Receiver<Event>,
@@ -825,6 +841,7 @@ impl Session {
             });
         }
         let child = process.spawn()?;
+        let pid = Arc::new(Mutex::new(Some(child.id() as i32)));
 
         let master = pty.master;
         let (output_tx, output_rx) = bounded(64);
@@ -857,6 +874,7 @@ impl Session {
             commands: commands_rx,
             input: input_tx,
             child,
+            pid: pid.clone(),
             master,
             slot: grid.clone(),
             events: events_tx,
@@ -870,10 +888,11 @@ impl Session {
                 );
                 (actor.waker)();
             }
-            terminate(&mut actor.child);
+            terminate(&mut actor.child, &actor.pid);
         });
         Ok(Self {
             id: next_id(),
+            pid,
             commands: Some(commands),
             grid,
             events,
@@ -886,12 +905,41 @@ impl Session {
     pub fn fixture(grid: Grid) -> Self {
         Self {
             id: next_id(),
+            pid: Arc::default(),
             commands: None,
             grid: Arc::new(Mutex::new(Arc::new(grid))),
             events: unbounded().1,
             sent_surface: std::cell::Cell::new(None),
             visibility: std::cell::Cell::new(Visibility::Shown),
         }
+    }
+
+    /// The process's current directory, which follows the shell's `cd`.
+    pub fn cwd(&self) -> Option<PathBuf> {
+        use std::os::unix::ffi::OsStrExt;
+        // Held through the lookup so the actor can't reap the process, freeing its pid, meanwhile.
+        let pid = self.pid.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut info = std::mem::MaybeUninit::<libc::proc_vnodepathinfo>::zeroed();
+        let size = std::mem::size_of::<libc::proc_vnodepathinfo>() as i32;
+        // SAFETY: `info` is a writable buffer of `size` bytes.
+        let written = unsafe {
+            libc::proc_pidinfo(
+                (*pid)?,
+                libc::PROC_PIDVNODEPATHINFO,
+                0,
+                info.as_mut_ptr().cast(),
+                size,
+            )
+        };
+        if written != size {
+            return None;
+        }
+        // SAFETY: the kernel filled the whole struct, and zeroed bytes are valid for it anyway.
+        let path = unsafe { info.assume_init() }.pvi_cdir.vip_path;
+        // SAFETY: `vip_path` is a flat 1024-byte buffer split into rows by libc.
+        let bytes: &[u8; 1024] = unsafe { &*path.as_ptr().cast() };
+        let path = std::ffi::CStr::from_bytes_until_nul(bytes).ok()?;
+        Some(PathBuf::from(std::ffi::OsStr::from_bytes(path.to_bytes())))
     }
 
     pub fn id(&self) -> u64 {
@@ -927,6 +975,11 @@ impl Session {
 
     pub fn paste(&self, text: String, allow_unsafe: bool) {
         self.send(Msg::Paste { text, allow_unsafe });
+    }
+
+    /// Ends the process but keeps its last screen.
+    pub fn stop(&self) {
+        self.send(Msg::Stop);
     }
 
     pub fn next_event(&self) -> Option<Event> {
@@ -1017,6 +1070,7 @@ struct Actor {
     commands: Receiver<Msg>,
     input: Sender<Vec<u8>>,
     child: Child,
+    pid: Arc<Mutex<Option<i32>>>,
     master: OwnedFd,
     slot: Arc<Mutex<Arc<Grid>>>,
     events: Sender<Event>,
@@ -1079,6 +1133,16 @@ impl Actor {
             let title_changed = title_changed.clone();
             move |_| title_changed.set(true)
         })?;
+        let alerted = Rc::new(std::cell::Cell::new(false));
+        terminal.on_bell({
+            let alerted = alerted.clone();
+            move |_| alerted.set(true)
+        })?;
+        terminal.on_desktop_notification({
+            let alerted = alerted.clone();
+            move |_, _| alerted.set(true)
+        })?;
+        let mut attention = Attention::None;
 
         let mut input = TerminalInput::new()?;
         let mut resize = ResizeThrottle {
@@ -1104,10 +1168,23 @@ impl Actor {
                 .map_or(wait, |due| wait.min(due.saturating_duration_since(now)));
             select! {
                 recv(self.output) -> bytes => match bytes {
-                    Ok(bytes) => { terminal.vt_write(&bytes); dirty = true; }
+                    Ok(bytes) => {
+                        terminal.vt_write(&bytes);
+                        dirty = true;
+                        let level = if alerted.replace(false) { Attention::Alert } else { Attention::Activity };
+                        if titles.visibility != Visibility::Shown && level > attention {
+                            attention = level;
+                            self.events.send(Event::Attention(level)).log_err("queue attention");
+                            (self.waker)();
+                        }
+                    }
                     Err(_) => {
                         self.output = never();
-                        self.child.wait().log_err("wait for process");
+                        forget(&self.pid);
+                        if let Some(status) = self.child.wait().log_err("wait for process") {
+                            self.events.send(Event::Exited(status)).log_err("queue exit");
+                            (self.waker)();
+                        }
                         terminal.vt_write(b"\r\n[process exited]\r\n");
                         dirty = true;
                     }
@@ -1173,7 +1250,11 @@ impl Actor {
                         resize.pending = Some(surface);
                         dirty = true;
                     }
+                    Ok(Msg::Stop) => terminate(&mut self.child, &self.pid),
                     Ok(Msg::Visibility(visibility)) => {
+                        if visibility == Visibility::Shown {
+                            attention = Attention::None;
+                        }
                         titles.visibility = visibility;
                         publisher.borrow_mut().visible = visibility == Visibility::Shown;
                         dirty = true;
@@ -1323,7 +1404,13 @@ fn signal_group(group: Pid, signal: Signal) {
     }
 }
 
-fn terminate(child: &mut Child) {
+/// Call before reaping `Child`, which frees its pid for reuse.
+fn forget(pid: &Mutex<Option<i32>>) {
+    *pid.lock().unwrap_or_else(PoisonError::into_inner) = None;
+}
+
+fn terminate(child: &mut Child, pid: &Mutex<Option<i32>>) {
+    forget(pid);
     // Also true once the actor has reaped the process, whose pid may have been reused.
     if matches!(child.try_wait(), Ok(Some(_))) {
         return;
@@ -2079,6 +2166,95 @@ mod tests {
             || format!("cols: {}", session.grid().cols),
             || (session.grid().cols == 33).then_some(()),
         );
+    }
+
+    fn wait_for_exit(session: &Session) -> ExitStatus {
+        wait_until(
+            Duration::from_secs(15),
+            || "the process never exited".to_owned(),
+            || match session.next_event() {
+                Some(Event::Exited(status)) => Some(status),
+                _ => None,
+            },
+        )
+    }
+
+    #[test]
+    fn an_exit_status_comes_back_to_the_ui() {
+        let session =
+            Session::spawn(Some("sh -c 'exit 3'"), Path::new("/tmp"), Arc::new(|| {})).unwrap();
+        assert_eq!(wait_for_exit(&session).code(), Some(3));
+    }
+
+    /// A reaped pid can be reused, so `cwd` would read another process's folder.
+    #[test]
+    fn exited_and_stopped_sessions_forget_their_pid() {
+        let exited =
+            Session::spawn(Some("sh -c 'exit 0'"), Path::new("/tmp"), Arc::new(|| {})).unwrap();
+        wait_for_exit(&exited);
+        assert_eq!(*exited.pid.lock().unwrap(), None);
+
+        let stopped =
+            Session::spawn(Some("sleep 100"), Path::new("/tmp"), Arc::new(|| {})).unwrap();
+        thread::sleep(Duration::from_millis(500));
+        stopped.stop();
+        wait_for_exit(&stopped);
+        assert_eq!(*stopped.pid.lock().unwrap(), None);
+    }
+
+    #[test]
+    fn the_working_directory_follows_the_shell() {
+        let session = spawn_shell();
+        assert_eq!(session.cwd(), Some(PathBuf::from("/private/tmp")));
+        type_line(&session, "cd /usr/bin");
+        wait_until(
+            Duration::from_secs(5),
+            || format!("cwd is {:?}", session.cwd()),
+            || (session.cwd() == Some(PathBuf::from("/usr/bin"))).then_some(()),
+        );
+        assert_eq!(Session::fixture(Grid::default()).cwd(), None);
+    }
+
+    #[test]
+    fn stopping_ends_the_process_and_keeps_the_session() {
+        let session =
+            Session::spawn(Some("sleep 100"), Path::new("/tmp"), Arc::new(|| {})).unwrap();
+        thread::sleep(Duration::from_millis(500));
+        session.stop();
+        assert!(!wait_for_exit(&session).success());
+        wait_for_line(&session, "[process exited]");
+    }
+
+    fn attention_events(session: &Session) -> Vec<Attention> {
+        std::iter::from_fn(|| session.next_event())
+            .filter_map(|event| match event {
+                Event::Attention(attention) => Some(attention),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn an_unseen_session_asks_for_attention_once_per_level() {
+        let session = spawn_shell();
+        session.set_visibility(Visibility::Listed);
+        type_line(
+            &session,
+            "echo one; printf '\\a'; echo two; printf '\\a'; echo three",
+        );
+        thread::sleep(Duration::from_millis(1500));
+        assert_eq!(
+            attention_events(&session),
+            [Attention::Activity, Attention::Alert]
+        );
+        session.set_visibility(Visibility::Shown);
+        type_line(&session, "printf '\\a'; echo shown");
+        wait_for_line(&session, "shown");
+        assert_eq!(attention_events(&session), []);
+        session.set_visibility(Visibility::Hidden);
+        type_line(&session, "printf '\\a'");
+        thread::sleep(Duration::from_millis(1000));
+        assert!(attention_events(&session).contains(&Attention::Alert));
     }
 
     #[test]

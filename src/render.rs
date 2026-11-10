@@ -541,14 +541,27 @@ impl TerminalCompositor {
                 scale: site.scale,
             },
         };
-        // Hidden tabs share the visible area, so they are sized too.
-        for session in state.workspace.sessions() {
-            session.resize(surface);
-        }
+        // Hidden tabs share the visible area, as closed tray processes share the drawer's, so they are sized too.
+        let workspace = &state.workspace;
+        let session = if site.mark == crate::DRAWER_MARK {
+            workspace
+                .tray_sessions()
+                .for_each(|session| session.resize(surface));
+            // Not `drawer_session`, which is gone once closing starts, so the drawer slides out showing its process.
+            workspace
+                .project()
+                .and_then(|project| project.tray.get(project.drawer))
+                .map(|tab| &tab.session)
+        } else {
+            workspace
+                .tab_sessions()
+                .for_each(|session| session.resize(surface));
+            workspace.active_session()
+        };
 
-        let grid = state.grid();
+        let grid = session.map_or_else(Default::default, Session::grid);
         let built = (
-            state.session().map_or(0, Session::id),
+            session.map_or(0, Session::id),
             grid.generation,
             rect,
             gpu.atlas.epoch,

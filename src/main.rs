@@ -16,10 +16,15 @@ use rune::{
     Tx, Waker, WheelEvent, col, effect, el, icon, row, text, text_input,
 };
 
-use session::{Event, Grid, PointerInput, PointerPhase, Session, WheelInput};
-use workspace::{Project, Tab, Workspace};
+use session::{Attention, Event, Grid, PointerInput, PointerPhase, Session, WheelInput};
+use workspace::{Project, Status, Tab, Workspace};
 
 const TERMINAL_MARK: u32 = 1;
+const DRAWER_MARK: u32 = 2;
+const TRAY_BAR_HEIGHT: f32 = 34.0;
+/// Fixed, so the drawer's terminal keeps its size while the drawer slides.
+const DRAWER_HEIGHT: f32 = 300.0;
+const DOT: f32 = 7.0;
 /// Wider than the traffic lights, which sit over the sidebar.
 const SIDEBAR_WIDTH: f32 = 200.0;
 /// The sidebar's top padding too, so the traffic lights clear the first project.
@@ -55,8 +60,10 @@ pub struct State {
     waker: Option<Waker>,
     workspace: Workspace,
     started: bool,
-    /// Session id and generation last drawn.
-    drawn: (u64, u64),
+    /// Session id and generation last drawn for the tab and the drawer.
+    drawn: [(u64, u64); 2],
+    /// The session keys went to at the last poll.
+    focused: u64,
     pending_paste: Option<String>,
     preedit: String,
     option_held: bool,
@@ -68,35 +75,91 @@ pub struct State {
 }
 
 impl State {
+    /// The session keys go to.
     fn session(&self) -> Option<&Session> {
-        self.workspace.active_session()
-    }
-
-    fn grid(&self) -> Arc<Grid> {
-        self.session().map_or_else(Arc::default, Session::grid)
+        self.workspace.focused_session()
     }
 
     fn spawn_tab(&self, title: &str, command: Option<&str>, cwd: &Path) -> Tab {
         let waker = self.waker.clone().unwrap_or_else(|| Arc::new(|| {}));
-        let session = Session::spawn(command, cwd, waker).unwrap_or_else(|error| {
-            Session::fixture(Grid::message(&format!(
-                "failed to start {title}: {error:#}"
-            )))
-        });
-        Tab::new(title, session)
+        let mut tab = match Session::spawn(command, cwd, waker) {
+            Ok(session) => Tab::new(title, session),
+            Err(error) => {
+                let message = format!("failed to start {title}: {error:#}");
+                let mut tab = Tab::new(title, Session::fixture(Grid::message(&message)));
+                tab.status = Status::Failed(format!("{error:#}"));
+                tab
+            }
+        };
+        tab.command = command.map(str::to_owned);
+        tab.cwd = Some(cwd.to_owned());
+        tab
+    }
+
+    fn active_root(&self) -> Option<PathBuf> {
+        self.workspace.project().map(|project| project.root.clone())
     }
 }
 
 fn open_tab(state: &mut State, title: &str, command: Option<&str>) {
-    let Some(root) = state
-        .workspace
-        .project()
-        .map(|project| project.root.clone())
-    else {
+    if let Some(root) = state.active_root() {
+        let tab = state.spawn_tab(title, command, &root);
+        state.workspace.add_tab(tab);
+    }
+}
+
+/// Runs in the focused shell's folder, so a command typed for a subfolder works there.
+fn open_tray(state: &mut State, command: &str) {
+    let cwd = state.session().and_then(Session::cwd);
+    if let Some(cwd) = cwd.or_else(|| state.active_root()) {
+        let tab = state.spawn_tab(command, Some(command), &cwd);
+        state.workspace.add_tray(tab);
+    }
+}
+
+/// Stops a running tray process first and respawns it from `poll` once it exits.
+fn restart_tray(state: &mut State, index: usize) {
+    let Some(tab) = state.workspace.tray_mut(index) else {
         return;
     };
-    let tab = state.spawn_tab(title, command, &root);
-    state.workspace.add_tab(tab);
+    if tab.status == Status::Running {
+        tab.restart = true;
+        tab.stop();
+    } else {
+        respawn_tray(state, state.workspace.active, index);
+    }
+}
+
+fn respawn_tray(state: &mut State, project: usize, index: usize) {
+    let Some(project_ref) = state.workspace.projects.get(project) else {
+        return;
+    };
+    let Some(old) = project_ref.tray.get(index) else {
+        return;
+    };
+    let cwd = old.cwd.clone().unwrap_or_else(|| project_ref.root.clone());
+    let tab = state.spawn_tab(&old.title, old.command.as_deref(), &cwd);
+    state.workspace.replace_tray(project, index, tab);
+}
+
+fn tray_action(state: &mut State, index: usize, picked: Option<&str>) {
+    match picked {
+        Some("restart") => restart_tray(state, index),
+        Some("stop") => {
+            if let Some(tab) = state.workspace.tray_mut(index) {
+                tab.stop();
+            }
+        }
+        Some("remove") => state.workspace.remove_tray(index),
+        _ => {}
+    }
+}
+
+fn toggle_last_drawer(state: &mut State) {
+    if let Some(project) = state.workspace.project() {
+        let index = project.drawer.min(project.tray.len().saturating_sub(1));
+        state.workspace.toggle_drawer(index);
+    }
 }
 
 fn open_project(state: &mut State, root: PathBuf) {
@@ -127,7 +190,7 @@ fn pick_new_tab(state: &mut State, picked: Option<&str>, tx: &mut Tx) {
     match picked {
         Some("shell") => run_action(state, &Action::Shell, tx),
         Some("lazygit") => run_action(state, &Action::Lazygit, tx),
-        Some("palette") => open_palette(state, tx),
+        Some("palette" | "tray") => open_palette(state, tx),
         _ => {}
     }
 }
@@ -138,6 +201,7 @@ enum Action {
     Lazygit,
     OpenProject,
     Run(String),
+    Tray(String),
 }
 
 impl Action {
@@ -147,6 +211,7 @@ impl Action {
             Action::Lazygit => "New lazygit tab".to_owned(),
             Action::OpenProject => "Open project…".to_owned(),
             Action::Run(command) => format!("Run “{command}” in a new tab"),
+            Action::Tray(command) => format!("Run “{command}” in the tray"),
         }
     }
 }
@@ -167,6 +232,7 @@ fn palette_actions(query: &str) -> Vec<Action> {
         .collect();
     if !query.is_empty() {
         actions.push(Action::Run(query.to_owned()));
+        actions.push(Action::Tray(query.to_owned()));
     }
     actions
 }
@@ -193,6 +259,7 @@ fn run_action(state: &mut State, action: &Action, tx: &mut Tx) {
         Action::Lazygit => open_tab(state, "lazygit", Some("lazygit")),
         Action::OpenProject => pick_folder(tx),
         Action::Run(command) => open_tab(state, command, Some(command)),
+        Action::Tray(command) => open_tray(state, command),
     }
 }
 
@@ -202,6 +269,13 @@ fn palette_key(state: &mut State, event: &KeyEvent, tx: &mut Tx) -> bool {
         Key::Escape => state.palette_open = false,
         Key::Up => state.palette_selected = state.palette_selected.min(last).saturating_sub(1),
         Key::Down => state.palette_selected = (state.palette_selected + 1).min(last),
+        Key::Enter if event.mods.cmd => {
+            let query = state.palette.text.trim().to_owned();
+            if !query.is_empty() {
+                state.palette_open = false;
+                open_tray(state, &query);
+            }
+        }
         Key::Enter => run_palette(state, state.palette_selected, tx),
         _ => return false,
     }
@@ -221,10 +295,18 @@ fn shortcut(state: &mut State, event: &KeyEvent, tx: &mut Tx) -> bool {
         open_palette(state, tx);
     } else if pressed("mod+b") {
         state.sidebar_hidden = !state.sidebar_hidden;
+    } else if pressed("mod+j") {
+        toggle_last_drawer(state);
     } else if pressed("mod+t") {
         run_action(state, &Action::Shell, tx);
     } else if pressed("mod+w") {
-        state.workspace.close_tab();
+        match state.workspace.project() {
+            Some(project) if project.drawer_focused => {
+                let index = project.drawer;
+                state.workspace.remove_tray(index);
+            }
+            _ => state.workspace.close_tab(),
+        }
     } else if pressed("mod+shift+[") {
         state.workspace.cycle_tab(-1);
     } else if pressed("mod+shift+]") {
@@ -248,14 +330,14 @@ fn pressed(binding: &str, event: &KeyEvent, tx: &Tx) -> bool {
 }
 
 fn send_pointer(
-    state: &State,
+    session: Option<&Session>,
     phase: PointerPhase,
     button: Option<mouse::Button>,
     x: f32,
     y: f32,
     mods: Mods,
 ) {
-    if let Some(session) = state.session() {
+    if let Some(session) = session {
         session.pointer(PointerInput {
             phase,
             button,
@@ -293,20 +375,125 @@ fn resolve_paste(state: &mut State, confirmed: bool) {
     }
 }
 
+fn dot(color: Color) -> El {
+    el().size(DOT, DOT).radius(DOT / 2.0).fill(color)
+}
+
+/// A terminal drawn into `mark`, taking pointer input for the session `pick` returns.
+/// Pressing it sends keys to it, so the drawer and the tab each take focus by click.
+fn terminal_surface(mark: u32, key: &str, pick: fn(&Workspace) -> Option<&Session>) -> El {
+    let drawer = mark == DRAWER_MARK;
+    effect(mark)
+        .key(key)
+        .cursor(Cursor::Text)
+        .pointer_buttons([PointerButton::Middle])
+        .on_drag(move |state: &mut State, drag: &mut Drag, tx: &mut Tx| {
+            let phase = match drag.phase {
+                Phase::Down => PointerPhase::Press,
+                Phase::Move => PointerPhase::Drag,
+                Phase::Up => PointerPhase::Release,
+            };
+            let button = match tx.button() {
+                PointerButton::Middle => mouse::Button::Middle,
+                _ => mouse::Button::Left,
+            };
+            let focus_moves = phase == PointerPhase::Press
+                && state
+                    .workspace
+                    .project()
+                    .is_some_and(|project| project.drawer_focused != drawer);
+            if focus_moves {
+                state.workspace.focus_drawer(drawer);
+            } else {
+                tx.live_only();
+            }
+            let session = pick(&state.workspace);
+            send_pointer(session, phase, Some(button), drag.x, drag.y, tx.mods());
+        })
+        .on_secondary_press_local(move |state: &mut State, event: PointerEvent, tx: &mut Tx| {
+            // Rune reports the right button once, with no separate release.
+            for phase in [PointerPhase::Press, PointerPhase::Release] {
+                let button = Some(mouse::Button::Right);
+                let session = pick(&state.workspace);
+                send_pointer(session, phase, button, event.x, event.y, tx.mods());
+            }
+        })
+        .on_pointer_move_local(move |state: &mut State, event: PointerEvent, tx: &mut Tx| {
+            let session = pick(&state.workspace);
+            send_pointer(
+                session,
+                PointerPhase::Move,
+                None,
+                event.x,
+                event.y,
+                tx.mods(),
+            );
+            tx.live_only();
+        })
+        .on_wheel(move |state: &mut State, event: WheelEvent, tx: &mut Tx| {
+            if let Some(session) = pick(&state.workspace) {
+                session.wheel(WheelInput {
+                    dy: event.dy,
+                    x: event.x,
+                    y: event.y,
+                    mods: input::vt_mods(event.mods),
+                });
+            }
+            tx.live_only();
+            true
+        })
+}
+
+fn status_text(status: &Status) -> &str {
+    match status {
+        Status::Running => "running",
+        Status::Stopped => "stopped",
+        Status::Exited => "exited",
+        Status::Failed(reason) => reason,
+    }
+}
+
+fn tray_menu() -> PopupMenu {
+    PopupMenu::new()
+        .item(PopupItem::new("restart", "Restart"))
+        .item(PopupItem::new("stop", "Stop"))
+        .item(PopupItem::new("remove", "Remove"))
+}
+
 fn view(state: &State, cx: &mut Cx<State>) -> El {
     let theme = tok::theme(true);
-    let button = |key: String, label: &str, active: bool| {
-        el().key(key).role("button").label(label).fill(if active {
-            theme.control_off
-        } else {
-            Color::TRANSPARENT
+    let accent = cx.accent();
+    let attention_dot = |attention: Attention| match attention {
+        Attention::None => None,
+        Attention::Activity => Some(dot(theme.text_secondary)),
+        Attention::Alert => Some(dot(accent)),
+    };
+    let status_dot = |status: &Status| {
+        dot(match status {
+            Status::Running => rune::color::oklch(0.74, 0.17, 150.0),
+            Status::Failed(_) => rune::color::oklch(0.66, 0.2, 25.0),
+            Status::Stopped | Status::Exited => theme.text_secondary,
         })
     };
-    let pill = |key: String, label: &str, active: bool| {
+    let button = |key: String, label: &str, active: bool| {
+        row()
+            .key(key)
+            .role("button")
+            .label(label)
+            .items_center()
+            .gap(6.0)
+            .fill(if active {
+                theme.control_off
+            } else {
+                Color::TRANSPARENT
+            })
+    };
+    let pill = |key: String, label: &str, active: bool, marker: Option<El>| {
         button(key, label, active)
             .px(10.0)
             .py(4.0)
             .radius(6.0)
+            .children(marker)
             .child(text(label.to_owned()).color(theme.text).truncate())
     };
     let rail = state.sidebar_hidden && state.workspace.projects.len() > 1;
@@ -332,13 +519,22 @@ fn view(state: &State, cx: &mut Cx<State>) -> El {
                     .flat_map(char::to_uppercase)
                     .chain(initials.next())
                     .collect();
+                let marker = attention_dot(project.attention())
+                    .map(|marker| marker.absolute(RAIL_TAB - DOT - 3.0, 3.0));
                 button(key, &project.name, active)
                     .size(RAIL_TAB, RAIL_TAB)
                     .center()
                     .radius(8.0)
                     .child(text(initials).color(theme.text))
+                    .children(marker)
             } else {
-                pill(key, &project.name, active).w_full()
+                pill(
+                    key,
+                    &project.name,
+                    active,
+                    attention_dot(project.attention()),
+                )
+                .w_full()
             };
             project_tab.on_press(move |state: &mut State| state.workspace.select_project(index))
         });
@@ -363,6 +559,7 @@ fn view(state: &State, cx: &mut Cx<State>) -> El {
                     format!("tab-{index}"),
                     tab.label(),
                     index == project.active_tab,
+                    attention_dot(tab.attention),
                 )
                 .max_w(TAB_MAX_WIDTH)
                 .on_press(move |state: &mut State| state.workspace.select_tab(index))
@@ -378,10 +575,11 @@ fn view(state: &State, cx: &mut Cx<State>) -> El {
         .child(icon(&SIDEBAR_ICON, 16.0).color(theme.text_secondary))
         .on_press(|state: &mut State| state.sidebar_hidden = !state.sidebar_hidden);
     let new_tab = state.workspace.project().map(|_| {
-        pill("new-tab".to_owned(), "+", false).on_press_tx(|_: &mut State, tx: &mut Tx| {
+        pill("new-tab".to_owned(), "+", false, None).on_press_tx(|_: &mut State, tx: &mut Tx| {
             let menu = PopupMenu::new()
                 .item(PopupItem::new("shell", "Shell"))
                 .item(PopupItem::new("lazygit", "lazygit"))
+                .item(PopupItem::new("tray", "Background command…"))
                 .item(PopupItem::new("palette", "Command centre…"));
             tx.popup_menu(menu, "new-tab", pick_new_tab);
         })
@@ -396,10 +594,12 @@ fn view(state: &State, cx: &mut Cx<State>) -> El {
                 .child(text("Open a folder with ⌘N, or drop one here").color(theme.text_secondary)),
         );
     }
+    // The caret, composition and paste bar belong to whichever terminal takes keys.
+    let mut focus_overlays = Vec::new();
     if let Some([x, y, width, height]) = state.caret {
         // winit routes Option through the input method while one is active, which eats Alt chords.
         if !state.option_held || !state.preedit.is_empty() {
-            overlays.push(
+            focus_overlays.push(
                 el().key("caret")
                     .absolute(x, y)
                     .size(width, height)
@@ -407,7 +607,7 @@ fn view(state: &State, cx: &mut Cx<State>) -> El {
             );
         }
         if !state.preedit.is_empty() {
-            overlays.push(
+            focus_overlays.push(
                 el().key("preedit")
                     .absolute(x, y)
                     .fill(theme.bg)
@@ -426,7 +626,7 @@ fn view(state: &State, cx: &mut Cx<State>) -> El {
                 .fill(theme.bg)
                 .child(text(label).color(theme.text))
         };
-        overlays.push(
+        focus_overlays.push(
             row()
                 .key("paste-confirm")
                 .absolute(12.0, 12.0)
@@ -447,6 +647,107 @@ fn view(state: &State, cx: &mut Cx<State>) -> El {
                 ),
         );
     }
+    let project = state.workspace.project();
+    let drawer_focused = project.is_some_and(|project| project.drawer_focused);
+    let mut drawer_overlays = Vec::new();
+    if drawer_focused {
+        drawer_overlays = focus_overlays;
+    } else {
+        overlays.extend(focus_overlays);
+    }
+    let tray_bar = project
+        .filter(|project| !project.tray.is_empty())
+        .map(|project| {
+            let chips = project.tray.iter().enumerate().map(|(index, tab)| {
+                let key = format!("chip-{index}");
+                let open = project.drawer_open && project.drawer == index;
+                pill(
+                    key.clone(),
+                    tab.label(),
+                    open,
+                    Some(status_dot(&tab.status)),
+                )
+                .max_w(TAB_MAX_WIDTH)
+                .on_press(move |state: &mut State| state.workspace.toggle_drawer(index))
+                .on_secondary_press(move |_: &mut State, _, tx: &mut Tx| {
+                    tx.popup_menu(tray_menu(), &key, move |state: &mut State, picked, _| {
+                        tray_action(state, index, picked);
+                    });
+                })
+            });
+            row()
+                .key("tray-bar")
+                .w_full()
+                .h(TRAY_BAR_HEIGHT)
+                .gap(4.0)
+                .px(8.0)
+                .items_center()
+                .fill(theme.card)
+                .children(chips)
+                .child(
+                    pill("tray-new".to_owned(), "+", false, None)
+                        .on_press_tx(|state: &mut State, tx: &mut Tx| open_palette(state, tx)),
+                )
+        });
+    // Stays in the tree with the last tray process it showed, so it can slide out as well as in.
+    let drawer = project.map(|project| {
+        let open = project.drawer_tab().is_some();
+        let header = project.tray.get(project.drawer).map(|tab| {
+            let index = project.drawer;
+            let action = |key: &str, label: &str, picked: &'static str| {
+                pill(key.to_owned(), label, false, None).on_press(move |state: &mut State| {
+                    tray_action(state, index, Some(picked));
+                })
+            };
+            row()
+                .w_full()
+                .h(TRAY_BAR_HEIGHT)
+                .gap(8.0)
+                .px(8.0)
+                .items_center()
+                .child(status_dot(&tab.status))
+                .child(text(tab.label().to_owned()).color(theme.text).truncate())
+                .child(text(status_text(&tab.status).to_owned()).color(theme.text_secondary))
+                .child(el().grow(1.0))
+                .child(action("drawer-restart", "Restart", "restart"))
+                .child(action("drawer-stop", "Stop", "stop"))
+                .child(
+                    pill("drawer-close".to_owned(), "Close", false, None)
+                        .on_press(move |state: &mut State| state.workspace.toggle_drawer(index)),
+                )
+        });
+        col()
+            .key("drawer")
+            .pin(
+                Some(0.0),
+                None,
+                Some(0.0),
+                Some(if tray_bar.is_some() {
+                    TRAY_BAR_HEIGHT
+                } else {
+                    0.0
+                }),
+            )
+            .h(if open { DRAWER_HEIGHT } else { 0.0 })
+            .justify_end()
+            .clip_rounded(0.0)
+            .child(
+                col()
+                    .key("drawer-panel")
+                    .w_full()
+                    .h(DRAWER_HEIGHT)
+                    .fill(theme.card)
+                    .border(1.0, theme.card_border)
+                    .children(header)
+                    .child(
+                        terminal_surface(DRAWER_MARK, "drawer-terminal", Workspace::drawer_session)
+                            .w_full()
+                            .grow(1.0)
+                            .min_h(0.0)
+                            .children(drawer_overlays),
+                    ),
+            )
+    });
     let terminal = col()
         .h_full()
         .grow(1.0)
@@ -466,60 +767,31 @@ fn view(state: &State, cx: &mut Cx<State>) -> El {
                 .children(new_tab),
         )
         .child(
-            effect(TERMINAL_MARK)
-                .key("terminal")
+            terminal_surface(TERMINAL_MARK, "terminal", Workspace::active_session)
                 .w_full()
                 .grow(1.0)
                 .min_h(0.0)
-                .cursor(Cursor::Text)
-                .pointer_buttons([PointerButton::Middle])
-                .on_drag(|state: &mut State, drag: &mut Drag, tx: &mut Tx| {
-                    let phase = match drag.phase {
-                        Phase::Down => PointerPhase::Press,
-                        Phase::Move => PointerPhase::Drag,
-                        Phase::Up => PointerPhase::Release,
-                    };
-                    let button = match tx.button() {
-                        PointerButton::Middle => mouse::Button::Middle,
-                        _ => mouse::Button::Left,
-                    };
-                    send_pointer(state, phase, Some(button), drag.x, drag.y, tx.mods());
-                    tx.live_only();
-                })
-                .on_secondary_press_local(|state: &mut State, event: PointerEvent, tx: &mut Tx| {
-                    // Rune reports the right button once, with no separate release.
-                    for phase in [PointerPhase::Press, PointerPhase::Release] {
-                        let button = Some(mouse::Button::Right);
-                        send_pointer(state, phase, button, event.x, event.y, tx.mods());
-                    }
-                })
-                .on_pointer_move_local(|state: &mut State, event: PointerEvent, tx: &mut Tx| {
-                    send_pointer(state, PointerPhase::Move, None, event.x, event.y, tx.mods());
-                    tx.live_only();
-                })
-                .on_wheel(|state: &mut State, event: WheelEvent, tx: &mut Tx| {
-                    if let Some(session) = state.session() {
-                        session.wheel(WheelInput {
-                            dy: event.dy,
-                            x: event.x,
-                            y: event.y,
-                            mods: input::vt_mods(event.mods),
-                        });
-                    }
-                    tx.live_only();
-                    true
-                })
                 .children(overlays),
-        );
+        )
+        .children(tray_bar)
+        .children(drawer);
     let palette = state.palette_open.then(|| {
         let actions = palette_actions(&state.palette.text);
         let selected = state.palette_selected.min(actions.len().saturating_sub(1));
         let rows = actions.iter().enumerate().map(|(index, action)| {
+            let shortcut = matches!(action, Action::Tray(_)).then(|| {
+                text("⌘↵")
+                    .key("palette-shortcut")
+                    .color(theme.text_secondary)
+            });
             pill(
                 format!("palette-{index}"),
                 &action.label(),
                 index == selected,
+                None,
             )
+            .children(shortcut)
+            .justify_between()
             .w_full()
             .on_press_tx(move |state: &mut State, tx: &mut Tx| run_palette(state, index, tx))
         });
@@ -581,12 +853,15 @@ fn poll(state: &mut State, _: f64, tx: &mut Tx) -> bool {
         }
     }
     let active = state.session().map(Session::id);
+    let shown = state.workspace.active_session().map(Session::id);
     let mut changed = false;
     // A paste is confirmed for the session that refused it, so a switch away dismisses it.
-    if state.drawn.0 != 0 && Some(state.drawn.0) != active && state.pending_paste.is_some() {
+    if state.focused != 0 && Some(state.focused) != active && state.pending_paste.is_some() {
         state.pending_paste = None;
         changed = true;
     }
+    state.focused = active.unwrap_or(0);
+    let mut restarts = Vec::new();
     for tab in state.workspace.tabs_mut() {
         while let Some(event) = tab.session.next_event() {
             match event {
@@ -600,15 +875,39 @@ fn poll(state: &mut State, _: f64, tx: &mut Tx) -> bool {
                     tab.program_title = Some(title).filter(|title| !title.is_empty());
                     changed = true;
                 }
+                Event::Exited(status) => {
+                    tab.exited(status);
+                    if tab.restart {
+                        restarts.push(tab.session.id());
+                    }
+                    changed = true;
+                }
+                // Sent before the tab was shown, which already cleared it.
+                Event::Attention(_) if Some(tab.session.id()) == shown => {}
+                Event::Attention(attention) => {
+                    tab.attention = tab.attention.max(attention);
+                    changed = true;
+                }
             }
         }
     }
-    let grid = state.grid();
+    for session in restarts {
+        if let Some((project, index)) = state.workspace.find_tray(session) {
+            respawn_tray(state, project, index);
+        }
+    }
     // Kept while programs hide the cursor, as dropping the caret cancels a composition.
+    let grid = state.session().map_or_else(Arc::default, Session::grid);
     if let Some(caret) = caret_rect(&grid) {
         state.caret = Some(caret);
     }
-    let drawn = (active.unwrap_or(0), grid.generation);
+    let drawn = |session: Option<&Session>| {
+        session.map_or((0, 0), |session| (session.id(), session.grid().generation))
+    };
+    let drawn = [
+        drawn(state.workspace.active_session()),
+        drawn(state.workspace.drawer_session()),
+    ];
     changed |= drawn != state.drawn;
     state.drawn = drawn;
     changed
@@ -704,6 +1003,26 @@ fn show_workspace_scene(state: &mut State) {
     state.workspace.select_project(0);
 }
 
+const SCENE_DEV_SERVER: &[u8] = b"\x1b[1;32m  VITE\x1b[0m ready in 412 ms\r\n\r\n  \x1b[32m\xe2\x9e\x9c\x1b[0m  Local:   \x1b[36mhttp://localhost:5173/\x1b[0m\r\n";
+
+fn add_scene_tray(state: &mut State) {
+    let mut failed = fixture_tab("test:watch", b"FAIL src/app.test.ts\r\n");
+    failed.status = Status::Failed("exit 1".to_owned());
+    let mut stopped = fixture_tab("storybook", b"");
+    stopped.status = Status::Stopped;
+    for tab in [fixture_tab("pnpm dev", SCENE_DEV_SERVER), failed, stopped] {
+        state.workspace.add_tray(tab);
+    }
+}
+
+fn show_tray_scene(state: &mut State) {
+    show_workspace_scene(state);
+    add_scene_tray(state);
+    state.workspace.projects[0].tabs[1].attention = Attention::Alert;
+    state.workspace.projects[0].tabs[2].attention = Attention::Activity;
+    state.workspace.toggle_drawer(0);
+}
+
 fn main() {
     let spec = AppSpec::<State> {
         scenes: &[
@@ -717,6 +1036,7 @@ fn main() {
                 state.palette = TextEdit::new("lz");
                 state.palette_open = true;
             }),
+            ("tray", show_tray_scene),
             ("empty", |state| state.started = true),
             ("collapsed", |state| {
                 show_workspace_scene(state);
@@ -990,6 +1310,24 @@ mod tests {
     }
 
     #[test]
+    fn command_w_in_the_drawer_removes_its_process_and_keeps_the_tabs() {
+        let mut runtime = tray_runtime();
+        click(&mut runtime, "chip-1");
+        press(&mut runtime, Key::Command('w'), command());
+        let project = &runtime.state.workspace.projects[0];
+        let tray: Vec<_> = project.tray.iter().map(|tab| tab.title.as_str()).collect();
+        assert_eq!(tray, ["pnpm dev", "storybook"]);
+        assert_eq!(project.tabs.len(), 3);
+        assert_eq!(drawer_id(&runtime), None);
+        click(&mut runtime, "chip-0");
+        click(&mut runtime, "terminal");
+        press(&mut runtime, Key::Command('w'), command());
+        let project = &runtime.state.workspace.projects[0];
+        assert_eq!(project.tray.len(), 2);
+        assert_eq!(project.tabs.len(), 2);
+    }
+
+    #[test]
     fn command_n_opening_a_known_folder_selects_its_project() {
         let mut runtime = workspace_runtime();
         press(&mut runtime, Key::Command('n'), command());
@@ -1029,6 +1367,35 @@ mod tests {
     }
 
     #[test]
+    fn command_enter_runs_the_query_in_the_tray() {
+        let mut runtime = palette_runtime();
+        press(&mut runtime, Key::Text("x".into()), Mods::default());
+        press(&mut runtime, Key::Enter, command());
+        let project = &runtime.state.workspace.projects[0];
+        let tray: Vec<_> = project.tray.iter().map(|tab| tab.title.as_str()).collect();
+        assert_eq!(tray, ["x"]);
+        assert_eq!(project.tabs.len(), 3);
+        assert!(!runtime.state.palette_open);
+    }
+
+    #[test]
+    fn the_tray_row_shows_its_shortcut() {
+        let mut runtime = palette_runtime();
+        press(&mut runtime, Key::Text("x".into()), Mods::default());
+        runtime.frame(0.0);
+        assert!(runtime.find("palette-shortcut").is_some());
+    }
+
+    #[test]
+    fn command_enter_with_no_query_does_nothing() {
+        let mut runtime = palette_runtime();
+        press(&mut runtime, Key::Enter, command());
+        let project = &runtime.state.workspace.projects[0];
+        assert!(project.tray.is_empty());
+        assert_eq!(project.tabs.len(), 3);
+    }
+
+    #[test]
     fn typing_in_the_command_centre_stays_out_of_the_terminal() {
         let mut runtime = palette_runtime();
         press(&mut runtime, Key::Text("x".into()), Mods::default());
@@ -1039,7 +1406,11 @@ mod tests {
     fn the_command_centre_filters_by_letters_in_order() {
         assert_eq!(
             palette_actions("lzg"),
-            [Action::Lazygit, Action::Run("lzg".to_owned())]
+            [
+                Action::Lazygit,
+                Action::Run("lzg".to_owned()),
+                Action::Tray("lzg".to_owned())
+            ]
         );
         assert_eq!(
             palette_actions(""),
@@ -1056,6 +1427,175 @@ mod tests {
             press(&mut runtime, Key::Down, Mods::default());
         }
         assert_eq!(runtime.state.palette_selected, 2);
+    }
+
+    fn tray_runtime() -> Runtime<State> {
+        let mut state = workspace_state();
+        add_scene_tray(&mut state);
+        let mut runtime = runtime_with(state);
+        runtime.on_key = Some(on_key);
+        runtime
+    }
+
+    fn drawer_height(runtime: &Runtime<State>) -> f32 {
+        runtime
+            .presented("drawer")
+            .map_or(-1.0, |(rect, _)| rect[3])
+    }
+
+    fn drawer_id(runtime: &Runtime<State>) -> Option<u64> {
+        runtime.state.workspace.drawer_session().map(Session::id)
+    }
+
+    fn tray_id(runtime: &Runtime<State>, index: usize) -> Option<u64> {
+        Some(runtime.state.workspace.projects[0].tray[index].session.id())
+    }
+
+    #[test]
+    fn clicking_a_chip_slides_its_drawer_open_and_again_closes_it() {
+        let mut runtime = tray_runtime();
+        assert_eq!(drawer_height(&runtime), 0.0);
+        click(&mut runtime, "chip-1");
+        assert_eq!(drawer_id(&runtime), tray_id(&runtime, 1));
+        runtime.frame(2.0 / 60.0);
+        let sliding = drawer_height(&runtime);
+        assert!(0.0 < sliding && sliding < DRAWER_HEIGHT, "{sliding}");
+        let panel = runtime.presented("drawer-panel").map(|(rect, _)| rect[3]);
+        assert_eq!(panel, Some(DRAWER_HEIGHT));
+        settle(&mut runtime);
+        assert_eq!(drawer_height(&runtime), DRAWER_HEIGHT);
+        click(&mut runtime, "chip-1");
+        settle(&mut runtime);
+        assert_eq!(drawer_id(&runtime), None);
+        assert_eq!(drawer_height(&runtime), 0.0);
+    }
+
+    #[test]
+    fn clicking_a_terminal_sends_keys_to_it() {
+        let mut runtime = tray_runtime();
+        click(&mut runtime, "chip-0");
+        settle(&mut runtime);
+        let focused = |runtime: &Runtime<State>| runtime.state.session().map(Session::id);
+        assert_eq!(focused(&runtime), tray_id(&runtime, 0));
+        click(&mut runtime, "terminal");
+        let tab = runtime.state.workspace.active_session().map(Session::id);
+        assert_eq!(focused(&runtime), tab);
+        click(&mut runtime, "drawer-terminal");
+        assert_eq!(focused(&runtime), tray_id(&runtime, 0));
+    }
+
+    #[test]
+    fn command_j_toggles_the_last_drawer() {
+        let mut runtime = tray_runtime();
+        click(&mut runtime, "chip-2");
+        click(&mut runtime, "chip-2");
+        press(&mut runtime, Key::Command('j'), command());
+        assert_eq!(drawer_id(&runtime), tray_id(&runtime, 2));
+        press(&mut runtime, Key::Command('j'), command());
+        assert_eq!(drawer_id(&runtime), None);
+    }
+
+    #[test]
+    fn a_chip_menu_removes_its_process() {
+        let mut runtime = tray_runtime();
+        let (x, y) = runtime.find("chip-1").unwrap();
+        runtime.secondary_down(x, y);
+        runtime.secondary_up(x, y);
+        runtime.frame(1.0 / 60.0);
+        runtime.resolve_popup(Some("remove")).unwrap();
+        runtime.frame(2.0 / 60.0);
+        let titles: Vec<_> = runtime.state.workspace.projects[0]
+            .tray
+            .iter()
+            .map(|tab| tab.title.as_str())
+            .collect();
+        assert_eq!(titles, ["pnpm dev", "storybook"]);
+    }
+
+    fn live_tray(command: &str) -> Runtime<State> {
+        let mut state = State::default();
+        state
+            .workspace
+            .add_project(Project::new("/tmp".into(), vec![]));
+        open_tray(&mut state, command);
+        let mut runtime = runtime_with(state);
+        runtime.poll = Some(poll);
+        runtime
+    }
+
+    fn poll_until(runtime: &mut Runtime<State>, done: impl Fn(&Tab) -> bool) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        let mut frame = 1.0;
+        while !done(&runtime.state.workspace.projects[0].tray[0]) {
+            assert!(std::time::Instant::now() < deadline, "timed out");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            frame += 1.0;
+            runtime.frame(frame / 60.0);
+        }
+    }
+
+    #[test]
+    fn a_crashing_tray_process_shows_as_failed() {
+        let mut runtime = live_tray("sh -c 'sleep 0.2; exit 4'");
+        poll_until(&mut runtime, |tab| tab.status != Status::Running);
+        let tray = &runtime.state.workspace.projects[0].tray[0];
+        assert_eq!(tray.status, Status::Failed("exit 4".to_owned()));
+        assert_eq!(
+            runtime.state.workspace.projects[0].attention(),
+            Attention::Alert
+        );
+    }
+
+    #[test]
+    fn restarting_waits_for_the_old_process_then_runs_the_command_again() {
+        let mut runtime = live_tray("sleep 100");
+        let old = runtime.state.workspace.projects[0].tray[0].session.id();
+        restart_tray(&mut runtime.state, 0);
+        assert_eq!(
+            runtime.state.workspace.projects[0].tray[0].session.id(),
+            old
+        );
+        poll_until(&mut runtime, |tab| tab.session.id() != old);
+        let tray = &runtime.state.workspace.projects[0].tray[0];
+        assert_eq!(tray.status, Status::Running);
+        assert_eq!(tray.command.as_deref(), Some("sleep 100"));
+    }
+
+    #[test]
+    fn a_tray_process_starts_and_restarts_in_the_shells_folder() {
+        let mut state = State::default();
+        state
+            .workspace
+            .add_project(Project::new("/tmp".into(), vec![]));
+        open_tab(
+            &mut state,
+            "shell",
+            Some("sh -c 'cd /usr/bin && exec sleep 100'"),
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while state.session().and_then(Session::cwd) != Some("/usr/bin".into()) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "shell never left /tmp"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        open_tray(&mut state, "sleep 100");
+        let mut runtime = runtime_with(state);
+        runtime.poll = Some(poll);
+        let in_usr_bin = |tab: &Tab| tab.session.cwd() == Some("/usr/bin".into());
+        poll_until(&mut runtime, in_usr_bin);
+        let old = runtime.state.workspace.projects[0].tray[0].session.id();
+        restart_tray(&mut runtime.state, 0);
+        poll_until(&mut runtime, |tab| {
+            tab.session.id() != old && in_usr_bin(tab)
+        });
+    }
+
+    #[test]
+    fn the_tray_bar_shows_only_with_tray_processes() {
+        assert!(runtime_with(workspace_state()).find("tray-bar").is_none());
+        assert!(tray_runtime().find("tray-bar").is_some());
     }
 
     #[test]
