@@ -481,18 +481,49 @@ fn dot(color: Color) -> El {
 
 /// A terminal drawn into `mark`, taking pointer input for the session `pick` returns.
 /// Pressing it sends keys to it, so the drawer and the tab each take focus by click.
-fn terminal_surface(mark: u32, key: &str, pick: fn(&Workspace) -> Option<&Session>) -> El {
+fn pointer_phase(phase: Phase) -> PointerPhase {
+    match phase {
+        Phase::Down => PointerPhase::Press,
+        Phase::Move => PointerPhase::Drag,
+        Phase::Up => PointerPhase::Release,
+    }
+}
+
+/// The right padding, where the thumb is drawn, while there is history to scroll.
+fn scrollbar_strip(key: &str, pick: fn(&Workspace) -> Option<&Session>) -> El {
+    el().key(format!("{key}-scrollbar"))
+        .pin(None, Some(0.0), Some(0.0), Some(0.0))
+        .w(render::PADDING_POINTS)
+        .cursor(Cursor::Default)
+        .on_hover_change(move |state: &mut State, hovered, tx: &mut Tx| {
+            if let Some(session) = pick(&state.workspace) {
+                session.hover_scrollbar(hovered);
+            }
+            tx.live_only();
+        })
+        .on_drag(move |state: &mut State, drag: &mut Drag, tx: &mut Tx| {
+            if let Some(session) = pick(&state.workspace) {
+                session.drag_scrollbar(pointer_phase(drag.phase), drag.y);
+            }
+            tx.live_only();
+        })
+}
+
+fn terminal_surface(
+    mark: u32,
+    key: &str,
+    workspace: &Workspace,
+    pick: fn(&Workspace) -> Option<&Session>,
+) -> El {
     let drawer = mark == DRAWER_MARK;
+    let scrollable = pick(workspace).is_some_and(|session| session.grid().scrollbar.is_some());
     effect(mark)
         .key(key)
         .cursor(Cursor::Text)
         .pointer_buttons([PointerButton::Middle])
+        .children(scrollable.then(|| scrollbar_strip(key, pick)))
         .on_drag(move |state: &mut State, drag: &mut Drag, tx: &mut Tx| {
-            let phase = match drag.phase {
-                Phase::Down => PointerPhase::Press,
-                Phase::Move => PointerPhase::Drag,
-                Phase::Up => PointerPhase::Release,
-            };
+            let phase = pointer_phase(drag.phase);
             let button = match tx.button() {
                 PointerButton::Middle => mouse::Button::Middle,
                 _ => mouse::Button::Left,
@@ -874,11 +905,16 @@ fn view(state: &State, cx: &mut Cx<State>) -> El {
                     .border(1.0, theme.card_border)
                     .children(header)
                     .child(
-                        terminal_surface(DRAWER_MARK, "drawer-terminal", Workspace::drawer_session)
-                            .w_full()
-                            .grow(1.0)
-                            .min_h(0.0)
-                            .children(drawer_overlays),
+                        terminal_surface(
+                            DRAWER_MARK,
+                            "drawer-terminal",
+                            &state.workspace,
+                            Workspace::drawer_session,
+                        )
+                        .w_full()
+                        .grow(1.0)
+                        .min_h(0.0)
+                        .children(drawer_overlays),
                     ),
             )
     });
@@ -901,11 +937,16 @@ fn view(state: &State, cx: &mut Cx<State>) -> El {
                 .children(new_tab),
         )
         .child(
-            terminal_surface(TERMINAL_MARK, "terminal", Workspace::active_session)
-                .w_full()
-                .grow(1.0)
-                .min_h(0.0)
-                .children(overlays),
+            terminal_surface(
+                TERMINAL_MARK,
+                "terminal",
+                &state.workspace,
+                Workspace::active_session,
+            )
+            .w_full()
+            .grow(1.0)
+            .min_h(0.0)
+            .children(overlays),
         )
         .children(tray_bar)
         .children(drawer);
@@ -1145,6 +1186,21 @@ fn show_scene(state: &mut State, bytes: &[u8]) {
         .add_project(Project::new("/fixture".into(), tabs));
 }
 
+/// History with the scrollbar as it shows just after scrolling, or while `hovered`.
+fn show_scrollback_scene(state: &mut State, hovered: bool) {
+    isolate_scene(state);
+    let lines: String = (1..=40).map(|line| format!("{line}\r\n")).collect();
+    let mut grid = Grid::from_vt(lines.as_bytes(), 60, 12)
+        .unwrap_or_else(|error| Grid::message(&format!("failed to build fixture: {error:#}")));
+    if let Some(scrollbar) = &mut grid.scrollbar {
+        (scrollbar.opacity, scrollbar.wide) = (1.0, hovered);
+    }
+    let tabs = vec![Tab::new("shell", Session::fixture(grid))];
+    state
+        .workspace
+        .add_project(Project::new("/fixture".into(), tabs));
+}
+
 fn show_workspace_scene(state: &mut State) {
     isolate_scene(state);
     let mut titled = fixture_tab("shell", b"$ ");
@@ -1220,9 +1276,9 @@ const SCENES: &[Scene] = &[
     ("unicode", |state| {
         show_scene(state, SCENE_UNICODE.as_bytes())
     }),
-    ("scrollback", |state| {
-        let lines: String = (1..=40).map(|line| format!("{line}\r\n")).collect();
-        show_scene(state, lines.as_bytes())
+    ("scrollback", |state| show_scrollback_scene(state, false)),
+    ("scrollback-hover", |state| {
+        show_scrollback_scene(state, true)
     }),
     ("workspace", show_workspace_scene),
     ("palette", |state| {
@@ -1281,6 +1337,24 @@ mod tests {
         let mut runtime = Runtime::new(state, view, (960.0, 640.0), env);
         runtime.frame(0.0);
         runtime
+    }
+
+    #[test]
+    fn the_scrollbar_strip_shows_an_arrow_only_with_history() {
+        let mut state = State::default();
+        show_scene(&mut state, b"$ ");
+        assert_eq!(runtime_with(state).find("terminal-scrollbar"), None);
+        let mut state = State::default();
+        show_scrollback_scene(&mut state, false);
+        let mut runtime = runtime_with(state);
+        let (x, y) = runtime.find("terminal-scrollbar").unwrap();
+        runtime.pointer_move(x, y);
+        runtime.frame(1.0 / 60.0);
+        assert_eq!(runtime.cursor(), Cursor::Default);
+        let (x, y) = runtime.find("terminal").unwrap();
+        runtime.pointer_move(x, y);
+        runtime.frame(2.0 / 60.0);
+        assert_eq!(runtime.cursor(), Cursor::Text);
     }
 
     #[test]

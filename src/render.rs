@@ -12,8 +12,10 @@ use crate::State;
 use crate::font::{Font, FontStyle, GlyphKind};
 use crate::session::{Cell, Grid, MIN_THUMB_POINTS, Metrics, Session, Surface};
 
-const PADDING_POINTS: f32 = 6.0;
+/// Also the width of the scrollbar's strip, which takes the right padding.
+pub const PADDING_POINTS: f32 = 6.0;
 const SCROLLBAR_POINTS: f32 = 3.0;
+const WIDE_SCROLLBAR_POINTS: f32 = 5.0;
 const ATLAS_SIZE: u32 = 2048;
 const MODE_SOLID: u32 = 0;
 const MODE_COVERAGE: u32 = 1;
@@ -315,20 +317,29 @@ fn scrollbar_thumb(
     scale: f32,
     cell_height: f32,
 ) -> Option<[f32; 4]> {
-    let scrollbar = grid.scrollbar?;
+    let scrollbar = grid.scrollbar.filter(|scrollbar| scrollbar.opacity > 0.0)?;
     let rows = grid.cells.len() / usize::from(grid.cols).max(1);
     let track = rows as f32 * cell_height;
     let (top, height) = scrollbar.thumb(track, MIN_THUMB_POINTS * scale);
-    let width = (SCROLLBAR_POINTS * scale).round();
+    let points = if scrollbar.wide {
+        WIDE_SCROLLBAR_POINTS
+    } else {
+        SCROLLBAR_POINTS
+    };
+    let width = (points * scale).round();
     let left = (rect[0] + rect[2] - (padding + width) / 2.0).round();
     Some([left, (rect[1] + padding).round() + top, width, height])
 }
 
-/// Two fifths of the way from the background toward white or black, whichever contrasts.
-fn thumb_color(bg: [u8; 3]) -> [u8; 3] {
+/// Two fifths of the way from the background toward white or black, whichever contrasts,
+/// scaled by `opacity`. The thumb lies on the plain background, so this fades it with no blending.
+fn thumb_color(bg: [u8; 3], opacity: f32) -> [u8; 3] {
     let dark = bg.iter().map(|&channel| u16::from(channel)).sum::<u16>() < 3 * 128;
-    let toward: u16 = if dark { 255 } else { 0 };
-    bg.map(|channel| ((3 * u16::from(channel) + 2 * toward) / 5) as u8)
+    let toward = if dark { 255.0 } else { 0.0 };
+    bg.map(|channel| {
+        let channel = f32::from(channel);
+        (channel + (toward - channel) * 0.4 * opacity).round() as u8
+    })
 }
 
 struct Slot {
@@ -607,13 +618,14 @@ impl TerminalCompositor {
                     (slot, atlas.epoch)
                 },
             );
-            if let Some(thumb) =
-                scrollbar_thumb(&grid, rect, padding, site.scale, font.cell_height as f32)
+            if let Some(scrollbar) = grid.scrollbar
+                && let Some(thumb) =
+                    scrollbar_thumb(&grid, rect, padding, site.scale, font.cell_height as f32)
             {
                 slot.scratch.push(Quad {
                     rect: thumb,
                     uv: [0.0; 4],
-                    color: color(thumb_color(grid.bg), site.srgb_blend),
+                    color: color(thumb_color(grid.bg, scrollbar.opacity), site.srgb_blend),
                     mode: MODE_SOLID,
                 });
             }
@@ -811,16 +823,30 @@ mod tests {
             scrollbar_thumb(&Grid::from_vt(b"hi", 20, 5).unwrap(), rect, 12.0, 2.0, 20.0),
             None
         );
-        let grid = Grid::from_vt("line\r\n".repeat(30).as_bytes(), 20, 5).unwrap();
-        let [left, top, width, height] = scrollbar_thumb(&grid, rect, 12.0, 2.0, 20.0).unwrap();
+        let mut grid = Grid::from_vt("line\r\n".repeat(30).as_bytes(), 20, 5).unwrap();
+        assert_eq!(
+            scrollbar_thumb(&grid, rect, 12.0, 2.0, 20.0),
+            None,
+            "hidden"
+        );
+        let mut thumb = |opacity, wide| {
+            if let Some(scrollbar) = &mut grid.scrollbar {
+                (scrollbar.opacity, scrollbar.wide) = (opacity, wide);
+            }
+            scrollbar_thumb(&grid, rect, 12.0, 2.0, 20.0).unwrap()
+        };
+        let [left, top, width, height] = thumb(0.5, false);
         assert!(left >= 300.0 - 12.0 && left + width <= 300.0);
         assert_eq!(top + height, 12.0 + 5.0 * 20.0);
+        let [wide_left, _, wide_width, _] = thumb(1.0, true);
+        assert!(wide_width > width && wide_left >= 300.0 - 12.0 && wide_left + wide_width <= 300.0);
     }
 
     #[test]
     fn the_thumb_contrasts_with_any_background() {
-        assert_eq!(thumb_color([0; 3]), [102; 3]);
-        assert_eq!(thumb_color([255; 3]), [153; 3]);
+        assert_eq!(thumb_color([0; 3], 1.0), [102; 3]);
+        assert_eq!(thumb_color([255; 3], 1.0), [153; 3]);
+        assert_eq!(thumb_color([0; 3], 0.5), [51; 3]);
     }
 
     #[test]
