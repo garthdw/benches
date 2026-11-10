@@ -32,6 +32,8 @@ use crate::config::{Config, Theme};
 use crate::input::KeyInput;
 
 const FRAME: Duration = Duration::from_millis(8);
+/// How long the size must hold before the program sees it, as each SIGWINCH makes inline TUIs reprint.
+const RESIZE_SETTLE: Duration = Duration::from_millis(100);
 const HOLD_TIMEOUT: Duration = Duration::from_secs(1);
 const BLINK: Duration = Duration::from_millis(530);
 const AUTOSCROLL: Duration = Duration::from_millis(50);
@@ -1147,25 +1149,35 @@ fn store(slot: &Mutex<Arc<Grid>>, grid: Grid) {
     *slot.lock().unwrap_or_else(PoisonError::into_inner) = Arc::new(grid);
 }
 
-/// Applies resizes at frame rate, so a live drag can't flood the program with SIGWINCH.
-struct ResizeThrottle {
+/// Holds a new grid size until it stops changing, so a sidebar slide or window drag sends one SIGWINCH.
+#[derive(Default)]
+struct ResizeDebounce {
     pending: Option<Surface>,
-    next: Instant,
+    applied: Option<Surface>,
+    due: Option<Instant>,
 }
 
-impl ResizeThrottle {
+impl ResizeDebounce {
+    /// The first size, and changes that keep the grid size, apply at once.
+    fn request(&mut self, surface: Surface, now: Instant) {
+        let same_grid = self
+            .applied
+            .is_none_or(|applied| (applied.cols, applied.rows) == (surface.cols, surface.rows));
+        self.pending = Some(surface);
+        self.due = Some(if same_grid { now } else { now + RESIZE_SETTLE });
+    }
+
     fn wait(&self, now: Instant) -> Option<Duration> {
-        self.pending
-            .map(|_| self.next.saturating_duration_since(now))
+        self.due.map(|due| due.saturating_duration_since(now))
     }
 
     fn take_due(&mut self, now: Instant) -> Option<Surface> {
-        if now < self.next {
+        if self.due.is_none_or(|due| now < due) {
             return None;
         }
-        let surface = self.pending.take()?;
-        self.next = now + FRAME;
-        Some(surface)
+        self.due = None;
+        self.applied = self.pending.take();
+        self.applied
     }
 }
 
@@ -1265,10 +1277,7 @@ impl Actor {
         let mut notified = false;
 
         let mut input = TerminalInput::new()?;
-        let mut resize = ResizeThrottle {
-            pending: None,
-            next: Instant::now(),
-        };
+        let mut resize = ResizeDebounce::default();
         let mut dirty = true;
         let mut titles = Titles {
             visibility: Visibility::Shown,
@@ -1379,8 +1388,7 @@ impl Actor {
                         }
                     }
                     Ok(Msg::Resize(surface)) => {
-                        resize.pending = Some(surface);
-                        dirty = true;
+                        resize.request(surface, Instant::now());
                     }
                     Ok(Msg::Stop) => terminate(&mut self.child, &self.pid),
                     Ok(Msg::Visibility(visibility)) => {
@@ -1410,6 +1418,7 @@ impl Actor {
                 self.apply_resize(&mut terminal, surface);
                 input.surface = Some(surface);
                 publisher.borrow_mut().presentation.metrics = surface.metrics;
+                dirty = true;
             }
             let mut publisher = publisher.borrow_mut();
             dirty |= publisher.tick_blink(Instant::now());
@@ -2082,17 +2091,86 @@ mod tests {
     }
 
     #[test]
-    fn a_second_resize_waits_a_frame_even_when_nothing_publishes() {
+    fn a_settled_resize_publishes_without_output() {
+        let session = Session::spawn(
+            Some("cat"),
+            Path::new("/tmp"),
+            &Config::default(),
+            Arc::new(|| {}),
+        )
+        .unwrap();
+        session.resize(TEST_SURFACE);
+        wait_until(
+            Duration::from_secs(5),
+            || format!("cols: {}", session.grid().cols),
+            || (session.grid().cols == TEST_SURFACE.cols).then_some(()),
+        );
+        session.resize(Surface {
+            cols: 30,
+            ..TEST_SURFACE
+        });
+        wait_until(
+            Duration::from_secs(5),
+            || format!("cols: {}", session.grid().cols),
+            || (session.grid().cols == 30).then_some(()),
+        );
+    }
+
+    #[test]
+    fn the_first_resize_applies_at_once() {
         let now = Instant::now();
-        let mut throttle = ResizeThrottle {
-            pending: Some(TEST_SURFACE),
-            next: now,
+        let mut debounce = ResizeDebounce::default();
+        debounce.request(TEST_SURFACE, now);
+        assert_eq!(debounce.take_due(now), Some(TEST_SURFACE));
+        assert_eq!(debounce.wait(now), None);
+    }
+
+    #[test]
+    fn a_burst_of_resizes_applies_once_it_settles() {
+        let now = Instant::now();
+        let mut debounce = ResizeDebounce::default();
+        debounce.request(TEST_SURFACE, now);
+        debounce.take_due(now);
+        let mut at = now;
+        for cols in 21..40 {
+            at += FRAME;
+            debounce.request(
+                Surface {
+                    cols,
+                    ..TEST_SURFACE
+                },
+                at,
+            );
+            assert_eq!(debounce.take_due(at), None);
+        }
+        assert_eq!(debounce.wait(at), Some(RESIZE_SETTLE));
+        assert_eq!(debounce.take_due(at + RESIZE_SETTLE - FRAME), None);
+        let settled = debounce.take_due(at + RESIZE_SETTLE);
+        assert_eq!(
+            settled,
+            Some(Surface {
+                cols: 39,
+                ..TEST_SURFACE
+            })
+        );
+        assert_eq!(debounce.wait(at + RESIZE_SETTLE), None);
+    }
+
+    #[test]
+    fn a_change_of_scale_alone_applies_at_once() {
+        let now = Instant::now();
+        let mut debounce = ResizeDebounce::default();
+        debounce.request(TEST_SURFACE, now);
+        debounce.take_due(now);
+        let rescaled = Surface {
+            metrics: Metrics {
+                scale: 2.0,
+                ..TEST_SURFACE.metrics
+            },
+            ..TEST_SURFACE
         };
-        assert_eq!(throttle.take_due(now), Some(TEST_SURFACE));
-        throttle.pending = Some(TEST_SURFACE);
-        assert_eq!(throttle.take_due(now), None);
-        assert_eq!(throttle.wait(now), Some(FRAME));
-        assert_eq!(throttle.take_due(now + FRAME), Some(TEST_SURFACE));
+        debounce.request(rescaled, now);
+        assert_eq!(debounce.take_due(now), Some(rescaled));
     }
 
     #[test]
