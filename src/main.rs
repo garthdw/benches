@@ -26,6 +26,9 @@ const SIDEBAR_WIDTH: f32 = 200.0;
 const TAB_STRIP_HEIGHT: f32 = 36.0;
 const TAB_MAX_WIDTH: f32 = 220.0;
 const PALETTE_WIDTH: f32 = 520.0;
+/// The collapsed sidebar: narrower than the traffic lights, which sit above its tabs.
+const RAIL_WIDTH: f32 = 44.0;
+const RAIL_TAB: f32 = 32.0;
 static SIDEBAR_ICON: Icon = Icon {
     name: "sidebar",
     view: 24.0,
@@ -298,27 +301,61 @@ fn view(state: &State, cx: &mut Cx<State>) -> El {
             })
             .child(text(label.to_owned()).color(theme.text).truncate())
     };
+    let rail = state.sidebar_hidden && state.workspace.projects.len() > 1;
+    let sidebar_width = match (state.sidebar_hidden, rail) {
+        (false, _) => SIDEBAR_WIDTH,
+        (true, true) => RAIL_WIDTH,
+        (true, false) => 0.0,
+    };
     let projects = state
         .workspace
         .projects
         .iter()
         .enumerate()
+        .filter(|_| sidebar_width > 0.0)
         .map(|(index, project)| {
-            pill(
-                format!("project-{index}"),
-                &project.name,
-                index == state.workspace.active,
-            )
-            .w_full()
-            .on_press(move |state: &mut State| state.workspace.select_project(index))
+            let key = format!("project-{index}");
+            let active = index == state.workspace.active;
+            let project_tab = if rail {
+                let mut initials = project.name.chars();
+                let initials: String = initials
+                    .next()
+                    .into_iter()
+                    .flat_map(char::to_uppercase)
+                    .chain(initials.next())
+                    .collect();
+                el().key(key)
+                    .role("button")
+                    .label(project.name.clone())
+                    .size(RAIL_TAB, RAIL_TAB)
+                    .center()
+                    .radius(8.0)
+                    .fill(if active {
+                        theme.control_off
+                    } else {
+                        Color::TRANSPARENT
+                    })
+                    .child(text(initials).color(theme.text))
+            } else {
+                pill(key, &project.name, active).w_full()
+            };
+            project_tab.on_press(move |state: &mut State| state.workspace.select_project(index))
         });
+    // Stays in the tree so its width springs between expanded, rail and gone.
     let sidebar = col()
         .key("sidebar")
-        .w(SIDEBAR_WIDTH)
+        .w(sidebar_width)
         .h_full()
         .gap(2.0)
         .pt(TAB_STRIP_HEIGHT)
-        .px(8.0)
+        .px(if rail {
+            6.0
+        } else if sidebar_width > 0.0 {
+            8.0
+        } else {
+            0.0
+        })
+        .clip_rounded(0.0)
         .fill(theme.card)
         .children(projects);
     let tabs = state.workspace.project().map_or_else(Vec::new, |project| {
@@ -425,12 +462,8 @@ fn view(state: &State, cx: &mut Cx<State>) -> El {
                 .w_full()
                 .h(TAB_STRIP_HEIGHT)
                 .gap(4.0)
-                // The traffic lights sit over the tab strip once the sidebar is gone.
-                .pl(if state.sidebar_hidden {
-                    cx.titlebar_inset() + 8.0
-                } else {
-                    8.0
-                })
+                // Clears the traffic lights once the sidebar is narrower than them.
+                .pl((cx.titlebar_inset() + 8.0 - sidebar_width).max(8.0))
                 .pr(8.0)
                 .items_center()
                 .child(sidebar_toggle)
@@ -538,7 +571,7 @@ fn view(state: &State, cx: &mut Cx<State>) -> El {
                 open_project(state, path.clone());
             }
         })
-        .children((!state.sidebar_hidden).then_some(sidebar))
+        .child(sidebar)
         .child(terminal)
         .children(palette)
 }
@@ -894,15 +927,44 @@ mod tests {
         assert_eq!(runtime.state.workspace.active, 1);
     }
 
+    fn settle(runtime: &mut Runtime<State>) {
+        for frame in 2..120 {
+            runtime.frame(frame as f64 / 60.0);
+        }
+    }
+
+    fn sidebar_width(runtime: &Runtime<State>) -> f32 {
+        runtime
+            .presented("sidebar")
+            .map_or(-1.0, |(rect, _)| rect[2])
+    }
+
     #[test]
-    fn command_b_and_the_toggle_collapse_and_restore_the_sidebar() {
+    fn collapsing_with_several_projects_leaves_a_rail_of_project_tabs() {
         let mut runtime = workspace_runtime();
         press(&mut runtime, Key::Command('b'), command());
+        settle(&mut runtime);
+        assert_eq!(sidebar_width(&runtime), RAIL_WIDTH);
+        click(&mut runtime, "project-1");
+        assert_eq!(runtime.state.workspace.active, 1);
+    }
+
+    #[test]
+    fn collapsing_with_one_project_slides_the_sidebar_away_and_the_toggle_restores_it() {
+        let mut state = State::default();
+        show_scene(&mut state, SCENE_FIXTURE);
+        let mut runtime = runtime_with(state);
+        runtime.on_key = Some(on_key);
+        press(&mut runtime, Key::Command('b'), command());
         runtime.frame(2.0 / 60.0);
-        assert!(runtime.find("sidebar").is_none());
+        let sliding = sidebar_width(&runtime);
+        assert!(0.0 < sliding && sliding < SIDEBAR_WIDTH, "{sliding}");
+        settle(&mut runtime);
+        assert_eq!(sidebar_width(&runtime), 0.0);
+        assert!(runtime.find("project-0").is_none());
         click(&mut runtime, "sidebar-toggle");
-        runtime.frame(3.0 / 60.0);
-        assert!(runtime.find("sidebar").is_some());
+        settle(&mut runtime);
+        assert_eq!(sidebar_width(&runtime), SIDEBAR_WIDTH);
     }
 
     #[test]
