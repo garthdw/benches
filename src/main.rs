@@ -43,6 +43,8 @@ static SIDEBAR_ICON: Icon = Icon {
     body: r#"<rect x="3" y="4.5" width="18" height="15" rx="3" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="M9.5 4.5v15" stroke="currentColor" stroke-width="1.6"/>"#,
 };
 const PALETTE_TOP: f32 = 96.0;
+/// Longer than `terminate`'s grace before it kills, so stubborn processes are killed too.
+const QUIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 const SCENE_FIXTURE: &[u8] = b"\x1b[1;32magentd\x1b[0m fixture\r\n\x1b[31mred\x1b[0m \x1b[42;30m on green \x1b[0m \x1b[7minverse\x1b[0m\r\n$ ";
 const SCENE_UNICODE: &str = concat!(
     "wide \u{4e16}\u{754c} kana \u{30ab}\u{30bf}\u{30ab}\u{30ca}|\r\n",
@@ -200,8 +202,10 @@ fn save_layout(state: &State) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Saves the layout, then ends every process so none outlives the app.
 fn on_quit(state: &mut State, _: &mut Tx) {
     save_layout(state).log_err("save layout");
+    state.workspace.shutdown(QUIT_TIMEOUT);
 }
 
 fn tray_action(state: &mut State, index: usize, picked: Option<&str>) {

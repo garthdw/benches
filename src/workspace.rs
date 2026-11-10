@@ -363,6 +363,23 @@ impl Workspace {
         self.show_active();
     }
 
+    /// Ends every process, waiting up to `timeout` in all for them to go.
+    pub fn shutdown(&mut self, timeout: std::time::Duration) {
+        let finished: Vec<_> = self.tabs_mut().map(|tab| tab.session.finished()).collect();
+        self.projects.clear();
+        let deadline = std::time::Instant::now() + timeout;
+        for receiver in finished {
+            // Only disconnection comes, once the process is gone.
+            if receiver
+                .recv_deadline(deadline)
+                .is_err_and(|error| error.is_timeout())
+            {
+                eprintln!("agentd: processes still running at quit");
+                return;
+            }
+        }
+    }
+
     pub fn set_window_focused(&mut self, focused: bool) {
         self.window_focused = focused;
         if let Some(session) = self.focused_session() {

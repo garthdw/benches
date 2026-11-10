@@ -826,6 +826,8 @@ pub struct Session {
     events: Receiver<Event>,
     sent_surface: std::cell::Cell<Option<Surface>>,
     visibility: std::cell::Cell<Visibility>,
+    /// Disconnects once the actor has ended the process, after the session is dropped.
+    finished: Receiver<()>,
 }
 
 impl Session {
@@ -889,6 +891,7 @@ impl Session {
         let (commands, commands_rx) = unbounded();
         let grid = Arc::new(Mutex::new(Arc::new(Grid::default())));
         let (events_tx, events) = unbounded();
+        let (finished_tx, finished) = bounded::<()>(0);
         let mut actor = Actor {
             cols,
             rows,
@@ -912,6 +915,7 @@ impl Session {
                 (actor.waker)();
             }
             terminate(&mut actor.child, &actor.pid);
+            drop(finished_tx);
         });
         Ok(Self {
             id: next_id(),
@@ -921,6 +925,7 @@ impl Session {
             events,
             sent_surface: std::cell::Cell::new(None),
             visibility: std::cell::Cell::new(Visibility::Shown),
+            finished,
         })
     }
 
@@ -934,6 +939,7 @@ impl Session {
             events: unbounded().1,
             sent_surface: std::cell::Cell::new(None),
             visibility: std::cell::Cell::new(Visibility::Shown),
+            finished: bounded(0).1,
         }
     }
 
@@ -986,6 +992,10 @@ impl Session {
         };
         // SAFETY: the kernel filled the whole struct, and zeroed bytes are valid for it anyway.
         written == size && unsafe { info.assume_init() }.e_tpgid != pid as u32
+    }
+
+    pub fn finished(&self) -> Receiver<()> {
+        self.finished.clone()
     }
 
     pub fn id(&self) -> u64 {
@@ -2392,6 +2402,41 @@ mod tests {
         type_line(&session, "sleep 5");
         let busy = || session.busy().then_some(());
         wait_until(Duration::from_secs(15), || "never busy".to_owned(), busy);
+    }
+
+    #[test]
+    fn a_dropped_session_reports_finished_once_its_process_is_gone() {
+        let session = Session::spawn(
+            Some("sleep 100"),
+            Path::new("/tmp"),
+            &Config::default(),
+            Arc::new(|| {}),
+        )
+        .unwrap();
+        let pid = session.pid.lock().unwrap().unwrap();
+        let finished = session.finished();
+        drop(session);
+        assert!(matches!(
+            finished.recv_timeout(Duration::from_secs(5)),
+            Err(crossbeam_channel::RecvTimeoutError::Disconnected)
+        ));
+        let alive = nix::sys::signal::kill(Pid::from_raw(pid), None);
+        assert_eq!(alive, Err(Errno::ESRCH));
+    }
+
+    #[test]
+    fn a_background_job_ends_with_its_dropped_shell() {
+        let session = spawn_shell();
+        type_line(&session, "sleep 4242 &; echo started");
+        wait_for_line(&session, "started");
+        let finished = session.finished();
+        drop(session);
+        assert!(finished.recv_timeout(Duration::from_secs(5)).is_err());
+        let survivors = Command::new("pgrep")
+            .args(["-f", "sleep 4242"])
+            .output()
+            .unwrap();
+        assert_eq!(String::from_utf8_lossy(&survivors.stdout), "");
     }
 
     #[test]
