@@ -589,12 +589,6 @@ pub enum Visibility {
     Hidden,
 }
 
-#[derive(Default)]
-struct PointerOutcome {
-    bytes: Vec<u8>,
-    selection_changed: bool,
-}
-
 /// Moves whole lines out of `remainder`, keeping the fraction for the next delta.
 fn whole_lines(remainder: &mut f32, delta: f32) -> i32 {
     *remainder += delta;
@@ -652,6 +646,8 @@ struct TerminalInput {
     wheel_remainder: f32,
     /// How far below the thumb's top the pointer holds it, while dragging the scrollbar.
     scrollbar_grab: Option<f32>,
+    /// Set by `select` for the actor to take, as libghostty doesn't mark the render state dirty.
+    selection_changed: bool,
 }
 
 impl TerminalInput {
@@ -676,7 +672,18 @@ impl TerminalInput {
             next_autoscroll: None,
             wheel_remainder: 0.0,
             scrollbar_grab: None,
+            selection_changed: false,
         })
+    }
+
+    fn select(
+        &mut self,
+        terminal: &Terminal<'static, '_>,
+        selection: Option<&libghostty_vt::selection::Selection<'_>>,
+    ) -> Result<()> {
+        terminal.set_selection(selection)?;
+        self.selection_changed = true;
+        Ok(())
     }
 
     fn encode_key(&mut self, terminal: &Terminal<'static, '_>, input: KeyInput) -> Result<Vec<u8>> {
@@ -830,16 +837,12 @@ impl TerminalInput {
         &mut self,
         terminal: &Terminal<'static, '_>,
         input: PointerInput,
-    ) -> Result<PointerOutcome> {
+    ) -> Result<Vec<u8>> {
         let Some(surface) = self.surface else {
-            return Ok(PointerOutcome::default());
+            return Ok(Vec::new());
         };
         let scale = surface.metrics.scale;
         self.position = (input.x * scale, input.y * scale);
-        let selection_changed = PointerOutcome {
-            selection_changed: true,
-            ..PointerOutcome::default()
-        };
         let grid_ref_point = Point::Viewport(Self::viewport_point(surface, self.position));
         let to_report = match input.phase {
             PointerPhase::Press => {
@@ -854,8 +857,8 @@ impl TerminalInput {
                         .set_time(self.started.elapsed())?
                         .set_position(self.position.0.into(), self.position.1.into())?
                         .apply(&mut self.gesture, terminal, grid_ref)?;
-                    terminal.set_selection(selection.as_ref())?;
-                    return Ok(selection_changed);
+                    self.select(terminal, selection.as_ref())?;
+                    return Ok(Vec::new());
                 }
                 if reporting {
                     self.pressed = input.button;
@@ -876,9 +879,9 @@ impl TerminalInput {
                         grid_ref,
                         Self::geometry(surface),
                     )?;
-                terminal.set_selection(selection.as_ref())?;
+                self.select(terminal, selection.as_ref())?;
                 self.schedule_autoscroll(terminal, Instant::now())?;
-                return Ok(selection_changed);
+                return Ok(Vec::new());
             }
             PointerPhase::Drag if self.pressed.is_some() => {
                 Some((mouse::Action::Motion, self.pressed))
@@ -902,25 +905,22 @@ impl TerminalInput {
             _ => None,
         };
         let Some((action, button)) = to_report else {
-            return Ok(PointerOutcome::default());
+            return Ok(Vec::new());
         };
-        Ok(PointerOutcome {
-            bytes: self.report(terminal, surface, action, button, input.mods)?,
-            ..PointerOutcome::default()
-        })
+        self.report(terminal, surface, action, button, input.mods)
     }
 
-    /// Scrolls one line while a selection drag is held past the edge. True if anything moved.
-    fn tick_autoscroll(&mut self, terminal: &Terminal<'static, '_>, now: Instant) -> Result<bool> {
+    /// Scrolls one line while a selection drag is held past the edge.
+    fn tick_autoscroll(&mut self, terminal: &Terminal<'static, '_>, now: Instant) -> Result<()> {
         let Some(surface) = self.surface else {
-            return Ok(false);
+            return Ok(());
         };
         if !self.next_autoscroll.is_some_and(|due| now >= due) {
-            return Ok(false);
+            return Ok(());
         }
         if matches!(self.gesture.autoscroll(terminal)?, Autoscroll::None) {
             self.next_autoscroll = None;
-            return Ok(false);
+            return Ok(());
         }
         let viewport = Self::viewport_point(surface, self.position);
         let selection = self.autoscroll_tick.apply(
@@ -929,9 +929,8 @@ impl TerminalInput {
             viewport,
             Self::geometry(surface),
         )?;
-        terminal.set_selection(selection.as_ref())?;
-        self.schedule_autoscroll(terminal, now)?;
-        Ok(true)
+        self.select(terminal, selection.as_ref())?;
+        self.schedule_autoscroll(terminal, now)
     }
 
     /// Bytes for the program, or `None` when the wheel scrolled the viewport.
@@ -993,12 +992,11 @@ impl TerminalInput {
     }
 }
 
-/// A process on a PTY. Its `Terminal` lives on an actor thread, as libghostty types are `!Send`.
 /// Apps launched from Finder get no locale, which leaves children in the C locale and mangles
 /// UTF-8, so give them the user's macOS locale (`system`, such as `en_GB@rg=zazzzz`) in UTF-8.
 fn missing_locale(
     var: impl Fn(&str) -> Option<std::ffi::OsString>,
-    system: Option<&str>,
+    system: impl FnOnce() -> Option<String>,
 ) -> Option<String> {
     let has_locale = ["LANG", "LC_ALL", "LC_CTYPE"]
         .into_iter()
@@ -1006,7 +1004,8 @@ fn missing_locale(
     if has_locale {
         return None;
     }
-    let candidate = system
+    let candidate = system()
+        .as_deref()
         .and_then(|identifier| identifier.split('@').next())
         .map(|language| format!("{language}.UTF-8"))
         .filter(|candidate| locale_exists(candidate));
@@ -1033,6 +1032,7 @@ fn system_locale() -> Option<String> {
     Some(identifier.to_string())
 }
 
+/// A process on a PTY. Its `Terminal` lives on an actor thread, as libghostty types are `!Send`.
 pub struct Session {
     id: u64,
     /// Cleared by the actor before it reaps the process, after which the pid may be reused.
@@ -1073,9 +1073,7 @@ impl Session {
             .env("TERM_PROGRAM", "agentd")
             .env("SHELL", &config.shell)
             .stdin(Stdio::from(pty.slave));
-        if let Some(locale) =
-            missing_locale(|name| std::env::var_os(name), system_locale().as_deref())
-        {
+        if let Some(locale) = missing_locale(|name| std::env::var_os(name), system_locale) {
             process.env("LANG", locale);
         }
         // SAFETY: only async-signal-safe calls run between fork and exec.
@@ -1168,28 +1166,23 @@ impl Session {
         }
     }
 
+    /// The process's pid and its `proc_pidinfo` of `flavor`, which must fill a `T`.
+    fn pid_info<T>(&self, flavor: libc::c_int) -> Option<(i32, T)> {
+        // Held through the lookup so the actor can't reap the process, freeing its pid, meanwhile.
+        let pid = (*self.pid.lock().unwrap_or_else(PoisonError::into_inner))?;
+        let mut info = std::mem::MaybeUninit::<T>::zeroed();
+        let size = std::mem::size_of::<T>() as i32;
+        // SAFETY: `info` is a writable buffer of `size` bytes.
+        let written = unsafe { libc::proc_pidinfo(pid, flavor, 0, info.as_mut_ptr().cast(), size) };
+        // SAFETY: the kernel filled the whole struct, and zeroed bytes are valid for it anyway.
+        (written == size).then(|| (pid, unsafe { info.assume_init() }))
+    }
+
     /// The process's current directory, which follows the shell's `cd`.
     pub fn cwd(&self) -> Option<PathBuf> {
         use std::os::unix::ffi::OsStrExt;
-        // Held through the lookup so the actor can't reap the process, freeing its pid, meanwhile.
-        let pid = self.pid.lock().unwrap_or_else(PoisonError::into_inner);
-        let mut info = std::mem::MaybeUninit::<libc::proc_vnodepathinfo>::zeroed();
-        let size = std::mem::size_of::<libc::proc_vnodepathinfo>() as i32;
-        // SAFETY: `info` is a writable buffer of `size` bytes.
-        let written = unsafe {
-            libc::proc_pidinfo(
-                (*pid)?,
-                libc::PROC_PIDVNODEPATHINFO,
-                0,
-                info.as_mut_ptr().cast(),
-                size,
-            )
-        };
-        if written != size {
-            return None;
-        }
-        // SAFETY: the kernel filled the whole struct, and zeroed bytes are valid for it anyway.
-        let path = unsafe { info.assume_init() }.pvi_cdir.vip_path;
+        let (_, info) = self.pid_info::<libc::proc_vnodepathinfo>(libc::PROC_PIDVNODEPATHINFO)?;
+        let path = info.pvi_cdir.vip_path;
         // SAFETY: `vip_path` is a flat 1024-byte buffer split into rows by libc.
         let bytes: &[u8; 1024] = unsafe { &*path.as_ptr().cast() };
         let path = std::ffi::CStr::from_bytes_until_nul(bytes).ok()?;
@@ -1198,25 +1191,8 @@ impl Session {
 
     /// True while a program other than the shell holds the terminal's foreground.
     pub fn busy(&self) -> bool {
-        // Held through the lookup so the actor can't reap the process, freeing its pid, meanwhile.
-        let pid = self.pid.lock().unwrap_or_else(PoisonError::into_inner);
-        let Some(pid) = *pid else {
-            return false;
-        };
-        let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::zeroed();
-        let size = std::mem::size_of::<libc::proc_bsdinfo>() as i32;
-        // SAFETY: `info` is a writable buffer of `size` bytes.
-        let written = unsafe {
-            libc::proc_pidinfo(
-                pid,
-                libc::PROC_PIDTBSDINFO,
-                0,
-                info.as_mut_ptr().cast(),
-                size,
-            )
-        };
-        // SAFETY: the kernel filled the whole struct, and zeroed bytes are valid for it anyway.
-        written == size && unsafe { info.assume_init() }.e_tpgid != pid as u32
+        self.pid_info::<libc::proc_bsdinfo>(libc::PROC_PIDTBSDINFO)
+            .is_some_and(|(pid, info)| info.e_tpgid != pid as u32)
     }
 
     pub fn finished(&self) -> Receiver<()> {
@@ -1356,10 +1332,6 @@ impl ResizeDebounce {
         self.due = Some(if same_grid { now } else { now + RESIZE_SETTLE });
     }
 
-    fn wait(&self, now: Instant) -> Option<Duration> {
-        self.due.map(|due| due.saturating_duration_since(now))
-    }
-
     fn take_due(&mut self, now: Instant) -> Option<Surface> {
         if self.due.is_none_or(|due| now < due) {
             return None;
@@ -1386,6 +1358,11 @@ struct Actor {
 }
 
 impl Actor {
+    fn emit(&self, event: Event) {
+        self.events.send(event).log_err("queue event");
+        (self.waker)();
+    }
+
     fn apply_resize(&self, terminal: &mut Terminal<'static, '_>, surface: Surface) {
         let Surface {
             cols,
@@ -1423,7 +1400,7 @@ impl Actor {
             hold_started: None,
             presentation: Presentation::default(),
             next_blink: None,
-            visible: true,
+            visibility: Visibility::Shown,
         }));
 
         let pty_input = self.input.clone();
@@ -1435,7 +1412,7 @@ impl Actor {
             let mut publisher = hold_publisher.borrow_mut();
             publisher.hold_started = held.then(Instant::now);
             // Keep the finished frame from before the hold, or a program that redraws constantly looks frozen.
-            if held && publisher.visible && Instant::now() >= publisher.next_frame {
+            if held && publisher.visible() && Instant::now() >= publisher.next_frame {
                 publisher.publish(terminal).log_err("publish held frame");
             }
         })?;
@@ -1472,24 +1449,23 @@ impl Actor {
         let mut resize = ResizeDebounce::default();
         let mut dirty = true;
         let mut titles = Titles {
-            visibility: Visibility::Shown,
             sent: String::new(),
             next: Instant::now(),
         };
         loop {
             let now = Instant::now();
-            let wait = publisher.borrow().wait(dirty, now);
-            let wait = input
-                .next_autoscroll
-                .map_or(wait, |due| wait.min(due.saturating_duration_since(now)));
-            let wait = resize.wait(now).map_or(wait, |due| wait.min(due));
-            let wait = fade
-                .next_change(now)
-                .map_or(wait, |due| wait.min(due.saturating_duration_since(now)));
-            let wait = titles
-                .due()
-                .filter(|_| title_changed.get())
-                .map_or(wait, |due| wait.min(due.saturating_duration_since(now)));
+            let publisher_deadline = publisher.borrow().deadline(dirty, now);
+            let visibility = publisher.borrow().visibility;
+            let wait = [
+                input.next_autoscroll,
+                resize.due,
+                fade.next_change(now),
+                titles.due(visibility).filter(|_| title_changed.get()),
+            ]
+            .into_iter()
+            .flatten()
+            .fold(publisher_deadline, Instant::min)
+            .saturating_duration_since(now);
             select! {
                 recv(self.output) -> bytes => match bytes {
                     Ok(bytes) => {
@@ -1499,25 +1475,25 @@ impl Actor {
                         let alerted = alerted.replace(false);
                         let notice = notice.borrow_mut().take();
                         let level = if alerted { Attention::Alert } else { Attention::Activity };
-                        if titles.visibility != Visibility::Shown && level > attention {
+                        if !publisher.borrow().visible() && level > attention {
                             attention = level;
-                            self.events.send(Event::Attention(level)).log_err("queue attention");
-                            (self.waker)();
+                            self.emit(Event::Attention(level));
                         }
-                        let seen = titles.visibility == Visibility::Shown && publisher.borrow().presentation.focused;
+                        let seen = {
+                            let publisher = publisher.borrow();
+                            publisher.visible() && publisher.presentation.focused
+                        };
                         if alerted && !seen && !notified {
                             notified = true;
                             let (title, body) = notice.unwrap_or_default();
-                            self.events.send(Event::Notify { title, body }).log_err("queue notification");
-                            (self.waker)();
+                            self.emit(Event::Notify { title, body });
                         }
                     }
                     Err(_) => {
                         self.output = never();
                         forget(&self.pid);
                         if let Some(status) = self.child.wait().log_err("wait for process") {
-                            self.events.send(Event::Exited(status)).log_err("queue exit");
-                            (self.waker)();
+                            self.emit(Event::Exited(status));
                         }
                         terminal.vt_write(b"\r\n[process exited]\r\n");
                         dirty = true;
@@ -1534,14 +1510,10 @@ impl Actor {
                         }
                     }
                     Ok(Msg::Pointer(pointer)) => {
-                        if let Some(outcome) = input.pointer(&terminal, pointer).log_err("handle pointer") {
-                            if !outcome.bytes.is_empty() {
-                                self.input.send(outcome.bytes).log_err("queue mouse report");
-                            }
-                            if outcome.selection_changed {
-                                publisher.borrow_mut().builder.selection_changed();
-                                dirty = true;
-                            }
+                        if let Some(bytes) = input.pointer(&terminal, pointer).log_err("handle pointer")
+                            && !bytes.is_empty()
+                        {
+                            self.input.send(bytes).log_err("queue mouse report");
                         }
                     }
                     Ok(Msg::Wheel(wheel)) => {
@@ -1562,15 +1534,14 @@ impl Actor {
                     Ok(Msg::ScrollbarHover(hovered)) => scrollbar_hovered = hovered,
                     Ok(Msg::Copy) => {
                         if let Some(Some(text)) = selection_text(&terminal).log_err("copy selection") {
-                            self.events.send(Event::Copied(text)).log_err("queue copied text");
-                            (self.waker)();
+                            self.emit(Event::Copied(text));
                         }
                     }
                     Ok(Msg::Focus(focused)) => {
-                        if focused && titles.visibility == Visibility::Shown {
+                        let mut publisher = publisher.borrow_mut();
+                        if focused && publisher.visible() {
                             notified = false;
                         }
-                        let mut publisher = publisher.borrow_mut();
                         publisher.presentation.focused = focused;
                         publisher.restart_blink(Instant::now());
                         dirty = true;
@@ -1585,8 +1556,7 @@ impl Actor {
                                 dirty = true;
                             }
                             Some(false) => {
-                                self.events.send(Event::PasteRejected(text)).log_err("queue rejected paste");
-                                (self.waker)();
+                                self.emit(Event::PasteRejected(text));
                             }
                             None => {}
                         }
@@ -1599,10 +1569,9 @@ impl Actor {
                         if visibility == Visibility::Shown {
                             attention = Attention::None;
                         }
-                        titles.visibility = visibility;
                         // The UI's hover moves to whichever session takes this one's place.
                         scrollbar_hovered &= visibility == Visibility::Shown;
-                        publisher.borrow_mut().visible = visibility == Visibility::Shown;
+                        publisher.borrow_mut().visibility = visibility;
                         dirty = true;
                     }
                     Err(_) => return Ok(()),
@@ -1610,13 +1579,17 @@ impl Actor {
                 default(wait) => {}
             }
             // libghostty only exposes a new title once the write that set it returns.
-            if title_changed.get() && titles.due().is_some_and(|due| Instant::now() >= due) {
+            let visibility = publisher.borrow().visibility;
+            if title_changed.get()
+                && titles
+                    .due(visibility)
+                    .is_some_and(|due| Instant::now() >= due)
+            {
                 title_changed.set(false);
                 if let Some(title) = terminal.title().log_err("read title")
                     && let Some(title) = titles.send(title, Instant::now())
                 {
-                    self.events.send(Event::Title(title)).log_err("queue title");
-                    (self.waker)();
+                    self.emit(Event::Title(title));
                 }
             }
             // Before borrowing the publisher: a resize ends any render hold through its callback.
@@ -1635,11 +1608,10 @@ impl Actor {
             dirty |=
                 (presentation.scrollbar_opacity, presentation.scrollbar_wide) != (opacity, held);
             (presentation.scrollbar_opacity, presentation.scrollbar_wide) = (opacity, held);
-            if input
+            input
                 .tick_autoscroll(&terminal, Instant::now())
-                .log_err("autoscroll selection")
-                == Some(true)
-            {
+                .log_err("autoscroll selection");
+            if std::mem::take(&mut input.selection_changed) {
                 publisher.builder.selection_changed();
                 dirty = true;
             }
@@ -1655,7 +1627,7 @@ impl Actor {
             }
             // A selection must track the pointer even while a program is holding its frame.
             let held = publisher.hold_started.is_some() && !input.selecting;
-            if dirty && !held && publisher.visible && Instant::now() >= publisher.next_frame {
+            if dirty && !held && publisher.visible() && Instant::now() >= publisher.next_frame {
                 publisher.publish(&terminal)?;
                 dirty = false;
             }
@@ -1665,15 +1637,14 @@ impl Actor {
 
 /// Sends program titles at most once a frame, and none while hidden, as animated titles can change constantly.
 struct Titles {
-    visibility: Visibility,
     sent: String,
     next: Instant,
 }
 
 impl Titles {
     /// When a changed title may next be sent, or `None` while hidden.
-    fn due(&self) -> Option<Instant> {
-        (self.visibility != Visibility::Hidden).then_some(self.next)
+    fn due(&self, visibility: Visibility) -> Option<Instant> {
+        (visibility != Visibility::Hidden).then_some(self.next)
     }
 
     /// The title to send, unless it is the one sent last, as shells often repeat it on every prompt.
@@ -1696,24 +1667,27 @@ struct Publisher {
     hold_started: Option<Instant>,
     presentation: Presentation,
     next_blink: Option<Instant>,
-    visible: bool,
+    visibility: Visibility,
 }
 
 impl Publisher {
-    fn wait(&self, dirty: bool, now: Instant) -> Duration {
+    fn visible(&self) -> bool {
+        self.visibility == Visibility::Shown
+    }
+
+    fn deadline(&self, dirty: bool, now: Instant) -> Instant {
         let deadline = match self.hold_started {
             Some(started) => started + HOLD_TIMEOUT,
-            None if dirty && self.visible => self.next_frame,
+            None if dirty && self.visible() => self.next_frame,
             None => now + Duration::from_secs(3600),
         };
         self.next_blink
-            .filter(|_| self.visible)
+            .filter(|_| self.visible())
             .map_or(deadline, |blink| deadline.min(blink))
-            .saturating_duration_since(now)
     }
 
     fn tick_blink(&mut self, now: Instant) -> bool {
-        if !self.visible || !self.next_blink.is_some_and(|blink| now >= blink) {
+        if !self.visible() || !self.next_blink.is_some_and(|blink| now >= blink) {
             return false;
         }
         self.presentation.cursor_on = !self.presentation.cursor_on;
@@ -1951,7 +1925,7 @@ mod tests {
             hold_started: None,
             presentation: Presentation::default(),
             next_blink: None,
-            visible: true,
+            visibility: Visibility::Shown,
         }
     }
 
@@ -1960,8 +1934,8 @@ mod tests {
         let now = Instant::now();
         let mut publisher = idle_publisher(now);
         publisher.next_blink = Some(now);
-        publisher.visible = false;
-        assert!(publisher.wait(true, now) > Duration::from_secs(60));
+        publisher.visibility = Visibility::Hidden;
+        assert!(publisher.deadline(true, now) > now + Duration::from_secs(60));
         assert!(!publisher.tick_blink(now));
     }
 
@@ -2026,11 +2000,11 @@ mod tests {
         let press = input
             .pointer(&terminal, pointer_at(PointerPhase::Press, 2, 1))
             .unwrap();
-        assert_eq!(press.bytes, b"\x1b[<0;3;2M");
+        assert_eq!(press, b"\x1b[<0;3;2M");
         let release = input
             .pointer(&terminal, pointer_at(PointerPhase::Release, 2, 1))
             .unwrap();
-        assert_eq!(release.bytes, b"\x1b[<0;3;2m");
+        assert_eq!(release, b"\x1b[<0;3;2m");
     }
 
     /// Rune reports a hover move alongside every drag move, and `main.rs` forwards both.
@@ -2053,7 +2027,7 @@ mod tests {
             if phase == PointerPhase::Move {
                 pointer.button = None;
             }
-            bytes.extend(input.pointer(terminal, pointer).unwrap().bytes);
+            bytes.extend(input.pointer(terminal, pointer).unwrap());
         }
         bytes
     }
@@ -2081,8 +2055,8 @@ mod tests {
         let mut input = input_for_test();
         let mut press = pointer_at(PointerPhase::Press, 2, 1);
         press.mods = key::Mods::SHIFT;
-        let outcome = input.pointer(&terminal, press).unwrap();
-        assert!(outcome.bytes.is_empty() && outcome.selection_changed);
+        let bytes = input.pointer(&terminal, press).unwrap();
+        assert!(bytes.is_empty() && input.selection_changed);
     }
 
     fn select_hello(terminal: &Terminal<'static, '_>, input: &mut TerminalInput) {
@@ -2194,8 +2168,11 @@ mod tests {
         let due = input
             .next_autoscroll
             .expect("autoscroll should be scheduled");
-        assert!(!input.tick_autoscroll(&terminal, due - AUTOSCROLL).unwrap());
-        assert!(input.tick_autoscroll(&terminal, due).unwrap());
+        input.selection_changed = false;
+        input.tick_autoscroll(&terminal, due - AUTOSCROLL).unwrap();
+        assert!(!input.selection_changed);
+        input.tick_autoscroll(&terminal, due).unwrap();
+        assert!(input.selection_changed);
         let number = |line: &str| line.trim_start_matches("line").parse::<u32>().unwrap();
         assert_eq!(number(&before) - number(&top_line(&terminal)), 1);
     }
@@ -2490,10 +2467,10 @@ mod tests {
     fn pointer_input_before_the_first_resize_is_ignored() {
         let terminal = new_terminal(20, 5).unwrap();
         let mut input = TerminalInput::new().unwrap();
-        let outcome = input
+        let bytes = input
             .pointer(&terminal, pointer_at(PointerPhase::Press, 0, 0))
             .unwrap();
-        assert!(outcome.bytes.is_empty() && !outcome.selection_changed);
+        assert!(bytes.is_empty() && !input.selection_changed);
     }
 
     #[test]
@@ -2544,7 +2521,7 @@ mod tests {
         let mut debounce = ResizeDebounce::default();
         debounce.request(TEST_SURFACE, now);
         assert_eq!(debounce.take_due(now), Some(TEST_SURFACE));
-        assert_eq!(debounce.wait(now), None);
+        assert_eq!(debounce.due, None);
     }
 
     #[test]
@@ -2565,7 +2542,7 @@ mod tests {
             );
             assert_eq!(debounce.take_due(at), None);
         }
-        assert_eq!(debounce.wait(at), Some(RESIZE_SETTLE));
+        assert_eq!(debounce.due, Some(at + RESIZE_SETTLE));
         assert_eq!(debounce.take_due(at + RESIZE_SETTLE - FRAME), None);
         let settled = debounce.take_due(at + RESIZE_SETTLE);
         assert_eq!(
@@ -2575,7 +2552,7 @@ mod tests {
                 ..TEST_SURFACE
             })
         );
-        assert_eq!(debounce.wait(at + RESIZE_SETTLE), None);
+        assert_eq!(debounce.due, None);
     }
 
     #[test]
@@ -2602,7 +2579,7 @@ mod tests {
             hold_started: Some(now),
             ..idle_publisher(now)
         };
-        assert_eq!(publisher.wait(true, now), HOLD_TIMEOUT);
+        assert_eq!(publisher.deadline(true, now), now + HOLD_TIMEOUT);
     }
 
     #[test]
@@ -2612,7 +2589,7 @@ mod tests {
             next_blink: Some(now + BLINK),
             ..idle_publisher(now)
         };
-        assert_eq!(publisher.wait(false, now), BLINK);
+        assert_eq!(publisher.deadline(false, now), now + BLINK);
     }
 
     #[test]
@@ -2755,15 +2732,13 @@ mod tests {
     fn titles_wait_a_frame_between_sends_and_while_hidden() {
         let now = Instant::now();
         let mut titles = Titles {
-            visibility: Visibility::Listed,
             sent: String::new(),
             next: now,
         };
         assert_eq!(titles.send(b"one", now).as_deref(), Some("one"));
-        assert_eq!(titles.due(), Some(now + FRAME));
+        assert_eq!(titles.due(Visibility::Listed), Some(now + FRAME));
         assert_eq!(titles.send(b"one", now + FRAME), None);
-        titles.visibility = Visibility::Hidden;
-        assert_eq!(titles.due(), None);
+        assert_eq!(titles.due(Visibility::Hidden), None);
     }
 
     #[test]
@@ -3098,7 +3073,7 @@ mod tests {
     #[test]
     fn children_get_the_users_utf8_locale_only_when_the_app_has_none() {
         let unset = |_: &str| None;
-        let locale = |system| missing_locale(unset, system);
+        let locale = |system: Option<&str>| missing_locale(unset, || system.map(str::to_owned));
         assert_eq!(locale(Some("en_GB")).as_deref(), Some("en_GB.UTF-8"));
         assert_eq!(
             locale(Some("en_GB@rg=zazzzz")).as_deref(),
@@ -3108,7 +3083,8 @@ mod tests {
         assert_eq!(locale(None).as_deref(), Some("en_US.UTF-8"));
         for set in ["LANG", "LC_ALL", "LC_CTYPE"] {
             let lookup = |name: &str| (name == set).then(|| "de_DE.UTF-8".into());
-            assert_eq!(missing_locale(lookup, Some("en_GB")), None, "{set} is set");
+            let system = || unreachable!("the system locale is read with {set} set");
+            assert_eq!(missing_locale(lookup, system), None, "{set} is set");
         }
     }
 
