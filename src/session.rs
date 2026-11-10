@@ -7,6 +7,7 @@ use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::rc::Rc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -408,6 +409,7 @@ enum Msg {
     Copy,
     Paste { text: String, allow_unsafe: bool },
     Resize(Surface),
+    Visible(bool),
 }
 
 #[derive(Default)]
@@ -767,6 +769,7 @@ impl TerminalInput {
 
 /// A process on a PTY. Its `Terminal` lives on an actor thread, as libghostty types are `!Send`.
 pub struct Session {
+    id: u64,
     commands: Option<Sender<Msg>>,
     grid: Arc<Mutex<Arc<Grid>>>,
     events: Receiver<Event>,
@@ -855,6 +858,7 @@ impl Session {
             terminate(&mut actor.child);
         });
         Ok(Self {
+            id: next_id(),
             commands: Some(commands),
             grid,
             events,
@@ -864,10 +868,15 @@ impl Session {
     /// A session with no process, showing `grid`. Input and resizes go nowhere.
     pub fn fixture(grid: Grid) -> Self {
         Self {
+            id: next_id(),
             commands: None,
             grid: Arc::new(Mutex::new(Arc::new(grid))),
             events: unbounded().1,
         }
+    }
+
+    pub fn id(&self) -> u64 {
+        self.id
     }
 
     pub fn grid(&self) -> Arc<Grid> {
@@ -909,11 +918,21 @@ impl Session {
         self.send(Msg::Resize(surface));
     }
 
+    /// A hidden session keeps running but stops publishing grids and waking the UI.
+    pub fn set_visible(&self, visible: bool) {
+        self.send(Msg::Visible(visible));
+    }
+
     fn send(&self, message: Msg) {
         if let Some(commands) = &self.commands {
             commands.send(message).log_err("send to session");
         }
     }
+}
+
+fn next_id() -> u64 {
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    NEXT.fetch_add(1, Ordering::Relaxed)
 }
 
 fn set_cloexec(fd: &OwnedFd) -> Result<()> {
@@ -1009,6 +1028,7 @@ impl Actor {
             hold_started: None,
             presentation: Presentation::default(),
             next_blink: None,
+            visible: true,
         }));
 
         let pty_input = self.input.clone();
@@ -1020,7 +1040,7 @@ impl Actor {
             let mut publisher = hold_publisher.borrow_mut();
             publisher.hold_started = held.then(Instant::now);
             // Keep the finished frame from before the hold, or a program that redraws constantly looks frozen.
-            if held && Instant::now() >= publisher.next_frame {
+            if held && publisher.visible && Instant::now() >= publisher.next_frame {
                 publisher.publish(terminal).log_err("publish held frame");
             }
         })?;
@@ -1109,6 +1129,10 @@ impl Actor {
                         resize.pending = Some(surface);
                         dirty = true;
                     }
+                    Ok(Msg::Visible(visible)) => {
+                        publisher.borrow_mut().visible = visible;
+                        dirty = true;
+                    }
                     Err(_) => return Ok(()),
                 },
                 default(wait) => {}
@@ -1140,7 +1164,7 @@ impl Actor {
             }
             // A selection must track the pointer even while a program is holding its frame.
             let held = publisher.hold_started.is_some() && !input.selecting;
-            if dirty && !held && Instant::now() >= publisher.next_frame {
+            if dirty && !held && publisher.visible && Instant::now() >= publisher.next_frame {
                 publisher.publish(&terminal)?;
                 dirty = false;
             }
@@ -1157,22 +1181,24 @@ struct Publisher {
     hold_started: Option<Instant>,
     presentation: Presentation,
     next_blink: Option<Instant>,
+    visible: bool,
 }
 
 impl Publisher {
     fn wait(&self, dirty: bool, now: Instant) -> Duration {
         let deadline = match self.hold_started {
             Some(started) => started + HOLD_TIMEOUT,
-            None if dirty => self.next_frame,
+            None if dirty && self.visible => self.next_frame,
             None => now + Duration::from_secs(3600),
         };
         self.next_blink
+            .filter(|_| self.visible)
             .map_or(deadline, |blink| deadline.min(blink))
             .saturating_duration_since(now)
     }
 
     fn tick_blink(&mut self, now: Instant) -> bool {
-        if !self.next_blink.is_some_and(|blink| now >= blink) {
+        if !self.visible || !self.next_blink.is_some_and(|blink| now >= blink) {
             return false;
         }
         self.presentation.cursor_on = !self.presentation.cursor_on;
@@ -1400,7 +1426,18 @@ mod tests {
             hold_started: None,
             presentation: Presentation::default(),
             next_blink: None,
+            visible: true,
         }
+    }
+
+    #[test]
+    fn a_hidden_dirty_publisher_sleeps() {
+        let now = Instant::now();
+        let mut publisher = idle_publisher(now);
+        publisher.next_blink = Some(now);
+        publisher.visible = false;
+        assert!(publisher.wait(true, now) > Duration::from_secs(60));
+        assert!(!publisher.tick_blink(now));
     }
 
     const TEST_SURFACE: Surface = Surface {
@@ -1838,6 +1875,38 @@ mod tests {
         let session = Session::spawn(None, Path::new("/tmp"), Arc::new(|| {})).unwrap();
         type_line(&session, "printf '\\033[?2026h'; echo held-2; sleep 30");
         wait_for_line(&session, "held-2");
+    }
+
+    #[test]
+    fn a_hidden_session_publishes_once_shown() {
+        let session = Session::spawn(None, Path::new("/tmp"), Arc::new(|| {})).unwrap();
+        session.set_visible(false);
+        type_line(&session, "echo hidden-ok");
+        thread::sleep(Duration::from_secs(1));
+        let lines = session.grid().lines();
+        assert!(!lines.iter().any(|line| line.trim_end() == "hidden-ok"));
+        session.set_visible(true);
+        wait_for_line(&session, "hidden-ok");
+    }
+
+    #[test]
+    fn a_hidden_flood_leaves_another_session_responsive() {
+        let flood = Session::spawn(None, Path::new("/tmp"), Arc::new(|| {})).unwrap();
+        flood.set_visible(false);
+        type_line(&flood, "yes");
+        thread::sleep(Duration::from_millis(500));
+        let generation = flood.grid().generation;
+        let typing = Session::spawn(None, Path::new("/tmp"), Arc::new(|| {})).unwrap();
+        type_line(&typing, "echo still-responsive");
+        wait_for_line(&typing, "still-responsive");
+        assert_eq!(flood.grid().generation, generation);
+    }
+
+    #[test]
+    fn sessions_have_distinct_ids() {
+        let first = Session::fixture(Grid::default());
+        let second = Session::fixture(Grid::default());
+        assert_ne!(first.id(), second.id());
     }
 
     #[test]

@@ -312,8 +312,8 @@ struct Slot {
     scratch: Vec<Quad>,
     uniforms: wgpu::Buffer,
     bind_group: wgpu::BindGroup,
-    built: Option<(u64, [f32; 4], u64, bool)>,
-    sent_size: Option<(u16, u16, u32, u32)>,
+    /// Session id, generation, rect, atlas epoch and blend mode; generations restart per session.
+    built: Option<(u64, u64, [f32; 4], u64, bool)>,
 }
 
 struct Gpu {
@@ -469,7 +469,6 @@ fn new_slot(
         uniforms,
         bind_group,
         built: None,
-        sent_size: None,
     }
 }
 
@@ -486,6 +485,8 @@ fn quad_buffer(device: &wgpu::Device, size: u64) -> wgpu::Buffer {
 pub struct TerminalCompositor {
     gpu: Option<Gpu>,
     font: Option<(f32, Font)>,
+    /// Last size sent to each session. Hidden tabs share the visible area, so they are sized too.
+    sent_sizes: HashMap<u64, (u16, u16, u32, u32)>,
 }
 
 impl TerminalCompositor {
@@ -533,23 +534,39 @@ impl TerminalCompositor {
         let cols = (((rect[2] - 2.0 * padding) / font.cell_width as f32) as u16).max(1);
         let rows = (((rect[3] - 2.0 * padding) / font.cell_height as f32) as u16).max(1);
         let size = (cols, rows, font.cell_width, font.cell_height);
-        if slot.sent_size.replace(size) != Some(size)
-            && let Some(session) = &state.session
-        {
-            session.resize(Surface {
-                cols,
-                rows,
-                metrics: Metrics {
-                    cell_width: font.cell_width as u16,
-                    cell_height: font.cell_height as u16,
-                    padding,
-                    scale: site.scale,
-                },
-            });
+        for session in state.workspace.sessions() {
+            if self.sent_sizes.insert(session.id(), size) != Some(size) {
+                session.resize(Surface {
+                    cols,
+                    rows,
+                    metrics: Metrics {
+                        cell_width: font.cell_width as u16,
+                        cell_height: font.cell_height as u16,
+                        padding,
+                        scale: site.scale,
+                    },
+                });
+            }
         }
+        self.sent_sizes.retain(|id, _| {
+            state
+                .workspace
+                .sessions()
+                .any(|session| session.id() == *id)
+        });
 
         let grid = state.grid();
-        if slot.built != Some((grid.generation, rect, gpu.atlas.epoch, site.srgb_blend)) {
+        let built = (
+            state
+                .workspace
+                .active_session()
+                .map_or(0, |session| session.id()),
+            grid.generation,
+            rect,
+            gpu.atlas.epoch,
+            site.srgb_blend,
+        );
+        if slot.built != Some(built) {
             let (atlas, texture) = (&mut gpu.atlas, &gpu.texture);
             build_quads(
                 &grid,
@@ -568,7 +585,7 @@ impl TerminalCompositor {
                 slot.quads = quad_buffer(device, (bytes.len() as u64).next_power_of_two());
             }
             queue.write_buffer(&slot.quads, 0, bytes);
-            slot.built = Some((grid.generation, rect, gpu.atlas.epoch, site.srgb_blend));
+            slot.built = Some((built.0, built.1, rect, gpu.atlas.epoch, site.srgb_blend));
         }
 
         let frame = [

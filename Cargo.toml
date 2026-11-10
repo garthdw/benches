@@ -5,7 +5,7 @@ edition = "2024"
 publish = false
 
 [dependencies]
-rune = { git = "https://github.com/anomalyco/rune", rev = "268ac7cb3db94610b3a6dd7173bc2b056f85f7bd" }
+rune = { git = "https://github.com/anomalyco/rune", rev = "268ac7cb3db94610b3a6dd7173bc2b056f85f7bd", features = ["native-file-dialog"] }
 libghostty-vt = { git = "https://github.com/Uzaaft/libghostty-rs", rev = "768add93c54ccdba3f5c4d8763789ab6416f3151" }
 wgpu = { version = "~30.0.1", default-features = false }
 bytemuck = { version = "1", features = ["derive"] }
