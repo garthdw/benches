@@ -1,13 +1,15 @@
 mod config;
 mod font;
 mod input;
+mod jump;
 mod render;
 mod session;
 mod sprite;
 mod workspace;
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, mpsc};
+use std::time::Duration;
 
 use libghostty_vt::mouse;
 use rune::tok;
@@ -45,6 +47,9 @@ static SIDEBAR_ICON: Icon = Icon {
 const PALETTE_TOP: f32 = 96.0;
 /// Longer than `terminate`'s grace before it kills, so stubborn processes are killed too.
 const QUIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+/// Waits for typing to pause, as the lookup starts a login shell.
+const JUMP_DEBOUNCE: Duration = Duration::from_millis(250);
+const JUMP_TIMEOUT: Duration = Duration::from_secs(5);
 const SCENE_FIXTURE: &[u8] = b"\x1b[1;32magentd\x1b[0m fixture\r\n\x1b[31mred\x1b[0m \x1b[42;30m on green \x1b[0m \x1b[7minverse\x1b[0m\r\n$ ";
 const SCENE_UNICODE: &str = concat!(
     "wide \u{4e16}\u{754c} kana \u{30ab}\u{30bf}\u{30ab}\u{30ca}|\r\n",
@@ -76,10 +81,21 @@ pub struct State {
     palette: TextEdit,
     palette_open: bool,
     palette_selected: usize,
+    jump: JumpLookup,
     sidebar_hidden: bool,
     config: config::Config,
     /// Unset in tests and scenes, which then read and write no files.
     paths: Option<config::Paths>,
+}
+
+/// The jump command's folder for the command centre's query.
+#[derive(Default)]
+struct JumpLookup {
+    query: String,
+    /// When to start the lookup, once typing pauses.
+    due: Option<f64>,
+    pending: Option<mpsc::Receiver<Option<PathBuf>>>,
+    found: Option<PathBuf>,
 }
 
 impl State {
@@ -106,6 +122,13 @@ impl State {
 
     fn active_root(&self) -> Option<PathBuf> {
         self.workspace.project().map(|project| project.root.clone())
+    }
+
+    fn jump_target(&self) -> Option<&Path> {
+        self.jump
+            .found
+            .as_deref()
+            .filter(|_| self.jump.query == self.palette.text.trim())
     }
 }
 
@@ -306,6 +329,7 @@ enum Action {
     Shell,
     Lazygit,
     OpenProject,
+    Jump(PathBuf),
     Run(String),
     Tray(String),
 }
@@ -316,14 +340,16 @@ impl Action {
             Action::Shell => "New shell tab".to_owned(),
             Action::Lazygit => "New lazygit tab".to_owned(),
             Action::OpenProject => "Open project…".to_owned(),
+            Action::Jump(root) => format!("Open project {}", root.display()),
             Action::Run(command) => format!("Run “{command}” in a new tab"),
             Action::Tray(command) => format!("Run “{command}” in the tray"),
         }
     }
 }
 
-/// The fixed actions whose labels contain the query's letters in order, then running the query.
-fn palette_actions(query: &str) -> Vec<Action> {
+/// The fixed actions whose labels contain the query's letters in order, then the jump command's
+/// folder, then running the query.
+fn palette_actions(query: &str, jump: Option<&Path>) -> Vec<Action> {
     let query = query.trim();
     let needle = query.to_lowercase();
     let mut actions: Vec<Action> = [Action::Shell, Action::Lazygit, Action::OpenProject]
@@ -336,6 +362,7 @@ fn palette_actions(query: &str) -> Vec<Action> {
                 .all(|wanted| letters.any(|letter| letter == wanted))
         })
         .collect();
+    actions.extend(jump.map(|root| Action::Jump(root.to_owned())));
     if !query.is_empty() {
         actions.push(Action::Run(query.to_owned()));
         actions.push(Action::Tray(query.to_owned()));
@@ -351,7 +378,7 @@ fn open_palette(state: &mut State, tx: &mut Tx) {
 }
 
 fn run_palette(state: &mut State, index: usize, tx: &mut Tx) {
-    let actions = palette_actions(&state.palette.text);
+    let actions = palette_actions(&state.palette.text, state.jump_target());
     let Some(action) = actions.get(index.min(actions.len().saturating_sub(1))) else {
         return;
     };
@@ -364,13 +391,16 @@ fn run_action(state: &mut State, action: &Action, tx: &mut Tx) {
         Action::Shell => open_tab(state, "shell", None),
         Action::Lazygit => open_tab(state, "lazygit", Some("lazygit")),
         Action::OpenProject => pick_folder(tx),
+        Action::Jump(root) => open_project(state, root.clone()),
         Action::Run(command) => open_tab(state, command, Some(command)),
         Action::Tray(command) => open_tray(state, command),
     }
 }
 
 fn palette_key(state: &mut State, event: &KeyEvent, tx: &mut Tx) -> bool {
-    let last = palette_actions(&state.palette.text).len().saturating_sub(1);
+    let last = palette_actions(&state.palette.text, state.jump_target())
+        .len()
+        .saturating_sub(1);
     match event.key {
         Key::Escape => state.palette_open = false,
         Key::Up => state.palette_selected = state.palette_selected.min(last).saturating_sub(1),
@@ -383,9 +413,67 @@ fn palette_key(state: &mut State, event: &KeyEvent, tx: &mut Tx) -> bool {
             }
         }
         Key::Enter => run_palette(state, state.palette_selected, tx),
-        _ => return false,
+        _ => {
+            // A poll after the edit lands starts the jump lookup's debounce.
+            tx.wake_after(Duration::ZERO);
+            return false;
+        }
     }
     true
+}
+
+/// Looks the command centre's query up with the jump command once typing pauses.
+fn poll_jump(state: &mut State, now: f64, tx: &mut Tx) -> bool {
+    let Some(command) = &state.config.jump_command else {
+        return false;
+    };
+    let query = if state.palette_open {
+        state.palette.text.trim()
+    } else {
+        ""
+    };
+    let jump = &mut state.jump;
+    let mut changed = false;
+    if query != jump.query {
+        changed = jump.found.take().is_some();
+        jump.query = query.to_owned();
+        jump.pending = None;
+        jump.due = (!query.is_empty()).then(|| {
+            tx.wake_after(JUMP_DEBOUNCE);
+            now + JUMP_DEBOUNCE.as_secs_f64()
+        });
+    }
+    if jump.due.is_some_and(|due| now >= due) {
+        jump.due = None;
+        let (sender, receiver) = mpsc::channel();
+        jump.pending = Some(receiver);
+        let (shell, command, query) = (
+            state.config.shell.clone(),
+            command.clone(),
+            jump.query.clone(),
+        );
+        let waker = state.waker.clone();
+        std::thread::spawn(move || {
+            let found = jump::lookup(&shell, &command, &query, JUMP_TIMEOUT)
+                .log_err("jump command")
+                .flatten();
+            if sender.send(found).is_ok()
+                && let Some(waker) = waker
+            {
+                waker();
+            }
+        });
+    }
+    if let Some(found) = jump
+        .pending
+        .as_ref()
+        .and_then(|pending| pending.try_recv().ok())
+    {
+        jump.pending = None;
+        jump.found = found;
+        changed = true;
+    }
+    changed
 }
 
 /// Workspace shortcuts. These keys never reach the terminal.
@@ -910,7 +998,7 @@ fn view(state: &State, cx: &mut Cx<State>) -> El {
         .children(tray_bar)
         .children(drawer);
     let palette = state.palette_open.then(|| {
-        let actions = palette_actions(&state.palette.text);
+        let actions = palette_actions(&state.palette.text, state.jump_target());
         let selected = state.palette_selected.min(actions.len().saturating_sub(1));
         let rows = actions.iter().enumerate().map(|(index, action)| {
             let shortcut = matches!(action, Action::Tray(_)).then(|| {
@@ -977,7 +1065,7 @@ fn view(state: &State, cx: &mut Cx<State>) -> El {
         .children(palette)
 }
 
-fn poll(state: &mut State, _: f64, tx: &mut Tx) -> bool {
+fn poll(state: &mut State, now: f64, tx: &mut Tx) -> bool {
     if !state.started {
         state.started = true;
         load_layout(state);
@@ -990,7 +1078,7 @@ fn poll(state: &mut State, _: f64, tx: &mut Tx) -> bool {
     launch_active(state);
     let active = state.session().map(Session::id);
     let shown = state.workspace.active_session().map(Session::id);
-    let mut changed = false;
+    let mut changed = poll_jump(state, now, tx);
     // A paste is confirmed for the session that refused it, so a switch away dismisses it.
     if state.focused != 0 && Some(state.focused) != active && state.pending_paste.is_some() {
         state.pending_paste = None;
@@ -1640,7 +1728,7 @@ mod tests {
     #[test]
     fn the_command_centre_filters_by_letters_in_order() {
         assert_eq!(
-            palette_actions("lzg"),
+            palette_actions("lzg", None),
             [
                 Action::Lazygit,
                 Action::Run("lzg".to_owned()),
@@ -1648,9 +1736,44 @@ mod tests {
             ]
         );
         assert_eq!(
-            palette_actions(""),
+            palette_actions("", None),
             [Action::Shell, Action::Lazygit, Action::OpenProject]
         );
+    }
+
+    #[test]
+    fn the_jump_commands_folder_follows_the_fixed_actions() {
+        let root = Path::new("/dev/site");
+        assert_eq!(
+            palette_actions("site", Some(root)),
+            [
+                Action::Jump(root.to_owned()),
+                Action::Run("site".to_owned()),
+                Action::Tray("site".to_owned())
+            ]
+        );
+    }
+
+    #[test]
+    fn enter_on_the_jump_commands_folder_opens_it_as_a_project() {
+        let mut runtime = palette_runtime();
+        press(&mut runtime, Key::Text("site".into()), Mods::default());
+        runtime.state.jump.query = "site".to_owned();
+        runtime.state.jump.found = Some(PathBuf::from("/dev/site"));
+        press(&mut runtime, Key::Enter, Mods::default());
+        let workspace = &runtime.state.workspace;
+        assert_eq!(workspace.projects.len(), 2);
+        assert_eq!(workspace.projects[1].root, Path::new("/dev/site"));
+        assert!(!runtime.state.palette_open);
+    }
+
+    #[test]
+    fn a_stale_jump_folder_is_not_offered() {
+        let mut runtime = palette_runtime();
+        press(&mut runtime, Key::Text("sit".into()), Mods::default());
+        runtime.state.jump.query = "si".to_owned();
+        runtime.state.jump.found = Some(PathBuf::from("/dev/site"));
+        assert_eq!(runtime.state.jump_target(), None);
     }
 
     #[test]
