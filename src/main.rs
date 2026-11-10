@@ -167,11 +167,7 @@ fn respawn(state: &mut State, project: usize, slot: Slot) {
     let Some(project_ref) = state.workspace.projects.get(project) else {
         return;
     };
-    let old = match slot {
-        Slot::Tab(index) => project_ref.tabs.get(index),
-        Slot::Tray(index) => project_ref.tray.get(index),
-    };
-    let Some(old) = old else {
+    let Some(old) = project_ref.tab(slot) else {
         return;
     };
     let cwd = old.cwd.clone().unwrap_or_else(|| project_ref.root.clone());
@@ -244,7 +240,7 @@ fn tray_action(state: &mut State, index: usize, picked: Option<&str>) {
             let open = state
                 .workspace
                 .project()
-                .is_some_and(|project| project.drawer_open && project.drawer == index);
+                .is_some_and(|project| project.drawer_shows(index));
             if !open {
                 state.workspace.toggle_drawer(index);
             }
@@ -920,7 +916,7 @@ fn view(state: &State, cx: &mut Cx<State>) -> El {
         .map(|project| {
             let chips = project.tray.iter().enumerate().map(|(index, tab)| {
                 let key = format!("chip-{index}");
-                let open = project.drawer_open && project.drawer == index;
+                let open = project.drawer_shows(index);
                 pill(
                     key.clone(),
                     tab.label(),
@@ -1172,10 +1168,7 @@ fn poll(state: &mut State, now: f64, tx: &mut Tx) -> bool {
     for (session, title, body) in notices {
         if let Some((project, slot)) = state.workspace.locate(session)
             && let Some(project) = state.workspace.projects.get(project)
-            && let Some(tab) = match slot {
-                Slot::Tab(index) => project.tabs.get(index),
-                Slot::Tray(index) => project.tray.get(index),
-            }
+            && let Some(tab) = project.tab(slot)
         {
             let notification = notify::Notification::new(&project.name, tab.label(), title, body);
             notify::post(session, &notification);

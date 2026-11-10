@@ -111,6 +111,28 @@ impl Project {
         self.tray.get(self.drawer).filter(|_| self.drawer_open)
     }
 
+    pub fn drawer_shows(&self, index: usize) -> bool {
+        self.drawer_open && self.drawer == index
+    }
+
+    pub fn active_tab(&self) -> Option<&Tab> {
+        self.tabs.get(self.active_tab)
+    }
+
+    pub fn tab(&self, slot: Slot) -> Option<&Tab> {
+        match slot {
+            Slot::Tab(index) => self.tabs.get(index),
+            Slot::Tray(index) => self.tray.get(index),
+        }
+    }
+
+    pub fn tab_mut(&mut self, slot: Slot) -> Option<&mut Tab> {
+        match slot {
+            Slot::Tab(index) => self.tabs.get_mut(index),
+            Slot::Tray(index) => self.tray.get_mut(index),
+        }
+    }
+
     /// The strongest signal among its tabs; a failed tray process alerts too.
     pub fn attention(&self) -> Attention {
         let failed = self
@@ -139,9 +161,12 @@ impl Workspace {
         self.projects.get(self.active)
     }
 
+    fn project_mut(&mut self) -> Option<&mut Project> {
+        self.projects.get_mut(self.active)
+    }
+
     pub fn active_tab(&self) -> Option<&Tab> {
-        let project = self.project()?;
-        project.tabs.get(project.active_tab)
+        self.project()?.active_tab()
     }
 
     pub fn active_session(&self) -> Option<&Session> {
@@ -152,15 +177,11 @@ impl Workspace {
         self.project()?.drawer_tab().map(|tab| &tab.session)
     }
 
-    /// Where keys go: the open drawer once clicked into, otherwise the active tab.
     pub fn focused_session(&self) -> Option<&Session> {
-        self.project()
-            .filter(|project| project.drawer_focused)
-            .and_then(|_| self.drawer_session())
-            .or_else(|| self.active_session())
+        self.focused_tab().map(|(_, tab)| &tab.session)
     }
 
-    /// The tab or tray process keys go to, by the same rule as `focused_session`.
+    /// Where keys go: the open drawer once clicked into, otherwise the active tab.
     pub fn focused_tab(&self) -> Option<(Slot, &Tab)> {
         let project = self.project()?;
         if project.drawer_focused
@@ -168,11 +189,9 @@ impl Workspace {
         {
             return Some((Slot::Tray(project.drawer), tab));
         }
-        let tab = project.tabs.get(project.active_tab)?;
-        Some((Slot::Tab(project.active_tab), tab))
+        Some((Slot::Tab(project.active_tab), project.active_tab()?))
     }
 
-    #[cfg(test)]
     pub fn sessions(&self) -> impl Iterator<Item = &Session> {
         self.tab_sessions().chain(self.tray_sessions())
     }
@@ -204,15 +223,13 @@ impl Workspace {
     }
 
     pub fn add_project(&mut self, project: Project) {
-        self.focus_active(false);
         self.projects.push(project);
         self.active = self.projects.len() - 1;
         self.show_active();
     }
 
     pub fn add_tab(&mut self, tab: Tab) {
-        self.focus_active(false);
-        if let Some(project) = self.projects.get_mut(self.active) {
+        if let Some(project) = self.project_mut() {
             project.tabs.push(tab);
             project.active_tab = project.tabs.len() - 1;
         }
@@ -221,27 +238,23 @@ impl Workspace {
 
     pub fn select_project(&mut self, index: usize) {
         if index < self.projects.len() && index != self.active {
-            self.focus_active(false);
             self.active = index;
             self.show_active();
         }
     }
 
     pub fn select_tab(&mut self, index: usize) {
-        let Some(project) = self.projects.get(self.active) else {
+        let Some(project) = self.project_mut() else {
             return;
         };
         if index < project.tabs.len() && index != project.active_tab {
-            self.focus_active(false);
-            if let Some(project) = self.projects.get_mut(self.active) {
-                project.active_tab = index;
-            }
+            project.active_tab = index;
             self.show_active();
         }
     }
 
     pub fn cycle_tab(&mut self, step: isize) {
-        let Some(project) = self.projects.get(self.active) else {
+        let Some(project) = self.project() else {
             return;
         };
         let count = project.tabs.len() as isize;
@@ -253,7 +266,7 @@ impl Workspace {
 
     /// Closes the active tab, and the project with its last tab. Dropping the session ends its process.
     pub fn close_tab(&mut self) {
-        let Some(project) = self.projects.get_mut(self.active) else {
+        let Some(project) = self.project_mut() else {
             return;
         };
         if project.active_tab >= project.tabs.len() {
@@ -270,7 +283,7 @@ impl Workspace {
     }
 
     pub fn add_tray(&mut self, tab: Tab) {
-        if let Some(project) = self.projects.get_mut(self.active) {
+        if let Some(project) = self.project_mut() {
             project.tray.push(tab);
         }
         self.show_active();
@@ -278,50 +291,40 @@ impl Workspace {
 
     /// Opens the drawer on tray process `index` with keys going to it, or closes it if it already shows that process.
     pub fn toggle_drawer(&mut self, index: usize) {
-        let Some(project) = self.projects.get(self.active) else {
+        let Some(project) = self.project_mut() else {
             return;
         };
         if index >= project.tray.len() {
             return;
         }
-        let open = !(project.drawer_open && project.drawer == index);
-        self.focus_active(false);
-        if let Some(project) = self.projects.get_mut(self.active) {
-            project.drawer = index;
-            project.drawer_open = open;
-            project.drawer_focused = open;
-        }
+        let open = !project.drawer_shows(index);
+        project.drawer = index;
+        project.drawer_open = open;
+        project.drawer_focused = open;
         self.show_active();
     }
 
     pub fn focus_drawer(&mut self, focused: bool) {
-        let Some(project) = self.projects.get(self.active) else {
+        let Some(project) = self.project_mut() else {
             return;
         };
         let focused = focused && project.drawer_tab().is_some();
         if project.drawer_focused != focused {
-            self.focus_active(false);
-            if let Some(project) = self.projects.get_mut(self.active) {
-                project.drawer_focused = focused;
-            }
+            project.drawer_focused = focused;
             self.show_active();
         }
     }
 
     pub fn tray_mut(&mut self, index: usize) -> Option<&mut Tab> {
-        self.projects.get_mut(self.active)?.tray.get_mut(index)
+        self.project_mut()?.tray.get_mut(index)
     }
 
     /// Replaces `project`'s tab or tray process at `slot` with `tab`; dropping the old session ends its process.
     pub fn replace(&mut self, project: usize, slot: Slot, tab: Tab) {
-        self.focus_active(false);
         if let Some(old) = self
             .projects
             .get_mut(project)
-            .and_then(|project| match slot {
-                Slot::Tab(index) => project.tabs.get_mut(index),
-                Slot::Tray(index) => project.tray.get_mut(index),
-            })
+            .and_then(|project| project.tab_mut(slot))
         {
             *old = tab;
         }
@@ -346,7 +349,6 @@ impl Workspace {
         let Some((project, slot)) = self.locate(session) else {
             return;
         };
-        self.focus_active(false);
         self.active = project;
         if let Some(project) = self.projects.get_mut(project) {
             match slot {
@@ -366,21 +368,18 @@ impl Workspace {
 
     /// Dropping the session ends its process.
     pub fn remove_tray(&mut self, index: usize) {
-        let Some(project) = self.projects.get(self.active) else {
+        let Some(project) = self.project_mut() else {
             return;
         };
         if index >= project.tray.len() {
             return;
         }
-        self.focus_active(false);
-        if let Some(project) = self.projects.get_mut(self.active) {
-            project.tray.remove(index);
-            if index == project.drawer {
-                project.drawer_open = false;
-                project.drawer_focused = false;
-            } else if index < project.drawer {
-                project.drawer -= 1;
-            }
+        project.tray.remove(index);
+        if index == project.drawer {
+            project.drawer_open = false;
+            project.drawer_focused = false;
+        } else if index < project.drawer {
+            project.drawer -= 1;
         }
         self.show_active();
     }
@@ -404,16 +403,17 @@ impl Workspace {
 
     pub fn set_window_focused(&mut self, focused: bool) {
         self.window_focused = focused;
-        if let Some(session) = self.focused_session() {
-            session.focus(focused);
-        }
+        self.sync_focus();
     }
 
-    fn focus_active(&self, focused: bool) {
-        if self.window_focused
-            && let Some(session) = self.focused_session()
-        {
-            session.focus(focused);
+    /// Only the session keys go to has focus, and only while the window has it.
+    fn sync_focus(&self) {
+        let focused = self
+            .focused_session()
+            .filter(|_| self.window_focused)
+            .map(Session::id);
+        for session in self.sessions() {
+            session.focus(Some(session.id()) == focused);
         }
     }
 
@@ -443,7 +443,7 @@ impl Workspace {
                 tab.session.set_visibility(visibility);
             }
         }
-        self.focus_active(true);
+        self.sync_focus();
     }
 }
 
@@ -684,6 +684,28 @@ mod tests {
             workspace.focused_session().map(Session::id),
             workspace.drawer_session().map(Session::id)
         );
+    }
+
+    #[test]
+    fn only_the_focused_session_has_focus_while_the_window_does() {
+        let mut workspace = tray_workspace();
+        let focused = |workspace: &Workspace| {
+            let sessions = workspace.sessions().filter(|session| session.focused());
+            sessions.map(Session::id).collect::<Vec<_>>()
+        };
+        workspace.set_window_focused(true);
+        workspace.toggle_drawer(0);
+        assert_eq!(
+            focused(&workspace),
+            Vec::from_iter(workspace.drawer_session().map(Session::id))
+        );
+        workspace.focus_drawer(false);
+        assert_eq!(
+            focused(&workspace),
+            Vec::from_iter(workspace.active_session().map(Session::id))
+        );
+        workspace.set_window_focused(false);
+        assert!(focused(&workspace).is_empty());
     }
 
     #[test]

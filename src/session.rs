@@ -1042,6 +1042,8 @@ pub struct Session {
     events: Receiver<Event>,
     sent_surface: std::cell::Cell<Option<Surface>>,
     visibility: std::cell::Cell<Visibility>,
+    /// Starts as the actor does.
+    focused: std::cell::Cell<bool>,
     /// Disconnects once the actor has ended the process, after the session is dropped.
     finished: Receiver<()>,
 }
@@ -1146,6 +1148,7 @@ impl Session {
             events,
             sent_surface: std::cell::Cell::new(None),
             visibility: std::cell::Cell::new(Visibility::Shown),
+            focused: std::cell::Cell::new(true),
             finished,
         })
     }
@@ -1160,6 +1163,7 @@ impl Session {
             events: unbounded().1,
             sent_surface: std::cell::Cell::new(None),
             visibility: std::cell::Cell::new(Visibility::Shown),
+            focused: std::cell::Cell::new(true),
             finished: bounded(0).1,
         }
     }
@@ -1235,7 +1239,9 @@ impl Session {
     }
 
     pub fn focus(&self, focused: bool) {
-        self.send(Msg::Focus(focused));
+        if self.focused.replace(focused) != focused {
+            self.send(Msg::Focus(focused));
+        }
     }
 
     pub fn pointer(&self, input: PointerInput) {
@@ -1289,6 +1295,11 @@ impl Session {
     #[cfg(test)]
     pub fn visibility(&self) -> Visibility {
         self.visibility.get()
+    }
+
+    #[cfg(test)]
+    pub fn focused(&self) -> bool {
+        self.focused.get()
     }
 
     fn send(&self, message: Msg) {
