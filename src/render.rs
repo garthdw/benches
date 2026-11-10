@@ -12,7 +12,6 @@ use crate::State;
 use crate::font::{Font, FontStyle, GlyphKind};
 use crate::session::{Cell, Grid, Metrics, Session, Surface};
 
-const FONT_POINTS: f64 = 18.0;
 const PADDING_POINTS: f32 = 6.0;
 const ATLAS_SIZE: u32 = 2048;
 const MODE_SOLID: u32 = 0;
@@ -484,7 +483,7 @@ fn quad_buffer(device: &wgpu::Device, size: u64) -> wgpu::Buffer {
 #[derive(Default)]
 pub struct TerminalCompositor {
     gpu: Option<Gpu>,
-    font: Option<(f32, Font)>,
+    font: Option<(f32, crate::config::FontConfig, Font)>,
 }
 
 impl TerminalCompositor {
@@ -499,18 +498,20 @@ impl TerminalCompositor {
         let Some(gpu) = self.gpu.as_mut() else {
             return;
         };
+        let wanted = (site.scale, &state.config.font);
         if self
             .font
             .as_ref()
-            .is_some_and(|(scale, _)| *scale != site.scale)
+            .is_some_and(|(scale, config, _)| (*scale, config) != wanted)
         {
             self.font = None;
         }
         if self.font.is_none() {
-            match Font::new(FONT_POINTS, site.scale) {
+            let config = &state.config.font;
+            match Font::new(&config.family, config.size, site.scale) {
                 Ok(font) => {
                     gpu.atlas.reset();
-                    self.font = Some((site.scale, font));
+                    self.font = Some((site.scale, config.clone(), font));
                 }
                 Err(error) => {
                     eprintln!("agentd: load font: {error:#}");
@@ -518,7 +519,7 @@ impl TerminalCompositor {
                 }
             }
         }
-        let Some((_, font)) = &self.font else {
+        let Some((_, _, font)) = &self.font else {
             return;
         };
         gpu.ensure_pipeline(device, site.format);
@@ -651,7 +652,7 @@ mod tests {
     }
 
     fn quads_for(grid: &Grid, scale: f32) -> (Vec<Quad>, Font) {
-        let font = Font::new(FONT_POINTS, scale).unwrap();
+        let font = Font::new(crate::config::DEFAULT_FONT_FAMILY, 18.0, scale).unwrap();
         let mut quads = Vec::new();
         build_quads(
             grid,
@@ -771,7 +772,7 @@ mod tests {
     #[test]
     fn a_reset_during_a_build_leaves_no_quad_on_a_wiped_slot() {
         let grid = Grid::message("abc");
-        let font = Font::new(FONT_POINTS, 1.0).unwrap();
+        let font = Font::new(crate::config::DEFAULT_FONT_FAMILY, 18.0, 1.0).unwrap();
         let mut slots: HashMap<GlyphKey, [u32; 2]> = HashMap::new();
         let mut epoch = 0;
         let mut quads = Vec::new();

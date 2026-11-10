@@ -28,6 +28,7 @@ use nix::sys::signal::{Signal, killpg};
 use nix::unistd::Pid;
 use rune::Waker;
 
+use crate::config::{Config, Theme};
 use crate::input::KeyInput;
 
 const FRAME: Duration = Duration::from_millis(8);
@@ -35,21 +36,19 @@ const HOLD_TIMEOUT: Duration = Duration::from_secs(1);
 const BLINK: Duration = Duration::from_millis(530);
 const AUTOSCROLL: Duration = Duration::from_millis(50);
 const MULTI_CLICK: Duration = Duration::from_millis(500);
-/// Fixed until `config.toml` arrives in M5.
-const LAUNCH_SHELL: &str = "/opt/homebrew/bin/fish";
 const MESSAGE_COLS: u16 = 80;
-const DEFAULT_FG: RgbColor = RgbColor {
+pub const DEFAULT_FG: RgbColor = RgbColor {
     r: 0xd8,
     g: 0xd9,
     b: 0xda,
 };
-const DEFAULT_BG: RgbColor = RgbColor {
+pub const DEFAULT_BG: RgbColor = RgbColor {
     r: 0x14,
     g: 0x15,
     b: 0x17,
 };
 
-trait LogErr<T> {
+pub trait LogErr<T> {
     fn log_err(self, context: &str) -> Option<T>;
 }
 
@@ -259,6 +258,19 @@ fn new_terminal<'cb>(cols: u16, rows: u16) -> Result<Terminal<'static, 'cb>> {
     Ok(terminal)
 }
 
+fn apply_theme(terminal: &mut Terminal<'static, '_>, theme: &Theme) -> Result<()> {
+    let mut palette = terminal.default_color_palette()?;
+    for &(index, color) in &theme.palette {
+        palette.0[usize::from(index)] = color;
+    }
+    terminal
+        .set_default_fg_color(Some(theme.foreground))?
+        .set_default_bg_color(Some(theme.background))?
+        .set_default_cursor_color(theme.cursor)?
+        .set_default_color_palette(Some(palette))?;
+    Ok(())
+}
+
 fn rgb(color: RgbColor) -> [u8; 3] {
     [color.r, color.g, color.b]
 }
@@ -292,6 +304,9 @@ struct GridBuilder {
     rows: RowIterator<'static>,
     cells: CellIterator<'static>,
     last_shown: Option<(CursorVisualStyle, bool, Presentation)>,
+    /// From the theme; without a background, selected cells swap their colours.
+    selection_background: Option<RgbColor>,
+    selection_foreground: Option<RgbColor>,
 }
 
 impl GridBuilder {
@@ -301,6 +316,8 @@ impl GridBuilder {
             rows: RowIterator::new()?,
             cells: CellIterator::new()?,
             last_shown: None,
+            selection_background: None,
+            selection_foreground: None,
         })
     }
 
@@ -341,7 +358,8 @@ impl GridBuilder {
                 let mut output = Cell::default();
                 let mut invisible = false;
                 let mut is_faint = false;
-                let mut inverted = cell.is_selected()?;
+                let selected = cell.is_selected()?;
+                let mut inverted = selected && self.selection_background.is_none();
                 if cell.has_styling()? {
                     let style = cell.style()?;
                     output.bold = style.bold;
@@ -364,6 +382,10 @@ impl GridBuilder {
                     let old_fg = fg;
                     fg = bg.unwrap_or(colors.background);
                     bg = Some(old_fg);
+                }
+                if selected && let Some(background) = self.selection_background {
+                    bg = Some(background);
+                    fg = self.selection_foreground.unwrap_or(fg);
                 }
                 let width = cell.raw_cell()?.wide()?;
                 output.wide = width == CellWide::Wide;
@@ -807,7 +829,7 @@ pub struct Session {
 }
 
 impl Session {
-    pub fn spawn(command: Option<&str>, cwd: &Path, waker: Waker) -> Result<Self> {
+    pub fn spawn(command: Option<&str>, cwd: &Path, config: &Config, waker: Waker) -> Result<Self> {
         let (cols, rows) = (80, 24);
         let size = Winsize {
             ws_col: cols,
@@ -819,7 +841,7 @@ impl Session {
         set_cloexec(&pty.master)?;
         set_cloexec(&pty.slave)?;
 
-        let mut process = Command::new(LAUNCH_SHELL);
+        let mut process = Command::new(&config.shell);
         process.args(["-l", "-i"]);
         if let Some(command) = command {
             process.arg("-c").arg(format!("exec {command}"));
@@ -829,7 +851,7 @@ impl Session {
             .env("TERM", "xterm-256color")
             .env("COLORTERM", "truecolor")
             .env("TERM_PROGRAM", "agentd")
-            .env("SHELL", LAUNCH_SHELL)
+            .env("SHELL", &config.shell)
             .stdin(Stdio::from(pty.slave));
         // SAFETY: only async-signal-safe calls run between fork and exec.
         unsafe {
@@ -879,6 +901,7 @@ impl Session {
             slot: grid.clone(),
             events: events_tx,
             waker,
+            theme: config.theme.clone(),
         };
         thread::spawn(move || {
             if let Err(error) = actor.run() {
@@ -1075,6 +1098,7 @@ struct Actor {
     slot: Arc<Mutex<Arc<Grid>>>,
     events: Sender<Event>,
     waker: Waker,
+    theme: Theme,
 }
 
 impl Actor {
@@ -1102,8 +1126,12 @@ impl Actor {
 
     fn run(&mut self) -> Result<()> {
         let mut terminal = new_terminal(self.cols, self.rows)?;
+        apply_theme(&mut terminal, &self.theme)?;
+        let mut builder = GridBuilder::new()?;
+        builder.selection_background = self.theme.selection_background;
+        builder.selection_foreground = self.theme.selection_foreground;
         let publisher = Rc::new(RefCell::new(Publisher {
-            builder: GridBuilder::new()?,
+            builder,
             slot: self.slot.clone(),
             waker: self.waker.clone(),
             generation: 0,
@@ -1533,7 +1561,7 @@ mod tests {
     }
 
     fn spawn_shell() -> Session {
-        Session::spawn(None, Path::new("/tmp"), Arc::new(|| {})).unwrap()
+        Session::spawn(None, Path::new("/tmp"), &Config::default(), Arc::new(|| {})).unwrap()
     }
 
     fn type_line(session: &Session, line: &str) {
@@ -1733,6 +1761,55 @@ mod tests {
             .unwrap();
         assert_eq!(grid.cells[0].bg, Some(rgb(DEFAULT_FG)));
         assert_eq!(grid.cells[0].fg, rgb(DEFAULT_BG));
+        assert_eq!(grid.cells[6].bg, None);
+    }
+
+    const THEME_RED: RgbColor = RgbColor {
+        r: 0xff,
+        g: 0,
+        b: 0,
+    };
+    const THEME_BLUE: RgbColor = RgbColor {
+        r: 0,
+        g: 0,
+        b: 0xff,
+    };
+
+    #[test]
+    fn a_theme_sets_the_default_colours_and_palette() {
+        let theme = Theme {
+            foreground: THEME_RED,
+            background: THEME_BLUE,
+            palette: vec![(1, THEME_BLUE)],
+            ..Theme::default()
+        };
+        let mut terminal = new_terminal(10, 2).unwrap();
+        apply_theme(&mut terminal, &theme).unwrap();
+        terminal.vt_write(b"a\x1b[31mb");
+        let grid = GridBuilder::new()
+            .unwrap()
+            .build(&terminal, 1, Presentation::default())
+            .unwrap()
+            .unwrap();
+        assert_eq!(grid.bg, rgb(THEME_BLUE));
+        assert_eq!(grid.cells[0].fg, rgb(THEME_RED));
+        assert_eq!(grid.cells[1].fg, rgb(THEME_BLUE));
+    }
+
+    #[test]
+    fn theme_selection_colours_replace_the_swap() {
+        let mut terminal = new_terminal(20, 5).unwrap();
+        terminal.vt_write(b"hello world");
+        let mut builder = GridBuilder::new().unwrap();
+        builder.selection_background = Some(THEME_RED);
+        builder.selection_foreground = Some(THEME_BLUE);
+        select_hello(&terminal, &mut input_for_test());
+        let grid = builder
+            .build(&terminal, 1, Presentation::default())
+            .unwrap()
+            .unwrap();
+        assert_eq!(grid.cells[0].bg, Some(rgb(THEME_RED)));
+        assert_eq!(grid.cells[0].fg, rgb(THEME_BLUE));
         assert_eq!(grid.cells[6].bg, None);
     }
 
@@ -2181,21 +2258,36 @@ mod tests {
 
     #[test]
     fn an_exit_status_comes_back_to_the_ui() {
-        let session =
-            Session::spawn(Some("sh -c 'exit 3'"), Path::new("/tmp"), Arc::new(|| {})).unwrap();
+        let session = Session::spawn(
+            Some("sh -c 'exit 3'"),
+            Path::new("/tmp"),
+            &Config::default(),
+            Arc::new(|| {}),
+        )
+        .unwrap();
         assert_eq!(wait_for_exit(&session).code(), Some(3));
     }
 
     /// A reaped pid can be reused, so `cwd` would read another process's folder.
     #[test]
     fn exited_and_stopped_sessions_forget_their_pid() {
-        let exited =
-            Session::spawn(Some("sh -c 'exit 0'"), Path::new("/tmp"), Arc::new(|| {})).unwrap();
+        let exited = Session::spawn(
+            Some("sh -c 'exit 0'"),
+            Path::new("/tmp"),
+            &Config::default(),
+            Arc::new(|| {}),
+        )
+        .unwrap();
         wait_for_exit(&exited);
         assert_eq!(*exited.pid.lock().unwrap(), None);
 
-        let stopped =
-            Session::spawn(Some("sleep 100"), Path::new("/tmp"), Arc::new(|| {})).unwrap();
+        let stopped = Session::spawn(
+            Some("sleep 100"),
+            Path::new("/tmp"),
+            &Config::default(),
+            Arc::new(|| {}),
+        )
+        .unwrap();
         thread::sleep(Duration::from_millis(500));
         stopped.stop();
         wait_for_exit(&stopped);
@@ -2217,8 +2309,13 @@ mod tests {
 
     #[test]
     fn stopping_ends_the_process_and_keeps_the_session() {
-        let session =
-            Session::spawn(Some("sleep 100"), Path::new("/tmp"), Arc::new(|| {})).unwrap();
+        let session = Session::spawn(
+            Some("sleep 100"),
+            Path::new("/tmp"),
+            &Config::default(),
+            Arc::new(|| {}),
+        )
+        .unwrap();
         thread::sleep(Duration::from_millis(500));
         session.stop();
         assert!(!wait_for_exit(&session).success());
@@ -2268,7 +2365,7 @@ mod tests {
     fn child_programs_see_the_launch_shell() {
         let session = spawn_shell();
         type_line(&session, "echo $SHELL");
-        wait_for_line(&session, LAUNCH_SHELL);
+        wait_for_line(&session, "/opt/homebrew/bin/fish");
     }
 
     #[test]

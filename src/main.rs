@@ -1,3 +1,4 @@
+mod config;
 mod font;
 mod input;
 mod render;
@@ -40,8 +41,6 @@ static SIDEBAR_ICON: Icon = Icon {
     body: r#"<rect x="3" y="4.5" width="18" height="15" rx="3" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="M9.5 4.5v15" stroke="currentColor" stroke-width="1.6"/>"#,
 };
 const PALETTE_TOP: f32 = 96.0;
-/// Title and command of each tab a new project opens with; `None` runs the launch shell.
-const PROJECT_TABS: [(&str, Option<&str>); 2] = [("claude", Some("claude")), ("shell", None)];
 const SCENE_FIXTURE: &[u8] = b"\x1b[1;32magentd\x1b[0m fixture\r\n\x1b[31mred\x1b[0m \x1b[42;30m on green \x1b[0m \x1b[7minverse\x1b[0m\r\n$ ";
 const SCENE_UNICODE: &str = concat!(
     "wide \u{4e16}\u{754c} kana \u{30ab}\u{30bf}\u{30ab}\u{30ca}|\r\n",
@@ -72,6 +71,7 @@ pub struct State {
     palette_open: bool,
     palette_selected: usize,
     sidebar_hidden: bool,
+    config: config::Config,
 }
 
 impl State {
@@ -82,7 +82,7 @@ impl State {
 
     fn spawn_tab(&self, title: &str, command: Option<&str>, cwd: &Path) -> Tab {
         let waker = self.waker.clone().unwrap_or_else(|| Arc::new(|| {}));
-        let mut tab = match Session::spawn(command, cwd, waker) {
+        let mut tab = match Session::spawn(command, cwd, &self.config, waker) {
             Ok(session) => Tab::new(title, session),
             Err(error) => {
                 let message = format!("failed to start {title}: {error:#}");
@@ -167,9 +167,11 @@ fn open_project(state: &mut State, root: PathBuf) {
         state.workspace.select_project(index);
         return;
     }
-    let tabs = PROJECT_TABS
+    let tabs = state
+        .config
+        .tabs
         .iter()
-        .map(|(title, command)| state.spawn_tab(title, *command, &root))
+        .map(|spec| state.spawn_tab(&spec.title, spec.command.as_deref(), &root))
         .collect();
     state.workspace.add_project(Project::new(root, tabs));
 }
@@ -1049,6 +1051,13 @@ fn main() {
         ..AppSpec::new("agentd", (960.0, 640.0), State::default, view)
     };
     App::new(spec)
+        .init(|| {
+            let paths = config::Paths::from_home();
+            State {
+                config: paths.as_ref().map(config::Config::load).unwrap_or_default(),
+                ..State::default()
+            }
+        })
         .compositor(render::TerminalCompositor::default())
         .on_ime(on_ime)
         .on_modifiers(|state, mods, _| state.option_held = mods.alt)

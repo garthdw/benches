@@ -16,3 +16,8 @@ objc2-core-foundation = "0.3"
 objc2-core-graphics = "0.3"
 objc2-core-text = "0.3"
 anyhow = "1.0.104"
+serde = { version = "1.0.229", features = ["derive"] }
+toml = "1.2.1"
+
+[dev-dependencies]
+tempfile = "3.27.0"

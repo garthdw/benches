@@ -1,6 +1,6 @@
 use std::ptr::NonNull;
 
-use anyhow::{Result, ensure};
+use anyhow::{Context, Result, ensure};
 use libghostty_vt::style::Underline;
 use objc2_core_foundation::{
     CFAttributedString, CFDictionary, CFRetained, CFString, CFType, kCFBooleanTrue,
@@ -9,10 +9,11 @@ use objc2_core_graphics::{
     CGBitmapContextCreate, CGColorSpace, CGContext, CGImageAlphaInfo, CGImageByteOrderInfo,
 };
 use objc2_core_text::{
-    CTFont, CTFontOrientation, CTLine, kCTFontAttributeName,
+    CTFont, CTFontOrientation, CTFontSymbolicTraits, CTLine, kCTFontAttributeName,
     kCTForegroundColorFromContextAttributeName,
 };
 
+use crate::config::DEFAULT_FONT_FAMILY;
 use crate::sprite;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
@@ -43,6 +44,26 @@ pub struct Font {
 fn face(name: &str, pixels: f64) -> CFRetained<CTFont> {
     // SAFETY: a null matrix means identity.
     unsafe { CTFont::with_name(&CFString::from_str(name), pixels, std::ptr::null()) }
+}
+
+/// Regular, bold, italic and bold italic faces of `family`, or `None` if it isn't installed.
+/// A style the family lacks reuses the regular face.
+fn family_faces(family: &str, pixels: f64) -> Option<[CFRetained<CTFont>; 4]> {
+    let regular = face(family, pixels);
+    // CoreText silently substitutes another family when a name isn't installed.
+    // SAFETY: a plain getter on a live font.
+    if unsafe { regular.family_name() }.to_string() != family {
+        return None;
+    }
+    let styled = |traits: CTFontSymbolicTraits| {
+        // SAFETY: a zero size keeps the font's size and a null matrix means identity.
+        unsafe { regular.copy_with_symbolic_traits(0.0, std::ptr::null(), traits, traits) }
+            .unwrap_or_else(|| regular.clone())
+    };
+    let bold = styled(CTFontSymbolicTraits::TraitBold);
+    let italic = styled(CTFontSymbolicTraits::TraitItalic);
+    let bold_italic = styled(CTFontSymbolicTraits::TraitBold | CTFontSymbolicTraits::TraitItalic);
+    Some([regular, bold, italic, bold_italic])
 }
 
 fn is_private_use(character: char) -> bool {
@@ -76,14 +97,16 @@ fn shaped_line(font: &CTFont, text: &str) -> Option<CFRetained<CTLine>> {
 }
 
 impl Font {
-    pub fn new(points: f64, scale: f32) -> Result<Self> {
+    pub fn new(family: &str, points: f64, scale: f32) -> Result<Self> {
         let pixels = points * f64::from(scale);
-        let faces = [
-            face("MonaspaceNeon-Regular", pixels),
-            face("MonaspaceNeon-Bold", pixels),
-            face("MonaspaceNeon-Italic", pixels),
-            face("MonaspaceNeon-BoldItalic", pixels),
-        ];
+        let faces = family_faces(family, pixels)
+            .or_else(|| {
+                eprintln!(
+                    "agentd: font family {family} isn't installed; using {DEFAULT_FONT_FAMILY}"
+                );
+                family_faces(DEFAULT_FONT_FAMILY, pixels)
+            })
+            .with_context(|| format!("neither {family} nor {DEFAULT_FONT_FAMILY} is installed"))?;
         let regular = &faces[0];
         let mut character = u16::from(b'M');
         let mut glyph = 0u16;
@@ -241,7 +264,7 @@ mod tests {
 
     #[test]
     fn plain_text_is_coverage_and_emoji_is_colour() {
-        let font = Font::new(13.0, 2.0).unwrap();
+        let font = Font::new(DEFAULT_FONT_FAMILY, 13.0, 2.0).unwrap();
         let mut pixels = Vec::new();
         assert_eq!(
             font.rasterize("A", REGULAR, 1, &mut pixels),
@@ -256,7 +279,7 @@ mod tests {
 
     #[test]
     fn a_character_missing_from_the_terminal_font_falls_back_to_another_face() {
-        let font = Font::new(13.0, 2.0).unwrap();
+        let font = Font::new(DEFAULT_FONT_FAMILY, 13.0, 2.0).unwrap();
         let mut pixels = Vec::new();
         assert_eq!(
             font.rasterize("世", REGULAR, 2, &mut pixels),
@@ -267,7 +290,7 @@ mod tests {
 
     #[test]
     fn a_zwj_sequence_shapes_into_one_glyph() {
-        let font = Font::new(13.0, 2.0).unwrap();
+        let font = Font::new(DEFAULT_FONT_FAMILY, 13.0, 2.0).unwrap();
         let mut single = Vec::new();
         font.rasterize("\u{1F468}", REGULAR, 2, &mut single);
         let mut family = Vec::new();
@@ -283,7 +306,7 @@ mod tests {
 
     #[test]
     fn box_drawing_is_procedural_and_touches_the_cell_edge() {
-        let font = Font::new(13.0, 2.0).unwrap();
+        let font = Font::new(DEFAULT_FONT_FAMILY, 13.0, 2.0).unwrap();
         let mut pixels = Vec::new();
         font.rasterize("│", REGULAR, 1, &mut pixels);
         assert_eq!(
@@ -295,24 +318,51 @@ mod tests {
 
     #[test]
     fn decoration_lines_fit_inside_the_cell() {
-        let font = Font::new(13.0, 2.0).unwrap();
+        let font = Font::new(DEFAULT_FONT_FAMILY, 13.0, 2.0).unwrap();
         assert!(font.underline_top + 3 * font.line_thickness <= font.cell_height);
         assert!(font.strike_top + font.line_thickness <= font.cell_height);
         assert!(font.strike_top < font.underline_top);
     }
 
+    fn face_names(font: &Font) -> Vec<String> {
+        font.faces
+            .iter()
+            // SAFETY: a plain getter on a live font.
+            .map(|face| unsafe { face.post_script_name() }.to_string())
+            .collect()
+    }
+
     #[test]
-    fn text_uses_monaspace_neon() {
-        let font = Font::new(13.0, 2.0).unwrap();
-        // CoreText silently substitutes another face when a name isn't installed.
-        // SAFETY: a plain getter on a live font.
-        let name = unsafe { font.faces[0].post_script_name() };
-        assert_eq!(name.to_string(), "MonaspaceNeon-Regular");
+    fn a_family_gives_its_four_styles() {
+        let font = Font::new(DEFAULT_FONT_FAMILY, 13.0, 2.0).unwrap();
+        assert_eq!(
+            face_names(&font),
+            [
+                "MonaspaceNeon-Regular",
+                "MonaspaceNeon-Bold",
+                "MonaspaceNeon-Italic",
+                "MonaspaceNeon-BoldItalic"
+            ]
+        );
+    }
+
+    #[test]
+    fn an_unknown_family_falls_back_to_monaspace_neon() {
+        let font = Font::new("No Such Family", 13.0, 2.0).unwrap();
+        assert_eq!(face_names(&font)[0], "MonaspaceNeon-Regular");
+    }
+
+    #[test]
+    fn a_family_without_a_style_reuses_the_regular_face() {
+        // Andale Mono has one face.
+        let font = Font::new("Andale Mono", 13.0, 2.0).unwrap();
+        let names = face_names(&font);
+        assert!(names.iter().all(|name| name == &names[0]), "{names:?}");
     }
 
     #[test]
     fn private_use_icons_are_real_glyphs_rather_than_tofu() {
-        let font = Font::new(13.0, 2.0).unwrap();
+        let font = Font::new(DEFAULT_FONT_FAMILY, 13.0, 2.0).unwrap();
         let (mut separator, mut icon) = (Vec::new(), Vec::new());
         font.rasterize("\u{E0C6}", REGULAR, 1, &mut separator);
         font.rasterize("\u{F432}", REGULAR, 1, &mut icon);
@@ -322,7 +372,7 @@ mod tests {
 
     #[test]
     fn the_bitmap_covers_every_requested_cell() {
-        let font = Font::new(13.0, 2.0).unwrap();
+        let font = Font::new(DEFAULT_FONT_FAMILY, 13.0, 2.0).unwrap();
         let mut pixels = Vec::new();
         font.rasterize("A", REGULAR, 2, &mut pixels);
         assert_eq!(
