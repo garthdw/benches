@@ -682,11 +682,21 @@ impl TerminalInput {
     }
 
     /// Ends any press, drag or selection, whose release would go to whichever session is shown next.
-    fn cancel_pointer(&mut self) {
+    /// Returns the release report for a button the program saw pressed, so it isn't left held.
+    fn cancel_pointer(&mut self, terminal: &Terminal<'static, '_>) -> Result<Vec<u8>> {
         self.selecting = false;
-        self.pressed = None;
         self.next_autoscroll = None;
         self.scrollbar_grab = None;
+        match (self.pressed.take(), self.surface) {
+            (Some(button), Some(surface)) => self.report(
+                terminal,
+                surface,
+                mouse::Action::Release,
+                Some(button),
+                key::Mods::empty(),
+            ),
+            _ => Ok(Vec::new()),
+        }
     }
 
     fn select(
@@ -1588,7 +1598,11 @@ impl Actor {
                         // The UI's hover and pointer move to whichever session takes this one's place.
                         if visibility != Visibility::Shown {
                             scrollbar_hovered = false;
-                            input.cancel_pointer();
+                            if let Some(release) = input.cancel_pointer(&terminal).log_err("cancel pointer")
+                                && !release.is_empty()
+                            {
+                                self.input.send(release).log_err("queue mouse release");
+                            }
                         }
                         publisher.borrow_mut().visibility = visibility;
                         dirty = true;
@@ -2024,6 +2038,18 @@ mod tests {
             .pointer(&terminal, pointer_at(PointerPhase::Release, 2, 1))
             .unwrap();
         assert_eq!(release, b"\x1b[<0;3;2m");
+    }
+
+    #[test]
+    fn cancelling_a_held_press_reports_its_release() {
+        let mut terminal = new_terminal(20, 5).unwrap();
+        terminal.vt_write(b"\x1b[?1000h\x1b[?1006h");
+        let mut input = input_for_test();
+        input
+            .pointer(&terminal, pointer_at(PointerPhase::Press, 2, 1))
+            .unwrap();
+        assert_eq!(input.cancel_pointer(&terminal).unwrap(), b"\x1b[<0;3;2m");
+        assert_eq!(input.cancel_pointer(&terminal).unwrap(), b"");
     }
 
     /// Rune reports a hover move alongside every drag move, and `main.rs` forwards both.
