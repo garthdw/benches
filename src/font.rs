@@ -3,14 +3,14 @@ use std::ptr::NonNull;
 use anyhow::{Context, Result, ensure};
 use libghostty_vt::style::Underline;
 use objc2_core_foundation::{
-    CFAttributedString, CFDictionary, CFRetained, CFString, CFType, kCFBooleanTrue,
+    CFAttributedString, CFData, CFDictionary, CFRetained, CFString, CFType, kCFBooleanTrue,
 };
 use objc2_core_graphics::{
     CGBitmapContextCreate, CGColorSpace, CGContext, CGImageAlphaInfo, CGImageByteOrderInfo,
 };
 use objc2_core_text::{
-    CTFont, CTFontOrientation, CTFontSymbolicTraits, CTLine, kCTFontAttributeName,
-    kCTForegroundColorFromContextAttributeName,
+    CTFont, CTFontManagerCreateFontDescriptorFromData, CTFontOrientation, CTFontSymbolicTraits,
+    CTLine, kCTFontAttributeName, kCTForegroundColorFromContextAttributeName,
 };
 
 use crate::config::DEFAULT_FONT_FAMILY;
@@ -40,6 +40,22 @@ pub struct Font {
     pub underline_top: u32,
     pub strike_top: u32,
     baseline: f64,
+}
+
+const SYMBOLS_FONT: &[u8] = include_bytes!("../assets/SymbolsNerdFontMono-Regular.ttf");
+
+fn symbols_face(pixels: f64) -> Result<CFRetained<CTFont>> {
+    // SAFETY: the data is live for the call, and a null matrix means identity.
+    unsafe {
+        let descriptor =
+            CTFontManagerCreateFontDescriptorFromData(&CFData::from_static_bytes(SYMBOLS_FONT))
+                .context("the bundled symbols font couldn't be loaded")?;
+        Ok(CTFont::with_font_descriptor(
+            &descriptor,
+            pixels,
+            std::ptr::null(),
+        ))
+    }
 }
 
 fn face(name: &str, pixels: f64) -> CFRetained<CTFont> {
@@ -156,7 +172,7 @@ impl Font {
             strike_top: (baseline_from_top - x_height / 2.0 - half_line).round() as u32,
             baseline,
             faces,
-            symbols: face("CaskaydiaMonoNFM-Regular", pixels),
+            symbols: symbols_face(pixels)?,
             color_space: CGColorSpace::new_device_rgb(),
         })
     }
@@ -169,7 +185,7 @@ impl Font {
         cells: u32,
         out: &mut Vec<u8>,
     ) -> Option<GlyphKind> {
-        // CoreText's cascade never picks a user-installed font for private-use codepoints.
+        // CoreText's cascade never picks an installed font for private-use codepoints.
         let font = if text.chars().any(is_private_use) {
             &self.symbols
         } else {
@@ -369,6 +385,9 @@ mod tests {
         font.rasterize("\u{F432}", REGULAR, 1, &mut icon);
         // Every missing private-use character draws the same placeholder.
         assert_ne!(separator, icon);
+        // SAFETY: a plain getter on a live font.
+        let name = unsafe { font.symbols.post_script_name() }.to_string();
+        assert_eq!(name, "SymbolsNFM");
     }
 
     #[test]
