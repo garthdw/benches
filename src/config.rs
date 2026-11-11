@@ -27,6 +27,10 @@ pub struct Config {
 pub struct FontConfig {
     pub family: String,
     pub size: f64,
+    /// The face for private-use icons; `None` tries `fallback_families`, then the main font.
+    pub symbols_family: Option<String>,
+    /// Ghostty's `font-family` lines after the first.
+    pub fallback_families: Vec<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq)]
@@ -67,6 +71,8 @@ impl Default for Config {
             font: FontConfig {
                 family: DEFAULT_FONT_FAMILY.to_owned(),
                 size: DEFAULT_FONT_SIZE,
+                symbols_family: None,
+                fallback_families: Vec::new(),
             },
             theme: Theme::default(),
             tabs: vec![
@@ -101,6 +107,8 @@ struct File {
 struct FontFile {
     family: Option<String>,
     size: Option<f64>,
+    #[serde(rename = "symbols-family")]
+    symbols_family: Option<String>,
 }
 
 /// Where to look for the files the config names.
@@ -145,6 +153,7 @@ impl Config {
                 .last()
                 .map(|value| (*value).to_owned())
         };
+        let ghostty_families = ghostty_values(&ghostty, "font-family");
         let defaults = Config::default();
         let ghostty_size = ghostty_value("font-size")
             .and_then(|size| size.parse::<f64>().log_err("ghostty font-size"));
@@ -160,17 +169,19 @@ impl Config {
                 family: file
                     .font
                     .family
-                    .or_else(|| {
-                        ghostty_values(&ghostty, "font-family")
-                            .first()
-                            .map(|family| (*family).to_owned())
-                    })
+                    .or_else(|| ghostty_families.first().map(|family| (*family).to_owned()))
                     .unwrap_or(defaults.font.family),
                 size: file
                     .font
                     .size
                     .or(ghostty_size)
                     .unwrap_or(defaults.font.size),
+                symbols_family: file.font.symbols_family,
+                fallback_families: ghostty_families
+                    .iter()
+                    .skip(1)
+                    .map(|family| (*family).to_owned())
+                    .collect(),
             },
             theme,
             tabs: file.tabs.unwrap_or(defaults.tabs),
@@ -303,7 +314,9 @@ mod tests {
             config.font,
             FontConfig {
                 family: "Iosevka".to_owned(),
-                size: 14.0
+                size: 14.0,
+                symbols_family: None,
+                fallback_families: vec!["Symbols".to_owned()],
             }
         );
         assert_eq!(
@@ -329,7 +342,7 @@ mod tests {
 
     #[test]
     fn config_toml_overrides_ghostty_key_by_key() {
-        let config = "shell = \"/bin/zsh\"\njump-command = \"j\"\n[font]\nsize = 12\n[[tabs]]\ntitle = \"shell\"\n";
+        let config = "shell = \"/bin/zsh\"\njump-command = \"j\"\n[font]\nsize = 12\nsymbols-family = \"Icons NF\"\n[[tabs]]\ntitle = \"shell\"\n";
         let (_root, paths) = paths(
             Some(config),
             Some("font-size = 14\nfont-family = Iosevka\n"),
@@ -341,7 +354,9 @@ mod tests {
             config.font,
             FontConfig {
                 family: "Iosevka".to_owned(),
-                size: 12.0
+                size: 12.0,
+                symbols_family: Some("Icons NF".to_owned()),
+                fallback_families: Vec::new(),
             }
         );
         assert_eq!(

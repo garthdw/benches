@@ -63,15 +63,57 @@ fn face(name: &str, pixels: f64) -> CFRetained<CTFont> {
     unsafe { CTFont::with_name(&CFString::from_str(name), pixels, std::ptr::null()) }
 }
 
-/// Regular, bold, italic and bold italic faces of `family`, or `None` if it isn't installed.
-/// A style the family lacks reuses the regular face.
-fn family_faces(family: &str, pixels: f64) -> Option<[CFRetained<CTFont>; 4]> {
+fn installed_face(family: &str, pixels: f64) -> Option<CFRetained<CTFont>> {
     let regular = face(family, pixels);
     // CoreText silently substitutes another family when a name isn't installed.
     // SAFETY: a plain getter on a live font.
-    if unsafe { regular.family_name() }.to_string() != family {
-        return None;
+    (unsafe { regular.family_name() }.to_string() == family).then_some(regular)
+}
+
+fn has_icons(font: &CTFont) -> bool {
+    // A Powerline separator and a Font Awesome icon.
+    let mut characters = [0xE0B0u16, 0xF432];
+    let mut glyphs = [0u16; 2];
+    // SAFETY: both arrays hold the two elements the count names.
+    unsafe {
+        font.glyphs_for_characters(
+            NonNull::from(&mut characters).cast(),
+            NonNull::from(&mut glyphs).cast(),
+            2,
+        )
     }
+}
+
+/// The face for private-use icons: the configured family, else the first Ghostty fallback, else the
+/// main font, each only when it has the icons, else the bundled Symbols Nerd Font.
+fn icon_face(
+    main: &CFRetained<CTFont>,
+    pixels: f64,
+    configured: Option<&str>,
+    fallbacks: &[String],
+) -> Result<CFRetained<CTFont>> {
+    let with_icons = |family: &str| installed_face(family, pixels).filter(|font| has_icons(font));
+    if let Some(family) = configured {
+        if let Some(font) = with_icons(family) {
+            return Ok(font);
+        }
+        eprintln!(
+            "agentd: symbols family {family} isn't installed or lacks icons; using the next choice"
+        );
+    }
+    if let Some(font) = fallbacks.iter().find_map(|family| with_icons(family)) {
+        return Ok(font);
+    }
+    if has_icons(main) {
+        return Ok(main.clone());
+    }
+    symbols_face(pixels)
+}
+
+/// Regular, bold, italic and bold italic faces of `family`, or `None` if it isn't installed.
+/// A style the family lacks reuses the regular face.
+fn family_faces(family: &str, pixels: f64) -> Option<[CFRetained<CTFont>; 4]> {
+    let regular = installed_face(family, pixels)?;
     let styled = |traits: CTFontSymbolicTraits| {
         // SAFETY: a zero size keeps the font's size and a null matrix means identity.
         unsafe { regular.copy_with_symbolic_traits(0.0, std::ptr::null(), traits, traits) }
@@ -114,7 +156,18 @@ fn shaped_line(font: &CTFont, text: &str) -> Option<CFRetained<CTLine>> {
 }
 
 impl Font {
+    #[cfg(test)]
     pub fn new(family: &str, points: f64, scale: f32) -> Result<Self> {
+        Self::with_symbols(family, points, scale, None, &[])
+    }
+
+    pub fn with_symbols(
+        family: &str,
+        points: f64,
+        scale: f32,
+        symbols_family: Option<&str>,
+        fallback_families: &[String],
+    ) -> Result<Self> {
         let pixels = points * f64::from(scale);
         let faces = family_faces(family, pixels)
             .or_else(|| {
@@ -163,6 +216,7 @@ impl Font {
         let half_line = f64::from(line_thickness) / 2.0;
         // Room for the second line of a double underline.
         let lowest_underline = cell_height.saturating_sub(3 * line_thickness);
+        let symbols = icon_face(regular, pixels, symbols_family, fallback_families)?;
         Ok(Self {
             cell_width: advance.ceil() as u32,
             cell_height,
@@ -172,7 +226,7 @@ impl Font {
             strike_top: (baseline_from_top - x_height / 2.0 - half_line).round() as u32,
             baseline,
             faces,
-            symbols: symbols_face(pixels)?,
+            symbols,
             color_space: CGColorSpace::new_device_rgb(),
         })
     }
@@ -388,6 +442,78 @@ mod tests {
         // SAFETY: a plain getter on a live font.
         let name = unsafe { font.symbols.post_script_name() }.to_string();
         assert_eq!(name, "SymbolsNFM");
+    }
+
+    fn symbols_name(font: &Font) -> String {
+        // SAFETY: a plain getter on a live font.
+        unsafe { font.symbols.post_script_name() }.to_string()
+    }
+
+    /// CI doesn't have Caskaydia; tests that need it skip.
+    fn nerd_family_installed() -> bool {
+        family_faces(NERD_FAMILY, 26.0).is_some()
+    }
+
+    const NERD_FAMILY: &str = "CaskaydiaMono Nerd Font Mono";
+
+    #[test]
+    fn a_configured_nerd_family_draws_the_icons() {
+        if !nerd_family_installed() {
+            return;
+        }
+        let font =
+            Font::with_symbols(DEFAULT_FONT_FAMILY, 13.0, 2.0, Some(NERD_FAMILY), &[]).unwrap();
+        assert_eq!(symbols_name(&font), "CaskaydiaMonoNFM-Regular");
+    }
+
+    #[test]
+    fn a_missing_configured_family_falls_back_to_the_embedded_face() {
+        let font = Font::with_symbols(DEFAULT_FONT_FAMILY, 13.0, 2.0, Some("No Such Family"), &[])
+            .unwrap();
+        assert_eq!(symbols_name(&font), "SymbolsNFM");
+    }
+
+    #[test]
+    fn a_family_without_icons_is_not_used_for_them() {
+        let font =
+            Font::with_symbols(DEFAULT_FONT_FAMILY, 13.0, 2.0, Some("Andale Mono"), &[]).unwrap();
+        assert_eq!(symbols_name(&font), "SymbolsNFM");
+    }
+
+    #[test]
+    fn the_first_ghostty_fallback_with_icons_is_used() {
+        if !nerd_family_installed() {
+            return;
+        }
+        let fallbacks = ["No Such Family", "Andale Mono", NERD_FAMILY].map(str::to_owned);
+        let font = Font::with_symbols(DEFAULT_FONT_FAMILY, 13.0, 2.0, None, &fallbacks).unwrap();
+        assert_eq!(symbols_name(&font), "CaskaydiaMonoNFM-Regular");
+    }
+
+    #[test]
+    fn a_configured_family_without_icons_falls_through_to_ghostty_fallbacks() {
+        if !nerd_family_installed() {
+            return;
+        }
+        let fallbacks = [NERD_FAMILY.to_owned()];
+        let font = Font::with_symbols(
+            DEFAULT_FONT_FAMILY,
+            13.0,
+            2.0,
+            Some("Andale Mono"),
+            &fallbacks,
+        )
+        .unwrap();
+        assert_eq!(symbols_name(&font), "CaskaydiaMonoNFM-Regular");
+    }
+
+    #[test]
+    fn a_main_font_with_icons_draws_them() {
+        if !nerd_family_installed() {
+            return;
+        }
+        let font = Font::new(NERD_FAMILY, 13.0, 2.0).unwrap();
+        assert_eq!(symbols_name(&font), "CaskaydiaMonoNFM-Regular");
     }
 
     #[test]
