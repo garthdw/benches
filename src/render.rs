@@ -181,8 +181,8 @@ fn glyph_key(grid: &Grid, cell: &Cell) -> Option<GlyphKey> {
 /// Longer runs are shaped in pieces, which keeps each one small enough to cache.
 const MAX_RUN: usize = 16;
 
-/// Neighbouring cells shaped together: the same style, on one row, and not the cursor, which
-/// splits a ligature as Ghostty does.
+/// Neighbouring cells shaped together: the same style, on one row, all selected or all not, and
+/// not the cursor, which splits a ligature as Ghostty does.
 struct Run {
     start: usize,
     end: usize,
@@ -210,7 +210,8 @@ fn find_run(
             index % cols == 0
                 || Some(index) == cursor
                 || !joins_run(cell)
-                || (cell.bold, cell.italic) != (first.bold, first.italic)
+                || (cell.bold, cell.italic, cell.selected)
+                    != (first.bold, first.italic, first.selected)
         })
         .unwrap_or(grid.cells.len().min(start + MAX_RUN));
     text.clear();
@@ -852,6 +853,29 @@ mod tests {
     fn the_cursor_breaks_a_ligature() {
         assert!(shaped_keys(b"a != b\x1b[1;3H", &[]).is_empty());
         assert!(shaped_keys(b"a != b\x1b[1;4H", &[]).is_empty());
+    }
+
+    #[test]
+    fn a_selection_edge_breaks_a_ligature() {
+        let font = Font::new(crate::config::DEFAULT_FONT_FAMILY, 18.0, 2.0).unwrap();
+        let mut grid = Grid::from_vt(b"a != b\x1b[2;1H", 8, 2).unwrap();
+        let mut cells = grid.cells.to_vec();
+        cells[2].selected = true;
+        grid.cells = cells.into();
+        let mut keys = 0;
+        build_quads(
+            &grid,
+            [0.0, 0.0, 800.0, 600.0],
+            metrics(&font, 0.0, 2.0),
+            &font,
+            true,
+            &mut Vec::new(),
+            |key| {
+                keys += usize::from(matches!(key.text, GlyphText::Shaped { .. }));
+                (Some(fake_glyph([0, 0])), 0)
+            },
+        );
+        assert_eq!(keys, 0);
     }
 
     #[test]
