@@ -566,7 +566,12 @@ impl TerminalCompositor {
         let surface = Surface::fit((rect[2], rect[3]), metrics);
         // Hidden tabs share the visible area, as closed tray processes share the drawer's, so they are sized too.
         let workspace = &state.workspace;
-        let session = if site.mark == crate::DRAWER_MARK {
+        let session = if site.mark == crate::OVERLAY_MARK {
+            workspace
+                .overlay_sessions()
+                .for_each(|session| session.resize(surface));
+            workspace.overlay_session()
+        } else if site.mark == crate::DRAWER_MARK {
             workspace
                 .tray_sessions()
                 .for_each(|session| session.resize(surface));
