@@ -71,6 +71,8 @@ pub struct State {
     started: bool,
     /// Session id and generation last drawn for the tab and the drawer.
     drawn: [(u64, u64); 2],
+    /// Sessions showing an attention dot, as the actors raise it without an event.
+    alerting: Vec<u64>,
     /// The session that refused a paste, and the text; dismissed when keys move elsewhere.
     pending_paste: Option<(u64, String)>,
     /// The session whose close waits for confirmation; dismissed when keys move elsewhere.
@@ -779,7 +781,7 @@ fn view(state: &State, cx: &mut Cx<State>) -> El {
                     format!("tab-{index}"),
                     tab.label(),
                     index == project.active_tab,
-                    attention_dot(tab.attention),
+                    attention_dot(tab.session.attention()),
                 )
                 .max_w(TAB_MAX_WIDTH)
                 .on_press(move |state: &mut State| state.workspace.select_tab(index))
@@ -1119,7 +1121,6 @@ fn poll(state: &mut State, now: f64, tx: &mut Tx) -> bool {
     }
     launch_active(state);
     let active = state.session().map(Session::id);
-    let shown = state.workspace.active_session().map(Session::id);
     let mut changed = poll_jump(state, now, tx);
     if state
         .pending_paste
@@ -1155,12 +1156,6 @@ fn poll(state: &mut State, now: f64, tx: &mut Tx) -> bool {
                     }
                     changed = true;
                 }
-                // Sent before the tab was shown, which already cleared it.
-                Event::Attention(_) if Some(tab.session.id()) == shown => {}
-                Event::Attention(attention) => {
-                    tab.attention = tab.attention.max(attention);
-                    changed = true;
-                }
                 Event::Notify { title, body } => notices.push((tab.session.id(), title, body)),
             }
         }
@@ -1193,6 +1188,14 @@ fn poll(state: &mut State, now: f64, tx: &mut Tx) -> bool {
     ];
     changed |= drawn != state.drawn;
     state.drawn = drawn;
+    let alerting: Vec<u64> = state
+        .workspace
+        .sessions()
+        .filter(|session| session.attention() == Attention::Alert)
+        .map(Session::id)
+        .collect();
+    changed |= alerting != state.alerting;
+    state.alerting = alerting;
     changed
 }
 
@@ -1338,7 +1341,7 @@ fn add_scene_tray(state: &mut State) {
 fn show_tray_scene(state: &mut State) {
     show_workspace_scene(state);
     add_scene_tray(state);
-    state.workspace.projects[0].tabs[1].attention = Attention::Alert;
+    state.workspace.projects[0].tabs[1].session.alert();
     state.workspace.toggle_drawer(0);
 }
 

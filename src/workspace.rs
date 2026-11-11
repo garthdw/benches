@@ -27,7 +27,6 @@ pub struct Tab {
     pub cwd: Option<PathBuf>,
     pub session: Session,
     pub status: Status,
-    pub attention: Attention,
     /// Respawn once the stopped process has exited, so the new one can take its port.
     pub restart: bool,
     stopping: bool,
@@ -42,7 +41,6 @@ impl Tab {
             cwd: None,
             session,
             status: Status::Running,
-            attention: Attention::None,
             restart: false,
             stopping: false,
         }
@@ -139,7 +137,7 @@ impl Project {
             .tray
             .iter()
             .any(|tab| matches!(tab.status, Status::Failed(_)));
-        let tabs = self.tabs.iter().map(|tab| tab.attention).max();
+        let tabs = self.tabs.iter().map(|tab| tab.session.attention()).max();
         tabs.unwrap_or_default().max(if failed {
             Attention::Alert
         } else {
@@ -418,7 +416,7 @@ impl Workspace {
     }
 
     /// Shows the active tab and open drawer and lists the rest of the project's tabs.
-    /// Other projects' tabs are hidden, so their titles wait. Showing a tab clears its attention.
+    /// Other projects' tabs are hidden, so their titles wait.
     fn show_active(&mut self) {
         let active = self.active;
         for (index, project) in self.projects.iter_mut().enumerate() {
@@ -427,7 +425,6 @@ impl Workspace {
                 let visibility = if !shown {
                     Visibility::Hidden
                 } else if tab_index == project.active_tab {
-                    tab.attention = Attention::None;
                     Visibility::Shown
                 } else {
                     Visibility::Listed
@@ -803,7 +800,7 @@ mod tests {
     #[test]
     fn showing_a_tab_clears_its_attention() {
         let mut workspace = workspace();
-        workspace.projects[0].tabs[1].attention = Attention::Alert;
+        workspace.projects[0].tabs[1].session.alert();
         assert_eq!(workspace.projects[0].attention(), Attention::Alert);
         workspace.select_project(0);
         assert_eq!(workspace.projects[0].attention(), Attention::Alert);
