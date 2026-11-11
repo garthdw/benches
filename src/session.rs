@@ -14,8 +14,10 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use crossbeam_channel::{Receiver, Sender, bounded, never, select, unbounded};
-use libghostty_vt::render::{CellIterator, CursorVisualStyle, Dirty, RowIterator};
-use libghostty_vt::screen::{CellWide, Screen};
+use libghostty_vt::render::{
+    CellIteration, CellIterator, Colors, CursorVisualStyle, Dirty, RowIterator,
+};
+use libghostty_vt::screen::{CellContentTag, CellWide, Screen, cell};
 use libghostty_vt::selection::gesture::{
     Autoscroll, AutoscrollTickEvent, DragEvent, Geometry, Gesture, PressEvent, ReleaseEvent,
 };
@@ -170,7 +172,7 @@ pub struct WheelInput {
     pub mods: key::Mods,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Cell {
     pub character: char,
     pub fg: [u8; 3],
@@ -460,6 +462,72 @@ impl Default for Presentation {
 
 type Content = (Arc<[Cell]>, Arc<[String]>);
 
+/// Reads one cell through libghostty's cell iterator, which costs several calls.
+fn read_cell(
+    cell: &CellIteration<'_, '_>,
+    colors: &Colors,
+    (selection_background, selection_foreground): (Option<RgbColor>, Option<RgbColor>),
+    clusters: &mut Vec<String>,
+) -> Result<Cell> {
+    let mut fg = cell.fg_color()?.unwrap_or(colors.foreground);
+    let mut bg = cell.bg_color()?;
+    let mut output = Cell::default();
+    let mut invisible = false;
+    let mut is_faint = false;
+    let selected = cell.is_selected()?;
+    let mut inverted = selected && selection_background.is_none();
+    if cell.has_styling()? {
+        let style = cell.style()?;
+        output.bold = style.bold;
+        output.italic = style.italic;
+        is_faint = style.faint;
+        output.strikethrough = style.strikethrough;
+        output.overline = style.overline;
+        output.underline = style.underline;
+        output.underline_color = match style.underline_color {
+            StyleColor::None => None,
+            StyleColor::Rgb(color) => Some(rgb(color)),
+            StyleColor::Palette(index) => Some(rgb(colors.palette[usize::from(index.0)])),
+        };
+        invisible = style.invisible;
+        inverted ^= style.inverse;
+    }
+    if inverted {
+        let old_fg = fg;
+        fg = bg.unwrap_or(colors.background);
+        bg = Some(old_fg);
+    }
+    if selected && let Some(background) = selection_background {
+        bg = Some(background);
+        fg = selection_foreground.unwrap_or(fg);
+    }
+    let width = cell.raw_cell()?.wide()?;
+    output.wide = width == CellWide::Wide;
+    output.spacer = matches!(width, CellWide::SpacerTail | CellWide::SpacerHead);
+    output.fg = if is_faint {
+        faint(rgb(fg), rgb(bg.unwrap_or(colors.background)))
+    } else {
+        rgb(fg)
+    };
+    output.bg = bg.map(rgb);
+    if !invisible {
+        let mut character = [' '];
+        match cell.graphemes_buf(&mut character) {
+            Ok(()) => {}
+            // The buffer holds the base codepoint even when the grapheme is longer.
+            Err(libghostty_vt::Error::OutOfSpace { .. }) => {
+                let mut cluster = String::new();
+                cell.graphemes_utf8(&mut cluster)?;
+                output.cluster = Some(u32::try_from(clusters.len())?);
+                clusters.push(cluster);
+            }
+            Err(error) => return Err(error.into()),
+        }
+        output.character = character[0];
+    }
+    Ok(output)
+}
+
 struct GridBuilder {
     state: RenderState<'static>,
     rows: RowIterator<'static>,
@@ -470,6 +538,8 @@ struct GridBuilder {
     /// From the theme; without a background, selected cells swap their colours.
     selection_background: Option<RgbColor>,
     selection_foreground: Option<RgbColor>,
+    /// Off only in tests, to compare against reading every cell the slow way.
+    plain_fast_path: bool,
 }
 
 impl GridBuilder {
@@ -482,6 +552,7 @@ impl GridBuilder {
             content: None,
             selection_background: None,
             selection_foreground: None,
+            plain_fast_path: true,
         })
     }
 
@@ -532,6 +603,8 @@ impl GridBuilder {
                 });
                 let mut cells = Vec::with_capacity(columns * usize::from(rows));
                 let mut clusters = Vec::new();
+                // Runs of identical cells, mostly blanks, share one decode.
+                let mut decoded = None;
                 let mut row_iterator = self.rows.update(&snapshot)?;
                 while let Some(row) = row_iterator.next() {
                     if let Some((old_cells, old_clusters)) = &previous
@@ -553,68 +626,54 @@ impl GridBuilder {
                         }
                         continue;
                     }
+                    let selection = row.selection()?;
                     let mut cell_iterator = self.cells.update(row)?;
-                    while let Some(cell) = cell_iterator.next() {
-                        let mut fg = cell.fg_color()?.unwrap_or(colors.foreground);
-                        let mut bg = cell.bg_color()?;
-                        let mut output = Cell::default();
-                        let mut invisible = false;
-                        let mut is_faint = false;
-                        let selected = cell.is_selected()?;
-                        let mut inverted = selected && self.selection_background.is_none();
-                        if cell.has_styling()? {
-                            let style = cell.style()?;
-                            output.bold = style.bold;
-                            output.italic = style.italic;
-                            is_faint = style.faint;
-                            output.strikethrough = style.strikethrough;
-                            output.overline = style.overline;
-                            output.underline = style.underline;
-                            output.underline_color = match style.underline_color {
-                                StyleColor::None => None,
-                                StyleColor::Rgb(color) => Some(rgb(color)),
-                                StyleColor::Palette(index) => {
-                                    Some(rgb(colors.palette[usize::from(index.0)]))
-                                }
-                            };
-                            invisible = style.invisible;
-                            inverted ^= style.inverse;
-                        }
-                        if inverted {
-                            let old_fg = fg;
-                            fg = bg.unwrap_or(colors.background);
-                            bg = Some(old_fg);
-                        }
-                        if selected && let Some(background) = self.selection_background {
-                            bg = Some(background);
-                            fg = self.selection_foreground.unwrap_or(fg);
-                        }
-                        let width = cell.raw_cell()?.wide()?;
-                        output.wide = width == CellWide::Wide;
-                        output.spacer =
-                            matches!(width, CellWide::SpacerTail | CellWide::SpacerHead);
-                        output.fg = if is_faint {
-                            faint(rgb(fg), rgb(bg.unwrap_or(colors.background)))
-                        } else {
-                            rgb(fg)
-                        };
-                        output.bg = bg.map(rgb);
-                        if !invisible {
-                            let mut character = [' '];
-                            match cell.graphemes_buf(&mut character) {
-                                Ok(()) => {}
-                                // The buffer holds the base codepoint even when the grapheme is longer.
-                                Err(libghostty_vt::Error::OutOfSpace { .. }) => {
-                                    let mut cluster = String::new();
-                                    cell.graphemes_utf8(&mut cluster)?;
-                                    output.cluster = Some(u32::try_from(clusters.len())?);
-                                    clusters.push(cluster);
-                                }
-                                Err(error) => return Err(error.into()),
+                    for (column, raw) in row.cells_raw()?.enumerate() {
+                        let column = u16::try_from(column)?;
+                        let (tag, codepoint, width, styled) = match decoded {
+                            Some((previous, values)) if previous == raw => values,
+                            _ => {
+                                let values = raw.get_multi((
+                                    cell::ContentTag,
+                                    cell::Codepoint,
+                                    cell::Wide,
+                                    cell::HasStyling,
+                                ))?;
+                                decoded = Some((raw, values));
+                                values
                             }
-                            output.character = character[0];
+                        };
+                        let selected = selection
+                            .is_some_and(|range| (range.start_x..=range.end_x).contains(&column));
+                        let character = match codepoint {
+                            0 => Some(' '),
+                            codepoint => char::from_u32(codepoint),
+                        };
+                        if let Some(character) = character
+                            && self.plain_fast_path
+                            && matches!(tag, CellContentTag::Codepoint)
+                            && !styled
+                            && !selected
+                        {
+                            cells.push(Cell {
+                                character,
+                                fg: rgb(colors.foreground),
+                                wide: width == CellWide::Wide,
+                                spacer: matches!(
+                                    width,
+                                    CellWide::SpacerTail | CellWide::SpacerHead
+                                ),
+                                ..Cell::default()
+                            });
+                            continue;
                         }
-                        cells.push(output);
+                        cell_iterator.select(column)?;
+                        cells.push(read_cell(
+                            &cell_iterator,
+                            &colors,
+                            (self.selection_background, self.selection_foreground),
+                            &mut clusters,
+                        )?);
                     }
                 }
                 let content: Content = (cells.into(), clusters.into());
@@ -2340,6 +2399,20 @@ mod tests {
             },
         );
         per_frame(
+            "steady styled output (scrolling)",
+            &mut terminal,
+            &mut builder,
+            |terminal, frame| {
+                let entry = format!(
+                    "\x1b[1;3{}mdrwxr-xr-x\x1b[0m 4 user \x1b[38;5;{}mstaff\x1b[0m \x1b[4;44mfile-{frame}.rs\x1b[0m \x1b[2mdim\x1b[7mrev\x1b[0m ",
+                    frame % 8,
+                    frame % 256
+                );
+                terminal.vt_write(format!("{}\r\n", entry.repeat(3)).as_bytes());
+                Presentation::default()
+            },
+        );
+        per_frame(
             "one dirty row",
             &mut terminal,
             &mut builder,
@@ -2473,6 +2546,44 @@ mod tests {
         assert_eq!(grid.cells[0].bg, Some(rgb(THEME_RED)));
         assert_eq!(grid.cells[0].fg, rgb(THEME_BLUE));
         assert_eq!(grid.cells[6].bg, None);
+    }
+
+    #[test]
+    fn the_plain_fast_path_reads_the_same_cells_as_reading_each_one() {
+        let vt = concat!(
+            "he\x1b[1;31mll\x1b[0m\u{4e16}o plain\r\n",
+            "\x1b[1mbold\x1b[3mital\x1b[2mfaint\x1b[22;7minverse\x1b[27;8minvisible\x1b[0m\r\n",
+            "\x1b[4:3;58;2;1;2;3munder\x1b[0m \x1b[9mstrike\x1b[53mover\x1b[0m\r\n",
+            "\x1b[48;5;4m   \x1b[48;2;9;8;7m   \x1b[0m\x1b[44mblue bg\x1b[0m\x1b[2K\r\n",
+            "\u{4e16}\u{754c}\u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467} e\u{301}\u{2764}\u{fe0f}x\r\n",
+            "\x1b[38;2;10;20;30mrgb \x1b[38;5;200mpalette\x1b[0m\x1b[K",
+        );
+        for selection_colours in [None, Some((THEME_RED, THEME_BLUE))] {
+            for selected in [false, true] {
+                let mut terminal = new_terminal(40, 8).unwrap();
+                terminal.vt_write(vt.as_bytes());
+                if selected {
+                    select_hello(&terminal, &mut input_for_test());
+                }
+                let build = |plain_fast_path| {
+                    let mut builder = GridBuilder::new().unwrap();
+                    builder.plain_fast_path = plain_fast_path;
+                    builder.selection_background = selection_colours.map(|colours| colours.0);
+                    builder.selection_foreground = selection_colours.map(|colours| colours.1);
+                    builder
+                        .build(&terminal, 1, Presentation::default())
+                        .unwrap()
+                        .unwrap()
+                };
+                let (fast, slow) = (build(true), build(false));
+                assert_eq!(fast.cells, slow.cells);
+                assert_eq!(fast.clusters, slow.clusters);
+                assert!(fast.cells.iter().any(|cell| cell.wide));
+                assert!(fast.cells.iter().any(|cell| cell.spacer));
+                assert!(fast.cells.iter().any(|cell| cell.cluster.is_some()));
+                assert!(fast.cells.iter().any(|cell| cell.bg.is_some()));
+            }
+        }
     }
 
     #[test]
