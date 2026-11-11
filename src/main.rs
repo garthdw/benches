@@ -504,8 +504,8 @@ fn switch_actions(
 
 /// Exact project and tab names, then the fixed actions whose labels contain the query's letters
 /// in order, then the jump command's folder, then the other projects and tabs, then the active
-/// project's tray restarts and stops, then creating a worktree named by a one-word query, then
-/// running the query. A query that names a project or tab outranks the fixed actions so Enter
+/// project's tray restarts and stops, then running the query, then creating a worktree named by
+/// a one-word query, kept last so Enter on a command never creates a branch. A query that names a project or tab outranks the fixed actions so Enter
 /// switches to it, and the switch, tray and worktree actions only appear once something is typed.
 fn palette_actions(query: &str, jump: Option<&Path>, workspace: &Workspace) -> Vec<Action> {
     let query = query.trim();
@@ -541,13 +541,13 @@ fn palette_actions(query: &str, jump: Option<&Path>, workspace: &Workspace) -> V
                 || letters_in_order(&action.label(), &needle)
         });
     }
-    let is_branch = !query.starts_with('-') && !query.contains(char::is_whitespace);
-    if is_branch && !query.is_empty() && workspace.project().is_some() {
-        actions.push(Action::CreateWorktree(query.to_owned()));
-    }
     if !query.is_empty() {
         actions.push(Action::Run(query.to_owned()));
         actions.push(Action::Tray(query.to_owned()));
+    }
+    let is_branch = !query.starts_with('-') && !query.contains(char::is_whitespace);
+    if is_branch && !query.is_empty() && workspace.project().is_some() {
+        actions.push(Action::CreateWorktree(query.to_owned()));
     }
     actions
 }
@@ -2475,9 +2475,9 @@ mod tests {
             palette_actions("lzg", None, &one_project()),
             [
                 Action::Lazygit,
-                Action::CreateWorktree("lzg".to_owned()),
                 Action::Run("lzg".to_owned()),
-                Action::Tray("lzg".to_owned())
+                Action::Tray("lzg".to_owned()),
+                Action::CreateWorktree("lzg".to_owned()),
             ]
         );
         assert_eq!(
@@ -2499,9 +2499,9 @@ mod tests {
             palette_actions("site", Some(root), &one_project()),
             [
                 Action::Jump(root.to_owned()),
-                Action::CreateWorktree("site".to_owned()),
                 Action::Run("site".to_owned()),
-                Action::Tray("site".to_owned())
+                Action::Tray("site".to_owned()),
+                Action::CreateWorktree("site".to_owned()),
             ]
         );
     }
@@ -2527,9 +2527,9 @@ mod tests {
             actions[..4],
             [
                 Action::SwitchProject(1, "site".to_owned()),
-                Action::CreateWorktree("sit".to_owned()),
                 Action::Run("sit".to_owned()),
                 Action::Tray("sit".to_owned()),
+                Action::CreateWorktree("sit".to_owned()),
             ]
         );
         let actions = palette_actions("lazy", None, &state.workspace);
@@ -3016,7 +3016,7 @@ mod tests {
         let workspace = one_project();
         let create = Action::CreateWorktree("feature-x".to_owned());
         let actions = palette_actions("feature-x", None, &workspace);
-        assert_eq!(actions[actions.len() - 3], create);
+        assert_eq!(actions.last(), Some(&create));
         for query in ["two words", "-x", ""] {
             assert!(
                 !palette_actions(query, None, &workspace)
