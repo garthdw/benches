@@ -502,51 +502,48 @@ fn switch_actions(
     found
 }
 
-/// Exact project and tab names, then the fixed actions whose labels contain the query's letters
-/// in order, then the jump command's folder, then the other projects and tabs, then the active
-/// project's tray restarts and stops, then running the query, then creating a worktree named by
-/// a one-word query, kept last so Enter on a command never creates a branch. A query that names a project or tab outranks the fixed actions so Enter
-/// switches to it, and the switch, tray and worktree actions only appear once something is typed.
+/// The fixed actions whose labels contain the query's letters in order, then the jump command's
+/// folder, then running the query, so Enter on a typed command always runs it. Below those come
+/// the open projects and tabs matching the query, exact names first, then the active project's
+/// tray restarts and stops, then creating a worktree named by a one-word query. Everything but
+/// the fixed actions appears only once something is typed.
 fn palette_actions(query: &str, jump: Option<&Path>, workspace: &Workspace) -> Vec<Action> {
     let query = query.trim();
     let needle = query.to_lowercase();
+    let mut actions: Vec<Action> = [
+        Action::Shell,
+        Action::Lazygit,
+        Action::OpenProject,
+        Action::ChangeFolder,
+    ]
+    .into_iter()
+    .filter(|action| *action != Action::ChangeFolder || workspace.project().is_some())
+    .filter(|action| letters_in_order(&action.label(), &needle))
+    .collect();
+    actions.extend(jump.map(|root| Action::Jump(root.to_owned())));
+    if query.is_empty() {
+        return actions;
+    }
+    actions.push(Action::Run(query.to_owned()));
+    actions.push(Action::Tray(query.to_owned()));
     let (exact, partial): (Vec<_>, Vec<_>) = switch_actions(&needle, jump, workspace)
         .into_iter()
-        .filter(|_| !query.is_empty())
         .partition(|(name, _)| name.to_lowercase() == needle);
-    let mut actions: Vec<Action> = exact.into_iter().map(|(_, action)| action).collect();
-    actions.extend(
-        [
-            Action::Shell,
-            Action::Lazygit,
-            Action::OpenProject,
-            Action::ChangeFolder,
-        ]
-        .into_iter()
-        .filter(|action| *action != Action::ChangeFolder || workspace.project().is_some())
-        .filter(|action| letters_in_order(&action.label(), &needle)),
-    );
-    actions.extend(jump.map(|root| Action::Jump(root.to_owned())));
-    actions.extend(partial.into_iter().map(|(_, action)| action));
-    if !query.is_empty() {
-        let tray = workspace.project().map_or(&[][..], |project| &project.tray);
-        for (index, tab) in tray.iter().enumerate() {
-            actions.push(Action::RestartTray(index, tab.label().to_owned()));
-            if tab.status == Status::Running {
-                actions.push(Action::StopTray(index, tab.label().to_owned()));
-            }
-        }
-        actions.retain(|action| {
-            !matches!(action, Action::RestartTray(..) | Action::StopTray(..))
-                || letters_in_order(&action.label(), &needle)
-        });
-    }
-    if !query.is_empty() {
-        actions.push(Action::Run(query.to_owned()));
-        actions.push(Action::Tray(query.to_owned()));
+    actions.extend(exact.into_iter().chain(partial).map(|(_, action)| action));
+    let tray = workspace.project().map_or(&[][..], |project| &project.tray);
+    for (index, tab) in tray.iter().enumerate() {
+        let restart = Action::RestartTray(index, tab.label().to_owned());
+        let stop = Action::StopTray(index, tab.label().to_owned());
+        let stoppable = tab.status == Status::Running;
+        actions.extend(
+            [Some(restart), stoppable.then_some(stop)]
+                .into_iter()
+                .flatten()
+                .filter(|action| letters_in_order(&action.label(), &needle)),
+        );
     }
     let is_branch = !query.starts_with('-') && !query.contains(char::is_whitespace);
-    if is_branch && !query.is_empty() && workspace.project().is_some() {
+    if is_branch && workspace.project().is_some() {
         actions.push(Action::CreateWorktree(query.to_owned()));
     }
     actions
@@ -2524,12 +2521,11 @@ mod tests {
         let state = workspace_state();
         let actions = palette_actions("sit", None, &state.workspace);
         assert_eq!(
-            actions[..4],
+            actions[..3],
             [
-                Action::SwitchProject(1, "site".to_owned()),
                 Action::Run("sit".to_owned()),
                 Action::Tray("sit".to_owned()),
-                Action::CreateWorktree("sit".to_owned()),
+                Action::SwitchProject(1, "site".to_owned()),
             ]
         );
         let actions = palette_actions("lazy", None, &state.workspace);
@@ -2542,17 +2538,16 @@ mod tests {
     }
 
     #[test]
-    fn exact_names_come_before_fixed_actions_and_partial_names_after_them() {
+    fn switching_comes_after_running_the_query_and_exact_names_lead_the_switches() {
         let state = workspace_state();
         let actions = palette_actions("shell", None, &state.workspace);
+        assert_eq!(actions[0], Action::Shell);
+        assert_eq!(actions[1], Action::Run("shell".to_owned()));
+        assert_eq!(actions[2], Action::Tray("shell".to_owned()));
         assert_eq!(
-            actions[0],
+            actions[3],
             Action::SwitchTab(1, 1, "shell (site)".to_owned())
         );
-        assert_eq!(actions[1], Action::Shell);
-        let actions = palette_actions("sh", None, &state.workspace);
-        assert_eq!(actions[0], Action::Shell);
-        assert!(matches!(actions[1], Action::SwitchTab(..)));
     }
 
     #[test]
@@ -2568,27 +2563,52 @@ mod tests {
         );
     }
 
+    fn enter_on_switch_row(runtime: &mut Runtime<State>, query: &str, row: Action) {
+        press(runtime, Key::Text(query.into()), Mods::default());
+        let actions = palette_actions(query, None, &runtime.state.workspace);
+        runtime.state.palette_selected = actions.iter().position(|action| *action == row).unwrap();
+        press(runtime, Key::Enter, Mods::default());
+    }
+
     #[test]
-    fn enter_on_a_project_name_makes_it_active() {
+    fn enter_on_a_project_row_makes_it_active() {
         let mut runtime = palette_runtime();
-        press(&mut runtime, Key::Text("site".into()), Mods::default());
-        press(&mut runtime, Key::Enter, Mods::default());
+        enter_on_switch_row(
+            &mut runtime,
+            "site",
+            Action::SwitchProject(1, "site".to_owned()),
+        );
         assert_eq!(runtime.state.workspace.active, 1);
         assert!(!runtime.state.palette_open);
     }
 
     #[test]
-    fn enter_on_a_tab_name_activates_its_project_and_tab() {
+    fn enter_on_a_tab_row_activates_its_project_and_tab() {
         let mut runtime = palette_runtime();
-        press(&mut runtime, Key::Text("lazygit".into()), Mods::default());
-        press(&mut runtime, Key::Enter, Mods::default());
+        enter_on_switch_row(
+            &mut runtime,
+            "lazygit",
+            Action::SwitchTab(0, 2, "lazygit (agentd)".to_owned()),
+        );
         assert_eq!(runtime.state.workspace.active, 0);
         assert_eq!(runtime.state.workspace.projects[0].active_tab, 2);
         let mut runtime = palette_runtime();
-        press(&mut runtime, Key::Text("shell".into()), Mods::default());
-        press(&mut runtime, Key::Enter, Mods::default());
+        enter_on_switch_row(
+            &mut runtime,
+            "shell",
+            Action::SwitchTab(1, 1, "shell (site)".to_owned()),
+        );
         assert_eq!(runtime.state.workspace.active, 1);
         assert_eq!(runtime.state.workspace.projects[1].active_tab, 1);
+    }
+
+    #[test]
+    fn enter_on_a_name_that_matches_a_project_still_runs_the_command() {
+        let mut runtime = palette_runtime();
+        press(&mut runtime, Key::Text("site".into()), Mods::default());
+        press(&mut runtime, Key::Enter, Mods::default());
+        assert_eq!(runtime.state.workspace.active, 0);
+        assert_eq!(runtime.state.workspace.projects[0].tabs.len(), 4);
     }
 
     fn worktree(branch: &str, path: &str) -> jump::Worktree {
@@ -3122,7 +3142,7 @@ mod tests {
         workspace.add_tray(stopped);
         state.workspace = workspace;
         let actions = palette_actions("stop", None, &state.workspace);
-        assert_eq!(actions[0], Action::StopTray(0, "pnpm dev".to_owned()));
+        assert_eq!(actions[2], Action::StopTray(0, "pnpm dev".to_owned()));
         assert!(
             !actions
                 .iter()
@@ -3130,14 +3150,14 @@ mod tests {
         );
         let actions = palette_actions("restart", None, &state.workspace);
         assert_eq!(
-            actions[..2],
+            actions[2..4],
             [
                 Action::RestartTray(0, "pnpm dev".to_owned()),
                 Action::RestartTray(1, "storybook".to_owned()),
             ]
         );
         let actions = palette_actions("restart sto", None, &state.workspace);
-        assert_eq!(actions[0], Action::RestartTray(1, "storybook".to_owned()));
+        assert_eq!(actions[2], Action::RestartTray(1, "storybook".to_owned()));
         assert!(
             palette_actions("", None, &state.workspace)
                 .iter()
@@ -3151,6 +3171,7 @@ mod tests {
         runtime.on_key = Some(on_key);
         press(runtime, Key::Command('p'), command());
         press(runtime, Key::Text(query.into()), Mods::default());
+        runtime.state.palette_selected = 2;
         press(runtime, Key::Enter, Mods::default());
     }
 
