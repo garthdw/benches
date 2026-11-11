@@ -536,7 +536,13 @@ impl TerminalCompositor {
             .is_none_or(|(scale, config, _)| (*scale, config) != wanted)
         {
             let config = &state.config.font;
-            match Font::new(&config.family, config.size, site.scale) {
+            match Font::with_symbols(
+                &config.family,
+                config.size,
+                site.scale,
+                config.symbols_family.as_deref(),
+                &config.fallback_families,
+            ) {
                 Ok(font) => {
                     gpu.atlas.reset();
                     self.font = Some((site.scale, config.clone(), font));
