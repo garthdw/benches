@@ -343,12 +343,18 @@ fn open_project(state: &mut State, root: PathBuf) {
     state.workspace.add_project(Project::new(root, tabs));
 }
 
-fn pick_folder(tx: &mut Tx) {
+fn pick_folder(tx: &mut Tx, replace_active: bool) {
     let options = FileDialogOptions {
-        title: "Open project".into(),
+        title: if replace_active {
+            "Change project folder"
+        } else {
+            "Open project"
+        }
+        .into(),
         ..FileDialogOptions::default()
     };
-    tx.open_folder(options, |state: &mut State, result, _| match result {
+    tx.open_folder(options, move |state: &mut State, result, _| match result {
+        Ok(Some(root)) if replace_active => state.workspace.change_root(root),
         Ok(Some(root)) => open_project(state, root),
         Ok(None) => {}
         Err(error) => eprintln!("agentd: open folder: {error}"),
@@ -369,6 +375,7 @@ enum Action {
     Shell,
     Lazygit,
     OpenProject,
+    ChangeFolder,
     Jump(PathBuf),
     Run(String),
     Tray(String),
@@ -380,6 +387,7 @@ impl Action {
             Action::Shell => "New shell tab".to_owned(),
             Action::Lazygit => "Toggle lazygit".to_owned(),
             Action::OpenProject => "Open project…".to_owned(),
+            Action::ChangeFolder => "Change project folder…".to_owned(),
             Action::Jump(root) => format!("Open project {}", root.display()),
             Action::Run(command) => format!("Run “{command}” in a new tab"),
             Action::Tray(command) => format!("Run “{command}” in the tray"),
@@ -389,19 +397,25 @@ impl Action {
 
 /// The fixed actions whose labels contain the query's letters in order, then the jump command's
 /// folder, then running the query.
-fn palette_actions(query: &str, jump: Option<&Path>) -> Vec<Action> {
+fn palette_actions(query: &str, jump: Option<&Path>, has_project: bool) -> Vec<Action> {
     let query = query.trim();
     let needle = query.to_lowercase();
-    let mut actions: Vec<Action> = [Action::Shell, Action::Lazygit, Action::OpenProject]
-        .into_iter()
-        .filter(|action| {
-            let label = action.label().to_lowercase();
-            let mut letters = label.chars();
-            needle
-                .chars()
-                .all(|wanted| letters.any(|letter| letter == wanted))
-        })
-        .collect();
+    let mut actions: Vec<Action> = [
+        Action::Shell,
+        Action::Lazygit,
+        Action::OpenProject,
+        Action::ChangeFolder,
+    ]
+    .into_iter()
+    .filter(|action| *action != Action::ChangeFolder || has_project)
+    .filter(|action| {
+        let label = action.label().to_lowercase();
+        let mut letters = label.chars();
+        needle
+            .chars()
+            .all(|wanted| letters.any(|letter| letter == wanted))
+    })
+    .collect();
     actions.extend(jump.map(|root| Action::Jump(root.to_owned())));
     if !query.is_empty() {
         actions.push(Action::Run(query.to_owned()));
@@ -418,7 +432,11 @@ fn open_palette(state: &mut State, tx: &mut Tx) {
 }
 
 fn run_palette(state: &mut State, index: usize, tx: &mut Tx) {
-    let actions = palette_actions(&state.palette.text, state.jump_target());
+    let actions = palette_actions(
+        &state.palette.text,
+        state.jump_target(),
+        state.workspace.project().is_some(),
+    );
     let Some(action) = actions.get(index.min(actions.len().saturating_sub(1))) else {
         return;
     };
@@ -430,7 +448,8 @@ fn run_action(state: &mut State, action: &Action, tx: &mut Tx) {
     match action {
         Action::Shell => open_tab(state, "shell", None),
         Action::Lazygit => toggle_lazygit(state),
-        Action::OpenProject => pick_folder(tx),
+        Action::OpenProject => pick_folder(tx, false),
+        Action::ChangeFolder => pick_folder(tx, true),
         Action::Jump(root) => open_project(state, root.clone()),
         Action::Run(command) => open_tab(state, command, Some(command)),
         Action::Tray(command) => open_tray(state, command),
@@ -438,9 +457,13 @@ fn run_action(state: &mut State, action: &Action, tx: &mut Tx) {
 }
 
 fn palette_key(state: &mut State, event: &KeyEvent, tx: &mut Tx) -> bool {
-    let last = palette_actions(&state.palette.text, state.jump_target())
-        .len()
-        .saturating_sub(1);
+    let last = palette_actions(
+        &state.palette.text,
+        state.jump_target(),
+        state.workspace.project().is_some(),
+    )
+    .len()
+    .saturating_sub(1);
     match event.key {
         Key::Escape => state.palette_open = false,
         Key::Up => state.palette_selected = state.palette_selected.min(last).saturating_sub(1),
@@ -524,7 +547,7 @@ fn shortcut(state: &mut State, event: &KeyEvent, tx: &mut Tx) -> bool {
     let pressed = |binding: &str| pressed(binding, event, tx);
     let digit = |prefix: &str| (1..=9usize).find(|digit| pressed(&format!("{prefix}{digit}")));
     if pressed("mod+n") {
-        pick_folder(tx);
+        pick_folder(tx, false);
     } else if pressed("mod+p") {
         open_palette(state, tx);
     } else if pressed("mod+b") {
@@ -1160,7 +1183,11 @@ fn view(state: &State, cx: &mut Cx<State>) -> El {
         .children(drawer)
         .children(overlay);
     let palette = state.palette_open.then(|| {
-        let actions = palette_actions(&state.palette.text, state.jump_target());
+        let actions = palette_actions(
+            &state.palette.text,
+            state.jump_target(),
+            state.workspace.project().is_some(),
+        );
         let selected = state.palette_selected.min(actions.len().saturating_sub(1));
         let rows = actions.iter().enumerate().map(|(index, action)| {
             let shortcut = matches!(action, Action::Tray(_)).then(|| {
@@ -1987,6 +2014,24 @@ mod tests {
         assert_eq!(workspace.active, 1);
     }
 
+    #[test]
+    fn change_project_folder_replaces_the_active_projects_root() {
+        let mut runtime = palette_runtime();
+        press(&mut runtime, Key::Text("change".into()), Mods::default());
+        press(&mut runtime, Key::Enter, Mods::default());
+        runtime
+            .resolve_file_dialog(Some(PathBuf::from("/dev/moved")))
+            .unwrap();
+        runtime.frame(2.0 / 60.0);
+        let workspace = &runtime.state.workspace;
+        assert_eq!(workspace.projects.len(), 2);
+        assert_eq!(
+            workspace.projects[workspace.active].root,
+            Path::new("/dev/moved")
+        );
+        assert_eq!(workspace.projects[workspace.active].name, "moved");
+    }
+
     fn palette_runtime() -> Runtime<State> {
         let mut runtime = workspace_runtime();
         press(&mut runtime, Key::Command('p'), command());
@@ -2052,7 +2097,7 @@ mod tests {
     #[test]
     fn the_command_centre_filters_by_letters_in_order() {
         assert_eq!(
-            palette_actions("lzg", None),
+            palette_actions("lzg", None, true),
             [
                 Action::Lazygit,
                 Action::Run("lzg".to_owned()),
@@ -2060,16 +2105,22 @@ mod tests {
             ]
         );
         assert_eq!(
-            palette_actions("", None),
-            [Action::Shell, Action::Lazygit, Action::OpenProject]
+            palette_actions("", None, true),
+            [
+                Action::Shell,
+                Action::Lazygit,
+                Action::OpenProject,
+                Action::ChangeFolder
+            ]
         );
+        assert!(!palette_actions("", None, false).contains(&Action::ChangeFolder));
     }
 
     #[test]
     fn the_jump_commands_folder_follows_the_fixed_actions() {
         let root = Path::new("/dev/site");
         assert_eq!(
-            palette_actions("site", Some(root)),
+            palette_actions("site", Some(root), true),
             [
                 Action::Jump(root.to_owned()),
                 Action::Run("site".to_owned()),
@@ -2108,7 +2159,7 @@ mod tests {
         for _ in 0..5 {
             press(&mut runtime, Key::Down, Mods::default());
         }
-        assert_eq!(runtime.state.palette_selected, 2);
+        assert_eq!(runtime.state.palette_selected, 3);
     }
 
     fn tray_runtime() -> Runtime<State> {

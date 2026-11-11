@@ -97,12 +97,8 @@ pub struct Project {
 impl Project {
     /// A project at `root` with `tabs` in order and the first one active.
     pub fn new(root: PathBuf, tabs: Vec<Tab>) -> Self {
-        let name = root.file_name().map_or_else(
-            || root.display().to_string(),
-            |name| name.to_string_lossy().into_owned(),
-        );
         Self {
-            name,
+            name: Self::name_of(&root),
             root,
             tabs,
             active_tab: 0,
@@ -114,6 +110,13 @@ impl Project {
             overlay_open: false,
             launched: true,
         }
+    }
+
+    fn name_of(root: &std::path::Path) -> String {
+        root.file_name().map_or_else(
+            || root.display().to_string(),
+            |name| name.to_string_lossy().into_owned(),
+        )
     }
 
     pub fn drawer_tab(&self) -> Option<&Tab> {
@@ -259,6 +262,17 @@ impl Workspace {
         self.projects
             .iter()
             .position(|project| project.root == root)
+    }
+
+    /// Moves the active project to `root`. Open tabs keep their folder. If another project already
+    /// has `root`, that one is selected instead.
+    pub fn change_root(&mut self, root: PathBuf) {
+        if let Some(index) = self.project_index(&root) {
+            self.select_project(index);
+        } else if let Some(project) = self.project_mut() {
+            project.name = Project::name_of(&root);
+            project.root = root;
+        }
     }
 
     pub fn add_project(&mut self, project: Project) {
@@ -1112,6 +1126,31 @@ mod tests {
             workspace.projects[1].tabs[0].session.visibility(),
             Visibility::Shown
         );
+    }
+
+    #[test]
+    fn changing_the_root_renames_the_project_and_persists() {
+        let mut workspace = workspace();
+        workspace.change_root("/c/site".into());
+        let project = &workspace.projects[1];
+        assert_eq!(
+            (project.name.as_str(), project.root.as_path()),
+            ("site", std::path::Path::new("/c/site"))
+        );
+        assert_eq!(
+            workspace.snapshot(false).projects[1].root,
+            std::path::Path::new("/c/site")
+        );
+        assert_eq!(workspace.projects[0].root, std::path::Path::new("/a"));
+    }
+
+    #[test]
+    fn changing_to_another_projects_root_selects_it() {
+        let mut workspace = workspace();
+        workspace.select_project(1);
+        workspace.change_root("/a".into());
+        assert_eq!(workspace.active, 0);
+        assert_eq!(workspace.projects[1].root, std::path::Path::new("/b"));
     }
 
     #[test]
