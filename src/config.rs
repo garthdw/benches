@@ -31,6 +31,8 @@ pub struct FontConfig {
     pub symbols_family: Option<String>,
     /// Ghostty's `font-family` lines after the first.
     pub fallback_families: Vec<String>,
+    /// Ghostty's `font-feature` syntax: `calt`, `-liga`, `ss01=2`.
+    pub features: Vec<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq)]
@@ -73,6 +75,7 @@ impl Default for Config {
                 size: DEFAULT_FONT_SIZE,
                 symbols_family: None,
                 fallback_families: Vec::new(),
+                features: Vec::new(),
             },
             theme: Theme::default(),
             tabs: vec![
@@ -109,6 +112,7 @@ struct FontFile {
     size: Option<f64>,
     #[serde(rename = "symbols-family")]
     symbols_family: Option<String>,
+    features: Option<Vec<String>>,
 }
 
 /// Where to look for the files the config names.
@@ -182,6 +186,12 @@ impl Config {
                     .skip(1)
                     .map(|family| (*family).to_owned())
                     .collect(),
+                features: file.font.features.unwrap_or_else(|| {
+                    ghostty_values(&ghostty, "font-feature")
+                        .into_iter()
+                        .map(str::to_owned)
+                        .collect()
+                }),
             },
             theme,
             tabs: file.tabs.unwrap_or(defaults.tabs),
@@ -317,6 +327,7 @@ mod tests {
                 size: 14.0,
                 symbols_family: None,
                 fallback_families: vec!["Symbols".to_owned()],
+                features: Vec::new(),
             }
         );
         assert_eq!(
@@ -357,6 +368,7 @@ mod tests {
                 size: 12.0,
                 symbols_family: Some("Icons NF".to_owned()),
                 fallback_families: Vec::new(),
+                features: Vec::new(),
             }
         );
         assert_eq!(
@@ -366,6 +378,18 @@ mod tests {
                 command: None
             }]
         );
+    }
+
+    #[test]
+    fn ghostty_font_features_fill_in_and_config_toml_replaces_them() {
+        let ghostty = "font-feature = -calt\nfont-feature = ss01\n";
+        let features = |config: Option<&str>| {
+            let (_root, paths) = paths(config, Some(ghostty));
+            Config::load(&paths).font.features
+        };
+        assert_eq!(features(None), ["-calt", "ss01"]);
+        assert_eq!(features(Some("[font]\nfeatures = [\"+liga\"]\n")), ["+liga"]);
+        assert!(features(Some("[font]\nfeatures = []\n")).is_empty());
     }
 
     #[test]
