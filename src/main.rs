@@ -3278,14 +3278,19 @@ mod tests {
     }
 
     fn poll_until_created(runtime: &mut Runtime<State>) {
-        let deadline = std::time::Instant::now() + Duration::from_secs(15);
         let mut frame = 1.0;
-        while runtime.state.creation.is_some() {
-            assert!(std::time::Instant::now() < deadline, "timed out");
-            std::thread::sleep(Duration::from_millis(20));
-            frame += 1.0;
-            runtime.frame(frame / 60.0);
-        }
+        wait_until(
+            Duration::from_secs(15),
+            || "timed out".to_owned(),
+            || {
+                if runtime.state.creation.is_none() {
+                    return Some(());
+                }
+                frame += 1.0;
+                runtime.frame(frame / 60.0);
+                None
+            },
+        );
     }
 
     #[test]
