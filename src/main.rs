@@ -1667,7 +1667,7 @@ fn view(state: &State, cx: &mut Cx<State>) -> El {
 fn window_title(workspace: &Workspace) -> String {
     workspace.project().map_or_else(
         || "agentd".to_owned(),
-        |project| format!("{} - agentd", project.name),
+        |project| format!("{} — agentd", project.name),
     )
 }
 
@@ -3887,7 +3887,7 @@ mod tests {
         let mut workspace = workspace_state().workspace;
         assert_eq!(window_title(&workspace), "agentd - agentd");
         workspace.select_project(1);
-        assert_eq!(window_title(&workspace), "site - agentd");
+        assert_eq!(window_title(&workspace), "site — agentd");
     }
 
     fn drag_project(runtime: &mut Runtime<State>, key: &str, to: (f32, f32)) {
