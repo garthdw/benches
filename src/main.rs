@@ -124,7 +124,7 @@ pub struct State {
     jump: JumpLookup,
     worktrees: Option<WorktreeChoice>,
     /// A `wt switch --create` running off the UI thread, answering with the new worktree's path.
-    creation: Option<mpsc::Receiver<anyhow::Result<PathBuf>>>,
+    creation: Option<Creation>,
     /// Why the last worktree creation failed, shown in the command centre until the next edit.
     palette_error: Option<String>,
     sidebar_hidden: bool,
@@ -141,6 +141,11 @@ struct JumpLookup {
     due: Option<f64>,
     pending: Option<mpsc::Receiver<Option<PathBuf>>>,
     found: Option<PathBuf>,
+}
+
+struct Creation {
+    result: mpsc::Receiver<anyhow::Result<PathBuf>>,
+    cancel: jump::Cancel,
 }
 
 /// The repository worktrees the command centre offers after ⌘↵ on the jump command's folder.
@@ -572,13 +577,17 @@ fn create_worktree(state: &mut State, branch: &str) {
         return;
     };
     let (sender, receiver) = mpsc::channel();
-    state.creation = Some(receiver);
+    let cancel = jump::Cancel::default();
+    state.creation = Some(Creation {
+        result: receiver,
+        cancel: cancel.clone(),
+    });
     state.palette_open = true;
     state.palette_error = None;
     let (shell, branch) = (state.config.shell.clone(), branch.to_owned());
     let waker = state.waker.clone();
     std::thread::spawn(move || {
-        let created = jump::create_worktree(&shell, &root, &branch, WORKTREE_TIMEOUT);
+        let created = jump::create_worktree(&shell, &root, &branch, WORKTREE_TIMEOUT, &cancel);
         if sender.send(created).is_ok()
             && let Some(waker) = waker
         {
@@ -591,7 +600,7 @@ fn poll_creation(state: &mut State) -> bool {
     let Some(created) = state
         .creation
         .as_ref()
-        .and_then(|pending| pending.try_recv().ok())
+        .and_then(|creation| creation.result.try_recv().ok())
     else {
         return false;
     };
@@ -706,8 +715,10 @@ fn open_worktree(state: &mut State, index: usize) {
 }
 
 fn palette_key(state: &mut State, event: &KeyEvent, tx: &mut Tx) -> bool {
-    if state.creation.is_some() {
+    if let Some(creation) = &state.creation {
         if event.key == Key::Escape {
+            creation.cancel.cancel().log_err("cancel wt switch");
+            state.creation = None;
             state.palette_open = false;
         }
         return true;
@@ -3145,6 +3156,37 @@ mod tests {
             Some("✗ Branch feature-x already exists")
         );
         assert!(runtime.find("palette-error").is_some());
+    }
+
+    #[test]
+    fn escape_cancels_a_running_worktree_creation_without_opening_a_project() {
+        let pids = tempfile::tempdir().unwrap();
+        let pid_file = pids.path().join("pid");
+        let (_directory, shell, _) = stub_shell(&format!(
+            "echo $$ > '{}'; echo '{{\"path\":\"/tmp\"}}'; sleep 30",
+            pid_file.display()
+        ));
+        let mut runtime = create_worktree_from_palette(shell, "feature-x");
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        let pid = loop {
+            if let Some(pid) = std::fs::read_to_string(&pid_file)
+                .ok()
+                .and_then(|text| text.trim().parse::<i32>().ok())
+            {
+                break pid;
+            }
+            assert!(std::time::Instant::now() < deadline, "timed out");
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        press(&mut runtime, Key::Escape, Mods::default());
+        assert!(runtime.state.creation.is_none());
+        assert!(!runtime.state.palette_open);
+        while nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None).is_ok() {
+            assert!(std::time::Instant::now() < deadline, "wt was not killed");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        runtime.frame(1000.0);
+        assert_eq!(runtime.state.workspace.projects.len(), 2);
     }
 
     #[test]

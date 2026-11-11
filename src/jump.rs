@@ -1,7 +1,8 @@
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
-use std::sync::mpsc;
+use std::sync::atomic::{AtomicI32, Ordering};
+use std::sync::{Arc, mpsc};
 use std::thread;
 use std::time::Duration;
 
@@ -22,7 +23,14 @@ pub fn lookup(
     timeout: Duration,
 ) -> Result<Option<PathBuf>> {
     let args = shell_args(shell, command, query);
-    let output = run(shell, &args, Path::new(START), timeout, command)?;
+    let output = run(
+        shell,
+        &args,
+        Path::new(START),
+        timeout,
+        command,
+        &Cancel::default(),
+    )?;
     Ok(output
         .status
         .success()
@@ -58,7 +66,7 @@ struct WorktreePath {
 /// `wt` is on the `PATH`. A folder that isn't a repository has none.
 pub fn worktrees(shell: &Path, root: &Path, timeout: Duration) -> Result<Vec<Worktree>> {
     let args = ["-l", "-i", "-c", "wt list --format=json"].map(str::to_owned);
-    let output = run(shell, &args, root, timeout, "wt list")?;
+    let output = run(shell, &args, root, timeout, "wt list", &Cancel::default())?;
     if !output.status.success() {
         return Ok(Vec::new());
     }
@@ -72,10 +80,11 @@ pub fn create_worktree(
     root: &Path,
     branch: &str,
     timeout: Duration,
+    cancel: &Cancel,
 ) -> Result<PathBuf> {
     let command = "wt switch --create --no-cd --format=json";
     let args = login_args(shell, command, "", [branch].into_iter());
-    let output = run(shell, &args, root, timeout, "wt switch")?;
+    let output = run(shell, &args, root, timeout, "wt switch", cancel)?;
     if !output.status.success() {
         bail!(
             "{}",
@@ -128,9 +137,33 @@ fn parse_worktrees(output: &str) -> Result<Vec<Worktree>> {
         .collect())
 }
 
+/// Lets another thread end a running command, which `run` watches through a clone.
+#[derive(Clone, Default)]
+pub struct Cancel(Arc<AtomicI32>);
+
+/// The state once cancelled or finished, so a late `cancel` signals nothing.
+const DONE: i32 = -1;
+
+impl Cancel {
+    /// Kills the command's process group, or stops it from starting if it hasn't yet.
+    pub fn cancel(&self) -> Result<()> {
+        match self.0.swap(DONE, Ordering::SeqCst) {
+            group if group > 0 => killpg(Pid::from_raw(group), Signal::SIGKILL).context("cancel"),
+            _ => Ok(()),
+        }
+    }
+}
+
 /// Runs the login shell with `args` in `cwd` and returns what it printed, ending the whole
-/// process group if it outlasts `timeout`.
-fn run(shell: &Path, args: &[String], cwd: &Path, timeout: Duration, what: &str) -> Result<Output> {
+/// process group if it outlasts `timeout` or `cancel` fires.
+fn run(
+    shell: &Path,
+    args: &[String],
+    cwd: &Path,
+    timeout: Duration,
+    what: &str,
+    cancel: &Cancel,
+) -> Result<Output> {
     let child = Command::new(shell)
         .args(args)
         .current_dir(cwd)
@@ -143,7 +176,15 @@ fn run(shell: &Path, args: &[String], cwd: &Path, timeout: Duration, what: &str)
     let group = Pid::from_raw(child.id() as i32);
     let (sender, receiver) = mpsc::channel();
     thread::spawn(move || sender.send(child.wait_with_output()).ok());
-    match receiver.recv_timeout(timeout) {
+    let started = cancel
+        .0
+        .compare_exchange(0, group.as_raw(), Ordering::SeqCst, Ordering::SeqCst);
+    if started.is_err() {
+        killpg(group, Signal::SIGKILL).context("kill cancelled lookup")?;
+    }
+    let received = receiver.recv_timeout(timeout);
+    cancel.0.store(DONE, Ordering::SeqCst);
+    match received {
         Ok(output) => output.context("wait for lookup"),
         Err(_) => {
             killpg(group, Signal::SIGKILL).context("kill lookup")?;
@@ -370,7 +411,14 @@ mod tests {
         let (_root, shell, record) = stub_shell(
             r#"echo 'welcome'; echo '{"action":"created","path":"/dev/site.new-branch"}'"#,
         );
-        let path = create_worktree(&shell, Path::new("/"), "new-branch", TIMEOUT).unwrap();
+        let path = create_worktree(
+            &shell,
+            Path::new("/"),
+            "new-branch",
+            TIMEOUT,
+            &Cancel::default(),
+        )
+        .unwrap();
         assert_eq!(path, Path::new("/dev/site.new-branch"));
         assert_eq!(
             std::fs::read_to_string(record).unwrap(),
@@ -383,7 +431,8 @@ mod tests {
         let (_root, shell, _) = stub_shell(
             "printf '\\033[31m✗ Branch x already exists\\033[0m\\n↳ run without --create\\n' >&2; exit 1",
         );
-        let error = create_worktree(&shell, Path::new("/"), "x", TIMEOUT).unwrap_err();
+        let error =
+            create_worktree(&shell, Path::new("/"), "x", TIMEOUT, &Cancel::default()).unwrap_err();
         assert_eq!(error.to_string(), "✗ Branch x already exists");
     }
 
