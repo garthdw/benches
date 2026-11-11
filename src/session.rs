@@ -32,6 +32,7 @@ use rune::Waker;
 
 use crate::config::{Config, Theme};
 use crate::input::KeyInput;
+use crate::link;
 
 const FRAME: Duration = Duration::from_millis(8);
 /// How long the size must hold before the program sees it, as each SIGWINCH makes inline TUIs reprint.
@@ -739,6 +740,12 @@ fn whole_lines(remainder: &mut f32, delta: f32) -> i32 {
     lines as i32
 }
 
+fn open_link(url: &str) {
+    let mut open = Command::new("/usr/bin/open");
+    open.arg(url);
+    thread::spawn(move || open.status().log_err("open link"));
+}
+
 /// False if libghostty refused the text because it could run commands.
 fn paste_text(
     terminal: &mut Terminal<'static, '_>,
@@ -990,6 +997,46 @@ impl TerminalInput {
         self.scrollbar_grab = Some(grab);
         terminal.scroll_viewport(ScrollViewport::Row(scrollbar.row_at(y - grab, track, min)));
         Ok(())
+    }
+
+    /// The link a ⌘-click starts on. The actor opens it instead of passing the press on, so it
+    /// neither selects nor reaches a mouse-tracking program.
+    fn link_under(
+        &self,
+        terminal: &Terminal<'static, '_>,
+        input: PointerInput,
+    ) -> Result<Option<String>> {
+        let Some(surface) = self.surface else {
+            return Ok(None);
+        };
+        if input.phase != PointerPhase::Press
+            || input.button != Some(mouse::Button::Left)
+            || !input.mods.contains(key::Mods::SUPER)
+        {
+            return Ok(None);
+        }
+        let scale = surface.metrics.scale;
+        let position = Self::viewport_point(surface, (input.x * scale, input.y * scale));
+        let cell = |x| terminal.grid_ref(Point::Viewport(PointCoordinate { x, ..position }));
+        let mut uri = [0; 4096];
+        let length = cell(position.x)?.hyperlink_uri(&mut uri)?;
+        if let Ok(uri) = std::str::from_utf8(&uri[..length])
+            && link::openable(uri)
+        {
+            return Ok(Some(uri.to_owned()));
+        }
+        let row = (0..surface.cols)
+            .map(|x| {
+                let mut character = [' '];
+                match cell(x)?.graphemes(&mut character) {
+                    Ok(_) => Ok(character[0]),
+                    // A cluster of several codepoints; any non-delimiter stands in for it.
+                    Err(libghostty_vt::Error::OutOfSpace { .. }) => Ok('\u{fffd}'),
+                    Err(error) => Err(error),
+                }
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(link::url_at(&row, position.x.into()))
     }
 
     fn pointer(
@@ -1695,7 +1742,11 @@ impl Actor {
                         }
                     }
                     Ok(Msg::Pointer(pointer)) => {
-                        if let Some(bytes) = input.pointer(&terminal, pointer).log_err("handle pointer")
+                        if let Some(Some(url)) =
+                            input.link_under(&terminal, pointer).log_err("find link")
+                        {
+                            open_link(&url);
+                        } else if let Some(bytes) = input.pointer(&terminal, pointer).log_err("handle pointer")
                             && !bytes.is_empty()
                         {
                             self.input.send(bytes).log_err("queue mouse report");
@@ -2234,6 +2285,61 @@ mod tests {
             y: 10.0,
             mods: key::Mods::empty(),
         }
+    }
+
+    fn command_press(column: u16, row: u16) -> PointerInput {
+        PointerInput {
+            mods: key::Mods::SUPER,
+            ..pointer_at(PointerPhase::Press, column, row)
+        }
+    }
+
+    #[test]
+    fn command_click_finds_a_plain_text_url() {
+        let mut terminal = new_terminal(20, 5).unwrap();
+        terminal.vt_write(b"\r\na https://a.te/x. ok");
+        let input = input_for_test();
+        let link = input.link_under(&terminal, command_press(6, 1)).unwrap();
+        assert_eq!(link.as_deref(), Some("https://a.te/x"));
+        let off_link = input.link_under(&terminal, command_press(1, 1)).unwrap();
+        assert_eq!(off_link, None);
+    }
+
+    #[test]
+    fn command_click_prefers_an_osc_8_hyperlink() {
+        let mut terminal = new_terminal(20, 5).unwrap();
+        terminal.vt_write(b"\x1b]8;;https://osc.test/x\x1b\\click me\x1b]8;;\x1b\\");
+        let input = input_for_test();
+        let link = input.link_under(&terminal, command_press(1, 0)).unwrap();
+        assert_eq!(link.as_deref(), Some("https://osc.test/x"));
+    }
+
+    #[test]
+    fn command_click_ignores_hyperlinks_with_other_schemes() {
+        let mut terminal = new_terminal(20, 5).unwrap();
+        terminal.vt_write(b"\x1b]8;;ssh://host\x1b\\click me\x1b]8;;\x1b\\");
+        let input = input_for_test();
+        let link = input.link_under(&terminal, command_press(1, 0)).unwrap();
+        assert_eq!(link, None);
+    }
+
+    #[test]
+    fn only_a_command_left_press_opens_a_link() {
+        let mut terminal = new_terminal(20, 5).unwrap();
+        terminal.vt_write(b"https://example.com");
+        let input = input_for_test();
+        let plain = pointer_at(PointerPhase::Press, 3, 0);
+        assert_eq!(input.link_under(&terminal, plain).unwrap(), None);
+        let release = PointerInput {
+            phase: PointerPhase::Release,
+            ..command_press(3, 0)
+        };
+        assert_eq!(input.link_under(&terminal, release).unwrap(), None);
+        let right = PointerInput {
+            button: Some(mouse::Button::Right),
+            ..command_press(3, 0)
+        };
+        assert_eq!(input.link_under(&terminal, right).unwrap(), None);
     }
 
     #[test]

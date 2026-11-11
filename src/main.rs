@@ -2,6 +2,7 @@ mod config;
 mod font;
 mod input;
 mod jump;
+mod link;
 mod notify;
 mod render;
 mod session;
