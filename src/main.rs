@@ -130,9 +130,29 @@ pub struct State {
     palette_error: Option<String>,
     sidebar_hidden: bool,
     config: config::Config,
+    /// Points added to the configured font size by ⌘= and ⌘-; never written to disk.
+    font_zoom: f64,
     /// Unset in tests and scenes, which then read and write no files.
     paths: Option<config::Paths>,
 }
+
+impl State {
+    fn font(&self) -> config::FontConfig {
+        let font = &self.config.font;
+        config::FontConfig {
+            size: (font.size + self.font_zoom).clamp(MIN_FONT_SIZE, MAX_FONT_SIZE),
+            ..font.clone()
+        }
+    }
+
+    fn zoom(&mut self, points: f64) {
+        let size = (self.font().size + points).clamp(MIN_FONT_SIZE, MAX_FONT_SIZE);
+        self.font_zoom = size - self.config.font.size;
+    }
+}
+
+const MIN_FONT_SIZE: f64 = 6.0;
+const MAX_FONT_SIZE: f64 = 72.0;
 
 /// The jump command's folder for the command centre's query.
 #[derive(Default)]
@@ -832,6 +852,12 @@ fn shortcut(state: &mut State, event: &KeyEvent, tx: &mut Tx) -> bool {
         run_action(state, &Action::Shell, tx);
     } else if pressed("mod+w") {
         request_close(state);
+    } else if pressed("mod+=") {
+        state.zoom(1.0);
+    } else if pressed("mod+-") {
+        state.zoom(-1.0);
+    } else if pressed("mod+0") {
+        state.font_zoom = 0.0;
     } else if pressed("mod+shift+[") {
         state.workspace.cycle_tab(-1);
     } else if pressed("mod+shift+]") {
@@ -2271,6 +2297,47 @@ mod tests {
         runtime
             .presented("sidebar")
             .map_or(-1.0, |(rect, _)| rect[2])
+    }
+
+    fn zoomed(chords: &[char]) -> Runtime<State> {
+        let mut state = State::default();
+        show_scene(&mut state, SCENE_FIXTURE);
+        let mut runtime = runtime_with(state);
+        runtime.on_key = Some(on_key);
+        for chord in chords {
+            press(&mut runtime, Key::Command(*chord), command());
+        }
+        runtime
+    }
+
+    #[test]
+    fn command_equals_and_minus_zoom_the_font_by_one_point() {
+        let base = State::default().font().size;
+        assert_eq!(zoomed(&['=']).state.font().size, base + 1.0);
+        assert_eq!(zoomed(&['=', '=', '-']).state.font().size, base + 1.0);
+        assert_eq!(zoomed(&['-']).state.font().size, base - 1.0);
+    }
+
+    #[test]
+    fn command_zero_restores_the_configured_size() {
+        let base = State::default().font().size;
+        assert_eq!(zoomed(&['=', '=', '0']).state.font().size, base);
+        assert_eq!(zoomed(&['-', '0']).state.font().size, base);
+    }
+
+    #[test]
+    fn zoom_stops_at_the_limits() {
+        assert_eq!(zoomed(&['='; 80]).state.font().size, MAX_FONT_SIZE);
+        assert_eq!(zoomed(&['-'; 80]).state.font().size, MIN_FONT_SIZE);
+        let mut runtime = zoomed(&['-'; 80]);
+        press(&mut runtime, Key::Command('='), command());
+        assert_eq!(runtime.state.font().size, MIN_FONT_SIZE + 1.0);
+    }
+
+    #[test]
+    fn zoom_leaves_the_configured_size_alone() {
+        let base = State::default().config.font.size;
+        assert_eq!(zoomed(&['=']).state.config.font.size, base);
     }
 
     #[test]
