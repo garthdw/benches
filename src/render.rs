@@ -205,9 +205,17 @@ fn find_run(
     if let Some(cursor) = cursor.filter(|&cursor| cursor > start && cursor < limit) {
         limit = cursor;
     }
-    let end = grid.cells[start + 1..limit]
-        .iter()
-        .position(|cell| !joins_run(cell, font) || !first.shapes_with(cell))
+    let end = grid.cells[start..limit]
+        .windows(2)
+        .position(|pair| {
+            !joins_run(&pair[1], font)
+                || !pair[0].shapes_with(&pair[1])
+                // Ghostty never ligates these, whatever the font says.
+                || matches!(
+                    (pair[0].character, pair[1].character),
+                    ('f', 'l' | 'i') | ('s', 't')
+                )
+        })
         .map_or(limit, |offset| start + 1 + offset);
     if end - start > 1 {
         text.clear();
@@ -859,7 +867,7 @@ mod tests {
     #[test]
     fn a_ligature_inside_a_long_token_still_shapes() {
         // The cells at 15 and 16 once fell either side of a fixed chunk boundary.
-        let token = b"abcdefghijklmno!=pqrstuvwxyz";
+        let token = b"abcdeghjklmnoqr!=uvwxyz";
         let keys = shaped_keys_in(token, 40, &[]);
         let run = String::from_utf8_lossy(token).into_owned();
         assert!(keys.contains(&(run.clone(), 15)) && keys.contains(&(run, 16)));
@@ -882,6 +890,18 @@ mod tests {
             shaped_keys(b"\x1b[41m!\x1b[42m=\x1b[0m\x1b[2;1H", &[]).len(),
             2
         );
+    }
+
+    #[test]
+    fn fl_fi_and_st_are_never_shaped_together() {
+        let font = Font::new(crate::config::DEFAULT_FONT_FAMILY, 18.0, 2.0).unwrap();
+        let grid = Grid::from_vt(b"flfist", 8, 1).unwrap();
+        let mut text = String::new();
+        let ends: Vec<usize> = (0..6)
+            .step_by(2)
+            .map(|start| find_run(&grid, start, None, &font, &mut text).end)
+            .collect();
+        assert_eq!(ends, [1, 3, 5]);
     }
 
     #[test]
