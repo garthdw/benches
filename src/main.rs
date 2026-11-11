@@ -75,8 +75,9 @@ pub struct State {
     pending_paste: Option<(u64, String)>,
     /// The session whose close waits for confirmation; dismissed when keys move elsewhere.
     pending_close: Option<u64>,
-    /// Whether the pending close takes the whole active project.
-    closing_project: bool,
+    /// The project the pending close takes whole, rather than the focused tab.
+    closing_project: Option<PathBuf>,
+    hovered_project: Option<usize>,
     preedit: String,
     option_held: bool,
     caret: Option<[f32; 4]>,
@@ -271,29 +272,28 @@ fn close_focused(state: &mut State) {
     }
 }
 
-/// Closes the active project, first asking if a program is running in any of its processes.
-fn request_close_project(state: &mut State) {
-    let Some(project) = state.workspace.project() else {
+/// Closes project `index`, first asking if a program is running in any of its processes.
+fn request_close_project(state: &mut State, index: usize) {
+    let Some(project) = state.workspace.projects.get(index) else {
         return;
     };
     if project.runs_program()
         && let Some(session) = state.session()
     {
         state.pending_close = Some(session.id());
-        state.closing_project = true;
+        state.closing_project = Some(project.root.clone());
     } else {
-        state.workspace.close_project(state.workspace.active);
+        state.workspace.close_project(index);
     }
 }
 
 fn resolve_close(state: &mut State, confirmed: bool) {
     let pending = state.pending_close.take();
-    let project = std::mem::take(&mut state.closing_project);
+    let project = state.closing_project.take();
     if confirmed && pending == state.session().map(Session::id) {
-        if project {
-            state.workspace.close_project(state.workspace.active);
-        } else {
-            close_focused(state);
+        match project.and_then(|root| state.workspace.project_index(&root)) {
+            Some(index) => state.workspace.close_project(index),
+            None => close_focused(state),
         }
     }
 }
@@ -753,6 +753,7 @@ fn view(state: &State, cx: &mut Cx<State>) -> El {
         .map(|(index, project)| {
             let key = format!("project-{index}");
             let active = index == state.workspace.active;
+            let shows_close = active || state.hovered_project == Some(index);
             let project_tab = if rail {
                 let mut initials = project.name.chars();
                 let initials: String = initials
@@ -777,18 +778,26 @@ fn view(state: &State, cx: &mut Cx<State>) -> El {
                     attention_dot(project.attention()),
                 )
                 .w_full()
-                .children(active.then(|| el().grow(1.0)))
-                .children(active.then(|| {
+                .children(shows_close.then(|| el().grow(1.0)))
+                .children(shows_close.then(|| {
                     el().key(format!("project-close-{index}"))
                         .role("button")
                         .label("Close project")
                         .px(4.0)
                         .radius(4.0)
                         .child(text("×").color(theme.text_secondary))
-                        .on_press(|state: &mut State| request_close_project(state))
+                        .on_press(move |state: &mut State| request_close_project(state, index))
                 }))
             };
-            project_tab.on_press(move |state: &mut State| state.workspace.select_project(index))
+            project_tab
+                .on_hover_change(move |state: &mut State, hovered, _: &mut Tx| {
+                    if hovered {
+                        state.hovered_project = Some(index);
+                    } else if state.hovered_project == Some(index) {
+                        state.hovered_project = None;
+                    }
+                })
+                .on_press(move |state: &mut State| state.workspace.select_project(index))
         });
     // Stays in the tree so its width springs between expanded, rail and gone.
     let sidebar = col()
@@ -868,7 +877,7 @@ fn view(state: &State, cx: &mut Cx<State>) -> El {
         }
     }
     let confirm_bar = |key: &'static str,
-                       message: &'static str,
+                       message: String,
                        action: &'static str,
                        resolve: fn(&mut State, bool)| {
         let button = |key: String, label: &'static str| {
@@ -903,15 +912,21 @@ fn view(state: &State, cx: &mut Cx<State>) -> El {
     if state.pending_paste.is_some() {
         focus_overlays.push(confirm_bar(
             "paste-confirm",
-            "This paste could run commands",
+            "This paste could run commands".to_owned(),
             "Paste",
             resolve_paste,
         ));
     }
     if state.pending_close.is_some() {
+        let place = state
+            .closing_project
+            .as_ref()
+            .and_then(|root| state.workspace.project_index(root))
+            .and_then(|index| state.workspace.projects.get(index))
+            .map_or("here".to_owned(), |project| format!("in {}", project.name));
         focus_overlays.push(confirm_bar(
             "close-confirm",
-            "A program is still running here",
+            format!("A program is still running {place}"),
             "Close",
             resolve_close,
         ));
@@ -1163,7 +1178,7 @@ fn poll(state: &mut State, now: f64, tx: &mut Tx) -> bool {
     }
     if state.pending_close.is_some() && state.pending_close != active {
         state.pending_close = None;
-        state.closing_project = false;
+        state.closing_project = None;
         changed = true;
     }
     let mut restarts = Vec::new();
@@ -1757,28 +1772,48 @@ mod tests {
         assert_eq!(titles, ["shell", "lazygit"]);
     }
 
+    fn hover(runtime: &mut Runtime<State>, key: &str) {
+        let (x, y) = runtime.find(key).unwrap();
+        runtime.pointer_move(x, y);
+        runtime.frame(1.0 / 60.0);
+    }
+
     #[test]
-    fn the_active_project_close_button_closes_an_idle_project() {
+    fn the_active_project_always_shows_its_close_button() {
         let mut runtime = runtime_with(workspace_state());
+        assert!(runtime.find("project-close-0").is_some());
         assert!(runtime.find("project-close-1").is_none());
         click(&mut runtime, "project-close-0");
         assert_eq!(runtime.state.workspace.projects.len(), 1);
     }
 
     #[test]
-    fn the_project_close_button_asks_when_a_tray_program_runs_and_enter_confirms() {
+    fn hovering_an_inactive_project_reveals_its_close_button_and_clicking_closes_it() {
+        let mut runtime = runtime_with(workspace_state());
+        hover(&mut runtime, "project-1");
+        assert!(runtime.find("project-close-1").is_some());
+        click(&mut runtime, "project-close-1");
+        let workspace = &runtime.state.workspace;
+        assert_eq!(workspace.projects.len(), 1);
+        assert_eq!(workspace.active, 0);
+    }
+
+    #[test]
+    fn closing_a_running_inactive_project_asks_without_selecting_it() {
         let mut runtime = tray_runtime();
-        runtime.state.workspace.projects[0].tray[0].command = Some("pnpm dev".to_owned());
-        click(&mut runtime, "project-close-0");
+        runtime.state.workspace.projects[1].tabs[0].command = Some("claude".to_owned());
+        hover(&mut runtime, "project-1");
+        click(&mut runtime, "project-close-1");
         assert!(runtime.find("close-confirm").is_some());
-        assert_eq!(runtime.state.workspace.projects.len(), 2);
+        assert_eq!(runtime.state.workspace.active, 0);
         press(&mut runtime, Key::Escape, Mods::default());
-        assert!(runtime.find("close-confirm").is_none());
         assert_eq!(runtime.state.workspace.projects.len(), 2);
-        click(&mut runtime, "project-close-0");
-        runtime.on_key = Some(on_key);
+        hover(&mut runtime, "project-1");
+        click(&mut runtime, "project-close-1");
         press(&mut runtime, Key::Enter, Mods::default());
-        assert_eq!(runtime.state.workspace.projects.len(), 1);
+        let workspace = &runtime.state.workspace;
+        assert_eq!(workspace.projects.len(), 1);
+        assert_eq!(workspace.projects[0].name, "agentd");
     }
 
     fn command_tab_runtime() -> Runtime<State> {
