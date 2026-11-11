@@ -89,8 +89,6 @@ pub enum Event {
 pub enum Attention {
     #[default]
     None,
-    /// New output.
-    Activity,
     /// A bell or desktop notification (OSC 9 or 777).
     Alert,
 }
@@ -1500,10 +1498,9 @@ impl Actor {
                         dirty = true;
                         let alerted = alerted.replace(false);
                         let notice = notice.borrow_mut().take();
-                        let level = if alerted { Attention::Alert } else { Attention::Activity };
-                        if !publisher.borrow().visible() && level > attention {
-                            attention = level;
-                            self.emit(Event::Attention(level));
+                        if alerted && !publisher.borrow().visible() && attention == Attention::None {
+                            attention = Attention::Alert;
+                            self.emit(Event::Attention(Attention::Alert));
                         }
                         let seen = {
                             let publisher = publisher.borrow();
@@ -3019,7 +3016,7 @@ mod tests {
     }
 
     #[test]
-    fn an_unseen_session_asks_for_attention_once_per_level() {
+    fn an_unseen_session_asks_for_attention_once_per_alert() {
         let session = spawn_shell();
         session.set_visibility(Visibility::Listed);
         type_line(
@@ -3027,10 +3024,7 @@ mod tests {
             "echo one; printf '\\a'; echo two; printf '\\a'; echo three",
         );
         thread::sleep(Duration::from_millis(1500));
-        assert_eq!(
-            attention_events(&session),
-            [Attention::Activity, Attention::Alert]
-        );
+        assert_eq!(attention_events(&session), [Attention::Alert]);
         session.set_visibility(Visibility::Shown);
         type_line(&session, "printf '\\a'; echo shown");
         wait_for_line(&session, "shown");
