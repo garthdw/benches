@@ -505,21 +505,25 @@ fn switch_actions(
 /// The fixed actions whose labels contain the query's letters in order, then the jump command's
 /// folder, then running the query, so Enter on a typed command always runs it. Below those come
 /// the open projects and tabs matching the query, exact names first, then the active project's
-/// tray restarts and stops, then creating a worktree named by a one-word query. Everything but
-/// the fixed actions appears only once something is typed.
+/// tray restarts and stops. A query of `wt` and one branch name puts creating that worktree
+/// first. Everything but the fixed actions appears only once something is typed.
 fn palette_actions(query: &str, jump: Option<&Path>, workspace: &Workspace) -> Vec<Action> {
     let query = query.trim();
     let needle = query.to_lowercase();
-    let mut actions: Vec<Action> = [
-        Action::Shell,
-        Action::Lazygit,
-        Action::OpenProject,
-        Action::ChangeFolder,
-    ]
-    .into_iter()
-    .filter(|action| *action != Action::ChangeFolder || workspace.project().is_some())
-    .filter(|action| letters_in_order(&action.label(), &needle))
-    .collect();
+    let mut actions: Vec<Action> = create_worktree_action(query, workspace)
+        .into_iter()
+        .collect();
+    actions.extend(
+        [
+            Action::Shell,
+            Action::Lazygit,
+            Action::OpenProject,
+            Action::ChangeFolder,
+        ]
+        .into_iter()
+        .filter(|action| *action != Action::ChangeFolder || workspace.project().is_some())
+        .filter(|action| letters_in_order(&action.label(), &needle)),
+    );
     actions.extend(jump.map(|root| Action::Jump(root.to_owned())));
     if query.is_empty() {
         return actions;
@@ -542,11 +546,15 @@ fn palette_actions(query: &str, jump: Option<&Path>, workspace: &Workspace) -> V
                 .filter(|action| letters_in_order(&action.label(), &needle)),
         );
     }
-    let is_branch = !query.starts_with('-') && !query.contains(char::is_whitespace);
-    if is_branch && workspace.project().is_some() {
-        actions.push(Action::CreateWorktree(query.to_owned()));
-    }
     actions
+}
+
+/// `wt <branch>` with exactly one branch name, which `wt` could not take for an option.
+fn create_worktree_action(query: &str, workspace: &Workspace) -> Option<Action> {
+    let branch = query.strip_prefix("wt ")?.trim();
+    let is_branch =
+        !branch.is_empty() && !branch.starts_with('-') && !branch.contains(char::is_whitespace);
+    (is_branch && workspace.project().is_some()).then(|| Action::CreateWorktree(branch.to_owned()))
 }
 
 fn open_palette(state: &mut State, tx: &mut Tx) {
@@ -2474,7 +2482,6 @@ mod tests {
                 Action::Lazygit,
                 Action::Run("lzg".to_owned()),
                 Action::Tray("lzg".to_owned()),
-                Action::CreateWorktree("lzg".to_owned()),
             ]
         );
         assert_eq!(
@@ -2498,7 +2505,6 @@ mod tests {
                 Action::Jump(root.to_owned()),
                 Action::Run("site".to_owned()),
                 Action::Tray("site".to_owned()),
-                Action::CreateWorktree("site".to_owned()),
             ]
         );
     }
@@ -3032,12 +3038,21 @@ mod tests {
     }
 
     #[test]
-    fn a_single_word_query_offers_creating_a_worktree() {
+    fn the_wt_prefix_offers_creating_a_worktree_first() {
         let workspace = one_project();
         let create = Action::CreateWorktree("feature-x".to_owned());
-        let actions = palette_actions("feature-x", None, &workspace);
-        assert_eq!(actions.last(), Some(&create));
-        for query in ["two words", "-x", ""] {
+        let actions = palette_actions("wt feature-x", None, &workspace);
+        assert_eq!(actions[0], create);
+        assert!(actions.contains(&Action::Run("wt feature-x".to_owned())));
+        for query in [
+            "feature-x",
+            "wt",
+            "wt ",
+            "wt -x",
+            "wt two words",
+            "wtf x",
+            "",
+        ] {
             assert!(
                 !palette_actions(query, None, &workspace)
                     .iter()
@@ -3045,7 +3060,7 @@ mod tests {
                 "{query:?}"
             );
         }
-        let none = palette_actions("feature-x", None, &Workspace::default());
+        let none = palette_actions("wt feature-x", None, &Workspace::default());
         assert!(!none.contains(&create));
     }
 
@@ -3072,11 +3087,11 @@ mod tests {
         runtime.on_key = Some(on_key);
         runtime.poll = Some(poll);
         press(&mut runtime, Key::Command('p'), command());
-        press(&mut runtime, Key::Text(branch.into()), Mods::default());
-        let create = Action::CreateWorktree(branch.to_owned());
-        let actions = palette_actions(branch, None, &runtime.state.workspace);
-        runtime.state.palette_selected =
-            actions.iter().position(|action| *action == create).unwrap();
+        press(
+            &mut runtime,
+            Key::Text(format!("wt {branch}")),
+            Mods::default(),
+        );
         press(&mut runtime, Key::Enter, Mods::default());
         runtime
     }
