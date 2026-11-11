@@ -194,6 +194,32 @@ pub struct Cell {
     pub cluster: Option<u32>,
 }
 
+impl Cell {
+    /// Whether two neighbours may be shaped together, which every style difference
+    /// except the background forbids, as in Ghostty, so a ligature never changes colour midway.
+    pub fn shapes_with(&self, other: &Cell) -> bool {
+        (
+            self.fg,
+            self.bold,
+            self.italic,
+            self.selected,
+            self.strikethrough,
+            self.overline,
+            self.underline,
+            self.underline_color,
+        ) == (
+            other.fg,
+            other.bold,
+            other.italic,
+            other.selected,
+            other.strikethrough,
+            other.overline,
+            other.underline,
+            other.underline_color,
+        )
+    }
+}
+
 impl Default for Cell {
     fn default() -> Self {
         Self {

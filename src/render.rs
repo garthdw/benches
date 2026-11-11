@@ -178,7 +178,7 @@ fn glyph_key(grid: &Grid, cell: &Cell) -> Option<GlyphKey> {
     })
 }
 
-/// Neighbouring cells shaped together: the same style, on one row, all selected or all not, and
+/// Neighbouring cells shaped together: the same style, on one row, identical but for the background (selection included), and
 /// not the cursor, which splits a ligature as Ghostty does.
 struct Run {
     start: usize,
@@ -207,11 +207,7 @@ fn find_run(
     }
     let end = grid.cells[start + 1..limit]
         .iter()
-        .position(|cell| {
-            !joins_run(cell, font)
-                || (cell.bold, cell.italic, cell.selected)
-                    != (first.bold, first.italic, first.selected)
-        })
+        .position(|cell| !joins_run(cell, font) || !first.shapes_with(cell))
         .map_or(limit, |offset| start + 1 + offset);
     if end - start > 1 {
         text.clear();
@@ -875,6 +871,17 @@ mod tests {
         for index in [2, 3] {
             assert!(keys.contains(&("→é!=".to_owned(), index)), "{keys:?}");
         }
+    }
+
+    #[test]
+    fn a_style_change_breaks_a_ligature_but_a_background_change_does_not() {
+        assert!(shaped_keys(b"\x1b[31m!\x1b[32m=\x1b[0m\x1b[2;1H", &[]).is_empty());
+        assert!(shaped_keys(b"\x1b[4m!\x1b[4:3m=\x1b[0m\x1b[2;1H", &[]).is_empty());
+        assert!(shaped_keys(b"\x1b[9m!\x1b[0m=\x1b[2;1H", &[]).is_empty());
+        assert_eq!(
+            shaped_keys(b"\x1b[41m!\x1b[42m=\x1b[0m\x1b[2;1H", &[]).len(),
+            2
+        );
     }
 
     #[test]
