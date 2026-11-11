@@ -201,18 +201,22 @@ fn find_run(
 ) -> Run {
     let cols = usize::from(grid.cols).max(1);
     let first = &grid.cells[start];
-    let end = (start + 1..grid.cells.len())
-        .find(|&index| {
-            let cell = &grid.cells[index];
-            index % cols == 0
-                || Some(index) == cursor
-                || !joins_run(cell, font)
+    let mut limit = ((start / cols + 1) * cols).min(grid.cells.len());
+    if let Some(cursor) = cursor.filter(|&cursor| cursor > start && cursor < limit) {
+        limit = cursor;
+    }
+    let end = grid.cells[start + 1..limit]
+        .iter()
+        .position(|cell| {
+            !joins_run(cell, font)
                 || (cell.bold, cell.italic, cell.selected)
                     != (first.bold, first.italic, first.selected)
         })
-        .unwrap_or(grid.cells.len());
-    text.clear();
-    text.extend(grid.cells[start..end].iter().map(|cell| cell.character));
+        .map_or(limit, |offset| start + 1 + offset);
+    if end - start > 1 {
+        text.clear();
+        text.extend(grid.cells[start..end].iter().map(|cell| cell.character));
+    }
     let style = FontStyle {
         bold: first.bold,
         italic: first.italic,
@@ -354,9 +358,9 @@ fn build_quads(
             if cell.overline {
                 quads.push(line(0.0, fg));
             }
-            if Some(index) != cursor
+            if run.as_ref().is_none_or(|run| index >= run.end)
+                && Some(index) != cursor
                 && joins_run(cell, font)
-                && run.as_ref().is_none_or(|run| index >= run.end)
             {
                 run = Some(find_run(grid, index, cursor, font, &mut run_text));
             }

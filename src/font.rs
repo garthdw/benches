@@ -1,5 +1,6 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::hash::{BuildHasherDefault, Hasher};
 use std::ptr::NonNull;
 use std::rc::Rc;
 
@@ -122,10 +123,34 @@ pub struct Font {
     /// A cell's advance before rounding up to whole pixels.
     advance: f64,
     /// Per style, which cells of a run shape differently from standing alone.
-    runs: RefCell<[HashMap<String, Rc<[bool]>>; 4]>,
+    runs: RefCell<[RunCache; 4]>,
     /// The glyph a character shapes to alone, per style index.
     alone: RefCell<HashMap<(usize, char), Option<u16>>>,
     joins: RefCell<HashMap<char, bool>>,
+}
+
+type RunCache = HashMap<String, Rc<[bool]>, BuildHasherDefault<Fnv>>;
+
+/// FNV-1a, because the run cache hashes every word of every rebuild and its keys are short.
+#[derive(Default)]
+struct Fnv(u64);
+
+impl Hasher for Fnv {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        let mut hash = if self.0 == 0 {
+            0xcbf2_9ce4_8422_2325
+        } else {
+            self.0
+        };
+        for byte in bytes {
+            hash = (hash ^ u64::from(*byte)).wrapping_mul(0x0100_0000_01b3);
+        }
+        self.0 = hash;
+    }
 }
 
 /// Runs cached before the cache is emptied; words are the usual run, so this bounds memory.
@@ -455,10 +480,16 @@ impl Font {
     /// itself qualify, which keeps a run in one font, and only those in the BMP, so a character
     /// is one UTF-16 unit and CoreText's string indices are cell offsets. Spaces, procedural
     /// glyphs and icons are drawn on their own.
+    #[inline]
     pub fn joins_run(&self, character: char) -> bool {
         if character.is_ascii() {
-            return character.is_ascii_graphic();
+            character.is_ascii_graphic()
+        } else {
+            self.joins_non_ascii(character)
         }
+    }
+
+    fn joins_non_ascii(&self, character: char) -> bool {
         *self.joins.borrow_mut().entry(character).or_insert_with(|| {
             let mut unit = [u16::try_from(u32::from(character)).unwrap_or(0)];
             let mut glyph = 0u16;
