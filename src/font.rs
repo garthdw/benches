@@ -1,6 +1,6 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
-use std::hash::{BuildHasherDefault, Hasher};
+use std::hash::{BuildHasherDefault, Hash, Hasher};
 use std::ptr::NonNull;
 use std::rc::Rc;
 
@@ -8,7 +8,7 @@ use anyhow::{Context, Result, ensure};
 use libghostty_vt::style::Underline;
 use objc2_core_foundation::{
     CFArray, CFAttributedString, CFData, CFDictionary, CFNumber, CFRange, CFRetained, CFString,
-    CFType, CGPoint, kCFBooleanTrue,
+    CFType, CGPoint, CGRect, kCFBooleanTrue,
 };
 use objc2_core_graphics::{
     CGBitmapContextCreate, CGColorSpace, CGContext, CGImageAlphaInfo, CGImageByteOrderInfo,
@@ -129,9 +129,31 @@ pub struct Font {
     /// The glyph a character shapes to alone, per style index.
     alone: RefCell<HashMap<(usize, char), Option<u16>>>,
     joins: RefCell<HashMap<char, bool>>,
+    /// The horizontal extent of a glyph's ink from its origin, per style index and glyph.
+    ink: RefCell<HashMap<(usize, u16), InkExtent>>,
 }
 
-type RunCache = HashMap<String, Rc<[bool]>, BuildHasherDefault<Fnv>>;
+/// Where a glyph's ink starts and ends horizontally, if it has any.
+type InkExtent = Option<(f64, f64)>;
+
+type RunCache = HashMap<Rc<str>, Rc<ShapedRun>, BuildHasherDefault<Fnv>>;
+
+/// A run shaped as a whole, and which of its cells differ from standing alone.
+pub struct ShapedRun {
+    pub text: Rc<str>,
+    /// Per cell, a hash of the glyphs that paint it, or 0 for a cell drawn as it would be alone.
+    /// Equal signatures draw equal bitmaps, so the atlas shares them between runs.
+    signatures: Box<[u64]>,
+}
+
+impl ShapedRun {
+    pub fn signature(&self, index: usize) -> Option<u64> {
+        self.signatures
+            .get(index)
+            .copied()
+            .filter(|&hash| hash != 0)
+    }
+}
 
 /// FNV-1a, because the run cache hashes every word of every rebuild and its keys are short.
 #[derive(Default)]
@@ -154,9 +176,6 @@ impl Hasher for Fnv {
         self.0 = hash;
     }
 }
-
-/// The most cells a ligature is assumed to span on either side of one of its cells.
-const LIGATURE_REACH: usize = 8;
 
 /// Runs cached before the cache is emptied; words are the usual run, so this bounds memory.
 const RUN_CACHE_LIMIT: usize = 4096;
@@ -274,11 +293,17 @@ fn shaped_line(font: &CTFont, text: &str) -> Option<CFRetained<CTLine>> {
     Some(unsafe { CTLine::with_attributed_string(&string) })
 }
 
+struct Placed {
+    glyph: u16,
+    x: f64,
+    y: f64,
+    /// Where the glyph's ink starts and ends horizontally, if it has any.
+    ink: Option<(f64, f64)>,
+}
+
 struct Shaped {
     glyphs: Vec<u16>,
     positions: Vec<CGPoint>,
-    /// The character each glyph came from.
-    indices: Vec<isize>,
 }
 
 fn shape(font: &CTFont, text: &str) -> Option<Shaped> {
@@ -290,7 +315,6 @@ fn shape(font: &CTFont, text: &str) -> Option<Shaped> {
     let mut shaped = Shaped {
         glyphs: Vec::new(),
         positions: Vec::new(),
-        indices: Vec::new(),
     };
     for run in runs.iter() {
         // SAFETY: plain getter.
@@ -300,20 +324,15 @@ fn shape(font: &CTFont, text: &str) -> Option<Shaped> {
             location: 0,
             length: count,
         };
-        let (mut glyphs, mut positions, mut indices) = (
-            vec![0u16; length],
-            vec![CGPoint { x: 0.0, y: 0.0 }; length],
-            vec![0isize; length],
-        );
+        let (mut glyphs, mut positions) =
+            (vec![0u16; length], vec![CGPoint { x: 0.0, y: 0.0 }; length]);
         // SAFETY: each buffer holds the `count` elements the range names.
         unsafe {
             run.glyphs(range, NonNull::new(glyphs.as_mut_ptr())?);
             run.positions(range, NonNull::new(positions.as_mut_ptr())?);
-            run.string_indices(range, NonNull::new(indices.as_mut_ptr())?);
         }
         shaped.glyphs.append(&mut glyphs);
         shaped.positions.append(&mut positions);
-        shaped.indices.append(&mut indices);
     }
     Some(shaped)
 }
@@ -396,6 +415,7 @@ impl Font {
             runs: RefCell::default(),
             alone: RefCell::default(),
             joins: RefCell::default(),
+            ink: RefCell::default(),
             faces,
             symbols,
             color_space: CGColorSpace::new_device_rgb(),
@@ -484,12 +504,12 @@ impl Font {
 
     /// Whether `character` may be shaped with its neighbours. Only characters the main face draws
     /// itself qualify, which keeps a run in one font, and only those in the BMP, so a character
-    /// is one UTF-16 unit and CoreText's string indices are cell offsets. Spaces, procedural
+    /// is one UTF-16 unit. A space joins, to be shaped through; other whitespace, procedural
     /// glyphs and icons are drawn on their own.
     #[inline]
     pub fn joins_run(&self, character: char) -> bool {
         if character.is_ascii() {
-            character.is_ascii_graphic()
+            character.is_ascii_graphic() || character == ' '
         } else {
             self.joins_non_ascii(character)
         }
@@ -530,48 +550,128 @@ impl Font {
             })
     }
 
+    fn glyph_ink(&self, face: usize, glyph: u16) -> InkExtent {
+        *self
+            .ink
+            .borrow_mut()
+            .entry((face, glyph))
+            .or_insert_with(|| {
+                let mut glyph = glyph;
+                let mut rect = CGRect::ZERO;
+                // SAFETY: one glyph and one rect, matching the count of 1.
+                unsafe {
+                    self.faces[face].bounding_rects_for_glyphs(
+                        CTFontOrientation::Horizontal,
+                        NonNull::from(&mut glyph),
+                        &mut rect,
+                        1,
+                    );
+                }
+                (rect.size.width > 0.0).then_some((rect.origin.x, rect.origin.x + rect.size.width))
+            })
+    }
+
+    /// The glyphs of `shaped` placed in the cell grid, each with its ink's horizontal extent.
+    /// A cell's glyph is centred in it and CoreText advances by the unrounded width.
+    fn placed(&self, face: usize, shaped: &Shaped) -> Vec<Placed> {
+        let ratio = f64::from(self.cell_width) / self.advance;
+        let centred = (f64::from(self.cell_width) - self.advance) / 2.0;
+        shaped
+            .glyphs
+            .iter()
+            .zip(&shaped.positions)
+            .map(|(glyph, position)| {
+                let x = position.x * ratio + centred;
+                let ink = self
+                    .glyph_ink(face, *glyph)
+                    .map(|(low, high)| (x + low * ratio, x + high * ratio));
+                Placed {
+                    glyph: *glyph,
+                    x,
+                    y: position.y + self.baseline,
+                    ink,
+                }
+            })
+            .collect()
+    }
+
+    /// The placed glyphs whose ink reaches into cell `index`, by more than antialiasing's half pixel.
+    fn painting<'a>(
+        &self,
+        placed: &'a [Placed],
+        index: usize,
+    ) -> impl Iterator<Item = &'a Placed> + use<'a> {
+        let left = index as f64 * f64::from(self.cell_width);
+        let right = left + f64::from(self.cell_width);
+        placed.iter().filter(move |glyph| {
+            glyph
+                .ink
+                .is_some_and(|(low, high)| low < right - 0.5 && high > left + 0.5)
+        })
+    }
+
     /// Which cells of `run` (see `joins_run`) come out differently from standing alone, such as
     /// the cells of a ligature. The rest can be drawn as plain cells, so the atlas stores nothing for them.
-    pub fn shaped_cells(&self, run: &str, style: FontStyle) -> Rc<[bool]> {
+    pub fn shaped_cells(&self, run: &str, style: FontStyle) -> Rc<ShapedRun> {
         let face = Self::face_index(style);
         if let Some(cells) = self.runs.borrow()[face].get(run) {
             return cells.clone();
         }
-        let cells: Rc<[bool]> = self.shaped_differences(run, face).into();
+        let cells = Rc::new(self.shape_run(run, face));
         let mut runs = self.runs.borrow_mut();
         if runs[face].len() >= RUN_CACHE_LIMIT {
             runs[face].clear();
         }
-        runs[face].insert(run.to_owned(), cells.clone());
+        runs[face].insert(cells.text.clone(), cells.clone());
         cells
     }
 
-    fn shaped_differences(&self, run: &str, face: usize) -> Vec<bool> {
+    fn shape_run(&self, run: &str, face: usize) -> ShapedRun {
         let length = run.chars().count();
-        let unchanged = vec![false; length];
+        let text: Rc<str> = run.into();
         let Some(shaped) = shape(&self.faces[face], run) else {
-            return unchanged;
+            return ShapedRun {
+                text,
+                signatures: vec![0; length].into(),
+            };
         };
-        // Fewer glyphs than characters is a true ligature, so no cell stands alone.
-        let in_order = shaped.glyphs.len() == length
-            && shaped
-                .indices
-                .iter()
+        let placed = self.placed(face, &shaped);
+        // A monospaced font gives a ligature one glyph per character, though CoreText clusters
+        // them under the first. Fewer glyphs than characters is a true ligature, so no cell
+        // stands alone.
+        let in_order = shaped.glyphs.len() == length;
+        let differs: Vec<bool> = if in_order {
+            run.chars()
+                .zip(&shaped.glyphs)
+                .zip(&shaped.positions)
                 .zip(0..)
-                .all(|(index, cell)| *index == cell);
-        if !in_order {
-            return vec![true; length];
-        }
-        run.chars()
-            .zip(shaped.glyphs.iter().zip(&shaped.positions))
-            .zip(0..)
-            .map(
-                |((character, (glyph, position)), cell): ((_, (&u16, &CGPoint)), u32)| {
+                .map(|(((character, glyph), position), cell): (_, u32)| {
                     self.glyph_alone(face, character) != Some(*glyph)
                         || (position.x - f64::from(cell) * self.advance).abs() > 0.5
-                },
-            )
-            .collect()
+                })
+                .collect()
+        } else {
+            vec![true; length]
+        };
+        let signatures = differs
+            .iter()
+            .enumerate()
+            .map(|(index, differs)| {
+                if !differs {
+                    return 0;
+                }
+                // The glyphs that paint a cell, and where, say everything about its bitmap, so the
+                // same ligature shares one atlas entry wherever it appears.
+                let mut hasher = Fnv::default();
+                face.hash(&mut hasher);
+                let origin = index as f64 * f64::from(self.cell_width);
+                for glyph in self.painting(&placed, index) {
+                    (glyph.glyph, ((glyph.x - origin) * 8.0).round() as i32).hash(&mut hasher);
+                }
+                hasher.finish() | 1
+            })
+            .collect();
+        ShapedRun { text, signatures }
     }
 
     /// The bitmap of cell `index` of `run`, shaped together with its neighbours, in the format
@@ -583,34 +683,25 @@ impl Font {
         index: usize,
         out: &mut Vec<u8>,
     ) -> Option<GlyphKind> {
-        let font = &self.faces[Self::face_index(style)];
-        let shaped = shape(font, run)?;
-        // A ligature glyph can be drawn several cells away from the cells it paints, so a long
-        // token draws a window around `index` rather than every cell.
-        let first = index.saturating_sub(LIGATURE_REACH);
-        let cells = (index + LIGATURE_REACH + 1).min(run.chars().count()) - first;
-        let row = (self.cell_width * 4) as usize;
-        let mut window = vec![0u8; row * cells * self.cell_height as usize];
-        let context = self.bitmap_context(&mut window, self.cell_width * cells as u32)?;
-        // A cell's glyph is centred in it and CoreText advances by the unrounded width.
-        let ratio = f64::from(self.cell_width) / self.advance;
-        let centred = (f64::from(self.cell_width) - self.advance) / 2.0;
-        let (mut glyphs, mut positions) = (Vec::new(), Vec::new());
-        for ((glyph, position), cell) in shaped
-            .glyphs
-            .iter()
-            .zip(&shaped.positions)
-            .zip(&shaped.indices)
-        {
-            let cell = usize::try_from(*cell).ok()?;
-            if (first..first + cells).contains(&cell) {
-                glyphs.push(*glyph);
-                positions.push(CGPoint {
-                    x: (position.x - first as f64 * self.advance) * ratio + centred,
-                    y: position.y + self.baseline,
-                });
-            }
-        }
+        let face = Self::face_index(style);
+        let font = &self.faces[face];
+        let placed = self.placed(face, &shape(font, run)?);
+        out.clear();
+        out.resize((self.cell_width * self.cell_height * 4) as usize, 0);
+        let context = self.bitmap_context(out, self.cell_width)?;
+        let origin = index as f64 * f64::from(self.cell_width);
+        let (mut glyphs, mut positions): (Vec<u16>, Vec<CGPoint>) = self
+            .painting(&placed, index)
+            .map(|glyph| {
+                (
+                    glyph.glyph,
+                    CGPoint {
+                        x: glyph.x - origin,
+                        y: glyph.y,
+                    },
+                )
+            })
+            .unzip();
         // SAFETY: both buffers hold `glyphs.len()` elements and `context` is live.
         unsafe {
             font.draw_glyphs(
@@ -619,11 +710,6 @@ impl Font {
                 glyphs.len(),
                 &context,
             );
-        }
-        out.clear();
-        let column = (index - first) * row;
-        for line in window.chunks_exact(row * cells) {
-            out.extend_from_slice(line.get(column..column + row)?);
         }
         Some(GlyphKind::Coverage)
     }
@@ -939,10 +1025,51 @@ mod tests {
         Font::with_symbols(DEFAULT_FONT_FAMILY, 13.0, 2.0, None, &[], &features).unwrap()
     }
 
+    fn differing(font: &Font, text: &str) -> Vec<bool> {
+        let shaped = font.shaped_cells(text, REGULAR);
+        (0..text.chars().count())
+            .map(|index| shaped.signature(index).is_some())
+            .collect()
+    }
+
+    #[test]
+    fn a_run_shapes_across_spaces() {
+        let font = with_features(&[]);
+        assert_eq!(
+            differing(&font, "a != b"),
+            [false, false, true, true, false, false]
+        );
+    }
+
+    #[test]
+    fn a_ligature_has_the_same_signature_whatever_surrounds_it() {
+        let font = with_features(&[]);
+        let signatures = |text: &str| -> Vec<Option<u64>> {
+            let shaped = font.shaped_cells(text, REGULAR);
+            (0..text.chars().count())
+                .map(|index| shaped.signature(index))
+                .collect()
+        };
+        let alone = signatures("!=");
+        assert!(alone.iter().all(Option::is_some));
+        assert_eq!(&signatures("a != b")[2..4], &alone[..]);
+        assert_eq!(&signatures("xx!=yy")[2..4], &alone[..]);
+        assert_ne!(alone[0], alone[1]);
+    }
+
+    #[test]
+    fn a_ligature_looks_the_same_in_a_long_run() {
+        let font = with_features(&[]);
+        assert_eq!(
+            &cells(&font, "some text != more")[10..12],
+            &cells(&font, "!=")[..]
+        );
+    }
+
     #[test]
     fn a_ligature_changes_both_of_its_cells() {
         let font = with_features(&[]);
-        assert_eq!(&*font.shaped_cells("!=", REGULAR), [true, true]);
+        assert_eq!(differing(&font, "!="), [true, true]);
         let (shaped, plain) = (cells(&font, "!="), alone(&font, "!="));
         assert_ne!(shaped[0], plain[0]);
         assert_ne!(shaped[1], plain[1]);
@@ -952,22 +1079,13 @@ mod tests {
     #[test]
     fn disabling_liga_leaves_a_run_unshaped_and_enabling_a_set_shapes_it() {
         let font = with_features(&["-liga"]);
-        assert_eq!(&*font.shaped_cells("!=", REGULAR), [false, false]);
+        assert_eq!(differing(&font, "!="), [false, false]);
         assert_eq!(cells(&font, "!="), alone(&font, "!="));
         // Monaspace builds `!=` from `liga`, so `calt` alone doesn't change it.
-        assert_eq!(
-            &*with_features(&["-calt"]).shaped_cells("!=", REGULAR),
-            [true, true]
-        );
+        assert_eq!(differing(&with_features(&["-calt"]), "!="), [true, true]);
         // `ss01` redraws `==`, which is plain by default.
-        assert_eq!(
-            &*with_features(&[]).shaped_cells("==", REGULAR),
-            [false, false]
-        );
-        assert_eq!(
-            &*with_features(&["ss01"]).shaped_cells("==", REGULAR),
-            [true, true]
-        );
+        assert_eq!(differing(&with_features(&[]), "=="), [false, false]);
+        assert_eq!(differing(&with_features(&["ss01"]), "=="), [true, true]);
     }
 
     #[test]
@@ -976,8 +1094,9 @@ mod tests {
         for joins in ['a', '!', 'é', '→'] {
             assert!(font.joins_run(joins), "{joins}");
         }
-        // Spaces, procedural box drawing, icons and glyphs only a fallback face has.
-        for apart in [' ', '│', '\u{E0B0}', '世', '\u{1F600}'] {
+        assert!(font.joins_run(' '));
+        // Other whitespace, procedural box drawing, icons and glyphs only a fallback face has.
+        for apart in ['\u{A0}', '│', '\u{E0B0}', '世', '\u{1F600}'] {
             assert!(!font.joins_run(apart), "{apart:?}");
         }
     }
@@ -985,7 +1104,7 @@ mod tests {
     #[test]
     fn a_run_with_non_ascii_cells_is_indexed_by_character() {
         let font = with_features(&[]);
-        let shaped = font.shaped_cells("→é!=", REGULAR);
+        let shaped = differing(&font, "→é!=");
         assert_eq!(shaped.len(), 4);
         assert_eq!(&shaped[2..], [true, true]);
         assert_eq!(cells(&font, "→é!=").len(), 4);
@@ -1006,6 +1125,6 @@ mod tests {
     #[test]
     fn unrelated_neighbours_leave_a_run_as_plain_cells() {
         let font = with_features(&[]);
-        assert!(!font.shaped_cells("{}", REGULAR).contains(&true));
+        assert!(!differing(&font, "{}").contains(&true));
     }
 }
