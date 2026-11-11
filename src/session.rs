@@ -32,6 +32,7 @@ use rune::Waker;
 
 use crate::config::{Config, Theme};
 use crate::input::KeyInput;
+use crate::link;
 
 const FRAME: Duration = Duration::from_millis(8);
 /// How long the size must hold before the program sees it, as each SIGWINCH makes inline TUIs reprint.
@@ -83,6 +84,8 @@ pub enum Event {
         title: String,
         body: String,
     },
+    /// ⌘ moved onto or off a link; read `Session::link_hovered`.
+    LinkHover,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
@@ -717,6 +720,7 @@ enum Msg {
     Wheel(WheelInput),
     Scrollbar { phase: PointerPhase, y: f32 },
     ScrollbarHover(bool),
+    CommandHeld(bool),
     Copy,
     Paste { text: String, allow_unsafe: bool },
     Resize(Surface),
@@ -741,6 +745,12 @@ fn whole_lines(remainder: &mut f32, delta: f32) -> i32 {
     let lines = remainder.trunc();
     *remainder -= lines;
     lines as i32
+}
+
+fn open_link(url: &str) {
+    let mut open = Command::new("/usr/bin/open");
+    open.args(link::open_args(url));
+    thread::spawn(move || open.status().log_err("open link"));
 }
 
 /// False if libghostty refused the text because it could run commands.
@@ -794,6 +804,7 @@ struct TerminalInput {
     scrollbar_grab: Option<f32>,
     /// Set by `select` for the actor to take, as libghostty doesn't mark the render state dirty.
     selection_changed: bool,
+    link_hovered: bool,
 }
 
 impl TerminalInput {
@@ -819,6 +830,7 @@ impl TerminalInput {
             wheel_remainder: 0.0,
             scrollbar_grab: None,
             selection_changed: false,
+            link_hovered: false,
         })
     }
 
@@ -994,6 +1006,88 @@ impl TerminalInput {
         self.scrollbar_grab = Some(grab);
         terminal.scroll_viewport(ScrollViewport::Row(scrollbar.row_at(y - grab, track, min)));
         Ok(())
+    }
+
+    /// The new state when whether ⌘ is held over a link at the last pointer position changed.
+    fn link_hover(
+        &mut self,
+        terminal: &Terminal<'static, '_>,
+        command: bool,
+    ) -> Result<Option<bool>> {
+        let Some(surface) = self.surface else {
+            return Ok(None);
+        };
+        let over_link = command && {
+            let position = Self::viewport_point(surface, self.position);
+            Self::link_at(terminal, surface, position)?.is_some()
+        };
+        Ok((over_link != self.link_hovered).then(|| {
+            self.link_hovered = over_link;
+            over_link
+        }))
+    }
+
+    /// The link a ⌘-click starts on. The actor opens it instead of passing the press on, so it
+    /// neither selects nor reaches a mouse-tracking program.
+    fn link_under(
+        &self,
+        terminal: &Terminal<'static, '_>,
+        input: PointerInput,
+    ) -> Result<Option<String>> {
+        let Some(surface) = self.surface else {
+            return Ok(None);
+        };
+        if input.phase != PointerPhase::Press
+            || input.button != Some(mouse::Button::Left)
+            || !input.mods.contains(key::Mods::SUPER)
+        {
+            return Ok(None);
+        }
+        let scale = surface.metrics.scale;
+        let position = Self::viewport_point(surface, (input.x * scale, input.y * scale));
+        Self::link_at(terminal, surface, position)
+    }
+
+    /// An OSC 8 hyperlink, or else a URL in the text, which may wrap across rows.
+    fn link_at(
+        terminal: &Terminal<'static, '_>,
+        surface: Surface,
+        position: PointCoordinate,
+    ) -> Result<Option<String>> {
+        let mut uri = [0; 4096];
+        let length = terminal
+            .grid_ref(Point::Viewport(position))?
+            .hyperlink_uri(&mut uri)?;
+        if let Ok(uri) = std::str::from_utf8(&uri[..length])
+            && link::openable(uri)
+        {
+            return Ok(Some(uri.to_owned()));
+        }
+        let grid_ref = |x, y| terminal.grid_ref(Point::Viewport(PointCoordinate { x, y }));
+        let mut first = position.y;
+        while first > 0 && grid_ref(0, first)?.row()?.is_wrap_continuation()? {
+            first -= 1;
+        }
+        let mut row = Vec::new();
+        let mut y = first;
+        loop {
+            for x in 0..surface.cols {
+                let mut character = [' '];
+                row.push(match grid_ref(x, y)?.graphemes(&mut character) {
+                    Ok(_) => character[0],
+                    // A cluster of several codepoints; any non-delimiter stands in for it.
+                    Err(libghostty_vt::Error::OutOfSpace { .. }) => '\u{fffd}',
+                    Err(error) => return Err(error.into()),
+                });
+            }
+            y += 1;
+            if y >= surface.rows.into() || !grid_ref(0, y - 1)?.row()?.is_wrapped()? {
+                break;
+            }
+        }
+        let column =
+            (position.y - first) as usize * usize::from(surface.cols) + usize::from(position.x);
+        Ok(link::url_at(&row, column))
     }
 
     fn pointer(
@@ -1204,6 +1298,7 @@ pub struct Session {
     grid: Arc<Mutex<Arc<Grid>>>,
     /// Set by the actor when an alert arrives while not shown; cleared when it is shown.
     alerted: Arc<AtomicBool>,
+    link_hovered: Arc<AtomicBool>,
     events: Receiver<Event>,
     sent_surface: std::cell::Cell<Option<Surface>>,
     visibility: std::cell::Cell<Visibility>,
@@ -1277,6 +1372,7 @@ impl Session {
         let (commands, commands_rx) = unbounded();
         let grid = Arc::new(Mutex::new(Arc::new(Grid::default())));
         let alerted = Arc::new(AtomicBool::new(false));
+        let link_hovered = Arc::new(AtomicBool::new(false));
         let (events_tx, events) = unbounded();
         let (finished_tx, finished) = bounded::<()>(0);
         let mut actor = Actor {
@@ -1290,6 +1386,7 @@ impl Session {
             master,
             slot: grid.clone(),
             alerted: alerted.clone(),
+            link_hovered: link_hovered.clone(),
             events: events_tx,
             waker,
             theme: config.theme.clone(),
@@ -1311,6 +1408,7 @@ impl Session {
             commands: Some(commands),
             grid,
             alerted,
+            link_hovered,
             events,
             sent_surface: std::cell::Cell::new(None),
             visibility: std::cell::Cell::new(Visibility::Shown),
@@ -1327,6 +1425,7 @@ impl Session {
             commands: None,
             grid: Arc::new(Mutex::new(Arc::new(grid))),
             alerted: Arc::default(),
+            link_hovered: Arc::default(),
             events: unbounded().1,
             sent_surface: std::cell::Cell::new(None),
             visibility: std::cell::Cell::new(Visibility::Shown),
@@ -1338,6 +1437,11 @@ impl Session {
     #[cfg(test)]
     pub fn publish_fixture(&self, grid: Grid) {
         store(&self.grid, grid);
+    }
+
+    #[cfg(test)]
+    pub fn set_link_hovered(&self, hovered: bool) {
+        self.link_hovered.store(hovered, Ordering::Release);
     }
 
     /// The process's pid and its `proc_pidinfo` of `flavor`, which must fill a `T`.
@@ -1405,6 +1509,15 @@ impl Session {
     /// `y` is in points from the top of the terminal surface.
     pub fn drag_scrollbar(&self, phase: PointerPhase, y: f32) {
         self.send(Msg::Scrollbar { phase, y });
+    }
+
+    /// Whether ⌘ is held over a link, which the terminal shows with a pointing hand.
+    pub fn link_hovered(&self) -> bool {
+        self.link_hovered.load(Ordering::Acquire)
+    }
+
+    pub fn command_held(&self, held: bool) {
+        self.send(Msg::CommandHeld(held));
     }
 
     pub fn hover_scrollbar(&self, hovered: bool) {
@@ -1541,12 +1654,25 @@ struct Actor {
     master: OwnedFd,
     slot: Arc<Mutex<Arc<Grid>>>,
     alerted: Arc<AtomicBool>,
+    link_hovered: Arc<AtomicBool>,
     events: Sender<Event>,
     waker: Waker,
     theme: Theme,
 }
 
 impl Actor {
+    fn update_link_hover(
+        &self,
+        input: &mut TerminalInput,
+        terminal: &Terminal<'static, '_>,
+        command: bool,
+    ) {
+        if let Some(Some(hovered)) = input.link_hover(terminal, command).log_err("find link") {
+            self.link_hovered.store(hovered, Ordering::Release);
+            self.emit(Event::LinkHover);
+        }
+    }
+
     fn emit(&self, event: Event) {
         self.events.send(event).log_err("queue event");
         (self.waker)();
@@ -1699,11 +1825,17 @@ impl Actor {
                         }
                     }
                     Ok(Msg::Pointer(pointer)) => {
-                        if let Some(bytes) = input.pointer(&terminal, pointer).log_err("handle pointer")
+                        if let Some(Some(url)) =
+                            input.link_under(&terminal, pointer).log_err("find link")
+                        {
+                            open_link(&url);
+                        } else if let Some(bytes) = input.pointer(&terminal, pointer).log_err("handle pointer")
                             && !bytes.is_empty()
                         {
                             self.input.send(bytes).log_err("queue mouse report");
                         }
+                        let command = pointer.mods.contains(key::Mods::SUPER);
+                        self.update_link_hover(&mut input, &terminal, command);
                     }
                     Ok(Msg::Wheel(wheel)) => {
                         match input.wheel(&mut terminal, wheel).log_err("handle wheel") {
@@ -1721,6 +1853,7 @@ impl Actor {
                         dirty = true;
                     }
                     Ok(Msg::ScrollbarHover(hovered)) => scrollbar_hovered = hovered,
+                    Ok(Msg::CommandHeld(held)) => self.update_link_hover(&mut input, &terminal, held),
                     Ok(Msg::Copy) => {
                         if let Some(Some(text)) = selection_text(&terminal).log_err("copy selection") {
                             self.emit(Event::Copied(text));
@@ -2238,6 +2371,98 @@ mod tests {
             y: 10.0,
             mods: key::Mods::empty(),
         }
+    }
+
+    fn command_press(column: u16, row: u16) -> PointerInput {
+        PointerInput {
+            mods: key::Mods::SUPER,
+            ..pointer_at(PointerPhase::Press, column, row)
+        }
+    }
+
+    #[test]
+    fn command_click_finds_a_plain_text_url() {
+        let mut terminal = new_terminal(20, 5).unwrap();
+        terminal.vt_write(b"\r\na https://a.te/x. ok");
+        let input = input_for_test();
+        let link = input.link_under(&terminal, command_press(6, 1)).unwrap();
+        assert_eq!(link.as_deref(), Some("https://a.te/x"));
+        let off_link = input.link_under(&terminal, command_press(1, 1)).unwrap();
+        assert_eq!(off_link, None);
+    }
+
+    #[test]
+    fn command_click_joins_a_url_wrapped_across_rows() {
+        let mut terminal = new_terminal(20, 5).unwrap();
+        terminal.vt_write(b"a https://example.com/long/path.\r\nnext");
+        let input = input_for_test();
+        for (column, row) in [(5, 0), (2, 1), (19, 0)] {
+            let link = input.link_under(&terminal, command_press(column, row));
+            assert_eq!(
+                link.unwrap().as_deref(),
+                Some("https://example.com/long/path"),
+                "at {column},{row}"
+            );
+        }
+        let after = input.link_under(&terminal, command_press(1, 2)).unwrap();
+        assert_eq!(after, None);
+    }
+
+    #[test]
+    fn hover_reports_only_changes_over_a_link_with_command_held() {
+        let mut terminal = new_terminal(20, 5).unwrap();
+        terminal.vt_write(b"a https://a.te/x ok");
+        let mut input = input_for_test();
+        let move_to = |input: &mut TerminalInput, column| {
+            let hover = pointer_at(PointerPhase::Move, column, 0);
+            input.pointer(&terminal, hover).unwrap();
+        };
+        move_to(&mut input, 5);
+        assert_eq!(input.link_hover(&terminal, false).unwrap(), None);
+        assert_eq!(input.link_hover(&terminal, true).unwrap(), Some(true));
+        assert_eq!(input.link_hover(&terminal, true).unwrap(), None);
+        move_to(&mut input, 0);
+        assert_eq!(input.link_hover(&terminal, true).unwrap(), Some(false));
+        move_to(&mut input, 5);
+        assert_eq!(input.link_hover(&terminal, true).unwrap(), Some(true));
+        assert_eq!(input.link_hover(&terminal, false).unwrap(), Some(false));
+    }
+
+    #[test]
+    fn command_click_prefers_an_osc_8_hyperlink() {
+        let mut terminal = new_terminal(20, 5).unwrap();
+        terminal.vt_write(b"\x1b]8;;https://osc.test/x\x1b\\click me\x1b]8;;\x1b\\");
+        let input = input_for_test();
+        let link = input.link_under(&terminal, command_press(1, 0)).unwrap();
+        assert_eq!(link.as_deref(), Some("https://osc.test/x"));
+    }
+
+    #[test]
+    fn command_click_ignores_hyperlinks_with_other_schemes() {
+        let mut terminal = new_terminal(20, 5).unwrap();
+        terminal.vt_write(b"\x1b]8;;ssh://host\x1b\\click me\x1b]8;;\x1b\\");
+        let input = input_for_test();
+        let link = input.link_under(&terminal, command_press(1, 0)).unwrap();
+        assert_eq!(link, None);
+    }
+
+    #[test]
+    fn only_a_command_left_press_opens_a_link() {
+        let mut terminal = new_terminal(20, 5).unwrap();
+        terminal.vt_write(b"https://example.com");
+        let input = input_for_test();
+        let plain = pointer_at(PointerPhase::Press, 3, 0);
+        assert_eq!(input.link_under(&terminal, plain).unwrap(), None);
+        let release = PointerInput {
+            phase: PointerPhase::Release,
+            ..command_press(3, 0)
+        };
+        assert_eq!(input.link_under(&terminal, release).unwrap(), None);
+        let right = PointerInput {
+            button: Some(mouse::Button::Right),
+            ..command_press(3, 0)
+        };
+        assert_eq!(input.link_under(&terminal, right).unwrap(), None);
     }
 
     #[test]
@@ -2874,6 +3099,38 @@ mod tests {
             input_for_test().key(&mut terminal, typed).unwrap(),
             b"\x1bb"
         );
+    }
+
+    fn command_k() -> crate::input::KeyInput {
+        let command = rune::Mods {
+            cmd: true,
+            logo: true,
+            ..rune::Mods::default()
+        };
+        crate::input::map_key(
+            &rune::KeyEvent {
+                key: rune::Key::Command('k'),
+                mods: command,
+            },
+            Some(rune::PhysicalKeyCode::KeyK),
+            Some('k'),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn an_unbound_command_chord_types_nothing_in_legacy_mode() {
+        let mut terminal = new_terminal(20, 5).unwrap();
+        let bytes = input_for_test().key(&mut terminal, command_k()).unwrap();
+        assert_eq!(bytes, b"");
+    }
+
+    #[test]
+    fn an_unbound_command_chord_reports_super_under_the_kitty_protocol() {
+        let mut terminal = new_terminal(20, 5).unwrap();
+        terminal.vt_write(b"\x1b[>1u");
+        let bytes = input_for_test().key(&mut terminal, command_k()).unwrap();
+        assert_eq!(bytes, b"\x1b[107;9u");
     }
 
     #[test]

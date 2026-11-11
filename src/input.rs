@@ -83,15 +83,19 @@ pub fn map_text(text: &str, mods: Mods, physical: Option<Code>, base: Option<cha
         key: physical.map_or(Vt::Unidentified, vt_key),
         mods: vt_mods(mods),
         consumed,
-        text: (!mods.ctrl).then(|| text.to_owned()),
+        text: (!mods.ctrl && !mods.logo).then(|| text.to_owned()),
         unshifted: base.unwrap_or('\0'),
     }
 }
 
-/// `None` for keys the terminal shouldn't receive, such as ⌘ chords.
+/// `None` for keys with no terminal meaning. The app's own ⌘ shortcuts are taken before this,
+/// so any ⌘ chord that gets here goes to the terminal with super set and the encoder decides.
 pub fn map_key(event: &KeyEvent, physical: Option<Code>, base: Option<char>) -> Option<KeyInput> {
     let named = match &event.key {
         Key::Text(text) => return Some(map_text(text, event.mods, physical, base)),
+        Key::Command(character) => {
+            return Some(map_text(&character.to_string(), event.mods, physical, base));
+        }
         Key::Enter => Vt::Enter,
         Key::Backspace => Vt::Backspace,
         Key::Delete => Vt::Delete,
@@ -198,7 +202,7 @@ mod tests {
     }
 
     #[test]
-    fn tab_and_escape_are_named_but_command_chords_are_not_for_the_terminal() {
+    fn tab_and_escape_are_named() {
         let named = |key| {
             map_key(
                 &KeyEvent {
@@ -212,6 +216,33 @@ mod tests {
         };
         assert_eq!(named(Key::Tab), Some(Vt::Tab));
         assert_eq!(named(Key::Escape), Some(Vt::Escape));
-        assert_eq!(named(Key::Command('w')), None);
+    }
+
+    fn command_key(key: Key, shift: bool) -> KeyInput {
+        let mods = Mods {
+            cmd: true,
+            logo: true,
+            shift,
+            ..Mods::default()
+        };
+        map_key(&KeyEvent { key, mods }, Some(Code::KeyK), Some('k')).unwrap()
+    }
+
+    #[test]
+    fn a_command_chord_reaches_the_terminal_with_super_and_no_text() {
+        let input = command_key(Key::Command('k'), false);
+        assert_eq!((input.key, input.text, input.unshifted), (Vt::K, None, 'k'));
+        assert!(input.mods.contains(VtMods::SUPER));
+    }
+
+    #[test]
+    fn command_space_carries_no_text() {
+        assert_eq!(command_key(Key::Text(" ".into()), false).text, None);
+    }
+
+    #[test]
+    fn a_shifted_command_chord_keeps_shift_as_a_modifier() {
+        let input = command_key(Key::Command('K'), true);
+        assert!(input.mods.contains(VtMods::SUPER | VtMods::SHIFT));
     }
 }
