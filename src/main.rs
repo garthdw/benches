@@ -432,6 +432,8 @@ enum Action {
     OpenProject,
     ChangeFolder,
     Jump(PathBuf),
+    SwitchProject(usize, String),
+    SwitchTab(usize, usize, String),
     Run(String),
     Tray(String),
 }
@@ -444,6 +446,8 @@ impl Action {
             Action::OpenProject => "Open project…".to_owned(),
             Action::ChangeFolder => "Change project folder…".to_owned(),
             Action::Jump(root) => format!("Open project {}", root.display()),
+            Action::SwitchProject(_, name) => format!("Switch to project {name}"),
+            Action::SwitchTab(_, _, name) => format!("Switch to tab {name}"),
             Action::Run(command) => format!("Run “{command}” in a new tab"),
             Action::Tray(command) => format!("Run “{command}” in the tray"),
         }
@@ -459,22 +463,58 @@ fn letters_in_order(label: &str, query: &str) -> bool {
         .all(|wanted| letters.any(|letter| letter == wanted))
 }
 
-/// The fixed actions whose labels contain the query's letters in order, then the jump command's
-/// folder, then running the query.
-fn palette_actions(query: &str, jump: Option<&Path>, has_project: bool) -> Vec<Action> {
+/// Open projects and tabs whose names contain the query's letters in order, as switch actions
+/// paired with their names. The jump folder's project is left out, as that action opens it.
+fn switch_actions(
+    query: &str,
+    jump: Option<&Path>,
+    workspace: &Workspace,
+) -> Vec<(String, Action)> {
+    let mut found = Vec::new();
+    for (index, project) in workspace.projects.iter().enumerate() {
+        if Some(project.root.as_path()) != jump {
+            found.push((
+                project.name.clone(),
+                Action::SwitchProject(index, project.name.clone()),
+            ));
+        }
+        for (tab_index, tab) in project.tabs.iter().enumerate() {
+            let name = format!("{} ({})", tab.label(), project.name);
+            found.push((
+                tab.label().to_owned(),
+                Action::SwitchTab(index, tab_index, name),
+            ));
+        }
+    }
+    found.retain(|(name, _)| letters_in_order(name, query));
+    found
+}
+
+/// Exact project and tab names, then the fixed actions whose labels contain the query's letters
+/// in order, then the jump command's folder, then the other projects and tabs, then running the
+/// query. A query that names a project or tab outranks the fixed actions so Enter switches to
+/// it, and the switch actions only appear once something is typed.
+fn palette_actions(query: &str, jump: Option<&Path>, workspace: &Workspace) -> Vec<Action> {
     let query = query.trim();
     let needle = query.to_lowercase();
-    let mut actions: Vec<Action> = [
-        Action::Shell,
-        Action::Lazygit,
-        Action::OpenProject,
-        Action::ChangeFolder,
-    ]
-    .into_iter()
-    .filter(|action| *action != Action::ChangeFolder || has_project)
-    .filter(|action| letters_in_order(&action.label(), &needle))
-    .collect();
+    let (exact, partial): (Vec<_>, Vec<_>) = switch_actions(&needle, jump, workspace)
+        .into_iter()
+        .filter(|_| !query.is_empty())
+        .partition(|(name, _)| name.to_lowercase() == needle);
+    let mut actions: Vec<Action> = exact.into_iter().map(|(_, action)| action).collect();
+    actions.extend(
+        [
+            Action::Shell,
+            Action::Lazygit,
+            Action::OpenProject,
+            Action::ChangeFolder,
+        ]
+        .into_iter()
+        .filter(|action| *action != Action::ChangeFolder || workspace.project().is_some())
+        .filter(|action| letters_in_order(&action.label(), &needle)),
+    );
     actions.extend(jump.map(|root| Action::Jump(root.to_owned())));
+    actions.extend(partial.into_iter().map(|(_, action)| action));
     if !query.is_empty() {
         actions.push(Action::Run(query.to_owned()));
         actions.push(Action::Tray(query.to_owned()));
@@ -491,11 +531,7 @@ fn open_palette(state: &mut State, tx: &mut Tx) {
 }
 
 fn run_palette(state: &mut State, index: usize, tx: &mut Tx) {
-    let actions = palette_actions(
-        &state.palette.text,
-        state.jump_target(),
-        state.workspace.project().is_some(),
-    );
+    let actions = palette_actions(&state.palette.text, state.jump_target(), &state.workspace);
     let Some(action) = actions.get(index.min(actions.len().saturating_sub(1))) else {
         return;
     };
@@ -510,6 +546,11 @@ fn run_action(state: &mut State, action: &Action, tx: &mut Tx) {
         Action::OpenProject => pick_folder(tx, false),
         Action::ChangeFolder => pick_folder(tx, true),
         Action::Jump(root) => open_project(state, root.clone()),
+        Action::SwitchProject(project, _) => state.workspace.select_project(*project),
+        Action::SwitchTab(project, tab, _) => {
+            state.workspace.select_project(*project);
+            state.workspace.select_tab(*tab);
+        }
         Action::Run(command) => open_tab(state, command, Some(command)),
         Action::Tray(command) => open_tray(state, command),
     }
@@ -586,11 +627,7 @@ fn palette_key(state: &mut State, event: &KeyEvent, tx: &mut Tx) -> bool {
     if state.worktrees.is_some() {
         return worktree_key(state, event);
     }
-    let actions = palette_actions(
-        &state.palette.text,
-        state.jump_target(),
-        state.workspace.project().is_some(),
-    );
+    let actions = palette_actions(&state.palette.text, state.jump_target(), &state.workspace);
     let last = actions.len().saturating_sub(1);
     match event.key {
         Key::Escape => state.palette_open = false,
@@ -1326,11 +1363,8 @@ fn view(state: &State, cx: &mut Cx<State>) -> El {
             });
             placeholder.into_iter().chain(worktrees).collect()
         } else {
-            let actions = palette_actions(
-                &state.palette.text,
-                state.jump_target(),
-                state.workspace.project().is_some(),
-            );
+            let actions =
+                palette_actions(&state.palette.text, state.jump_target(), &state.workspace);
             let selected = state.palette_selected.min(actions.len().saturating_sub(1));
             actions
                 .iter()
@@ -2328,10 +2362,16 @@ mod tests {
         assert_eq!(runtime.state.palette.text, "x");
     }
 
+    fn one_project() -> Workspace {
+        let mut workspace = Workspace::default();
+        workspace.add_project(Project::new("/dev/agentd".into(), Vec::new()));
+        workspace
+    }
+
     #[test]
     fn the_command_centre_filters_by_letters_in_order() {
         assert_eq!(
-            palette_actions("lzg", None, true),
+            palette_actions("lzg", None, &one_project()),
             [
                 Action::Lazygit,
                 Action::Run("lzg".to_owned()),
@@ -2339,7 +2379,7 @@ mod tests {
             ]
         );
         assert_eq!(
-            palette_actions("", None, true),
+            palette_actions("", None, &one_project()),
             [
                 Action::Shell,
                 Action::Lazygit,
@@ -2347,14 +2387,14 @@ mod tests {
                 Action::ChangeFolder
             ]
         );
-        assert!(!palette_actions("", None, false).contains(&Action::ChangeFolder));
+        assert!(!palette_actions("", None, &Workspace::default()).contains(&Action::ChangeFolder));
     }
 
     #[test]
     fn the_jump_commands_folder_follows_the_fixed_actions() {
         let root = Path::new("/dev/site");
         assert_eq!(
-            palette_actions("site", Some(root), true),
+            palette_actions("site", Some(root), &one_project()),
             [
                 Action::Jump(root.to_owned()),
                 Action::Run("site".to_owned()),
@@ -2374,6 +2414,77 @@ mod tests {
         assert_eq!(workspace.projects.len(), 2);
         assert_eq!(workspace.projects[1].root, Path::new("/dev/site"));
         assert!(!runtime.state.palette_open);
+    }
+
+    #[test]
+    fn typing_a_project_or_tab_name_offers_switching_to_it() {
+        let state = workspace_state();
+        let actions = palette_actions("sit", None, &state.workspace);
+        assert_eq!(
+            actions[..3],
+            [
+                Action::SwitchProject(1, "site".to_owned()),
+                Action::Run("sit".to_owned()),
+                Action::Tray("sit".to_owned()),
+            ]
+        );
+        let actions = palette_actions("lazy", None, &state.workspace);
+        assert!(actions.contains(&Action::SwitchTab(0, 2, "lazygit (agentd)".to_owned())));
+        assert!(
+            !palette_actions("", None, &state.workspace)
+                .iter()
+                .any(|action| matches!(action, Action::SwitchProject(..) | Action::SwitchTab(..)))
+        );
+    }
+
+    #[test]
+    fn exact_names_come_before_fixed_actions_and_partial_names_after_them() {
+        let state = workspace_state();
+        let actions = palette_actions("shell", None, &state.workspace);
+        assert_eq!(
+            actions[0],
+            Action::SwitchTab(1, 1, "shell (site)".to_owned())
+        );
+        assert_eq!(actions[1], Action::Shell);
+        let actions = palette_actions("sh", None, &state.workspace);
+        assert_eq!(actions[0], Action::Shell);
+        assert!(matches!(actions[1], Action::SwitchTab(..)));
+    }
+
+    #[test]
+    fn the_jump_folder_replaces_the_switch_to_its_open_project() {
+        let state = workspace_state();
+        let root = Path::new("/dev/site");
+        let actions = palette_actions("site", Some(root), &state.workspace);
+        assert_eq!(actions[0], Action::Jump(root.to_owned()));
+        assert!(
+            !actions
+                .iter()
+                .any(|action| matches!(action, Action::SwitchProject(..)))
+        );
+    }
+
+    #[test]
+    fn enter_on_a_project_name_makes_it_active() {
+        let mut runtime = palette_runtime();
+        press(&mut runtime, Key::Text("site".into()), Mods::default());
+        press(&mut runtime, Key::Enter, Mods::default());
+        assert_eq!(runtime.state.workspace.active, 1);
+        assert!(!runtime.state.palette_open);
+    }
+
+    #[test]
+    fn enter_on_a_tab_name_activates_its_project_and_tab() {
+        let mut runtime = palette_runtime();
+        press(&mut runtime, Key::Text("lazygit".into()), Mods::default());
+        press(&mut runtime, Key::Enter, Mods::default());
+        assert_eq!(runtime.state.workspace.active, 0);
+        assert_eq!(runtime.state.workspace.projects[0].active_tab, 2);
+        let mut runtime = palette_runtime();
+        press(&mut runtime, Key::Text("shell".into()), Mods::default());
+        press(&mut runtime, Key::Enter, Mods::default());
+        assert_eq!(runtime.state.workspace.active, 1);
+        assert_eq!(runtime.state.workspace.projects[1].active_tab, 1);
     }
 
     fn worktree(branch: &str, path: &str) -> jump::Worktree {
