@@ -473,7 +473,7 @@ fn poll_jump(state: &mut State, now: f64, tx: &mut Tx) -> bool {
 
 /// Workspace shortcuts. These keys never reach the terminal.
 fn shortcut(state: &mut State, event: &KeyEvent, tx: &mut Tx) -> bool {
-    if !matches!(event.key, Key::Command(_)) {
+    if !matches!(event.key, Key::Command(_)) && !event.mods.ctrl {
         return false;
     }
     let pressed = |binding: &str| pressed(binding, event, tx);
@@ -494,7 +494,7 @@ fn shortcut(state: &mut State, event: &KeyEvent, tx: &mut Tx) -> bool {
         state.workspace.cycle_tab(-1);
     } else if pressed("mod+shift+]") {
         state.workspace.cycle_tab(1);
-    } else if let Some(digit) = digit("mod+shift+") {
+    } else if let Some(digit) = digit("ctrl+") {
         let last = state.workspace.projects.len().saturating_sub(1);
         state.workspace.select_project((digit - 1).min(last));
     } else if let Some(digit) = digit("mod+") {
@@ -1623,6 +1623,13 @@ mod tests {
         }
     }
 
+    fn control() -> Mods {
+        Mods {
+            ctrl: true,
+            ..Mods::default()
+        }
+    }
+
     fn workspace_runtime() -> Runtime<State> {
         let mut runtime = runtime_with(workspace_state());
         runtime.on_key = Some(on_key);
@@ -1630,9 +1637,9 @@ mod tests {
     }
 
     #[test]
-    fn command_shift_digits_pick_projects_and_command_digits_pick_tabs() {
+    fn control_digits_pick_projects_and_command_digits_pick_tabs() {
         let mut runtime = workspace_runtime();
-        press(&mut runtime, Key::Command('2'), command_shift());
+        press(&mut runtime, Key::Text("2".into()), control());
         press(&mut runtime, Key::Command('2'), command());
         let workspace = &runtime.state.workspace;
         assert_eq!(workspace.active, 1);
@@ -1647,10 +1654,19 @@ mod tests {
     }
 
     #[test]
-    fn a_command_shift_digit_past_the_last_project_selects_the_last_project() {
+    fn a_control_digit_past_the_last_project_selects_the_last_project() {
         let mut runtime = workspace_runtime();
-        press(&mut runtime, Key::Command('9'), command_shift());
+        press(&mut runtime, Key::Text("9".into()), control());
         assert_eq!(runtime.state.workspace.active, 1);
+    }
+
+    #[test]
+    fn command_shift_digits_are_left_to_macos() {
+        let mut runtime = workspace_runtime();
+        press(&mut runtime, Key::Command('2'), command_shift());
+        press(&mut runtime, Key::Command('@'), command_shift());
+        let workspace = &runtime.state.workspace;
+        assert_eq!((workspace.active, workspace.projects[0].active_tab), (0, 0));
     }
 
     fn settle(runtime: &mut Runtime<State>) {
@@ -1691,17 +1707,6 @@ mod tests {
         click(&mut runtime, "sidebar-toggle");
         settle(&mut runtime);
         assert_eq!(sidebar_width(&runtime), SIDEBAR_WIDTH);
-    }
-
-    #[test]
-    fn control_digits_reach_the_terminal() {
-        let mut runtime = workspace_runtime();
-        let control = Mods {
-            ctrl: true,
-            ..Mods::default()
-        };
-        press(&mut runtime, Key::Text("2".into()), control);
-        assert_eq!(runtime.state.workspace.projects[0].active_tab, 0);
     }
 
     #[test]
