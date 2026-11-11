@@ -823,9 +823,10 @@ fn terminal_surface(
         _ => Some(mark == DRAWER_MARK),
     };
     let scrollable = pick(workspace).is_some_and(|session| session.grid().scrollbar.is_some());
-    let cursor = match pick(workspace).is_some_and(Session::link_hovered) {
-        true => Cursor::Pointer,
-        false => Cursor::Text,
+    let cursor = if pick(workspace).is_some_and(Session::link_hovered) {
+        Cursor::Pointer
+    } else {
+        Cursor::Text
     };
     effect(mark)
         .key(key)

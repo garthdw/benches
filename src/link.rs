@@ -41,8 +41,7 @@ fn percent_decode(text: &str) -> String {
     String::from_utf8_lossy(&decoded).into_owned()
 }
 
-/// The URL under `column` in one row of cells, one `char` per column. Links that wrap onto
-/// the next row are not joined.
+/// The URL under `column` in a logical line of cells, one `char` per column.
 pub fn url_at(row: &[char], column: usize) -> Option<String> {
     let delimiter = |character: &char| character.is_whitespace() || "<>\"'`".contains(*character);
     if row.get(column).is_none_or(delimiter) {
