@@ -55,6 +55,8 @@ const QUIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 /// Waits for typing to pause, as the lookup starts a login shell.
 const JUMP_DEBOUNCE: Duration = Duration::from_millis(250);
 const JUMP_TIMEOUT: Duration = Duration::from_secs(5);
+/// Longer than a lookup, as `wt switch --create` runs the project's `pre-start` hooks first.
+const WORKTREE_TIMEOUT: Duration = Duration::from_secs(120);
 const SCENE_FIXTURE: &[u8] = b"\x1b[1;32magentd\x1b[0m fixture\r\n\x1b[31mred\x1b[0m \x1b[42;30m on green \x1b[0m \x1b[7minverse\x1b[0m\r\n$ ";
 const SCENE_UNICODE: &str = concat!(
     "wide \u{4e16}\u{754c} kana \u{30ab}\u{30bf}\u{30ab}\u{30ca}|\r\n",
@@ -121,6 +123,10 @@ pub struct State {
     palette_selected: usize,
     jump: JumpLookup,
     worktrees: Option<WorktreeChoice>,
+    /// A `wt switch --create` running off the UI thread, answering with the new worktree's path.
+    creation: Option<mpsc::Receiver<anyhow::Result<PathBuf>>>,
+    /// Why the last worktree creation failed, shown in the command centre until the next edit.
+    palette_error: Option<String>,
     sidebar_hidden: bool,
     config: config::Config,
     /// Unset in tests and scenes, which then read and write no files.
@@ -436,6 +442,7 @@ enum Action {
     SwitchTab(usize, usize, String),
     RestartTray(usize, String),
     StopTray(usize, String),
+    CreateWorktree(String),
     Run(String),
     Tray(String),
 }
@@ -452,6 +459,7 @@ impl Action {
             Action::SwitchTab(_, _, name) => format!("Switch to tab {name}"),
             Action::RestartTray(_, title) => format!("Restart {title}"),
             Action::StopTray(_, title) => format!("Stop {title}"),
+            Action::CreateWorktree(branch) => format!("Create worktree “{branch}”"),
             Action::Run(command) => format!("Run “{command}” in a new tab"),
             Action::Tray(command) => format!("Run “{command}” in the tray"),
         }
@@ -496,8 +504,9 @@ fn switch_actions(
 
 /// Exact project and tab names, then the fixed actions whose labels contain the query's letters
 /// in order, then the jump command's folder, then the other projects and tabs, then the active
-/// project's tray restarts and stops, then running the query. A query that names a project or tab outranks the fixed actions so Enter switches to
-/// it, and the switch and tray actions only appear once something is typed.
+/// project's tray restarts and stops, then creating a worktree named by a one-word query, then
+/// running the query. A query that names a project or tab outranks the fixed actions so Enter
+/// switches to it, and the switch, tray and worktree actions only appear once something is typed.
 fn palette_actions(query: &str, jump: Option<&Path>, workspace: &Workspace) -> Vec<Action> {
     let query = query.trim();
     let needle = query.to_lowercase();
@@ -532,6 +541,10 @@ fn palette_actions(query: &str, jump: Option<&Path>, workspace: &Workspace) -> V
                 || letters_in_order(&action.label(), &needle)
         });
     }
+    let is_branch = !query.starts_with('-') && !query.contains(char::is_whitespace);
+    if is_branch && !query.is_empty() && workspace.project().is_some() {
+        actions.push(Action::CreateWorktree(query.to_owned()));
+    }
     if !query.is_empty() {
         actions.push(Action::Run(query.to_owned()));
         actions.push(Action::Tray(query.to_owned()));
@@ -544,7 +557,51 @@ fn open_palette(state: &mut State, tx: &mut Tx) {
     state.palette_open = true;
     state.palette_selected = 0;
     state.worktrees = None;
+    state.palette_error = None;
     tx.focus("palette-input", false);
+}
+
+/// Keeps the command centre open until `wt` answers, as its hooks can take a while.
+fn create_worktree(state: &mut State, branch: &str) {
+    let Some(root) = state.active_root() else {
+        return;
+    };
+    let (sender, receiver) = mpsc::channel();
+    state.creation = Some(receiver);
+    state.palette_open = true;
+    state.palette_error = None;
+    let (shell, branch) = (state.config.shell.clone(), branch.to_owned());
+    let waker = state.waker.clone();
+    std::thread::spawn(move || {
+        let created = jump::create_worktree(&shell, &root, &branch, WORKTREE_TIMEOUT);
+        if sender.send(created).is_ok()
+            && let Some(waker) = waker
+        {
+            waker();
+        }
+    });
+}
+
+fn poll_creation(state: &mut State) -> bool {
+    let Some(created) = state
+        .creation
+        .as_ref()
+        .and_then(|pending| pending.try_recv().ok())
+    else {
+        return false;
+    };
+    state.creation = None;
+    match created {
+        Ok(path) => {
+            state.palette_open = false;
+            open_project(state, path);
+        }
+        Err(error) => {
+            state.palette_open = true;
+            state.palette_error = Some(format!("{error:#}"));
+        }
+    }
+    true
 }
 
 fn run_palette(state: &mut State, index: usize, tx: &mut Tx) {
@@ -570,6 +627,7 @@ fn run_action(state: &mut State, action: &Action, tx: &mut Tx) {
         }
         Action::RestartTray(index, _) => tray_action(state, *index, Some("restart")),
         Action::StopTray(index, _) => tray_action(state, *index, Some("stop")),
+        Action::CreateWorktree(branch) => create_worktree(state, branch),
         Action::Run(command) => open_tab(state, command, Some(command)),
         Action::Tray(command) => open_tray(state, command),
     }
@@ -643,6 +701,12 @@ fn open_worktree(state: &mut State, index: usize) {
 }
 
 fn palette_key(state: &mut State, event: &KeyEvent, tx: &mut Tx) -> bool {
+    if state.creation.is_some() {
+        if event.key == Key::Escape {
+            state.palette_open = false;
+        }
+        return true;
+    }
     if state.worktrees.is_some() {
         return worktree_key(state, event);
     }
@@ -669,6 +733,7 @@ fn palette_key(state: &mut State, event: &KeyEvent, tx: &mut Tx) -> bool {
         _ => {
             // A poll after the edit lands starts the jump lookup's debounce.
             tx.wake_after(Duration::ZERO);
+            state.palette_error = None;
             return false;
         }
     }
@@ -1366,7 +1431,9 @@ fn view(state: &State, cx: &mut Cx<State>) -> El {
         .children(drawer)
         .children(overlay);
     let palette = state.palette_open.then(|| {
-        let rows: Vec<El> = if let Some(choice) = &state.worktrees {
+        let rows: Vec<El> = if state.creation.is_some() {
+            vec![pill("palette-0".to_owned(), "Creating worktree…", false, None).w_full()]
+        } else if let Some(choice) = &state.worktrees {
             let visible = state.visible_worktrees();
             let selected = state.palette_selected.min(visible.len().saturating_sub(1));
             let placeholder = choice
@@ -1445,6 +1512,13 @@ fn view(state: &State, cx: &mut Cx<State>) -> El {
                             .on_edit(|state: &mut State| &mut state.palette)
                             .on_input_key(palette_key),
                     )
+                    .children(state.palette_error.as_deref().map(|error| {
+                        text(error)
+                            .key("palette-error")
+                            .color(rune::color::oklch(0.66, 0.2, 25.0))
+                            .px(10.0)
+                            .py(4.0)
+                    }))
                     .children(rows),
             )
     });
@@ -1482,6 +1556,7 @@ fn poll(state: &mut State, now: f64, tx: &mut Tx) -> bool {
     let active = state.session().map(Session::id);
     let mut changed = poll_jump(state, now, tx);
     changed |= poll_worktrees(state);
+    changed |= poll_creation(state);
     if state
         .pending_paste
         .as_ref()
@@ -1775,6 +1850,13 @@ const SCENES: &[Scene] = &[
         show_workspace_scene(state);
         state.palette = TextEdit::new("lz");
         state.palette_open = true;
+    }),
+    ("palette-error", |state| {
+        show_workspace_scene(state);
+        add_scene_tray(state);
+        state.palette = TextEdit::new("site");
+        state.palette_open = true;
+        state.palette_error = Some("✗ Branch site already exists".to_owned());
     }),
     ("worktrees", |state| {
         show_workspace_scene(state);
@@ -2393,6 +2475,7 @@ mod tests {
             palette_actions("lzg", None, &one_project()),
             [
                 Action::Lazygit,
+                Action::CreateWorktree("lzg".to_owned()),
                 Action::Run("lzg".to_owned()),
                 Action::Tray("lzg".to_owned())
             ]
@@ -2416,6 +2499,7 @@ mod tests {
             palette_actions("site", Some(root), &one_project()),
             [
                 Action::Jump(root.to_owned()),
+                Action::CreateWorktree("site".to_owned()),
                 Action::Run("site".to_owned()),
                 Action::Tray("site".to_owned())
             ]
@@ -2440,9 +2524,10 @@ mod tests {
         let state = workspace_state();
         let actions = palette_actions("sit", None, &state.workspace);
         assert_eq!(
-            actions[..3],
+            actions[..4],
             [
                 Action::SwitchProject(1, "site".to_owned()),
+                Action::CreateWorktree("sit".to_owned()),
                 Action::Run("sit".to_owned()),
                 Action::Tray("sit".to_owned()),
             ]
@@ -2924,6 +3009,107 @@ mod tests {
         let tray = &runtime.state.workspace.projects[0].tray[0];
         assert_eq!(tray.status, Status::Running);
         assert_eq!(tray.command.as_deref(), Some("sleep 100"));
+    }
+
+    #[test]
+    fn a_single_word_query_offers_creating_a_worktree() {
+        let workspace = one_project();
+        let create = Action::CreateWorktree("feature-x".to_owned());
+        let actions = palette_actions("feature-x", None, &workspace);
+        assert_eq!(actions[actions.len() - 3], create);
+        for query in ["two words", "-x", ""] {
+            assert!(
+                !palette_actions(query, None, &workspace)
+                    .iter()
+                    .any(|action| matches!(action, Action::CreateWorktree(_))),
+                "{query:?}"
+            );
+        }
+        let none = palette_actions("feature-x", None, &Workspace::default());
+        assert!(!none.contains(&create));
+    }
+
+    /// Stands in for the login shell, so no real `wt` runs. It records its arguments and runs `body`.
+    fn stub_shell(body: &str) -> (tempfile::TempDir, PathBuf, PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempfile::tempdir().unwrap();
+        let record = directory.path().join("args");
+        let shell = directory.path().join("stub-shell");
+        let script = format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" >> '{}'\n{body}\n",
+            record.display()
+        );
+        std::fs::write(&shell, script).unwrap();
+        std::fs::set_permissions(&shell, std::fs::Permissions::from_mode(0o755)).unwrap();
+        (directory, shell, record)
+    }
+
+    fn create_worktree_from_palette(shell: PathBuf, branch: &str) -> Runtime<State> {
+        let mut state = workspace_state();
+        state.config.shell = shell;
+        state.workspace.projects[0].root = std::env::temp_dir();
+        let mut runtime = runtime_with(state);
+        runtime.on_key = Some(on_key);
+        runtime.poll = Some(poll);
+        press(&mut runtime, Key::Command('p'), command());
+        press(&mut runtime, Key::Text(branch.into()), Mods::default());
+        let create = Action::CreateWorktree(branch.to_owned());
+        let actions = palette_actions(branch, None, &runtime.state.workspace);
+        runtime.state.palette_selected =
+            actions.iter().position(|action| *action == create).unwrap();
+        press(&mut runtime, Key::Enter, Mods::default());
+        runtime
+    }
+
+    fn poll_until_created(runtime: &mut Runtime<State>) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        let mut frame = 1.0;
+        while runtime.state.creation.is_some() {
+            assert!(std::time::Instant::now() < deadline, "timed out");
+            std::thread::sleep(Duration::from_millis(20));
+            frame += 1.0;
+            runtime.frame(frame / 60.0);
+        }
+    }
+
+    #[test]
+    fn creating_a_worktree_runs_wt_switch_and_opens_the_result_as_a_project() {
+        let created = tempfile::tempdir().unwrap();
+        let (_directory, shell, record) = stub_shell(&format!(
+            "echo '{{\"path\":\"{}\"}}'",
+            created.path().display()
+        ));
+        let mut runtime = create_worktree_from_palette(shell, "feature-x");
+        assert!(runtime.state.palette_open);
+        assert!(runtime.find("palette-0").is_some());
+        poll_until_created(&mut runtime);
+        let workspace = &runtime.state.workspace;
+        assert_eq!(workspace.projects.len(), 3);
+        assert_eq!(workspace.active, 2);
+        assert_eq!(workspace.projects[2].root, created.path());
+        assert!(!runtime.state.palette_open);
+        let args = std::fs::read_to_string(record).unwrap();
+        assert!(
+            args.contains("wt switch --create --no-cd --format=json \"$@\""),
+            "{args}"
+        );
+        assert!(args.contains("agentd\nfeature-x\n"));
+    }
+
+    #[test]
+    fn a_refused_worktree_keeps_the_command_centre_open_with_the_reason() {
+        let (_directory, shell, _) =
+            stub_shell("echo '✗ Branch feature-x already exists' >&2; exit 1");
+        let mut runtime = create_worktree_from_palette(shell, "feature-x");
+        poll_until_created(&mut runtime);
+        runtime.frame(1000.0);
+        assert_eq!(runtime.state.workspace.projects.len(), 2);
+        assert!(runtime.state.palette_open);
+        assert_eq!(
+            runtime.state.palette_error.as_deref(),
+            Some("✗ Branch feature-x already exists")
+        );
+        assert!(runtime.find("palette-error").is_some());
     }
 
     #[test]
