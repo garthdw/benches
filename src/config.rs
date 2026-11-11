@@ -126,6 +126,7 @@ struct FontFile {
 }
 
 /// Where to look for the files the config names.
+#[derive(Clone)]
 pub struct Paths {
     /// Holds `config.toml`, `state.json` and a `themes` folder.
     pub dir: PathBuf,
