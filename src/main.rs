@@ -2,6 +2,7 @@ mod config;
 mod font;
 mod input;
 mod jump;
+mod link;
 mod notify;
 mod render;
 mod session;
@@ -822,9 +823,14 @@ fn terminal_surface(
         _ => Some(mark == DRAWER_MARK),
     };
     let scrollable = pick(workspace).is_some_and(|session| session.grid().scrollbar.is_some());
+    let cursor = if pick(workspace).is_some_and(Session::link_hovered) {
+        Cursor::Pointer
+    } else {
+        Cursor::Text
+    };
     effect(mark)
         .key(key)
-        .cursor(Cursor::Text)
+        .cursor(cursor)
         .pointer_buttons([PointerButton::Middle])
         .children(scrollable.then(|| scrollbar_strip(key, drawer, pick)))
         .on_drag(move |state: &mut State, drag: &mut Drag, tx: &mut Tx| {
@@ -1468,6 +1474,7 @@ fn poll(state: &mut State, now: f64, tx: &mut Tx) -> bool {
                     }
                     changed = true;
                 }
+                Event::LinkHover => changed = true,
                 Event::Notify { title, body } => notices.push((tab.session.id(), title, body)),
             }
         }
@@ -1771,7 +1778,12 @@ fn main() {
         })
         .compositor(render::TerminalCompositor::default())
         .on_ime(on_ime)
-        .on_modifiers(|state, mods, _| state.option_held = mods.alt)
+        .on_modifiers(|state, mods, _| {
+            state.option_held = mods.alt;
+            for tab in state.workspace.tabs_mut() {
+                tab.session.command_held(mods.logo);
+            }
+        })
         .on_quit(on_quit)
         .on_focus(|state, focused, _| state.workspace.set_window_focused(focused));
     let handle = app.handle();
@@ -1849,6 +1861,24 @@ mod tests {
         runtime.pointer_move(x, y);
         runtime.frame(2.0 / 60.0);
         assert_eq!(runtime.cursor(), Cursor::Text);
+    }
+
+    #[test]
+    fn the_terminal_shows_a_hand_while_command_hovers_a_link() {
+        let mut state = State::default();
+        show_scene(&mut state, b"https://a.test");
+        let mut runtime = runtime_with(state);
+        let (x, y) = runtime.find("terminal").unwrap();
+        runtime.pointer_move(x, y);
+        runtime.frame(1.0 / 60.0);
+        assert_eq!(runtime.cursor(), Cursor::Text);
+        runtime.update(|state, _| {
+            if let Some(session) = state.workspace.active_session() {
+                session.set_link_hovered(true);
+            }
+        });
+        runtime.frame(2.0 / 60.0);
+        assert_eq!(runtime.cursor(), Cursor::Pointer);
     }
 
     #[test]
