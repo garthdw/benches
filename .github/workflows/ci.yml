@@ -22,6 +22,9 @@ jobs:
         with:
           version: 0.17.1
 
+      # Tests use the default shell and font.
+      - run: brew install fish font-monaspace
+
       - run: cargo fmt --check
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test
