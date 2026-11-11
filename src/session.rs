@@ -7,7 +7,7 @@ use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::rc::Rc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -75,8 +75,6 @@ pub enum Event {
     /// The program's title (OSC 0 or 2); empty when it clears it.
     Title(String),
     Exited(ExitStatus),
-    /// Sent while not shown, once for each level raised since the session was last shown.
-    Attention(Attention),
     /// A bell or desktop notification while not shown with keys, once until it next is.
     /// A bell has an empty title and body; OSC 9 has no title.
     Notify {
@@ -1063,6 +1061,8 @@ pub struct Session {
     pid: Arc<Mutex<Option<i32>>>,
     commands: Option<Sender<Msg>>,
     grid: Arc<Mutex<Arc<Grid>>>,
+    /// Set by the actor when an alert arrives while not shown; cleared when it is shown.
+    alerted: Arc<AtomicBool>,
     events: Receiver<Event>,
     sent_surface: std::cell::Cell<Option<Surface>>,
     visibility: std::cell::Cell<Visibility>,
@@ -1135,6 +1135,7 @@ impl Session {
 
         let (commands, commands_rx) = unbounded();
         let grid = Arc::new(Mutex::new(Arc::new(Grid::default())));
+        let alerted = Arc::new(AtomicBool::new(false));
         let (events_tx, events) = unbounded();
         let (finished_tx, finished) = bounded::<()>(0);
         let mut actor = Actor {
@@ -1147,6 +1148,7 @@ impl Session {
             pid: pid.clone(),
             master,
             slot: grid.clone(),
+            alerted: alerted.clone(),
             events: events_tx,
             waker,
             theme: config.theme.clone(),
@@ -1167,6 +1169,7 @@ impl Session {
             pid,
             commands: Some(commands),
             grid,
+            alerted,
             events,
             sent_surface: std::cell::Cell::new(None),
             visibility: std::cell::Cell::new(Visibility::Shown),
@@ -1182,6 +1185,7 @@ impl Session {
             pid: Arc::default(),
             commands: None,
             grid: Arc::new(Mutex::new(Arc::new(grid))),
+            alerted: Arc::default(),
             events: unbounded().1,
             sent_surface: std::cell::Cell::new(None),
             visibility: std::cell::Cell::new(Visibility::Shown),
@@ -1292,6 +1296,20 @@ impl Session {
         }
     }
 
+    /// A shown session has been seen, so it reads as none.
+    pub fn attention(&self) -> Attention {
+        if self.visibility.get() != Visibility::Shown && self.alerted.load(Ordering::Acquire) {
+            Attention::Alert
+        } else {
+            Attention::None
+        }
+    }
+
+    /// For fixtures, which have no actor to raise it.
+    pub fn alert(&self) {
+        self.alerted.store(true, Ordering::Release);
+    }
+
     #[cfg(test)]
     pub fn visibility(&self) -> Visibility {
         self.visibility.get()
@@ -1376,6 +1394,7 @@ struct Actor {
     pid: Arc<Mutex<Option<i32>>>,
     master: OwnedFd,
     slot: Arc<Mutex<Arc<Grid>>>,
+    alerted: Arc<AtomicBool>,
     events: Sender<Event>,
     waker: Waker,
     theme: Theme,
@@ -1463,7 +1482,6 @@ impl Actor {
                 ));
             }
         })?;
-        let mut attention = Attention::None;
         let mut notified = false;
 
         let mut input = TerminalInput::new()?;
@@ -1498,9 +1516,11 @@ impl Actor {
                         dirty = true;
                         let alerted = alerted.replace(false);
                         let notice = notice.borrow_mut().take();
-                        if alerted && !publisher.borrow().visible() && attention == Attention::None {
-                            attention = Attention::Alert;
-                            self.emit(Event::Attention(Attention::Alert));
+                        if alerted
+                            && !publisher.borrow().visible()
+                            && !self.alerted.swap(true, Ordering::AcqRel)
+                        {
+                            (self.waker)();
                         }
                         let seen = {
                             let publisher = publisher.borrow();
@@ -1590,7 +1610,7 @@ impl Actor {
                     Ok(Msg::Stop) => terminate(&mut self.child, &self.pid),
                     Ok(Msg::Visibility(visibility)) => {
                         if visibility == Visibility::Shown {
-                            attention = Attention::None;
+                            self.alerted.store(false, Ordering::Release);
                         }
                         // The UI's hover and pointer move to whichever session takes this one's place.
                         if visibility != Visibility::Shown {
@@ -3006,33 +3026,40 @@ mod tests {
         wait_for_line(&session, "[process exited]");
     }
 
-    fn attention_events(session: &Session) -> Vec<Attention> {
-        std::iter::from_fn(|| session.next_event())
-            .filter_map(|event| match event {
-                Event::Attention(attention) => Some(attention),
-                _ => None,
-            })
-            .collect()
+    fn wait_for_alert(session: &Session) {
+        wait_until(
+            Duration::from_secs(15),
+            || "no alert while unseen".to_owned(),
+            || (session.attention() == Attention::Alert).then_some(()),
+        );
     }
 
     #[test]
-    fn an_unseen_session_asks_for_attention_once_per_alert() {
+    fn an_unseen_session_raises_attention_until_shown() {
         let session = spawn_shell();
         session.set_visibility(Visibility::Listed);
-        type_line(
-            &session,
-            "echo one; printf '\\a'; echo two; printf '\\a'; echo three",
-        );
-        thread::sleep(Duration::from_millis(1500));
-        assert_eq!(attention_events(&session), [Attention::Alert]);
+        type_line(&session, "printf '\\a'");
+        wait_for_alert(&session);
         session.set_visibility(Visibility::Shown);
+        assert_eq!(session.attention(), Attention::None);
         type_line(&session, "printf '\\a'; echo shown");
         wait_for_line(&session, "shown");
-        assert_eq!(attention_events(&session), []);
+        assert_eq!(session.attention(), Attention::None);
         session.set_visibility(Visibility::Hidden);
         type_line(&session, "printf '\\a'");
-        thread::sleep(Duration::from_millis(1000));
-        assert!(attention_events(&session).contains(&Attention::Alert));
+        wait_for_alert(&session);
+    }
+
+    #[test]
+    fn an_alert_landing_as_the_session_is_shown_leaves_no_dot() {
+        let session = Session::fixture(Grid::default());
+        session.set_visibility(Visibility::Listed);
+        session.alert();
+        assert_eq!(session.attention(), Attention::Alert);
+        // The actor may raise the flag before it handles the visibility change.
+        session.set_visibility(Visibility::Shown);
+        session.alert();
+        assert_eq!(session.attention(), Attention::None);
     }
 
     fn notify_events(session: &Session) -> Vec<(String, String)> {
