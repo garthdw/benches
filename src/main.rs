@@ -1917,6 +1917,29 @@ const SCENES: &[Scene] = &[
     }),
 ];
 
+/// One window's app, with its state made by `init`.
+fn window_app(init: impl FnOnce() -> State + 'static) -> App<State> {
+    let spec = AppSpec::<State> {
+        scenes: SCENES,
+        setup: Some(|state, waker| state.waker = Some(waker)),
+        poll: Some(poll),
+        on_key: Some(on_key),
+        ..AppSpec::new("agentd", (960.0, 640.0), State::default, view)
+    };
+    App::new(spec)
+        .init(init)
+        .compositor(render::TerminalCompositor::default())
+        .on_ime(on_ime)
+        .on_modifiers(|state, mods, _| {
+            state.option_held = mods.alt;
+            for tab in state.workspace.tabs_mut() {
+                tab.session.command_held(mods.logo);
+            }
+        })
+        .on_quit(on_quit)
+        .on_focus(|state, focused, _| state.workspace.set_window_focused(focused))
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if let Some((_, config_args)) = args.split_first().filter(|(name, _)| *name == "config") {
@@ -1930,32 +1953,14 @@ fn main() {
         return;
     }
     log_to_file_in_bundle().log_err("log file");
-    let spec = AppSpec::<State> {
-        scenes: SCENES,
-        setup: Some(|state, waker| state.waker = Some(waker)),
-        poll: Some(poll),
-        on_key: Some(on_key),
-        ..AppSpec::new("agentd", (960.0, 640.0), State::default, view)
-    };
-    let app = App::new(spec)
-        .init(|| {
-            let paths = config::Paths::from_home();
-            State {
-                config: paths.as_ref().map(config::Config::load).unwrap_or_default(),
-                paths,
-                ..State::default()
-            }
-        })
-        .compositor(render::TerminalCompositor::default())
-        .on_ime(on_ime)
-        .on_modifiers(|state, mods, _| {
-            state.option_held = mods.alt;
-            for tab in state.workspace.tabs_mut() {
-                tab.session.command_held(mods.logo);
-            }
-        })
-        .on_quit(on_quit)
-        .on_focus(|state, focused, _| state.workspace.set_window_focused(focused));
+    let app = window_app(|| {
+        let paths = config::Paths::from_home();
+        State {
+            config: paths.as_ref().map(config::Config::load).unwrap_or_default(),
+            paths,
+            ..State::default()
+        }
+    });
     let handle = app.handle();
     notify::start(move |session| {
         if let Some(session) = session {
