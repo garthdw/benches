@@ -9,6 +9,7 @@ mod sprite;
 mod workspace;
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, mpsc};
 use std::time::Duration;
 
@@ -16,8 +17,8 @@ use libghostty_vt::mouse;
 use rune::tok;
 use rune::{
     App, AppSpec, Chord, ClipboardContent, Color, Cursor, Cx, Drag, El, FileDialogOptions, Icon,
-    Ime, Key, KeyEvent, Mods, Phase, PointerButton, PointerEvent, PopupItem, PopupMenu, TextEdit,
-    Tx, Waker, WheelEvent, col, effect, el, icon, row, text, text_input,
+    Ime, Key, KeyEvent, Live, Mods, Phase, PointerButton, PointerEvent, PopupItem, PopupMenu,
+    TextEdit, Tx, Waker, WheelEvent, col, effect, el, icon, row, text, text_input,
 };
 
 use anyhow::Context;
@@ -67,13 +68,42 @@ const SCENE_UNICODE: &str = concat!(
     "\x1b[32m\u{F432}\x1b[0m $ "
 );
 
+/// Asks for a frame without a new view: terminal output only changes the effect slot's pixels.
+#[derive(Clone)]
+struct Repaint {
+    live: Live<f32>,
+    flip: Arc<AtomicBool>,
+}
+
+impl Default for Repaint {
+    fn default() -> Self {
+        Self {
+            live: Live::new(0.0),
+            flip: Arc::default(),
+        }
+    }
+}
+
+impl Repaint {
+    /// Rune ignores a `Live` set that doesn't change its value, so each call flips it.
+    fn waker(&self, wake: Waker) -> Waker {
+        let repaint = self.clone();
+        Arc::new(move || {
+            let flipped = !repaint.flip.fetch_xor(true, Ordering::Relaxed);
+            repaint.live.set(f32::from(flipped));
+            wake();
+        })
+    }
+}
+
 #[derive(Default)]
 pub struct State {
     waker: Option<Waker>,
+    repaint: Repaint,
     workspace: Workspace,
     started: bool,
-    /// Session id and generation last drawn for the tab, the drawer and the overlay.
-    drawn: [(u64, u64); 3],
+    /// Session id and scrollbar presence last built for the tab, the drawer and the overlay.
+    drawn: [(u64, bool); 3],
     /// Sessions showing an attention dot, as the actors raise it without an event.
     alerting: Vec<u64>,
     /// The session that refused a paste, and the text; dismissed when keys move elsewhere.
@@ -123,6 +153,7 @@ impl State {
 
     fn spawn_tab(&self, title: &str, command: Option<&str>, cwd: &Path) -> Tab {
         let waker = self.waker.clone().unwrap_or_else(|| Arc::new(|| {}));
+        let waker = self.repaint.waker(waker);
         let mut tab = match Session::spawn(command, cwd, &self.config, waker) {
             Ok(session) => Tab::new(title, session),
             Err(error) => {
@@ -1368,6 +1399,12 @@ fn view(state: &State, cx: &mut Cx<State>) -> El {
         .w_full()
         .h_full()
         .fill(theme.bg)
+        .child(
+            el().key("repaint")
+                .absolute(0.0, 0.0)
+                .size(0.0, 0.0)
+                .live_opacity(&state.repaint.live),
+        )
         .on_drop_files(|state: &mut State, paths: &[PathBuf], _: &mut Tx| {
             for path in paths.iter().filter(|path| path.is_dir()) {
                 open_project(state, path.clone());
@@ -1456,11 +1493,16 @@ fn poll(state: &mut State, now: f64, tx: &mut Tx) -> bool {
     }
     // Kept while programs hide the cursor, as dropping the caret cancels a composition.
     let grid = state.session().map_or_else(Arc::default, Session::grid);
-    if let Some(caret) = caret_rect(&grid) {
+    if let Some(caret) = caret_rect(&grid)
+        && state.caret != Some(caret)
+    {
         state.caret = Some(caret);
+        changed = true;
     }
     let drawn = |session: Option<&Session>| {
-        session.map_or((0, 0), |session| (session.id(), session.grid().generation))
+        session.map_or((0, false), |session| {
+            (session.id(), session.grid().scrollbar.is_some())
+        })
     };
     let drawn = [
         drawn(state.workspace.active_session()),
@@ -1759,6 +1801,36 @@ mod tests {
         let mut runtime = Runtime::new(state, view, (960.0, 640.0), env);
         runtime.frame(0.0);
         runtime
+    }
+
+    fn output(bytes: &[u8], generation: u64) -> Grid {
+        Grid {
+            generation,
+            ..fixture_grid(bytes)
+        }
+    }
+
+    #[test]
+    fn output_alone_repaints_without_rebuilding_the_view() {
+        let mut state = State::default();
+        show_scene(&mut state, b"$ ");
+        let mut runtime = runtime_with(state);
+        runtime.poll = Some(poll);
+        runtime.frame(1.0 / 60.0);
+        let commits = runtime.stats.commits;
+        let session = runtime.state.workspace.active_session().unwrap();
+        session.publish_fixture(output(b"$ ls", 2));
+        runtime.frame(2.0 / 60.0);
+        assert_eq!(runtime.stats.commits, commits);
+        assert!(!runtime.live_pending());
+        runtime.state.repaint.waker(Arc::new(|| {}))();
+        assert!(runtime.live_pending());
+        let session = runtime.state.workspace.active_session().unwrap();
+        let history: String = (1..=40).map(|line| format!("{line}\r\n")).collect();
+        session.publish_fixture(output(history.as_bytes(), 3));
+        runtime.frame(3.0 / 60.0);
+        assert!(runtime.stats.commits > commits);
+        assert!(runtime.find("terminal-scrollbar").is_some());
     }
 
     #[test]

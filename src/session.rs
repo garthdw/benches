@@ -1272,6 +1272,11 @@ impl Session {
         }
     }
 
+    #[cfg(test)]
+    pub fn publish_fixture(&self, grid: Grid) {
+        store(&self.grid, grid);
+    }
+
     /// The process's pid and its `proc_pidinfo` of `flavor`, which must fill a `T`.
     fn pid_info<T>(&self, flavor: libc::c_int) -> Option<(i32, T)> {
         // Held through the lookup so the actor can't reap the process, freeing its pid, meanwhile.
