@@ -1,7 +1,11 @@
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::os::unix::process::ExitStatusExt;
 use std::path::PathBuf;
 use std::process::ExitStatus;
+use std::rc::Rc;
 
+use rune::Waker;
 use serde::{Deserialize, Serialize};
 
 use crate::session::{Attention, Grid, Retarget, Session, Visibility};
@@ -175,6 +179,58 @@ impl Project {
         } else {
             Attention::None
         })
+    }
+}
+
+pub type WindowId = u32;
+
+/// Hands projects between the windows of the app, whose workspaces each show only their own.
+/// A project travels with its sessions running; the receiving window takes it on its next poll.
+#[derive(Clone, Default)]
+pub struct Fleet(Rc<RefCell<Windows>>);
+
+#[derive(Default)]
+struct Windows {
+    opened: WindowId,
+    entries: HashMap<WindowId, Entry>,
+}
+
+#[derive(Default)]
+struct Entry {
+    waker: Option<Waker>,
+    inbox: Vec<Project>,
+}
+
+impl Fleet {
+    pub fn reserve_window(&self) -> WindowId {
+        let mut windows = self.0.borrow_mut();
+        windows.opened += 1;
+        windows.opened
+    }
+
+    pub fn register(&self, window: WindowId, waker: Waker) {
+        self.0.borrow_mut().entries.entry(window).or_default().waker = Some(waker);
+    }
+
+    pub fn send(&self, window: WindowId, project: Project) {
+        let waker = {
+            let mut windows = self.0.borrow_mut();
+            let entry = windows.entries.entry(window).or_default();
+            entry.inbox.push(project);
+            entry.waker.clone()
+        };
+        if let Some(waker) = waker {
+            waker();
+        }
+    }
+
+    pub fn take(&self, window: WindowId) -> Vec<Project> {
+        self.0
+            .borrow_mut()
+            .entries
+            .get_mut(&window)
+            .map(|entry| std::mem::take(&mut entry.inbox))
+            .unwrap_or_default()
     }
 }
 

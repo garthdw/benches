@@ -19,13 +19,13 @@ use rune::tok;
 use rune::{
     App, AppSpec, Chord, ClipboardContent, Color, Cursor, Cx, Drag, El, FileDialogOptions, Icon,
     Ime, Key, KeyEvent, Live, Mods, Phase, PointerButton, PointerEvent, PopupItem, PopupMenu,
-    TextEdit, Tx, Waker, WheelEvent, col, effect, el, icon, row, text, text_input,
+    TextEdit, Tx, Waker, WheelEvent, WindowSpec, col, effect, el, icon, row, text, text_input,
 };
 
 use anyhow::Context;
 use session::LogErr;
 use session::{Attention, Event, Grid, PointerInput, PointerPhase, Retarget, Session, WheelInput};
-use workspace::{Project, SavedWorkspace, Slot, Status, Tab, Workspace};
+use workspace::{Fleet, Project, SavedWorkspace, Slot, Status, Tab, WindowId, Workspace};
 
 const TERMINAL_MARK: u32 = 1;
 const DRAWER_MARK: u32 = 2;
@@ -103,6 +103,8 @@ impl Repaint {
 pub struct State {
     waker: Option<Waker>,
     repaint: Repaint,
+    fleet: Fleet,
+    window: WindowId,
     workspace: Workspace,
     started: bool,
     /// Session id and scrollbar presence last built for the tab, the drawer and the overlay.
@@ -418,6 +420,44 @@ fn open_project(state: &mut State, root: PathBuf) {
     state.workspace.add_project(Project::new(root, tabs));
 }
 
+/// Hands project `index` to a new window, with its processes still running. A window's last
+/// project stays, as it would leave that window empty.
+fn move_to_new_window(state: &mut State, index: usize) {
+    if state.workspace.projects.len() < 2 {
+        return;
+    }
+    let Some(project) = state.workspace.take_project(index) else {
+        return;
+    };
+    let window = state.fleet.reserve_window();
+    state.fleet.send(window, project);
+    let (fleet, config) = (state.fleet.clone(), state.config.clone());
+    rune::open_window(WindowSpec::from_app(
+        format!("agentd-{window}"),
+        window_app(move || State {
+            fleet,
+            window,
+            config,
+            started: true,
+            ..State::default()
+        }),
+    ));
+}
+
+/// Takes the projects other windows handed over, pointing their sessions at this window.
+fn adopt_projects(state: &mut State) -> bool {
+    let projects = state.fleet.take(state.window);
+    let adopted = !projects.is_empty();
+    for mut project in projects {
+        let waker = state.window_waker();
+        for retarget in project.tabs_mut().filter_map(|tab| tab.retarget.as_ref()) {
+            retarget.set(waker.clone());
+        }
+        state.workspace.add_project(project);
+    }
+    adopted
+}
+
 fn pick_folder(tx: &mut Tx, replace_active: bool) {
     let options = FileDialogOptions {
         title: if replace_active {
@@ -451,6 +491,7 @@ enum Action {
     Lazygit,
     OpenProject,
     ChangeFolder,
+    MoveToNewWindow,
     Jump(PathBuf),
     SwitchProject(usize, String),
     SwitchTab(usize, usize, String),
@@ -468,6 +509,7 @@ impl Action {
             Action::Lazygit => "Toggle lazygit".to_owned(),
             Action::OpenProject => "Open project…".to_owned(),
             Action::ChangeFolder => "Change project folder…".to_owned(),
+            Action::MoveToNewWindow => "Move project to new window".to_owned(),
             Action::Jump(root) => format!("Open project {}", root.display()),
             Action::SwitchProject(_, name) => format!("Switch to project {name}"),
             Action::SwitchTab(_, _, name) => format!("Switch to tab {name}"),
@@ -533,9 +575,11 @@ fn palette_actions(query: &str, jump: Option<&Path>, workspace: &Workspace) -> V
             Action::Lazygit,
             Action::OpenProject,
             Action::ChangeFolder,
+            Action::MoveToNewWindow,
         ]
         .into_iter()
         .filter(|action| *action != Action::ChangeFolder || workspace.project().is_some())
+        .filter(|action| *action != Action::MoveToNewWindow || workspace.projects.len() > 1)
         .filter(|action| letters_in_order(&action.label(), &needle)),
     );
     actions.extend(jump.map(|root| Action::Jump(root.to_owned())));
@@ -642,6 +686,7 @@ fn run_action(state: &mut State, action: &Action, tx: &mut Tx) {
         Action::Lazygit => toggle_lazygit(state),
         Action::OpenProject => pick_folder(tx, false),
         Action::ChangeFolder => pick_folder(tx, true),
+        Action::MoveToNewWindow => move_to_new_window(state, state.workspace.active),
         Action::Jump(root) => open_project(state, root.clone()),
         Action::SwitchProject(project, _) => state.workspace.select_project(*project),
         Action::SwitchTab(project, tab, _) => {
@@ -1087,6 +1132,7 @@ fn view(state: &State, cx: &mut Cx<State>) -> El {
         .filter(|_| sidebar_width > 0.0)
         .map(|(index, project)| {
             let key = format!("project-{index}");
+            let menu_key = key.clone();
             let active = index == state.workspace.active;
             let shows_close = active || state.hovered_project == Some(index);
             let project_tab = if rail {
@@ -1133,6 +1179,14 @@ fn view(state: &State, cx: &mut Cx<State>) -> El {
                     }
                 })
                 .on_press(move |state: &mut State| state.workspace.select_project(index))
+                .on_secondary_press(move |_: &mut State, _, tx: &mut Tx| {
+                    let menu = PopupMenu::new().item(PopupItem::new("move", "Move to new window"));
+                    tx.popup_menu(menu, &menu_key, move |state: &mut State, picked, _| {
+                        if picked == Some("move") {
+                            move_to_new_window(state, index);
+                        }
+                    });
+                })
         });
     // Stays in the tree so its width springs between expanded, rail and gone.
     let sidebar = col()
@@ -1582,9 +1636,10 @@ fn poll(state: &mut State, now: f64, tx: &mut Tx) -> bool {
             state.workspace.add_project(Project::new(home, vec![tab]));
         }
     }
+    let mut changed = adopt_projects(state);
     launch_active(state);
     let active = state.session().map(Session::id);
-    let mut changed = poll_jump(state, now, tx);
+    changed |= poll_jump(state, now, tx);
     changed |= poll_worktrees(state);
     changed |= poll_creation(state);
     if state
@@ -1921,7 +1976,10 @@ const SCENES: &[Scene] = &[
 fn window_app(init: impl FnOnce() -> State + 'static) -> App<State> {
     let spec = AppSpec::<State> {
         scenes: SCENES,
-        setup: Some(|state, waker| state.waker = Some(waker)),
+        setup: Some(|state, waker| {
+            state.fleet.register(state.window, waker.clone());
+            state.waker = Some(waker);
+        }),
         poll: Some(poll),
         on_key: Some(on_key),
         ..AppSpec::new("agentd", (960.0, 640.0), State::default, view)
@@ -2835,7 +2893,7 @@ mod tests {
         for _ in 0..5 {
             press(&mut runtime, Key::Down, Mods::default());
         }
-        assert_eq!(runtime.state.palette_selected, 3);
+        assert_eq!(runtime.state.palette_selected, 4);
     }
 
     fn tray_runtime() -> Runtime<State> {
@@ -3496,5 +3554,160 @@ mod tests {
         assert_ne!(Some(tab.session.id()), old);
         assert_eq!(tab.status, Status::Running);
         assert_eq!(tab.command.as_deref(), Some("sh -c 'exit 0'"));
+    }
+    fn counting_waker() -> (Waker, Arc<AtomicUsize>) {
+        let count = Arc::new(AtomicUsize::new(0));
+        let waker: Waker = {
+            let count = count.clone();
+            Arc::new(move || {
+                count.fetch_add(1, Ordering::Relaxed);
+            })
+        };
+        (waker, count)
+    }
+
+    fn second_window(fleet: &Fleet, window: WindowId) -> Runtime<State> {
+        let state = State {
+            fleet: fleet.clone(),
+            window,
+            started: true,
+            ..State::default()
+        };
+        state.fleet.register(window, Arc::new(|| {}));
+        let mut runtime = runtime_with(state);
+        runtime.poll = Some(poll);
+        runtime
+    }
+
+    #[test]
+    fn moving_a_project_is_offered_only_beside_another_project() {
+        let moves = |workspace: &Workspace| {
+            palette_actions("", None, workspace).contains(&Action::MoveToNewWindow)
+        };
+        assert!(!moves(&one_project()));
+        assert!(moves(&workspace_state().workspace));
+        assert_eq!(
+            Action::MoveToNewWindow.label(),
+            "Move project to new window"
+        );
+    }
+
+    #[test]
+    fn the_palette_hands_the_active_project_to_a_new_window() {
+        let mut runtime = workspace_runtime();
+        runtime.state.workspace.select_project(1);
+        press(&mut runtime, Key::Command('p'), command());
+        press(
+            &mut runtime,
+            Key::Text("move project".into()),
+            Mods::default(),
+        );
+        runtime.state.palette_selected = 0;
+        press(&mut runtime, Key::Enter, Mods::default());
+        let workspace = &runtime.state.workspace;
+        assert_eq!(workspace.projects.len(), 1);
+        assert_eq!(
+            workspace.project().map(|project| project.name.as_str()),
+            Some("agentd")
+        );
+
+        let mut second = second_window(&runtime.state.fleet, 1);
+        second.frame(3.0 / 60.0);
+        let adopted = &second.state.workspace;
+        assert_eq!(adopted.projects.len(), 1);
+        assert_eq!(
+            adopted.project().map(|project| project.name.as_str()),
+            Some("site")
+        );
+        assert_eq!(
+            adopted.active_tab().map(|tab| tab.title.as_str()),
+            Some("claude")
+        );
+    }
+
+    #[test]
+    fn a_window_keeps_its_last_project() {
+        let mut state = State::default();
+        state
+            .workspace
+            .add_project(Project::new("/tmp".into(), vec![]));
+        move_to_new_window(&mut state, 0);
+        assert_eq!(state.workspace.projects.len(), 1);
+        assert!(state.fleet.take(1).is_empty());
+    }
+
+    #[test]
+    fn each_window_shows_only_its_own_active_session() {
+        let mut runtime = workspace_runtime();
+        move_to_new_window(&mut runtime.state, 1);
+        let mut second = second_window(&runtime.state.fleet, 1);
+        second.frame(3.0 / 60.0);
+        let shown = |runtime: &Runtime<State>| {
+            runtime
+                .state
+                .workspace
+                .active_session()
+                .map(|session| session.visibility())
+        };
+        assert_eq!(shown(&runtime), Some(session::Visibility::Shown));
+        assert_eq!(shown(&second), Some(session::Visibility::Shown));
+    }
+
+    #[test]
+    fn a_moved_session_keeps_running_and_wakes_its_new_window() {
+        let (first_waker, first_wakes) = counting_waker();
+        let mut state = State {
+            waker: Some(first_waker),
+            ..State::default()
+        };
+        state
+            .workspace
+            .add_project(Project::new("/tmp".into(), vec![]));
+        open_tab(&mut state, "slow", Some("sh -c 'sleep 0.5; echo moved'"));
+        state
+            .workspace
+            .add_project(Project::new("/dev/site".into(), vec![]));
+        state.workspace.select_project(0);
+        move_to_new_window(&mut state, 0);
+
+        let (second_waker, second_wakes) = counting_waker();
+        let mut second = second_window(&state.fleet, 1);
+        second.state.waker = Some(second_waker);
+        second.frame(1.0 / 60.0);
+        assert_eq!(second.state.workspace.projects.len(), 1);
+        let before = first_wakes.load(Ordering::Relaxed);
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        let mut frame = 1.0;
+        while !second
+            .state
+            .workspace
+            .active_session()
+            .is_some_and(|session| {
+                let grid = session.grid();
+                let text: String = grid.cells.iter().map(|cell| cell.character).collect();
+                text.contains("moved")
+            })
+        {
+            assert!(std::time::Instant::now() < deadline, "timed out");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            frame += 1.0;
+            second.frame(frame / 60.0);
+        }
+        assert!(second_wakes.load(Ordering::Relaxed) > 0);
+        assert_eq!(first_wakes.load(Ordering::Relaxed), before);
+    }
+
+    #[test]
+    fn a_project_menu_moves_it_to_a_new_window() {
+        let mut runtime = workspace_runtime();
+        let (x, y) = runtime.find("project-1").unwrap();
+        runtime.secondary_down(x, y);
+        runtime.secondary_up(x, y);
+        runtime.frame(1.0 / 60.0);
+        runtime.resolve_popup(Some("move")).unwrap();
+        runtime.frame(2.0 / 60.0);
+        assert_eq!(runtime.state.workspace.projects.len(), 1);
+        assert_eq!(runtime.state.fleet.take(1).len(), 1);
     }
 }

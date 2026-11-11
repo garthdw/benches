@@ -43,6 +43,10 @@ impl Retarget {
         Self(Arc::new(Mutex::new(waker)))
     }
 
+    pub fn set(&self, waker: Waker) {
+        *self.0.lock().unwrap_or_else(PoisonError::into_inner) = waker;
+    }
+
     pub fn waker(&self) -> Waker {
         let target = self.clone();
         Arc::new(move || {
