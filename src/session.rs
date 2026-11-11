@@ -481,7 +481,8 @@ impl GridBuilder {
         }
         let colors = snapshot.colors()?;
         let (cols, rows) = (snapshot.cols()?, snapshot.rows()?);
-        let reusable = if matches!(snapshot.dirty()?, Dirty::Clean) {
+        let dirty = snapshot.dirty()?;
+        let reusable = if matches!(dirty, Dirty::Clean) {
             self.content.clone()
         } else {
             None
@@ -489,10 +490,33 @@ impl GridBuilder {
         let (cells, clusters) = match reusable {
             Some(content) => content,
             None => {
-                let mut cells = Vec::with_capacity(usize::from(cols) * usize::from(rows));
+                let columns = usize::from(cols);
+                let previous = self.content.clone().filter(|(cells, _)| {
+                    matches!(dirty, Dirty::Partial) && cells.len() == columns * usize::from(rows)
+                });
+                let mut cells = Vec::with_capacity(columns * usize::from(rows));
                 let mut clusters = Vec::new();
                 let mut row_iterator = self.rows.update(&snapshot)?;
                 while let Some(row) = row_iterator.next() {
+                    if let Some((old_cells, old_clusters)) = &previous
+                        && !row.dirty()?
+                        && let Some(old_row) = old_cells.get(cells.len()..cells.len() + columns)
+                    {
+                        for old in old_row {
+                            let mut cell = *old;
+                            if let Some(index) = cell.cluster {
+                                cell.cluster = Some(u32::try_from(clusters.len())?);
+                                clusters.push(
+                                    old_clusters
+                                        .get(usize::try_from(index)?)
+                                        .context("a copied cell's cluster should exist")?
+                                        .clone(),
+                                );
+                            }
+                            cells.push(cell);
+                        }
+                        continue;
+                    }
                     let mut cell_iterator = self.cells.update(row)?;
                     while let Some(cell) = cell_iterator.next() {
                         let mut fg = cell.fg_color()?.unwrap_or(colors.foreground);
@@ -2164,12 +2188,26 @@ mod tests {
         terminal
     }
 
-    fn per_frame(label: &str, frames: u32, mut frame: impl FnMut(u32)) {
-        let start = std::time::Instant::now();
-        (0..frames).for_each(&mut frame);
+    /// Times only the build; `prepare` writes to the terminal and picks the presentation.
+    fn per_frame(
+        label: &str,
+        terminal: &mut Terminal<'static, 'static>,
+        builder: &mut GridBuilder,
+        mut prepare: impl FnMut(&mut Terminal<'static, 'static>, u32) -> Presentation,
+    ) {
+        let frames = 300;
+        let mut elapsed = std::time::Duration::ZERO;
+        for frame in 0..frames {
+            let presentation = prepare(terminal, frame);
+            let start = std::time::Instant::now();
+            builder
+                .build(terminal, u64::from(frame), presentation)
+                .unwrap();
+            elapsed += start.elapsed();
+        }
         println!(
             "{label}: {} ns/frame",
-            start.elapsed().as_nanos() / u128::from(frames)
+            elapsed.as_nanos() / u128::from(frames)
         );
     }
 
@@ -2181,30 +2219,35 @@ mod tests {
         builder
             .build(&terminal, 1, Presentation::default())
             .unwrap();
-        per_frame("steady output (full rebuild)", 300, |frame| {
-            terminal.vt_write(b"\x1b[32msteady output line with some text 12345\x1b[0m\r\n");
-            builder
-                .build(&terminal, u64::from(frame) + 2, Presentation::default())
-                .unwrap()
-                .unwrap();
-        });
-        per_frame("presentation-only (cursor blink)", 300, |frame| {
-            let presentation = Presentation {
+        per_frame(
+            "steady output (scrolling)",
+            &mut terminal,
+            &mut builder,
+            |terminal, _| {
+                terminal.vt_write(b"\x1b[32msteady output line with some text 12345\x1b[0m\r\n");
+                Presentation::default()
+            },
+        );
+        per_frame(
+            "one dirty row",
+            &mut terminal,
+            &mut builder,
+            |terminal, frame| {
+                terminal.vt_write(format!("\x1b[30;1H\x1b[2Kspinner {frame}").as_bytes());
+                Presentation::default()
+            },
+        );
+        per_frame("cursor blink", &mut terminal, &mut builder, |_, frame| {
+            Presentation {
                 cursor_on: frame % 2 == 0,
                 ..Presentation::default()
-            };
-            builder
-                .build(&terminal, u64::from(frame) + 1000, presentation)
-                .unwrap();
+            }
         });
-        per_frame("presentation-only (scrollbar fade)", 300, |frame| {
-            let presentation = Presentation {
+        per_frame("scrollbar fade", &mut terminal, &mut builder, |_, frame| {
+            Presentation {
                 scrollbar_opacity: frame as f32 / 300.0,
                 ..Presentation::default()
-            };
-            builder
-                .build(&terminal, u64::from(frame) + 2000, presentation)
-                .unwrap();
+            }
         });
     }
 
@@ -2248,6 +2291,28 @@ mod tests {
         builder.selection_changed();
         let third = builder.build(&terminal, 3, blinked_off).unwrap().unwrap();
         assert!(!Arc::ptr_eq(&first.cells, &third.cells));
+    }
+
+    #[test]
+    fn a_partial_update_copies_clean_rows_and_rereads_dirty_ones() {
+        let mut terminal = new_terminal(20, 5).unwrap();
+        terminal.vt_write("e\u{301}x\r\nsecond\r\n\x1b[4;1H\u{1f468}\u{200d}\u{1f469}".as_bytes());
+        let mut builder = GridBuilder::new().unwrap();
+        let first = builder
+            .build(&terminal, 1, Presentation::default())
+            .unwrap()
+            .unwrap();
+        terminal.vt_write(b"\x1b[2;1Hchanged\x1b[5;1Hlast");
+        let second = builder
+            .build(&terminal, 2, Presentation::default())
+            .unwrap()
+            .unwrap();
+        let lines = second.lines();
+        assert_eq!(lines[0], first.lines()[0]);
+        assert_eq!(lines[1].trim_end(), "changed");
+        assert_eq!(lines[3], first.lines()[3]);
+        assert_eq!(lines[4].trim_end(), "last");
+        assert_eq!(second.cluster(&second.cells[0]), Some("e\u{301}"));
     }
 
     const THEME_RED: RgbColor = RgbColor {
