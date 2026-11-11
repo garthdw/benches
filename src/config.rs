@@ -126,6 +126,8 @@ struct FontFile {
     /// the main font.
     #[serde(rename = "symbols-family")]
     symbols_family: Option<String>,
+    /// OpenType features in Ghostty's `font-feature` syntax, such as `-calt` or `ss01`; replaces
+    /// Ghostty's list, and `[]` turns them all off.
     features: Option<Vec<String>>,
 }
 
@@ -241,6 +243,8 @@ fn default_config_text() -> String {
          # size = {size:?}\n\
          # The face for private-use icons.\n\
          # symbols-family = \"Symbols Nerd Font Mono\"\n\
+         # OpenType features in Ghostty's `font-feature` syntax; unset uses Ghostty's.\n\
+         # features = [\"-calt\", \"ss01\"]\n\
          {tabs}",
         size = defaults.font.size,
     )
