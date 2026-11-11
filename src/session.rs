@@ -1017,26 +1017,40 @@ impl TerminalInput {
         }
         let scale = surface.metrics.scale;
         let position = Self::viewport_point(surface, (input.x * scale, input.y * scale));
-        let cell = |x| terminal.grid_ref(Point::Viewport(PointCoordinate { x, ..position }));
         let mut uri = [0; 4096];
-        let length = cell(position.x)?.hyperlink_uri(&mut uri)?;
+        let length = terminal
+            .grid_ref(Point::Viewport(position))?
+            .hyperlink_uri(&mut uri)?;
         if let Ok(uri) = std::str::from_utf8(&uri[..length])
             && link::openable(uri)
         {
             return Ok(Some(uri.to_owned()));
         }
-        let row = (0..surface.cols)
-            .map(|x| {
+        let grid_ref = |x, y| terminal.grid_ref(Point::Viewport(PointCoordinate { x, y }));
+        let mut first = position.y;
+        while first > 0 && grid_ref(0, first)?.row()?.is_wrap_continuation()? {
+            first -= 1;
+        }
+        let mut row = Vec::new();
+        let mut y = first;
+        loop {
+            for x in 0..surface.cols {
                 let mut character = [' '];
-                match cell(x)?.graphemes(&mut character) {
-                    Ok(_) => Ok(character[0]),
+                row.push(match grid_ref(x, y)?.graphemes(&mut character) {
+                    Ok(_) => character[0],
                     // A cluster of several codepoints; any non-delimiter stands in for it.
-                    Err(libghostty_vt::Error::OutOfSpace { .. }) => Ok('\u{fffd}'),
-                    Err(error) => Err(error),
-                }
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(link::url_at(&row, position.x.into()))
+                    Err(libghostty_vt::Error::OutOfSpace { .. }) => '\u{fffd}',
+                    Err(error) => return Err(error.into()),
+                });
+            }
+            y += 1;
+            if y >= surface.rows.into() || !grid_ref(0, y - 1)?.row()?.is_wrapped()? {
+                break;
+            }
+        }
+        let column =
+            (position.y - first) as usize * usize::from(surface.cols) + usize::from(position.x);
+        Ok(link::url_at(&row, column))
     }
 
     fn pointer(
@@ -2303,6 +2317,23 @@ mod tests {
         assert_eq!(link.as_deref(), Some("https://a.te/x"));
         let off_link = input.link_under(&terminal, command_press(1, 1)).unwrap();
         assert_eq!(off_link, None);
+    }
+
+    #[test]
+    fn command_click_joins_a_url_wrapped_across_rows() {
+        let mut terminal = new_terminal(20, 5).unwrap();
+        terminal.vt_write(b"a https://example.com/long/path.\r\nnext");
+        let input = input_for_test();
+        for (column, row) in [(5, 0), (2, 1), (19, 0)] {
+            let link = input.link_under(&terminal, command_press(column, row));
+            assert_eq!(
+                link.unwrap().as_deref(),
+                Some("https://example.com/long/path"),
+                "at {column},{row}"
+            );
+        }
+        let after = input.link_under(&terminal, command_press(1, 2)).unwrap();
+        assert_eq!(after, None);
     }
 
     #[test]
