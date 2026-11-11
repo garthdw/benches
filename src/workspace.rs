@@ -64,6 +64,10 @@ impl Tab {
         };
     }
 
+    pub fn runs_program(&self) -> bool {
+        self.status == Status::Running && (self.command.is_some() || self.session.busy())
+    }
+
     pub fn stop(&mut self) {
         if self.status == Status::Running {
             self.stopping = true;
@@ -117,6 +121,10 @@ impl Project {
 
     pub fn active_tab(&self) -> Option<&Tab> {
         self.tabs.get(self.active_tab)
+    }
+
+    pub fn runs_program(&self) -> bool {
+        self.tabs.iter().chain(&self.tray).any(Tab::runs_program)
     }
 
     pub fn tab(&self, slot: Slot) -> Option<&Tab> {
@@ -279,6 +287,19 @@ impl Workspace {
         } else {
             project.active_tab = project.active_tab.min(project.tabs.len() - 1);
         }
+        self.show_active();
+    }
+
+    /// Closes project `index` with all its tabs and tray processes, keeping the selected project selected.
+    pub fn close_project(&mut self, index: usize) {
+        if index >= self.projects.len() {
+            return;
+        }
+        self.projects.remove(index);
+        if index < self.active {
+            self.active -= 1;
+        }
+        self.active = self.active.min(self.projects.len().saturating_sub(1));
         self.show_active();
     }
 
@@ -593,6 +614,48 @@ mod tests {
         workspace.add_tab(tab("lazygit"));
         assert_eq!(workspace.projects[1].tabs.len(), 2);
         assert_eq!(active_title(&workspace), Some("lazygit"));
+    }
+
+    #[test]
+    fn closing_the_active_project_selects_its_neighbour() {
+        let mut workspace = workspace();
+        workspace.add_project(Project::new("/c".into(), vec![tab("htop")]));
+        workspace.select_project(1);
+        workspace.close_project(1);
+        assert_eq!(workspace.projects.len(), 2);
+        assert_eq!(workspace.active, 1);
+        assert_eq!(active_title(&workspace), Some("htop"));
+        workspace.close_project(1);
+        assert_eq!(active_title(&workspace), Some("claude"));
+    }
+
+    #[test]
+    fn closing_an_earlier_project_keeps_the_selection_and_drops_its_sessions() {
+        let mut workspace = workspace();
+        workspace.projects[0].tray.push(tab("pnpm dev"));
+        assert_eq!(workspace.sessions().count(), 4);
+        workspace.close_project(0);
+        assert_eq!(workspace.active, 0);
+        assert_eq!(active_title(&workspace), Some("vim"));
+        assert_eq!(workspace.sessions().count(), 1);
+    }
+
+    #[test]
+    fn closing_the_only_project_leaves_none() {
+        let mut workspace = Workspace::default();
+        workspace.add_project(Project::new("/a".into(), vec![tab("shell")]));
+        workspace.close_project(0);
+        assert!(workspace.projects.is_empty());
+        workspace.close_project(0);
+    }
+
+    #[test]
+    fn a_project_runs_a_program_when_a_tab_or_tray_process_has_a_command() {
+        let mut workspace = workspace();
+        assert!(!workspace.projects[0].runs_program());
+        workspace.projects[0].tray.push(tab("pnpm dev"));
+        workspace.projects[0].tray[0].command = Some("pnpm dev".to_owned());
+        assert!(workspace.projects[0].runs_program());
     }
 
     #[test]

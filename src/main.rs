@@ -75,6 +75,8 @@ pub struct State {
     pending_paste: Option<(u64, String)>,
     /// The session whose close waits for confirmation; dismissed when keys move elsewhere.
     pending_close: Option<u64>,
+    /// Whether the pending close takes the whole active project.
+    closing_project: bool,
     preedit: String,
     option_held: bool,
     caret: Option<[f32; 4]>,
@@ -254,8 +256,7 @@ fn request_close(state: &mut State) {
     let Some((_, tab)) = state.workspace.focused_tab() else {
         return;
     };
-    let running = tab.status == Status::Running;
-    if running && (tab.command.is_some() || tab.session.busy()) {
+    if tab.runs_program() {
         state.pending_close = Some(tab.session.id());
     } else {
         close_focused(state);
@@ -270,10 +271,30 @@ fn close_focused(state: &mut State) {
     }
 }
 
+/// Closes the active project, first asking if a program is running in any of its processes.
+fn request_close_project(state: &mut State) {
+    let Some(project) = state.workspace.project() else {
+        return;
+    };
+    if project.runs_program()
+        && let Some(session) = state.session()
+    {
+        state.pending_close = Some(session.id());
+        state.closing_project = true;
+    } else {
+        state.workspace.close_project(state.workspace.active);
+    }
+}
+
 fn resolve_close(state: &mut State, confirmed: bool) {
     let pending = state.pending_close.take();
+    let project = std::mem::take(&mut state.closing_project);
     if confirmed && pending == state.session().map(Session::id) {
-        close_focused(state);
+        if project {
+            state.workspace.close_project(state.workspace.active);
+        } else {
+            close_focused(state);
+        }
     }
 }
 
@@ -756,6 +777,16 @@ fn view(state: &State, cx: &mut Cx<State>) -> El {
                     attention_dot(project.attention()),
                 )
                 .w_full()
+                .children(active.then(|| el().grow(1.0)))
+                .children(active.then(|| {
+                    el().key(format!("project-close-{index}"))
+                        .role("button")
+                        .label("Close project")
+                        .px(4.0)
+                        .radius(4.0)
+                        .child(text("×").color(theme.text_secondary))
+                        .on_press(|state: &mut State| request_close_project(state))
+                }))
             };
             project_tab.on_press(move |state: &mut State| state.workspace.select_project(index))
         });
@@ -1132,6 +1163,7 @@ fn poll(state: &mut State, now: f64, tx: &mut Tx) -> bool {
     }
     if state.pending_close.is_some() && state.pending_close != active {
         state.pending_close = None;
+        state.closing_project = false;
         changed = true;
     }
     let mut restarts = Vec::new();
@@ -1723,6 +1755,30 @@ mod tests {
             .map(|tab| tab.title.as_str())
             .collect();
         assert_eq!(titles, ["shell", "lazygit"]);
+    }
+
+    #[test]
+    fn the_active_project_close_button_closes_an_idle_project() {
+        let mut runtime = runtime_with(workspace_state());
+        assert!(runtime.find("project-close-1").is_none());
+        click(&mut runtime, "project-close-0");
+        assert_eq!(runtime.state.workspace.projects.len(), 1);
+    }
+
+    #[test]
+    fn the_project_close_button_asks_when_a_tray_program_runs_and_enter_confirms() {
+        let mut runtime = tray_runtime();
+        runtime.state.workspace.projects[0].tray[0].command = Some("pnpm dev".to_owned());
+        click(&mut runtime, "project-close-0");
+        assert!(runtime.find("close-confirm").is_some());
+        assert_eq!(runtime.state.workspace.projects.len(), 2);
+        press(&mut runtime, Key::Escape, Mods::default());
+        assert!(runtime.find("close-confirm").is_none());
+        assert_eq!(runtime.state.workspace.projects.len(), 2);
+        click(&mut runtime, "project-close-0");
+        runtime.on_key = Some(on_key);
+        press(&mut runtime, Key::Enter, Mods::default());
+        assert_eq!(runtime.state.workspace.projects.len(), 1);
     }
 
     fn command_tab_runtime() -> Runtime<State> {
