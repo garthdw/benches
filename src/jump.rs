@@ -9,6 +9,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use nix::sys::signal::{Signal, killpg};
 use nix::unistd::Pid;
+use serde::Deserialize;
 
 /// Where the lookup starts, so a command that only `cd`s is told apart by the `pwd` after it.
 const START: &str = "/";
@@ -21,9 +22,76 @@ pub fn lookup(
     query: &str,
     timeout: Duration,
 ) -> Result<Option<PathBuf>> {
+    let args = shell_args(shell, command, query);
+    let output = run(shell, &args, Path::new(START), timeout, command)?;
+    Ok(output.and_then(|output| parse_output(&String::from_utf8_lossy(&output))))
+}
+
+/// A worktrunk worktree of a repository.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Worktree {
+    pub branch: Option<String>,
+    pub path: PathBuf,
+}
+
+#[derive(Deserialize)]
+struct WorktreeList {
+    items: Vec<WorktreeItem>,
+}
+
+#[derive(Deserialize)]
+struct WorktreeItem {
+    branch: Option<String>,
+    /// Absent for a branch with no worktree.
+    worktree: Option<WorktreePath>,
+}
+
+#[derive(Deserialize)]
+struct WorktreePath {
+    path: PathBuf,
+}
+
+/// Lists the worktrees of the repository at `root` with `wt list`, through the login shell so
+/// `wt` is on the `PATH`. A folder that isn't a repository has none.
+pub fn worktrees(shell: &Path, root: &Path, timeout: Duration) -> Result<Vec<Worktree>> {
+    let args = ["-l", "-i", "-c", "wt list --format=json"].map(str::to_owned);
+    let Some(output) = run(shell, &args, root, timeout, "wt list")? else {
+        return Ok(Vec::new());
+    };
+    parse_worktrees(&String::from_utf8_lossy(&output))
+}
+
+/// Interactive shells may print a banner before the JSON.
+fn parse_worktrees(output: &str) -> Result<Vec<Worktree>> {
+    let json = &output[output.find('{').unwrap_or(0)..];
+    let list: WorktreeList = serde_json::Deserializer::from_str(json)
+        .into_iter()
+        .next()
+        .context("no output")?
+        .context("parse wt list")?;
+    Ok(list
+        .items
+        .into_iter()
+        .filter_map(|item| {
+            Some(Worktree {
+                branch: item.branch,
+                path: item.worktree?.path,
+            })
+        })
+        .collect())
+}
+
+/// Runs the login shell with `args` in `cwd` and returns its output, or `None` if it failed.
+fn run(
+    shell: &Path,
+    args: &[String],
+    cwd: &Path,
+    timeout: Duration,
+    what: &str,
+) -> Result<Option<Vec<u8>>> {
     let mut child = Command::new(shell)
-        .args(shell_args(shell, command, query))
-        .current_dir(START)
+        .args(args)
+        .current_dir(cwd)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -42,13 +110,11 @@ pub fn lookup(
         Err(_) => {
             killpg(Pid::from_raw(child.id() as i32), Signal::SIGKILL).context("kill lookup")?;
             child.wait().context("reap lookup")?;
-            bail!("“{command}” took longer than {timeout:?}");
+            bail!("“{what}” took longer than {timeout:?}");
         }
     };
-    if !child.wait().context("wait for lookup")?.success() {
-        return Ok(None);
-    }
-    Ok(parse_output(&String::from_utf8_lossy(&output)))
+    let succeeded = child.wait().context("wait for lookup")?.success();
+    Ok(succeeded.then_some(output))
 }
 
 /// The query goes in as separate arguments rather than spliced into the script, so nothing in
@@ -85,6 +151,19 @@ fn parse_output(output: &str) -> Option<PathBuf> {
             _ => PathBuf::from(line),
         })
         .find(|path| path.is_absolute() && path.is_dir())
+}
+
+/// The path with `~` for the home folder, as `parse_output` expands it.
+pub fn abbreviate_home(path: &Path) -> String {
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    match home
+        .as_deref()
+        .and_then(|home| path.strip_prefix(home).ok())
+    {
+        Some(rest) if rest.as_os_str().is_empty() => "~".to_owned(),
+        Some(rest) => format!("~/{}", rest.display()),
+        None => path.display().to_string(),
+    }
 }
 
 /// Drops CSI sequences such as colours, which is all lookup commands print.
@@ -125,6 +204,44 @@ mod tests {
         );
         assert_eq!(parse_output(&output), Some(second));
         assert_eq!(parse_output("autojump: not found\n.\n/\n"), None);
+    }
+
+    #[test]
+    fn wt_list_output_parses_into_worktrees() {
+        let output = concat!(
+            "welcome back\n",
+            r#"{"schema":2,"repo":{},"items":["#,
+            r#"{"branch":"main","head":{"sha":"a"},"worktree":{"path":"/dev/site","main":true}},"#,
+            r#"{"branch":"feature","worktree":{"path":"/dev/site.feature"}},"#,
+            r#"{"branch":null,"worktree":{"path":"/dev/site.detached"}},"#,
+            r#"{"branch":"remote-only"}]}"#,
+        );
+        assert_eq!(
+            parse_worktrees(output).unwrap(),
+            [
+                Worktree {
+                    branch: Some("main".to_owned()),
+                    path: PathBuf::from("/dev/site")
+                },
+                Worktree {
+                    branch: Some("feature".to_owned()),
+                    path: PathBuf::from("/dev/site.feature")
+                },
+                Worktree {
+                    branch: None,
+                    path: PathBuf::from("/dev/site.detached")
+                },
+            ]
+        );
+        assert!(parse_worktrees("not json").is_err());
+    }
+
+    #[test]
+    fn the_home_folder_is_abbreviated_to_a_tilde() {
+        let home = PathBuf::from(std::env::var_os("HOME").unwrap());
+        assert_eq!(abbreviate_home(&home), "~");
+        assert_eq!(abbreviate_home(&home.join("dev/site")), "~/dev/site");
+        assert_eq!(abbreviate_home(Path::new("/dev/site")), "/dev/site");
     }
 
     #[test]
