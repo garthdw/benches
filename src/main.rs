@@ -1658,6 +1658,9 @@ fn poll(state: &mut State, now: f64, tx: &mut Tx) -> bool {
         }
     }
     let mut changed = adopt_projects(state);
+    if state.window != MAIN_WINDOW && state.workspace.projects.is_empty() {
+        tx.close_window();
+    }
     launch_active(state);
     let active = state.session().map(Session::id);
     changed |= poll_jump(state, now, tx);
@@ -3824,5 +3827,32 @@ mod tests {
             .map(|project| project.root.clone())
             .collect();
         assert_eq!(roots, [PathBuf::from("/"), PathBuf::from("/usr")]);
+    }
+
+    #[test]
+    fn a_torn_off_window_closes_when_its_last_project_goes() {
+        let fleet = Fleet::default();
+        let mut second = second_window(&fleet, 1);
+        second.frame(2.0 / 60.0);
+        assert_eq!(second.shell_request, Some(rune::Shell::Close));
+    }
+
+    #[test]
+    fn a_torn_off_window_with_a_project_stays_open() {
+        let fleet = Fleet::default();
+        let mut second = second_window(&fleet, 1);
+        second
+            .state
+            .workspace
+            .add_project(Project::new("/tmp".into(), vec![]));
+        second.frame(2.0 / 60.0);
+        assert_eq!(second.shell_request, None);
+    }
+
+    #[test]
+    fn the_main_window_stays_open_with_no_projects() {
+        let mut main = second_window(&Fleet::default(), MAIN_WINDOW);
+        main.frame(2.0 / 60.0);
+        assert_eq!(main.shell_request, None);
     }
 }
