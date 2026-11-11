@@ -22,8 +22,8 @@ jobs:
         with:
           version: 0.17.1
 
-      # Tests use the default shell and font.
-      - run: brew install fish font-monaspace
+      # Tests use the default shell and font, and a Nerd Font for icons.
+      - run: brew install fish font-monaspace font-symbols-only-nerd-font
 
       - run: cargo fmt --check
       - run: cargo clippy --all-targets -- -D warnings
