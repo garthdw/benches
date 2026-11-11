@@ -48,3 +48,7 @@ tempfile = "3.27.0"
 lto = "thin"
 # Symbols for xctrace; macOS keeps them in target/, not in the bundle.
 debug = "line-tables-only"
+
+# Cargo passes `DEBUG=true` when any debug info is on, which builds libghostty in Zig's Debug mode.
+[profile.release.package.libghostty-vt-sys]
+debug = false

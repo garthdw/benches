@@ -850,6 +850,48 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "benchmark: cargo test --release bench_ -- --ignored --nocapture"]
+    fn bench_build_quads() {
+        let mut bytes = Vec::new();
+        for row in 0..60 {
+            bytes.extend(
+                format!(
+                    "\x1b[3{}mline {row} the quick brown fox \x1b[1;4{}mjumps\x1b[0m over 世界 the lazy dog é\r\n",
+                    row % 8,
+                    row % 7
+                )
+                .as_bytes(),
+            );
+        }
+        let grid = Grid::from_vt(&bytes, 200, 60).unwrap();
+        let font = Font::new(crate::config::DEFAULT_FONT_FAMILY, 18.0, 2.0).unwrap();
+        let mut slots: HashMap<GlyphKey, [u32; 2]> = HashMap::new();
+        let mut quads = Vec::new();
+        let frames = 300u32;
+        let start = std::time::Instant::now();
+        for _ in 0..frames {
+            build_quads(
+                &grid,
+                [0.0, 0.0, 2000.0, 1500.0],
+                metrics(&font, 0.0, 2.0),
+                &font,
+                true,
+                &mut quads,
+                |key| {
+                    let next = [slots.len() as u32 * 16, 0];
+                    let position = *slots.entry(key).or_insert(next);
+                    (Some(fake_glyph(position)), 0)
+                },
+            );
+        }
+        println!(
+            "build_quads 200x60: {} ns/frame, {} quads",
+            start.elapsed().as_nanos() / u128::from(frames),
+            quads.len()
+        );
+    }
+
+    #[test]
     fn a_reset_during_a_build_leaves_no_quad_on_a_wiped_slot() {
         let grid = Grid::message("abc");
         let font = Font::new(crate::config::DEFAULT_FONT_FAMILY, 18.0, 1.0).unwrap();

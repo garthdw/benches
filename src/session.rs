@@ -209,8 +209,8 @@ impl Default for Cell {
 pub struct Grid {
     pub generation: u64,
     pub cols: u16,
-    pub cells: Vec<Cell>,
-    pub clusters: Vec<String>,
+    pub cells: Arc<[Cell]>,
+    pub clusters: Arc<[String]>,
     pub cursor: Option<(u16, u16)>,
     pub cursor_style: CursorVisualStyle,
     pub cursor_blinking: bool,
@@ -225,8 +225,8 @@ impl Default for Grid {
         Self {
             generation: 0,
             cols: 0,
-            cells: Vec::new(),
-            clusters: Vec::new(),
+            cells: Arc::default(),
+            clusters: Arc::default(),
             cursor: None,
             cursor_style: CursorVisualStyle::Block,
             cursor_blinking: false,
@@ -265,7 +265,7 @@ impl Grid {
             // A live session never reaches this, so the UI always sees the message as a change.
             generation: u64::MAX,
             cols: MESSAGE_COLS,
-            cells,
+            cells: cells.into(),
             ..Self::default()
         }
     }
@@ -458,11 +458,15 @@ impl Default for Presentation {
     }
 }
 
+type Content = (Arc<[Cell]>, Arc<[String]>);
+
 struct GridBuilder {
     state: RenderState<'static>,
     rows: RowIterator<'static>,
     cells: CellIterator<'static>,
     last_shown: Option<(CursorVisualStyle, bool, Presentation, Option<Scrollbar>)>,
+    /// The cells and clusters of the last build, for frames where only the presentation changed.
+    content: Option<Content>,
     /// From the theme; without a background, selected cells swap their colours.
     selection_background: Option<RgbColor>,
     selection_foreground: Option<RgbColor>,
@@ -475,6 +479,7 @@ impl GridBuilder {
             rows: RowIterator::new()?,
             cells: CellIterator::new()?,
             last_shown: None,
+            content: None,
             selection_background: None,
             selection_foreground: None,
         })
@@ -483,6 +488,7 @@ impl GridBuilder {
     /// libghostty isn't known to mark the render state dirty when only the selection moves.
     fn selection_changed(&mut self) {
         self.last_shown = None;
+        self.content = None;
     }
 
     fn build(
@@ -511,73 +517,111 @@ impl GridBuilder {
         }
         let colors = snapshot.colors()?;
         let (cols, rows) = (snapshot.cols()?, snapshot.rows()?);
-        let mut cells = Vec::with_capacity(usize::from(cols) * usize::from(rows));
-        let mut clusters = Vec::new();
-        let mut row_iterator = self.rows.update(&snapshot)?;
-        while let Some(row) = row_iterator.next() {
-            let mut cell_iterator = self.cells.update(row)?;
-            while let Some(cell) = cell_iterator.next() {
-                let mut fg = cell.fg_color()?.unwrap_or(colors.foreground);
-                let mut bg = cell.bg_color()?;
-                let mut output = Cell::default();
-                let mut invisible = false;
-                let mut is_faint = false;
-                let selected = cell.is_selected()?;
-                let mut inverted = selected && self.selection_background.is_none();
-                if cell.has_styling()? {
-                    let style = cell.style()?;
-                    output.bold = style.bold;
-                    output.italic = style.italic;
-                    is_faint = style.faint;
-                    output.strikethrough = style.strikethrough;
-                    output.overline = style.overline;
-                    output.underline = style.underline;
-                    output.underline_color = match style.underline_color {
-                        StyleColor::None => None,
-                        StyleColor::Rgb(color) => Some(rgb(color)),
-                        StyleColor::Palette(index) => {
-                            Some(rgb(colors.palette[usize::from(index.0)]))
+        let dirty = snapshot.dirty()?;
+        let reusable = if matches!(dirty, Dirty::Clean) {
+            self.content.clone()
+        } else {
+            None
+        };
+        let (cells, clusters) = match reusable {
+            Some(content) => content,
+            None => {
+                let columns = usize::from(cols);
+                let previous = self.content.clone().filter(|(cells, _)| {
+                    matches!(dirty, Dirty::Partial) && cells.len() == columns * usize::from(rows)
+                });
+                let mut cells = Vec::with_capacity(columns * usize::from(rows));
+                let mut clusters = Vec::new();
+                let mut row_iterator = self.rows.update(&snapshot)?;
+                while let Some(row) = row_iterator.next() {
+                    if let Some((old_cells, old_clusters)) = &previous
+                        && !row.dirty()?
+                        && let Some(old_row) = old_cells.get(cells.len()..cells.len() + columns)
+                    {
+                        for old in old_row {
+                            let mut cell = *old;
+                            if let Some(index) = cell.cluster {
+                                cell.cluster = Some(u32::try_from(clusters.len())?);
+                                clusters.push(
+                                    old_clusters
+                                        .get(usize::try_from(index)?)
+                                        .context("a copied cell's cluster should exist")?
+                                        .clone(),
+                                );
+                            }
+                            cells.push(cell);
                         }
-                    };
-                    invisible = style.invisible;
-                    inverted ^= style.inverse;
-                }
-                if inverted {
-                    let old_fg = fg;
-                    fg = bg.unwrap_or(colors.background);
-                    bg = Some(old_fg);
-                }
-                if selected && let Some(background) = self.selection_background {
-                    bg = Some(background);
-                    fg = self.selection_foreground.unwrap_or(fg);
-                }
-                let width = cell.raw_cell()?.wide()?;
-                output.wide = width == CellWide::Wide;
-                output.spacer = matches!(width, CellWide::SpacerTail | CellWide::SpacerHead);
-                output.fg = if is_faint {
-                    faint(rgb(fg), rgb(bg.unwrap_or(colors.background)))
-                } else {
-                    rgb(fg)
-                };
-                output.bg = bg.map(rgb);
-                if !invisible {
-                    let mut character = [' '];
-                    match cell.graphemes_buf(&mut character) {
-                        Ok(()) => {}
-                        // The buffer holds the base codepoint even when the grapheme is longer.
-                        Err(libghostty_vt::Error::OutOfSpace { .. }) => {
-                            let mut cluster = String::new();
-                            cell.graphemes_utf8(&mut cluster)?;
-                            output.cluster = Some(u32::try_from(clusters.len())?);
-                            clusters.push(cluster);
-                        }
-                        Err(error) => return Err(error.into()),
+                        continue;
                     }
-                    output.character = character[0];
+                    let mut cell_iterator = self.cells.update(row)?;
+                    while let Some(cell) = cell_iterator.next() {
+                        let mut fg = cell.fg_color()?.unwrap_or(colors.foreground);
+                        let mut bg = cell.bg_color()?;
+                        let mut output = Cell::default();
+                        let mut invisible = false;
+                        let mut is_faint = false;
+                        let selected = cell.is_selected()?;
+                        let mut inverted = selected && self.selection_background.is_none();
+                        if cell.has_styling()? {
+                            let style = cell.style()?;
+                            output.bold = style.bold;
+                            output.italic = style.italic;
+                            is_faint = style.faint;
+                            output.strikethrough = style.strikethrough;
+                            output.overline = style.overline;
+                            output.underline = style.underline;
+                            output.underline_color = match style.underline_color {
+                                StyleColor::None => None,
+                                StyleColor::Rgb(color) => Some(rgb(color)),
+                                StyleColor::Palette(index) => {
+                                    Some(rgb(colors.palette[usize::from(index.0)]))
+                                }
+                            };
+                            invisible = style.invisible;
+                            inverted ^= style.inverse;
+                        }
+                        if inverted {
+                            let old_fg = fg;
+                            fg = bg.unwrap_or(colors.background);
+                            bg = Some(old_fg);
+                        }
+                        if selected && let Some(background) = self.selection_background {
+                            bg = Some(background);
+                            fg = self.selection_foreground.unwrap_or(fg);
+                        }
+                        let width = cell.raw_cell()?.wide()?;
+                        output.wide = width == CellWide::Wide;
+                        output.spacer =
+                            matches!(width, CellWide::SpacerTail | CellWide::SpacerHead);
+                        output.fg = if is_faint {
+                            faint(rgb(fg), rgb(bg.unwrap_or(colors.background)))
+                        } else {
+                            rgb(fg)
+                        };
+                        output.bg = bg.map(rgb);
+                        if !invisible {
+                            let mut character = [' '];
+                            match cell.graphemes_buf(&mut character) {
+                                Ok(()) => {}
+                                // The buffer holds the base codepoint even when the grapheme is longer.
+                                Err(libghostty_vt::Error::OutOfSpace { .. }) => {
+                                    let mut cluster = String::new();
+                                    cell.graphemes_utf8(&mut cluster)?;
+                                    output.cluster = Some(u32::try_from(clusters.len())?);
+                                    clusters.push(cluster);
+                                }
+                                Err(error) => return Err(error.into()),
+                            }
+                            output.character = character[0];
+                        }
+                        cells.push(output);
+                    }
                 }
-                cells.push(output);
+                let content: Content = (cells.into(), clusters.into());
+                self.content = Some(content.clone());
+                content
             }
-        }
+        };
         let cursor = if snapshot.cursor_visible()? && (presentation.cursor_on || !cursor_blinking) {
             snapshot.cursor_viewport()?.map(|viewport| {
                 let x = viewport.x.saturating_sub(u16::from(viewport.at_wide_tail));
@@ -2234,6 +2278,85 @@ mod tests {
         assert_eq!(selection_text(&terminal).unwrap(), None);
     }
 
+    fn busy_terminal() -> Terminal<'static, 'static> {
+        let mut terminal = new_terminal(200, 60).unwrap();
+        for row in 0..80 {
+            terminal.vt_write(
+                format!(
+                    "\x1b[3{}mline {row} the quick brown fox \x1b[1;4{}mjumps\x1b[0m over 世界 the lazy dog é\r\n",
+                    row % 8,
+                    row % 7
+                )
+                .repeat(1)
+                .as_bytes(),
+            );
+        }
+        terminal
+    }
+
+    /// Times only the build; `prepare` writes to the terminal and picks the presentation.
+    fn per_frame(
+        label: &str,
+        terminal: &mut Terminal<'static, 'static>,
+        builder: &mut GridBuilder,
+        mut prepare: impl FnMut(&mut Terminal<'static, 'static>, u32) -> Presentation,
+    ) {
+        let frames = 300;
+        let mut elapsed = std::time::Duration::ZERO;
+        for frame in 0..frames {
+            let presentation = prepare(terminal, frame);
+            let start = std::time::Instant::now();
+            builder
+                .build(terminal, u64::from(frame), presentation)
+                .unwrap();
+            elapsed += start.elapsed();
+        }
+        println!(
+            "{label}: {} ns/frame",
+            elapsed.as_nanos() / u128::from(frames)
+        );
+    }
+
+    #[test]
+    #[ignore = "benchmark: cargo test --release bench_ -- --ignored --nocapture"]
+    fn bench_grid_build() {
+        let mut terminal = busy_terminal();
+        let mut builder = GridBuilder::new().unwrap();
+        builder
+            .build(&terminal, 1, Presentation::default())
+            .unwrap();
+        per_frame(
+            "steady output (scrolling)",
+            &mut terminal,
+            &mut builder,
+            |terminal, _| {
+                terminal.vt_write(b"\x1b[32msteady output line with some text 12345\x1b[0m\r\n");
+                Presentation::default()
+            },
+        );
+        per_frame(
+            "one dirty row",
+            &mut terminal,
+            &mut builder,
+            |terminal, frame| {
+                terminal.vt_write(format!("\x1b[30;1H\x1b[2Kspinner {frame}").as_bytes());
+                Presentation::default()
+            },
+        );
+        per_frame("cursor blink", &mut terminal, &mut builder, |_, frame| {
+            Presentation {
+                cursor_on: frame % 2 == 0,
+                ..Presentation::default()
+            }
+        });
+        per_frame("scrollbar fade", &mut terminal, &mut builder, |_, frame| {
+            Presentation {
+                scrollbar_opacity: frame as f32 / 300.0,
+                ..Presentation::default()
+            }
+        });
+    }
+
     #[test]
     fn selected_cells_swap_their_colours() {
         let mut terminal = new_terminal(20, 5).unwrap();
@@ -2251,6 +2374,51 @@ mod tests {
         assert_eq!(grid.cells[0].bg, Some(rgb(DEFAULT_FG)));
         assert_eq!(grid.cells[0].fg, rgb(DEFAULT_BG));
         assert_eq!(grid.cells[6].bg, None);
+    }
+
+    #[test]
+    fn a_presentation_only_change_shares_cells_and_moves_the_cursor_state() {
+        let mut terminal = new_terminal(20, 5).unwrap();
+        terminal.vt_write(b"hello \x1b[?12h");
+        let mut builder = GridBuilder::new().unwrap();
+        let first = builder
+            .build(&terminal, 1, Presentation::default())
+            .unwrap()
+            .unwrap();
+        let blinked_off = Presentation {
+            cursor_on: false,
+            scrollbar_opacity: 0.5,
+            ..Presentation::default()
+        };
+        let second = builder.build(&terminal, 2, blinked_off).unwrap().unwrap();
+        assert!(Arc::ptr_eq(&first.cells, &second.cells));
+        assert_eq!(first.cursor, Some((6, 0)));
+        assert_eq!(second.cursor, None);
+        builder.selection_changed();
+        let third = builder.build(&terminal, 3, blinked_off).unwrap().unwrap();
+        assert!(!Arc::ptr_eq(&first.cells, &third.cells));
+    }
+
+    #[test]
+    fn a_partial_update_copies_clean_rows_and_rereads_dirty_ones() {
+        let mut terminal = new_terminal(20, 5).unwrap();
+        terminal.vt_write("e\u{301}x\r\nsecond\r\n\x1b[4;1H\u{1f468}\u{200d}\u{1f469}".as_bytes());
+        let mut builder = GridBuilder::new().unwrap();
+        let first = builder
+            .build(&terminal, 1, Presentation::default())
+            .unwrap()
+            .unwrap();
+        terminal.vt_write(b"\x1b[2;1Hchanged\x1b[5;1Hlast");
+        let second = builder
+            .build(&terminal, 2, Presentation::default())
+            .unwrap()
+            .unwrap();
+        let lines = second.lines();
+        assert_eq!(lines[0], first.lines()[0]);
+        assert_eq!(lines[1].trim_end(), "changed");
+        assert_eq!(lines[3], first.lines()[3]);
+        assert_eq!(lines[4].trim_end(), "last");
+        assert_eq!(second.cluster(&second.cells[0]), Some("e\u{301}"));
     }
 
     const THEME_RED: RgbColor = RgbColor {
