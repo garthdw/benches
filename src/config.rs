@@ -34,6 +34,8 @@ pub struct FontConfig {
     pub fallback_families: Vec<String>,
     /// Ghostty's `font-feature` syntax: `calt`, `-liga`, `ss01=2`.
     pub features: Vec<String>,
+    /// Ghostty's `font-shaping-break = cursor`: the cursor splits a ligature.
+    pub shaping_breaks_at_cursor: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq)]
@@ -78,6 +80,7 @@ impl Default for Config {
                 symbols_family: None,
                 fallback_families: Vec::new(),
                 features: Vec::new(),
+                shaping_breaks_at_cursor: true,
             },
             theme: Theme::default(),
             tabs: vec![
@@ -129,6 +132,10 @@ struct FontFile {
     /// OpenType features in Ghostty's `font-feature` syntax, such as `-calt` or `ss01`; replaces
     /// Ghostty's list, and `[]` turns them all off.
     features: Option<Vec<String>>,
+    /// Where to split ligatures, in Ghostty's `font-shaping-break` syntax: `cursor` (the default)
+    /// or `no-cursor`. Replaces Ghostty's setting.
+    #[serde(rename = "shaping-break")]
+    shaping_break: Option<Vec<String>>,
 }
 
 /// Where to look for the files the config names.
@@ -245,6 +252,9 @@ fn default_config_text() -> String {
          # symbols-family = \"Symbols Nerd Font Mono\"\n\
          # OpenType features in Ghostty's `font-feature` syntax; unset uses Ghostty's.\n\
          # features = [\"-calt\", \"ss01\"]\n\
+         # Where to split ligatures, in Ghostty's `font-shaping-break` syntax: `cursor` (the\n\
+         # default) shows the characters under the cursor; `no-cursor` keeps the ligature.\n\
+         # shaping-break = [\"no-cursor\"]\n\
          {tabs}",
         size = defaults.font.size,
     )
@@ -306,6 +316,14 @@ impl Config {
                         .map(str::to_owned)
                         .collect()
                 }),
+                shaping_breaks_at_cursor: shaping_breaks_at_cursor(
+                    &file.font.shaping_break.unwrap_or_else(|| {
+                        ghostty_values(&ghostty, "font-shaping-break")
+                            .into_iter()
+                            .map(str::to_owned)
+                            .collect()
+                    }),
+                ),
             },
             theme,
             tabs: file.tabs.unwrap_or(defaults.tabs),
@@ -329,6 +347,20 @@ fn ghostty_values<'a>(text: &'a str, key: &str) -> Vec<&'a str> {
         .filter(|(name, _)| name.trim() == key)
         .map(|(_, value)| value.trim().trim_matches('"'))
         .collect()
+}
+
+/// Ghostty's `font-shaping-break`: comma-separated options, where `no-` turns one off, and the
+/// cursor is on unless a later mention says otherwise.
+fn shaping_breaks_at_cursor(values: &[String]) -> bool {
+    values
+        .iter()
+        .flat_map(|value| value.split(','))
+        .map(str::trim)
+        .fold(true, |breaks, option| match option {
+            "cursor" => true,
+            "no-cursor" => false,
+            _ => breaks,
+        })
 }
 
 /// A theme name as Ghostty takes it; `light:X,dark:Y` picks the dark one, as agentd is dark.
@@ -442,6 +474,7 @@ mod tests {
                 symbols_family: None,
                 fallback_families: vec!["Symbols".to_owned()],
                 features: Vec::new(),
+                shaping_breaks_at_cursor: true,
             }
         );
         assert_eq!(
@@ -483,6 +516,7 @@ mod tests {
                 symbols_family: Some("Icons NF".to_owned()),
                 fallback_families: Vec::new(),
                 features: Vec::new(),
+                shaping_breaks_at_cursor: true,
             }
         );
         assert_eq!(
@@ -507,6 +541,31 @@ mod tests {
             ["+liga"]
         );
         assert!(features(Some("[font]\nfeatures = []\n")).is_empty());
+    }
+
+    #[test]
+    fn shaping_break_reads_ghostty_and_config_toml_replaces_it() {
+        let breaks = |config: Option<&str>, ghostty: Option<&str>| {
+            let (_root, paths) = paths(config, ghostty);
+            Config::load(&paths).font.shaping_breaks_at_cursor
+        };
+        assert!(breaks(None, None));
+        assert!(!breaks(None, Some("font-shaping-break = no-cursor\n")));
+        assert!(breaks(
+            None,
+            Some("font-shaping-break = no-cursor,cursor\n")
+        ));
+        assert!(!breaks(
+            None,
+            Some("font-shaping-break = cursor\nfont-shaping-break = no-cursor\n")
+        ));
+        let off = "[font]\nshaping-break = [\"no-cursor\"]\n";
+        assert!(!breaks(Some(off), None));
+        assert!(!breaks(Some(off), Some("font-shaping-break = cursor\n")));
+        assert!(breaks(
+            Some("[font]\nshaping-break = []\n"),
+            Some("font-shaping-break = no-cursor\n")
+        ));
     }
 
     #[test]

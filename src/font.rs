@@ -117,6 +117,8 @@ pub struct Font {
     pub cell_width: u32,
     pub cell_height: u32,
     pub line_thickness: u32,
+    /// Ghostty's `font-shaping-break = cursor`, applied by the renderer.
+    pub break_runs_at_cursor: bool,
     pub underline_top: u32,
     pub strike_top: u32,
     baseline: f64,
@@ -389,6 +391,7 @@ impl Font {
                 .min(lowest_underline),
             strike_top: (baseline_from_top - x_height / 2.0 - half_line).round() as u32,
             baseline,
+            break_runs_at_cursor: true,
             advance,
             runs: RefCell::default(),
             alone: RefCell::default(),

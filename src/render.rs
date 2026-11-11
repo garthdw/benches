@@ -296,6 +296,7 @@ fn build_quads(
             quads.push(solid(*edge, grid.cursor_color));
         }
     }
+    let run_cursor = cursor.filter(|_| font.break_runs_at_cursor);
     let inverted = cursor.filter(|_| grid.cursor_style == CursorVisualStyle::Block);
     let glyphs_start = quads.len();
     let underline_top = font.underline_top as f32;
@@ -363,10 +364,10 @@ fn build_quads(
                 quads.push(line(0.0, fg));
             }
             if run.as_ref().is_none_or(|run| index >= run.end)
-                && Some(index) != cursor
+                && Some(index) != run_cursor
                 && joins_run(cell, font)
             {
-                run = Some(find_run(grid, index, cursor, font, &mut run_text));
+                run = Some(find_run(grid, index, run_cursor, font, &mut run_text));
             }
             let shaped = run
                 .as_mut()
@@ -639,7 +640,8 @@ impl TerminalCompositor {
                 &config.fallback_families,
                 &config.features,
             ) {
-                Ok(font) => {
+                Ok(mut font) => {
+                    font.break_runs_at_cursor = config.shaping_breaks_at_cursor;
                     gpu.atlas.reset();
                     self.font = Some((site.scale, config.clone(), font));
                 }
@@ -819,11 +821,20 @@ mod tests {
     }
 
     fn shaped_keys_in(bytes: &[u8], cols: u16, features: &[&str]) -> Vec<(String, u16)> {
+        shaped_keys_with(bytes, cols, features, true)
+    }
+
+    fn shaped_keys_with(
+        bytes: &[u8],
+        cols: u16,
+        features: &[&str],
+        break_at_cursor: bool,
+    ) -> Vec<(String, u16)> {
         let features: Vec<String> = features
             .iter()
             .map(|feature| (*feature).to_owned())
             .collect();
-        let font = Font::with_symbols(
+        let mut font = Font::with_symbols(
             crate::config::DEFAULT_FONT_FAMILY,
             18.0,
             2.0,
@@ -832,6 +843,7 @@ mod tests {
             &features,
         )
         .unwrap();
+        font.break_runs_at_cursor = break_at_cursor;
         let grid = Grid::from_vt(bytes, cols, 2).unwrap();
         let mut keys = Vec::new();
         build_quads(
@@ -925,6 +937,12 @@ mod tests {
             },
         );
         assert_eq!(keys, 0);
+    }
+
+    #[test]
+    fn without_shaping_break_the_cursor_leaves_a_ligature_whole() {
+        let keys = shaped_keys_with(b"a != b\x1b[1;3H", 8, &[], false);
+        assert_eq!(keys, [("!=".to_owned(), 0), ("!=".to_owned(), 1)]);
     }
 
     #[test]

@@ -20,6 +20,16 @@
             "null"
           ]
         },
+        "shaping-break": {
+          "description": "Where to split ligatures, in Ghostty's `font-shaping-break` syntax: `cursor` (the default)\nor `no-cursor`. Replaces Ghostty's setting.",
+          "items": {
+            "type": "string"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
         "size": {
           "description": "The font size in points. Falls back to Ghostty's `font-size`.",
           "format": "double",
