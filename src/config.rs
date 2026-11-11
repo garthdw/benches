@@ -2,6 +2,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use libghostty_vt::style::RgbColor;
+use schemars::JsonSchema;
 use serde::Deserialize;
 
 use crate::session::{DEFAULT_BG, DEFAULT_FG, LogErr};
@@ -33,10 +34,11 @@ pub struct FontConfig {
     pub fallback_families: Vec<String>,
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq)]
 pub struct TabSpec {
+    /// The tab's label.
     pub title: String,
-    /// `None` runs the launch shell.
+    /// The command to run through the launch shell; omit to open the shell itself.
     pub command: Option<String>,
 }
 
@@ -90,23 +92,35 @@ impl Default for Config {
     }
 }
 
-#[derive(Debug, Default, Deserialize)]
+/// The `config.toml` format. Every key is optional.
+#[derive(Debug, Default, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct File {
+    /// The shell new tabs run, as an absolute path.
     shell: Option<PathBuf>,
+    /// A Ghostty theme name or absolute path; `light:X,dark:Y` picks the dark one.
+    /// Falls back to Ghostty's theme.
     theme: Option<String>,
+    /// The terminal font. Each key falls back to Ghostty's config.
     #[serde(default)]
     font: FontFile,
+    /// The tabs a new project opens with.
     tabs: Option<Vec<TabSpec>>,
+    /// A command such as `j` or `zoxide query` that the command centre runs through `shell`
+    /// with the query to find a folder to open as a project.
     #[serde(rename = "jump-command")]
     jump_command: Option<String>,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct FontFile {
+    /// The font family. Falls back to Ghostty's first `font-family`.
     family: Option<String>,
+    /// The font size in points. Falls back to Ghostty's `font-size`.
     size: Option<f64>,
+    /// The face for private-use icons; unset tries Ghostty's other `font-family` lines, then
+    /// the main font.
     #[serde(rename = "symbols-family")]
     symbols_family: Option<String>,
 }
@@ -130,6 +144,102 @@ impl Paths {
     pub fn state(&self) -> PathBuf {
         self.dir.join("state.json")
     }
+
+    fn config(&self) -> PathBuf {
+        self.dir.join("config.toml")
+    }
+
+    fn schema(&self) -> PathBuf {
+        self.dir.join("config.schema.json")
+    }
+}
+
+const SCHEMA_DIRECTIVE: &str = "#:schema ./config.schema.json";
+
+pub fn schema() -> String {
+    format!("{:#}\n", schemars::schema_for!(File).as_value())
+}
+
+/// `agentd config init|migrate|schema`, run before the app starts.
+pub fn command(args: &[String], paths: &Paths, out: &mut impl std::io::Write) -> Result<()> {
+    match args {
+        [name] if name == "init" => init(paths),
+        [name] if name == "migrate" => migrate(paths),
+        [name] if name == "schema" => write!(out, "{}", schema()).context("print schema"),
+        _ => bail!("usage: agentd config init|migrate|schema"),
+    }
+}
+
+fn write_schema(paths: &Paths) -> Result<()> {
+    std::fs::create_dir_all(&paths.dir)
+        .with_context(|| format!("create {}", paths.dir.display()))?;
+    std::fs::write(paths.schema(), schema())
+        .with_context(|| format!("write {}", paths.schema().display()))
+}
+
+fn init(paths: &Paths) -> Result<()> {
+    if paths.config().exists() {
+        bail!(
+            "{} already exists; run `agentd config migrate` to update it",
+            paths.config().display()
+        );
+    }
+    write_schema(paths)?;
+    std::fs::write(paths.config(), default_config_text())
+        .with_context(|| format!("write {}", paths.config().display()))
+}
+
+/// Edits the first line as text, which keeps every comment and the key order as written.
+fn migrate(paths: &Paths) -> Result<()> {
+    let text = read_optional(&paths.config())?
+        .with_context(|| format!("no {}; run `agentd config init`", paths.config().display()))?;
+    text.parse::<toml_edit::DocumentMut>()
+        .context("parse config.toml")?;
+    write_schema(paths)?;
+    let body = match text.split_once('\n') {
+        Some((first, rest)) if first.starts_with("#:schema") => rest,
+        _ => &text,
+    };
+    std::fs::write(paths.config(), format!("{SCHEMA_DIRECTIVE}\n{body}"))
+        .with_context(|| format!("write {}", paths.config().display()))
+}
+
+fn default_config_text() -> String {
+    use toml_edit::Value;
+    let defaults = Config::default();
+    let shell = Value::from(defaults.shell.to_string_lossy().as_ref());
+    let family = Value::from(defaults.font.family.as_str());
+    let tabs: String = defaults
+        .tabs
+        .iter()
+        .map(|tab| {
+            let command = tab.command.as_deref().map_or_else(
+                || "# command = \"...\"\n".to_owned(),
+                |command| format!("command = {}\n", Value::from(command)),
+            );
+            format!(
+                "\n[[tabs]]\ntitle = {}\n{command}",
+                Value::from(tab.title.as_str())
+            )
+        })
+        .collect();
+    format!(
+        "{SCHEMA_DIRECTIVE}\n\
+         # The shell new tabs run.\n\
+         shell = {shell}\n\
+         # A Ghostty theme name or absolute path; unset uses Ghostty's theme.\n\
+         # theme = \"dusk\"\n\
+         # A command the command centre runs through `shell` with the query to find a folder.\n\
+         # jump-command = \"zoxide query\"\n\
+         \n\
+         [font]\n\
+         family = {family}\n\
+         size = {size:?}\n\
+         # The face for private-use icons.\n\
+         # symbols-family = \"Symbols Nerd Font Mono\"\n\
+         {tabs}",
+        size = defaults.font.size,
+    )
 }
 
 impl Config {
@@ -385,5 +495,120 @@ mod tests {
     fn a_broken_config_falls_back_to_the_defaults() {
         let (_root, paths) = paths(Some("shel = 1"), None);
         assert_eq!(Config::load(&paths), Config::default());
+    }
+}
+
+#[cfg(test)]
+mod schema_tests {
+    use super::*;
+
+    fn dir_paths() -> (tempfile::TempDir, Paths) {
+        let root = tempfile::tempdir().unwrap();
+        let paths = Paths {
+            dir: root.path().join("agentd"),
+            ghostty_dir: root.path().join("ghostty"),
+        };
+        (root, paths)
+    }
+
+    fn run(paths: &Paths, args: &[&str]) -> Result<String> {
+        let mut out = Vec::new();
+        command(
+            &args.iter().map(|arg| (*arg).to_owned()).collect::<Vec<_>>(),
+            paths,
+            &mut out,
+        )?;
+        Ok(String::from_utf8(out).unwrap())
+    }
+
+    fn read(paths: &Paths, name: &str) -> String {
+        std::fs::read_to_string(paths.dir.join(name)).unwrap()
+    }
+
+    #[test]
+    fn committed_schema_is_up_to_date() {
+        let committed = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/schema/config.schema.json"
+        ))
+        .unwrap_or_default();
+        assert!(
+            committed == schema(),
+            "schema/config.schema.json is out of date; run `cargo run -- config schema > schema/config.schema.json`"
+        );
+    }
+
+    #[test]
+    fn schema_denies_unknown_keys_and_uses_renamed_keys() {
+        let schema: serde_json::Value = serde_json::from_str(&schema()).unwrap();
+        assert_eq!(schema["additionalProperties"], false);
+        assert!(schema["properties"]["jump-command"].is_object());
+        let font = &schema["$defs"]["FontFile"];
+        assert_eq!(font["additionalProperties"], false);
+        assert!(font["properties"]["symbols-family"].is_object());
+    }
+
+    #[test]
+    fn init_writes_the_config_with_the_schema_line_and_the_schema_file() {
+        let (_root, paths) = dir_paths();
+        run(&paths, &["init"]).unwrap();
+        assert!(read(&paths, "config.toml").starts_with("#:schema ./config.schema.json\n"));
+        assert_eq!(read(&paths, "config.schema.json"), schema());
+    }
+
+    #[test]
+    fn init_refuses_to_overwrite_a_config() {
+        let (_root, paths) = dir_paths();
+        std::fs::create_dir_all(&paths.dir).unwrap();
+        std::fs::write(paths.dir.join("config.toml"), "mine").unwrap();
+        assert!(run(&paths, &["init"]).is_err());
+        assert_eq!(read(&paths, "config.toml"), "mine");
+    }
+
+    #[test]
+    fn init_output_loads_as_the_defaults() {
+        let (_root, paths) = dir_paths();
+        run(&paths, &["init"]).unwrap();
+        toml::from_str::<File>(&read(&paths, "config.toml")).unwrap();
+        assert_eq!(Config::load(&paths), Config::default());
+    }
+
+    #[test]
+    fn migrate_adds_the_line_and_keeps_comments_and_order() {
+        let (_root, paths) = dir_paths();
+        std::fs::create_dir_all(&paths.dir).unwrap();
+        let original = "# mine\nshell = \"/bin/zsh\"  # sh\n\n[font]\nsize = 12\n";
+        std::fs::write(paths.dir.join("config.toml"), original).unwrap();
+        run(&paths, &["migrate"]).unwrap();
+        assert_eq!(
+            read(&paths, "config.toml"),
+            format!("#:schema ./config.schema.json\n{original}")
+        );
+        assert!(paths.dir.join("config.schema.json").is_file());
+    }
+
+    #[test]
+    fn migrate_replaces_a_stale_schema_line_and_is_idempotent() {
+        let (_root, paths) = dir_paths();
+        std::fs::create_dir_all(&paths.dir).unwrap();
+        std::fs::write(
+            paths.dir.join("config.toml"),
+            "#:schema https://example.com/old.json\nshell = \"/bin/zsh\"\n",
+        )
+        .unwrap();
+        run(&paths, &["migrate"]).unwrap();
+        let once = read(&paths, "config.toml");
+        assert_eq!(
+            once,
+            "#:schema ./config.schema.json\nshell = \"/bin/zsh\"\n"
+        );
+        run(&paths, &["migrate"]).unwrap();
+        assert_eq!(read(&paths, "config.toml"), once);
+    }
+
+    #[test]
+    fn schema_prints_the_schema() {
+        let (_root, paths) = dir_paths();
+        assert_eq!(run(&paths, &["schema"]).unwrap(), schema());
     }
 }
