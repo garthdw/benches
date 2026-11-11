@@ -153,6 +153,19 @@ fn parse_output(output: &str) -> Option<PathBuf> {
         .find(|path| path.is_absolute() && path.is_dir())
 }
 
+/// The path with `~` for the home folder, as `parse_output` expands it.
+pub fn abbreviate_home(path: &Path) -> String {
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    match home
+        .as_deref()
+        .and_then(|home| path.strip_prefix(home).ok())
+    {
+        Some(rest) if rest.as_os_str().is_empty() => "~".to_owned(),
+        Some(rest) => format!("~/{}", rest.display()),
+        None => path.display().to_string(),
+    }
+}
+
 /// Drops CSI sequences such as colours, which is all lookup commands print.
 fn strip_escapes(text: &str) -> String {
     let mut plain = String::with_capacity(text.len());
@@ -221,6 +234,14 @@ mod tests {
             ]
         );
         assert!(parse_worktrees("not json").is_err());
+    }
+
+    #[test]
+    fn the_home_folder_is_abbreviated_to_a_tilde() {
+        let home = PathBuf::from(std::env::var_os("HOME").unwrap());
+        assert_eq!(abbreviate_home(&home), "~");
+        assert_eq!(abbreviate_home(&home.join("dev/site")), "~/dev/site");
+        assert_eq!(abbreviate_home(Path::new("/dev/site")), "/dev/site");
     }
 
     #[test]
