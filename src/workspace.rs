@@ -1,5 +1,5 @@
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::os::unix::process::ExitStatusExt;
 use std::path::PathBuf;
 use std::process::ExitStatus;
@@ -184,6 +184,8 @@ impl Project {
 
 pub type WindowId = u32;
 
+pub const MAIN_WINDOW: WindowId = 0;
+
 /// Hands projects between the windows of the app, whose workspaces each show only their own.
 /// A project travels with its sessions running; the receiving window takes it on its next poll.
 #[derive(Clone, Default)]
@@ -193,11 +195,14 @@ pub struct Fleet(Rc<RefCell<Windows>>);
 struct Windows {
     opened: WindowId,
     entries: HashMap<WindowId, Entry>,
+    /// What each window left for the layout as the app quit.
+    saved: BTreeMap<WindowId, SavedWorkspace>,
 }
 
 #[derive(Default)]
 struct Entry {
     waker: Option<Waker>,
+    reveal: Option<Rc<dyn Fn(u64)>>,
     inbox: Vec<Project>,
 }
 
@@ -212,6 +217,30 @@ impl Fleet {
         self.0.borrow_mut().entries.entry(window).or_default().waker = Some(waker);
     }
 
+    /// `reveal` shows a session in `window` and brings the window forward, if the window has it.
+    pub fn on_reveal(&self, window: WindowId, reveal: impl Fn(u64) + 'static) {
+        self.0
+            .borrow_mut()
+            .entries
+            .entry(window)
+            .or_default()
+            .reveal = Some(Rc::new(reveal));
+    }
+
+    /// Shows the session wherever it lives, as a clicked notification asks.
+    pub fn reveal(&self, session: u64) {
+        let reveals: Vec<_> = self
+            .0
+            .borrow()
+            .entries
+            .values()
+            .filter_map(|entry| entry.reveal.clone())
+            .collect();
+        for reveal in reveals {
+            reveal(session);
+        }
+    }
+
     pub fn send(&self, window: WindowId, project: Project) {
         let waker = {
             let mut windows = self.0.borrow_mut();
@@ -222,6 +251,20 @@ impl Fleet {
         if let Some(waker) = waker {
             waker();
         }
+    }
+
+    /// Records `window`'s layout at quit. Once the main window's is in, answers its layout with
+    /// the other windows' projects after its own, so whichever window quits last saves them all.
+    /// Torn-off windows are not restored: their projects come back in the main window.
+    pub fn deposit(&self, window: WindowId, layout: SavedWorkspace) -> Option<SavedWorkspace> {
+        let mut windows = self.0.borrow_mut();
+        windows.saved.insert(window, layout);
+        let mut merged = windows.saved.get(&MAIN_WINDOW)?.clone();
+        let others = windows.saved.iter().filter(|(id, _)| **id != MAIN_WINDOW);
+        merged
+            .projects
+            .extend(others.flat_map(|(_, layout)| layout.projects.clone()));
+        Some(merged)
     }
 
     pub fn take(&self, window: WindowId) -> Vec<Project> {
@@ -633,14 +676,14 @@ pub enum Slot {
 }
 
 /// The layout `state.json` keeps between launches.
-#[derive(Debug, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct SavedWorkspace {
     pub active: usize,
     pub sidebar_hidden: bool,
     pub projects: Vec<SavedProject>,
 }
 
-#[derive(Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct SavedProject {
     pub root: PathBuf,
     pub active_tab: usize,
@@ -648,7 +691,7 @@ pub struct SavedProject {
     pub tray: Vec<SavedTab>,
 }
 
-#[derive(Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct SavedTab {
     pub title: String,
     pub command: Option<String>,

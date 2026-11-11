@@ -25,7 +25,9 @@ use rune::{
 use anyhow::Context;
 use session::LogErr;
 use session::{Attention, Event, Grid, PointerInput, PointerPhase, Retarget, Session, WheelInput};
-use workspace::{Fleet, Project, SavedWorkspace, Slot, Status, Tab, WindowId, Workspace};
+use workspace::{
+    Fleet, MAIN_WINDOW, Project, SavedWorkspace, Slot, Status, Tab, WindowId, Workspace,
+};
 
 const TERMINAL_MARK: u32 = 1;
 const DRAWER_MARK: u32 = 2;
@@ -294,13 +296,36 @@ fn save_layout(state: &State) -> anyhow::Result<()> {
         return Ok(());
     };
     let path = paths.state();
-    let json = serde_json::to_string_pretty(&state.workspace.snapshot(state.sidebar_hidden))?;
+    let layout = state.workspace.snapshot(state.sidebar_hidden);
+    let Some(layout) = state.fleet.deposit(state.window, layout) else {
+        return Ok(());
+    };
+    let json = serde_json::to_string_pretty(&layout)?;
     std::fs::create_dir_all(&paths.dir)
         .with_context(|| format!("create {}", paths.dir.display()))?;
     let temporary = path.with_extension("json.tmp");
     std::fs::write(&temporary, json).with_context(|| format!("write {}", temporary.display()))?;
     std::fs::rename(&temporary, &path).with_context(|| format!("replace {}", path.display()))?;
     Ok(())
+}
+
+/// Closing the main window quits, as it did when it was the only one. Closing another gives its
+/// projects, still running, back to the main window.
+fn on_close(state: &mut State, tx: &mut Tx) {
+    if rune::quitting() {
+        return;
+    }
+    if state.window == MAIN_WINDOW {
+        tx.quit();
+    } else {
+        merge_into_main(state);
+    }
+}
+
+fn merge_into_main(state: &mut State) {
+    while let Some(project) = state.workspace.take_project(0) {
+        state.fleet.send(MAIN_WINDOW, project);
+    }
 }
 
 /// Saves the layout, then ends every process so none outlives the app.
@@ -431,17 +456,13 @@ fn move_to_new_window(state: &mut State, index: usize) {
     };
     let window = state.fleet.reserve_window();
     state.fleet.send(window, project);
-    let (fleet, config) = (state.fleet.clone(), state.config.clone());
-    rune::open_window(WindowSpec::from_app(
-        format!("agentd-{window}"),
-        window_app(move || State {
-            fleet,
-            window,
-            config,
-            started: true,
-            ..State::default()
-        }),
-    ));
+    let (config, paths) = (state.config.clone(), state.paths.clone());
+    let app = window_app(&state.fleet, window, move |state| {
+        state.config = config;
+        state.paths = paths;
+        state.started = true;
+    });
+    rune::open_window(WindowSpec::from_app(format!("agentd-{window}"), app));
 }
 
 /// Takes the projects other windows handed over, pointing their sessions at this window.
@@ -1973,7 +1994,11 @@ const SCENES: &[Scene] = &[
 ];
 
 /// One window's app, with its state made by `init`.
-fn window_app(init: impl FnOnce() -> State + 'static) -> App<State> {
+fn window_app(
+    fleet: &Fleet,
+    window: WindowId,
+    configure: impl FnOnce(&mut State) + 'static,
+) -> App<State> {
     let spec = AppSpec::<State> {
         scenes: SCENES,
         setup: Some(|state, waker| {
@@ -1984,8 +2009,17 @@ fn window_app(init: impl FnOnce() -> State + 'static) -> App<State> {
         on_key: Some(on_key),
         ..AppSpec::new("agentd", (960.0, 640.0), State::default, view)
     };
-    App::new(spec)
-        .init(init)
+    let init_fleet = fleet.clone();
+    let app = App::new(spec)
+        .init(move || {
+            let mut state = State {
+                fleet: init_fleet,
+                window,
+                ..State::default()
+            };
+            configure(&mut state);
+            state
+        })
         .compositor(render::TerminalCompositor::default())
         .on_ime(on_ime)
         .on_modifiers(|state, mods, _| {
@@ -1995,7 +2029,19 @@ fn window_app(init: impl FnOnce() -> State + 'static) -> App<State> {
             }
         })
         .on_quit(on_quit)
-        .on_focus(|state, focused, _| state.workspace.set_window_focused(focused))
+        .on_close(on_close)
+        .on_focus(|state, focused, _| state.workspace.set_window_focused(focused));
+    let handle = app.handle();
+    fleet.on_reveal(window, move |session| {
+        let opener = handle.clone();
+        handle.update(move |state, _| {
+            if state.workspace.locate(session).is_some() {
+                state.workspace.reveal(session);
+                opener.open();
+            }
+        });
+    });
+    app
 }
 
 fn main() {
@@ -2011,20 +2057,19 @@ fn main() {
         return;
     }
     log_to_file_in_bundle().log_err("log file");
-    let app = window_app(|| {
-        let paths = config::Paths::from_home();
-        State {
-            config: paths.as_ref().map(config::Config::load).unwrap_or_default(),
-            paths,
-            ..State::default()
-        }
+    let fleet = Fleet::default();
+    let app = window_app(&fleet, MAIN_WINDOW, |state| {
+        state.paths = config::Paths::from_home();
+        state.config = state
+            .paths
+            .as_ref()
+            .map(config::Config::load)
+            .unwrap_or_default();
     });
     let handle = app.handle();
-    notify::start(move |session| {
-        if let Some(session) = session {
-            handle.update(move |state, _| state.workspace.reveal(session));
-        }
-        handle.open();
+    notify::start(move |session| match session {
+        Some(session) => fleet.reveal(session),
+        None => handle.open(),
     });
     app.run();
 }
@@ -3709,5 +3754,75 @@ mod tests {
         runtime.frame(2.0 / 60.0);
         assert_eq!(runtime.state.workspace.projects.len(), 1);
         assert_eq!(runtime.state.fleet.take(1).len(), 1);
+    }
+
+    #[test]
+    fn closing_a_window_gives_its_running_projects_back_to_the_main_window() {
+        let (main_waker, _) = counting_waker();
+        let mut main = State {
+            waker: Some(main_waker),
+            ..State::default()
+        };
+        main.workspace
+            .add_project(Project::new("/dev/site".into(), vec![]));
+        let mut second = State {
+            fleet: main.fleet.clone(),
+            window: 1,
+            started: true,
+            ..State::default()
+        };
+        second
+            .workspace
+            .add_project(Project::new("/tmp".into(), vec![]));
+        open_tab(&mut second, "slow", Some("sh -c 'sleep 0.5; echo back'"));
+        let session = second.workspace.active_session().map(Session::id);
+        merge_into_main(&mut second);
+        assert!(second.workspace.projects.is_empty());
+
+        assert!(adopt_projects(&mut main));
+        assert_eq!(main.workspace.projects.len(), 2);
+        assert_eq!(main.workspace.active_session().map(Session::id), session);
+        assert_eq!(
+            main.workspace.active_session().map(Session::visibility),
+            Some(session::Visibility::Shown)
+        );
+        assert!(!adopt_projects(&mut main));
+    }
+
+    #[test]
+    fn the_last_window_to_quit_saves_every_windows_projects() {
+        let directory = tempfile::tempdir().unwrap();
+        let paths = config::Paths {
+            dir: directory.path().join("agentd"),
+            ghostty_dir: directory.path().join("ghostty"),
+        };
+        let fleet = Fleet::default();
+        let window = |window, root: &str| {
+            let mut state = State {
+                fleet: fleet.clone(),
+                window,
+                paths: Some(paths.clone()),
+                ..State::default()
+            };
+            let tabs = vec![fixture_tab("shell", b"$ ")];
+            state.workspace.add_project(Project::new(root.into(), tabs));
+            state
+        };
+        let (main, second) = (window(MAIN_WINDOW, "/"), window(1, "/usr"));
+        save_layout(&second).unwrap();
+        assert!(!paths.state().exists());
+        save_layout(&main).unwrap();
+        let mut loaded = State {
+            paths: Some(paths),
+            ..State::default()
+        };
+        load_layout(&mut loaded);
+        let roots: Vec<_> = loaded
+            .workspace
+            .projects
+            .iter()
+            .map(|project| project.root.clone())
+            .collect();
+        assert_eq!(roots, [PathBuf::from("/"), PathBuf::from("/usr")]);
     }
 }
