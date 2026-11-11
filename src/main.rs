@@ -88,6 +88,7 @@ pub struct State {
     palette_open: bool,
     palette_selected: usize,
     jump: JumpLookup,
+    worktrees: Option<WorktreeChoice>,
     sidebar_hidden: bool,
     config: config::Config,
     /// Unset in tests and scenes, which then read and write no files.
@@ -102,6 +103,14 @@ struct JumpLookup {
     due: Option<f64>,
     pending: Option<mpsc::Receiver<Option<PathBuf>>>,
     found: Option<PathBuf>,
+}
+
+/// The repository worktrees the command centre offers after ⌘↵ on the jump command's folder.
+#[derive(Default)]
+struct WorktreeChoice {
+    root: PathBuf,
+    pending: Option<mpsc::Receiver<Vec<jump::Worktree>>>,
+    found: Vec<jump::Worktree>,
 }
 
 impl State {
@@ -128,6 +137,19 @@ impl State {
 
     fn active_root(&self) -> Option<PathBuf> {
         self.workspace.project().map(|project| project.root.clone())
+    }
+
+    /// The worktrees whose branch and path contain the query's letters in order.
+    fn visible_worktrees(&self) -> Vec<&jump::Worktree> {
+        let query = self.palette.text.trim();
+        self.worktrees
+            .iter()
+            .flat_map(|choice| &choice.found)
+            .filter(|worktree| {
+                let branch = worktree.branch.as_deref().unwrap_or_default();
+                letters_in_order(&format!("{branch} {}", worktree.path.display()), query)
+            })
+            .collect()
     }
 
     fn jump_target(&self) -> Option<&Path> {
@@ -395,6 +417,15 @@ impl Action {
     }
 }
 
+fn letters_in_order(label: &str, query: &str) -> bool {
+    let label = label.to_lowercase();
+    let mut letters = label.chars();
+    query
+        .to_lowercase()
+        .chars()
+        .all(|wanted| letters.any(|letter| letter == wanted))
+}
+
 /// The fixed actions whose labels contain the query's letters in order, then the jump command's
 /// folder, then running the query.
 fn palette_actions(query: &str, jump: Option<&Path>, has_project: bool) -> Vec<Action> {
@@ -408,13 +439,7 @@ fn palette_actions(query: &str, jump: Option<&Path>, has_project: bool) -> Vec<A
     ]
     .into_iter()
     .filter(|action| *action != Action::ChangeFolder || has_project)
-    .filter(|action| {
-        let label = action.label().to_lowercase();
-        let mut letters = label.chars();
-        needle
-            .chars()
-            .all(|wanted| letters.any(|letter| letter == wanted))
-    })
+    .filter(|action| letters_in_order(&action.label(), &needle))
     .collect();
     actions.extend(jump.map(|root| Action::Jump(root.to_owned())));
     if !query.is_empty() {
@@ -428,6 +453,7 @@ fn open_palette(state: &mut State, tx: &mut Tx) {
     state.palette = TextEdit::new("");
     state.palette_open = true;
     state.palette_selected = 0;
+    state.worktrees = None;
     tx.focus("palette-input", false);
 }
 
@@ -456,18 +482,93 @@ fn run_action(state: &mut State, action: &Action, tx: &mut Tx) {
     }
 }
 
-fn palette_key(state: &mut State, event: &KeyEvent, tx: &mut Tx) -> bool {
-    let last = palette_actions(
-        &state.palette.text,
-        state.jump_target(),
-        state.workspace.project().is_some(),
-    )
-    .len()
-    .saturating_sub(1);
+fn list_worktrees(state: &mut State, root: PathBuf, tx: &mut Tx) {
+    let (sender, receiver) = mpsc::channel();
+    state.worktrees = Some(WorktreeChoice {
+        root: root.clone(),
+        pending: Some(receiver),
+        found: Vec::new(),
+    });
+    state.palette = TextEdit::new("");
+    state.palette_selected = 0;
+    tx.focus("palette-input", false);
+    let shell = state.config.shell.clone();
+    let waker = state.waker.clone();
+    std::thread::spawn(move || {
+        let found = jump::worktrees(&shell, &root, JUMP_TIMEOUT)
+            .log_err("wt list")
+            .unwrap_or_default();
+        if sender.send(found).is_ok()
+            && let Some(waker) = waker
+        {
+            waker();
+        }
+    });
+}
+
+fn poll_worktrees(state: &mut State) -> bool {
+    let Some(choice) = &mut state.worktrees else {
+        return false;
+    };
+    let Some(found) = choice
+        .pending
+        .as_ref()
+        .and_then(|pending| pending.try_recv().ok())
+    else {
+        return false;
+    };
+    choice.pending = None;
+    choice.found = found;
+    if choice.found.is_empty() {
+        let root = choice.root.clone();
+        state.palette_open = false;
+        open_project(state, root);
+    }
+    true
+}
+
+/// Whether the key was one of the list's; typing edits the palette's input, which filters it.
+fn worktree_key(state: &mut State, event: &KeyEvent) -> bool {
+    let last = state.visible_worktrees().len().saturating_sub(1);
     match event.key {
         Key::Escape => state.palette_open = false,
         Key::Up => state.palette_selected = state.palette_selected.min(last).saturating_sub(1),
         Key::Down => state.palette_selected = (state.palette_selected + 1).min(last),
+        Key::Enter => open_worktree(state, state.palette_selected.min(last)),
+        _ => return false,
+    }
+    true
+}
+
+fn open_worktree(state: &mut State, index: usize) {
+    let Some(worktree) = state.visible_worktrees().get(index).copied() else {
+        return;
+    };
+    let path = worktree.path.clone();
+    state.palette_open = false;
+    open_project(state, path);
+}
+
+fn palette_key(state: &mut State, event: &KeyEvent, tx: &mut Tx) -> bool {
+    if state.worktrees.is_some() {
+        return worktree_key(state, event);
+    }
+    let actions = palette_actions(
+        &state.palette.text,
+        state.jump_target(),
+        state.workspace.project().is_some(),
+    );
+    let last = actions.len().saturating_sub(1);
+    match event.key {
+        Key::Escape => state.palette_open = false,
+        Key::Up => state.palette_selected = state.palette_selected.min(last).saturating_sub(1),
+        Key::Down => state.palette_selected = (state.palette_selected + 1).min(last),
+        Key::Enter
+            if event.mods.cmd
+                && let Some(Action::Jump(root)) = actions.get(state.palette_selected.min(last)) =>
+        {
+            list_worktrees(state, root.clone(), tx);
+        }
         Key::Enter if event.mods.cmd => {
             let query = state.palette.text.trim().to_owned();
             if !query.is_empty() {
@@ -1183,29 +1284,57 @@ fn view(state: &State, cx: &mut Cx<State>) -> El {
         .children(drawer)
         .children(overlay);
     let palette = state.palette_open.then(|| {
-        let actions = palette_actions(
-            &state.palette.text,
-            state.jump_target(),
-            state.workspace.project().is_some(),
-        );
-        let selected = state.palette_selected.min(actions.len().saturating_sub(1));
-        let rows = actions.iter().enumerate().map(|(index, action)| {
-            let shortcut = matches!(action, Action::Tray(_)).then(|| {
-                text("⌘↵")
-                    .key("palette-shortcut")
-                    .color(theme.text_secondary)
+        let rows: Vec<El> = if let Some(choice) = &state.worktrees {
+            let visible = state.visible_worktrees();
+            let selected = state.palette_selected.min(visible.len().saturating_sub(1));
+            let placeholder = choice
+                .pending
+                .is_some()
+                .then(|| pill("palette-0".to_owned(), "Loading worktrees…", false, None).w_full());
+            let worktrees = visible.iter().enumerate().map(|(index, worktree)| {
+                let branch = worktree.branch.as_deref().unwrap_or("(detached)");
+                let label = format!("{branch}  {}", jump::abbreviate_home(&worktree.path));
+                pill(format!("palette-{index}"), &label, index == selected, None)
+                    .w_full()
+                    .on_press(move |state: &mut State| open_worktree(state, index))
             });
-            pill(
-                format!("palette-{index}"),
-                &action.label(),
-                index == selected,
-                None,
-            )
-            .children(shortcut)
-            .justify_between()
-            .w_full()
-            .on_press_tx(move |state: &mut State, tx: &mut Tx| run_palette(state, index, tx))
-        });
+            placeholder.into_iter().chain(worktrees).collect()
+        } else {
+            let actions = palette_actions(
+                &state.palette.text,
+                state.jump_target(),
+                state.workspace.project().is_some(),
+            );
+            let selected = state.palette_selected.min(actions.len().saturating_sub(1));
+            actions
+                .iter()
+                .enumerate()
+                .map(|(index, action)| {
+                    let shortcut = match action {
+                        Action::Tray(_) => Some("⌘↵"),
+                        Action::Jump(_) => Some("⌘↵ worktrees"),
+                        _ => None,
+                    }
+                    .map(|hint| {
+                        text(hint)
+                            .key("palette-shortcut")
+                            .color(theme.text_secondary)
+                    });
+                    pill(
+                        format!("palette-{index}"),
+                        &action.label(),
+                        index == selected,
+                        None,
+                    )
+                    .children(shortcut)
+                    .justify_between()
+                    .w_full()
+                    .on_press_tx(move |state: &mut State, tx: &mut Tx| {
+                        run_palette(state, index, tx)
+                    })
+                })
+                .collect()
+        };
         col()
             .key("palette-layer")
             .pin(Some(0.0), Some(0.0), Some(0.0), Some(0.0))
@@ -1268,6 +1397,7 @@ fn poll(state: &mut State, now: f64, tx: &mut Tx) -> bool {
     let active = state.session().map(Session::id);
     let shown = state.workspace.active_session().map(Session::id);
     let mut changed = poll_jump(state, now, tx);
+    changed |= poll_worktrees(state);
     if state
         .pending_paste
         .as_ref()
@@ -1554,6 +1684,25 @@ const SCENES: &[Scene] = &[
         show_workspace_scene(state);
         state.palette = TextEdit::new("lz");
         state.palette_open = true;
+    }),
+    ("worktrees", |state| {
+        show_workspace_scene(state);
+        state.palette = TextEdit::new("site");
+        state.palette_open = true;
+        state.worktrees = Some(WorktreeChoice {
+            root: PathBuf::from("/Users/me/dev/site"),
+            pending: None,
+            found: vec![
+                jump::Worktree {
+                    branch: Some("main".to_owned()),
+                    path: PathBuf::from("/Users/me/dev/site"),
+                },
+                jump::Worktree {
+                    branch: Some("redesign".to_owned()),
+                    path: PathBuf::from("/Users/me/dev/site.redesign"),
+                },
+            ],
+        });
     }),
     ("tray", show_tray_scene),
     ("lazygit", show_lazygit_scene),
@@ -2140,6 +2289,142 @@ mod tests {
         assert_eq!(workspace.projects.len(), 2);
         assert_eq!(workspace.projects[1].root, Path::new("/dev/site"));
         assert!(!runtime.state.palette_open);
+    }
+
+    fn worktree(branch: &str, path: &str) -> jump::Worktree {
+        jump::Worktree {
+            branch: Some(branch.to_owned()),
+            path: PathBuf::from(path),
+        }
+    }
+
+    fn loaded(found: Vec<jump::Worktree>) -> WorktreeChoice {
+        WorktreeChoice {
+            root: PathBuf::from("/dev/site"),
+            pending: None,
+            found,
+        }
+    }
+
+    fn jump_runtime() -> Runtime<State> {
+        let mut runtime = palette_runtime();
+        press(&mut runtime, Key::Text("site".into()), Mods::default());
+        runtime.state.jump.query = "site".to_owned();
+        runtime.state.jump.found = Some(PathBuf::from("/dev/site"));
+        runtime
+    }
+
+    #[test]
+    fn the_jump_row_hints_at_worktrees() {
+        let mut runtime = jump_runtime();
+        runtime.frame(0.0);
+        assert!(runtime.find("palette-shortcut").is_some());
+    }
+
+    #[test]
+    fn command_enter_on_the_jump_row_lists_worktrees_and_enter_opens_one() {
+        let mut runtime = jump_runtime();
+        press(&mut runtime, Key::Enter, command());
+        assert!(runtime.state.palette_open);
+        assert!(runtime.state.worktrees.is_some());
+        let found = vec![
+            worktree("main", "/dev/site"),
+            worktree("feature", "/dev/site.feature"),
+        ];
+        runtime.state.worktrees = Some(loaded(found));
+        press(&mut runtime, Key::Down, Mods::default());
+        press(&mut runtime, Key::Enter, Mods::default());
+        let workspace = &runtime.state.workspace;
+        assert_eq!(workspace.projects.len(), 3);
+        assert_eq!(workspace.projects[2].root, Path::new("/dev/site.feature"));
+        assert!(!runtime.state.palette_open);
+    }
+
+    #[test]
+    fn an_open_worktree_is_selected_rather_than_reopened() {
+        let mut runtime = jump_runtime();
+        let root = runtime.state.workspace.projects[1].root.clone();
+        runtime.state.worktrees = Some(loaded(vec![jump::Worktree {
+            branch: None,
+            path: root,
+        }]));
+        press(&mut runtime, Key::Enter, Mods::default());
+        assert_eq!(runtime.state.workspace.projects.len(), 2);
+        assert_eq!(runtime.state.workspace.active, 1);
+        assert!(!runtime.state.palette_open);
+    }
+
+    #[test]
+    fn entering_worktree_mode_clears_the_query_and_typing_filters_the_list() {
+        let mut runtime = jump_runtime();
+        press(&mut runtime, Key::Enter, command());
+        assert_eq!(runtime.state.palette.text, "");
+        runtime.state.worktrees = Some(loaded(vec![
+            worktree("main", "/dev/site"),
+            worktree("feature", "/dev/site.feature"),
+            worktree("redesign", "/dev/site.redesign"),
+        ]));
+        press(&mut runtime, Key::Text("rdsn".into()), Mods::default());
+        let branches: Vec<_> = runtime
+            .state
+            .visible_worktrees()
+            .iter()
+            .map(|worktree| worktree.branch.clone().unwrap())
+            .collect();
+        assert_eq!(branches, ["redesign"]);
+        for _ in 0..3 {
+            press(&mut runtime, Key::Down, Mods::default());
+        }
+        press(&mut runtime, Key::Enter, Mods::default());
+        let workspace = &runtime.state.workspace;
+        assert_eq!(workspace.projects[2].root, Path::new("/dev/site.redesign"));
+    }
+
+    #[test]
+    fn a_filter_matching_nothing_leaves_enter_with_nothing_to_open() {
+        let mut runtime = jump_runtime();
+        runtime.state.worktrees = Some(loaded(vec![worktree("main", "/dev/site")]));
+        press(&mut runtime, Key::Text("zzz".into()), Mods::default());
+        press(&mut runtime, Key::Enter, Mods::default());
+        assert!(runtime.state.palette_open);
+        assert_eq!(runtime.state.workspace.projects.len(), 2);
+    }
+
+    #[test]
+    fn no_worktrees_falls_back_to_opening_the_jump_target() {
+        let mut runtime = jump_runtime();
+        let (sender, receiver) = mpsc::channel();
+        runtime.state.worktrees = Some(WorktreeChoice {
+            root: PathBuf::from("/dev/elsewhere"),
+            pending: Some(receiver),
+            ..loaded(Vec::new())
+        });
+        assert!(!poll_worktrees(&mut runtime.state));
+        assert!(runtime.state.palette_open);
+        sender.send(Vec::new()).unwrap();
+        assert!(poll_worktrees(&mut runtime.state));
+        let workspace = &runtime.state.workspace;
+        assert_eq!(workspace.projects[2].root, Path::new("/dev/elsewhere"));
+        assert!(!runtime.state.palette_open);
+    }
+
+    #[test]
+    fn escape_closes_the_worktree_list_and_reopening_resets_it() {
+        let mut runtime = jump_runtime();
+        press(&mut runtime, Key::Enter, command());
+        press(&mut runtime, Key::Escape, Mods::default());
+        assert!(!runtime.state.palette_open);
+        press(&mut runtime, Key::Command('p'), command());
+        assert!(runtime.state.worktrees.is_none());
+    }
+
+    #[test]
+    fn command_enter_off_the_jump_row_still_runs_in_the_tray() {
+        let mut runtime = jump_runtime();
+        press(&mut runtime, Key::Down, Mods::default());
+        press(&mut runtime, Key::Enter, command());
+        assert!(runtime.state.worktrees.is_none());
+        assert_eq!(runtime.state.workspace.projects[0].tray.len(), 1);
     }
 
     #[test]
