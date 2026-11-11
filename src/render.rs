@@ -51,7 +51,7 @@ enum GlyphText {
     /// Cell `index` of a run of characters shaped together, for cells that differ from standing alone.
     Shaped {
         run: Rc<str>,
-        index: u8,
+        index: u16,
     },
     Underline(Underline),
 }
@@ -178,9 +178,6 @@ fn glyph_key(grid: &Grid, cell: &Cell) -> Option<GlyphKey> {
     })
 }
 
-/// Longer runs are shaped in pieces, which keeps each one small enough to cache.
-const MAX_RUN: usize = 16;
-
 /// Neighbouring cells shaped together: the same style, on one row, all selected or all not, and
 /// not the cursor, which splits a ligature as Ghostty does.
 struct Run {
@@ -204,7 +201,7 @@ fn find_run(
 ) -> Run {
     let cols = usize::from(grid.cols).max(1);
     let first = &grid.cells[start];
-    let end = (start + 1..grid.cells.len().min(start + MAX_RUN))
+    let end = (start + 1..grid.cells.len())
         .find(|&index| {
             let cell = &grid.cells[index];
             index % cols == 0
@@ -213,7 +210,7 @@ fn find_run(
                 || (cell.bold, cell.italic, cell.selected)
                     != (first.bold, first.italic, first.selected)
         })
-        .unwrap_or(grid.cells.len().min(start + MAX_RUN));
+        .unwrap_or(grid.cells.len());
     text.clear();
     text.extend(grid.cells[start..end].iter().map(|cell| cell.character));
     let style = FontStyle {
@@ -378,7 +375,7 @@ fn build_quads(
                             .text
                             .get_or_insert_with(|| run_text.as_str().into())
                             .clone(),
-                        index: (index - run.start) as u8,
+                        index: (index - run.start) as u16,
                     },
                     style: FontStyle {
                         bold: cell.bold,
@@ -809,7 +806,11 @@ mod tests {
     }
 
     /// The run cells `build_quads` asks the atlas for, as `(run, index)`.
-    fn shaped_keys(bytes: &[u8], features: &[&str]) -> Vec<(String, u8)> {
+    fn shaped_keys(bytes: &[u8], features: &[&str]) -> Vec<(String, u16)> {
+        shaped_keys_in(bytes, 8, features)
+    }
+
+    fn shaped_keys_in(bytes: &[u8], cols: u16, features: &[&str]) -> Vec<(String, u16)> {
         let features: Vec<String> = features
             .iter()
             .map(|feature| (*feature).to_owned())
@@ -823,7 +824,7 @@ mod tests {
             &features,
         )
         .unwrap();
-        let grid = Grid::from_vt(bytes, 8, 2).unwrap();
+        let grid = Grid::from_vt(bytes, cols, 2).unwrap();
         let mut keys = Vec::new();
         build_quads(
             &grid,
@@ -853,6 +854,15 @@ mod tests {
     fn the_cursor_breaks_a_ligature() {
         assert!(shaped_keys(b"a != b\x1b[1;3H", &[]).is_empty());
         assert!(shaped_keys(b"a != b\x1b[1;4H", &[]).is_empty());
+    }
+
+    #[test]
+    fn a_ligature_inside_a_long_token_still_shapes() {
+        // The cells at 15 and 16 once fell either side of a fixed chunk boundary.
+        let token = b"abcdefghijklmno!=pqrstuvwxyz";
+        let keys = shaped_keys_in(token, 40, &[]);
+        let run = String::from_utf8_lossy(token).into_owned();
+        assert!(keys.contains(&(run.clone(), 15)) && keys.contains(&(run, 16)));
     }
 
     #[test]

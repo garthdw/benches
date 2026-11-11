@@ -521,30 +521,44 @@ impl Font {
     ) -> Option<GlyphKind> {
         let font = &self.faces[Self::face_index(style)];
         let shaped = shape(font, run)?;
-        let cells = run.len();
+        // A glyph spills at most into its neighbours, so a long token needs only three cells drawn.
+        let first = index.saturating_sub(1);
+        let cells = (index + 2).min(run.len()) - first;
         let row = (self.cell_width * 4) as usize;
-        let mut whole = vec![0u8; row * cells * self.cell_height as usize];
-        let context = self.bitmap_context(&mut whole, self.cell_width * cells as u32)?;
+        let mut window = vec![0u8; row * cells * self.cell_height as usize];
+        let context = self.bitmap_context(&mut window, self.cell_width * cells as u32)?;
         // A cell's glyph is centred in it and CoreText advances by the unrounded width.
         let ratio = f64::from(self.cell_width) / self.advance;
         let centred = (f64::from(self.cell_width) - self.advance) / 2.0;
-        let mut positions = shaped.positions;
-        for position in &mut positions {
-            position.x = position.x * ratio + centred;
-            position.y += self.baseline;
+        let (mut glyphs, mut positions) = (Vec::new(), Vec::new());
+        for ((glyph, position), cell) in shaped
+            .glyphs
+            .iter()
+            .zip(&shaped.positions)
+            .zip(&shaped.indices)
+        {
+            let cell = usize::try_from(*cell).ok()?;
+            if (first..first + cells).contains(&cell) {
+                glyphs.push(*glyph);
+                positions.push(CGPoint {
+                    x: (position.x - first as f64 * self.advance) * ratio + centred,
+                    y: position.y + self.baseline,
+                });
+            }
         }
         // SAFETY: both buffers hold `glyphs.len()` elements and `context` is live.
         unsafe {
             font.draw_glyphs(
-                NonNull::new(shaped.glyphs.as_ptr().cast_mut())?,
+                NonNull::new(glyphs.as_mut_ptr())?,
                 NonNull::new(positions.as_mut_ptr())?,
-                shaped.glyphs.len(),
+                glyphs.len(),
                 &context,
             );
         }
         out.clear();
-        for line in whole.chunks_exact(row * cells) {
-            out.extend_from_slice(line.get(index * row..(index + 1) * row)?);
+        let column = (index - first) * row;
+        for line in window.chunks_exact(row * cells) {
+            out.extend_from_slice(line.get(column..column + row)?);
         }
         Some(GlyphKind::Coverage)
     }
