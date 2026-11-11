@@ -742,7 +742,7 @@ fn whole_lines(remainder: &mut f32, delta: f32) -> i32 {
 
 fn open_link(url: &str) {
     let mut open = Command::new("/usr/bin/open");
-    open.arg(url);
+    open.args(link::open_args(url));
     thread::spawn(move || open.status().log_err("open link"));
 }
 

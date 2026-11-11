@@ -11,6 +11,36 @@ pub fn openable(uri: &str) -> bool {
     })
 }
 
+/// Arguments for `/usr/bin/open`. A file is revealed in Finder rather than opened, because
+/// opening would launch an `.app` or `.command` that program output merely named.
+pub fn open_args(uri: &str) -> Vec<String> {
+    let Some(rest) = uri
+        .get(..7)
+        .filter(|scheme| scheme.eq_ignore_ascii_case("file://"))
+        .and_then(|_| uri.get(7..))
+    else {
+        return vec![uri.to_owned()];
+    };
+    // Skips a host such as `localhost`.
+    let path = &rest[rest.find('/').unwrap_or(rest.len())..];
+    vec!["-R".to_owned(), percent_decode(path)]
+}
+
+fn percent_decode(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut at = 0;
+    while let Some(&byte) = bytes.get(at) {
+        let escaped = (byte == b'%')
+            .then(|| text.get(at + 1..at + 3))
+            .flatten()
+            .and_then(|hex| u8::from_str_radix(hex, 16).ok());
+        decoded.push(escaped.unwrap_or(byte));
+        at += if escaped.is_some() { 3 } else { 1 };
+    }
+    String::from_utf8_lossy(&decoded).into_owned()
+}
+
 /// The URL under `column` in one row of cells, one `char` per column. Links that wrap onto
 /// the next row are not joined.
 pub fn url_at(row: &[char], column: usize) -> Option<String> {
@@ -131,6 +161,18 @@ mod tests {
             at("HTTPS://X.TEST/a", "X.TEST").as_deref(),
             Some("HTTPS://X.TEST/a")
         );
+    }
+
+    #[test]
+    fn web_and_mail_links_open_plainly() {
+        assert_eq!(open_args("https://a.test/x"), ["https://a.test/x"]);
+        assert_eq!(open_args("mailto:a@b.test"), ["mailto:a@b.test"]);
+    }
+
+    #[test]
+    fn file_links_are_revealed_not_opened() {
+        assert_eq!(open_args("file:///tmp/a%20b.app"), ["-R", "/tmp/a b.app"]);
+        assert_eq!(open_args("FILE://localhost/tmp/x"), ["-R", "/tmp/x"]);
     }
 
     #[test]
