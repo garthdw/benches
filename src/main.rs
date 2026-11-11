@@ -711,15 +711,8 @@ fn caret_rect(grid: &Grid) -> Option<[f32; 4]> {
     if metrics.cell_width == 0 {
         return None;
     }
-    let width = f32::from(metrics.cell_width) / metrics.scale;
-    let height = f32::from(metrics.cell_height) / metrics.scale;
-    let padding = metrics.padding / metrics.scale;
-    Some([
-        padding + f32::from(x) * width,
-        padding + f32::from(y) * height,
-        width,
-        height,
-    ])
+    let origin = metrics.origin([0.0; 4]);
+    Some(metrics.to_points(metrics.cell_rect(origin, x, y)))
 }
 
 fn resolve_paste(state: &mut State, confirmed: bool) {
@@ -1896,6 +1889,23 @@ mod tests {
             scale: 2.0,
         };
         assert_eq!(caret_rect(&grid), Some([22.0, 6.0, 8.0, 16.0]));
+    }
+
+    #[test]
+    fn the_caret_is_the_drawn_cell_in_points_at_fractional_scales() {
+        for scale in [1.0, 1.25, 1.5, 2.0] {
+            let mut grid = Grid::from_vt(b"ab", 10, 2).unwrap();
+            grid.metrics = session::Metrics {
+                cell_width: 9,
+                cell_height: 19,
+                padding: 12.0 * scale,
+                scale,
+            };
+            let metrics = grid.metrics;
+            let (x, y) = grid.cursor.unwrap();
+            let drawn = metrics.cell_rect(metrics.origin([0.0; 4]), x, y);
+            assert_eq!(caret_rect(&grid), Some(metrics.to_points(drawn)), "{scale}");
+        }
     }
 
     fn workspace_state() -> State {

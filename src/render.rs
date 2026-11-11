@@ -181,24 +181,21 @@ fn solid(rect: [f32; 4], fill: [u8; 3], srgb_blend: bool) -> Quad {
 fn build_quads(
     grid: &Grid,
     rect: [f32; 4],
-    padding: f32,
+    metrics: Metrics,
     font: &Font,
     srgb_blend: bool,
     quads: &mut Vec<Quad>,
     mut glyph: impl FnMut(GlyphKey) -> (Option<AtlasGlyph>, u64),
 ) {
     let solid = |rect, fill| solid(rect, fill, srgb_blend);
-    let (width, height) = (font.cell_width as f32, font.cell_height as f32);
-    let (origin_x, origin_y) = ((rect[0] + padding).round(), (rect[1] + padding).round());
+    let (width, height) = (
+        f32::from(metrics.cell_width),
+        f32::from(metrics.cell_height),
+    );
+    let origin = metrics.origin(rect);
     let cols = usize::from(grid.cols);
-    let cell_rect = |index: usize| {
-        [
-            origin_x + (index % cols) as f32 * width,
-            origin_y + (index / cols) as f32 * height,
-            width,
-            height,
-        ]
-    };
+    let cell_rect =
+        |index: usize| metrics.cell_rect(origin, (index % cols) as u16, (index / cols) as u16);
 
     quads.clear();
     quads.push(solid(rect, grid.bg));
@@ -314,25 +311,19 @@ fn build_quads(
 }
 
 /// The thumb, centred in the right padding beside the rows the grid fills, as the pointer finds it there.
-fn scrollbar_thumb(
-    grid: &Grid,
-    rect: [f32; 4],
-    padding: f32,
-    scale: f32,
-    cell_height: f32,
-) -> Option<[f32; 4]> {
+fn scrollbar_thumb(grid: &Grid, rect: [f32; 4], metrics: Metrics) -> Option<[f32; 4]> {
     let scrollbar = grid.scrollbar.filter(|scrollbar| scrollbar.opacity > 0.0)?;
     let rows = grid.cells.len() / usize::from(grid.cols).max(1);
-    let (track, min) = Scrollbar::track(rows, cell_height, scale);
+    let (track, min) = Scrollbar::track(rows, f32::from(metrics.cell_height), metrics.scale);
     let (top, height) = scrollbar.thumb(track, min);
     let points = if scrollbar.wide {
         WIDE_SCROLLBAR_POINTS
     } else {
         SCROLLBAR_POINTS
     };
-    let width = (points * scale).round();
-    let left = (rect[0] + rect[2] - (padding + width) / 2.0).round();
-    Some([left, (rect[1] + padding).round() + top, width, height])
+    let width = (points * metrics.scale).round();
+    let left = (rect[0] + rect[2] - (metrics.padding + width) / 2.0).round();
+    Some([left, metrics.origin(rect).1 + top, width, height])
 }
 
 /// Two fifths of the way from the background toward white or black, whichever contrasts,
@@ -566,19 +557,13 @@ impl TerminalCompositor {
             .or_insert_with(|| new_slot(device, &gpu.layout, &gpu.view, &gpu.sampler));
 
         let rect = site.instance.rect;
-        let padding = PADDING_POINTS * site.scale;
-        let cols = (((rect[2] - 2.0 * padding) / font.cell_width as f32) as u16).max(1);
-        let rows = (((rect[3] - 2.0 * padding) / font.cell_height as f32) as u16).max(1);
-        let surface = Surface {
-            cols,
-            rows,
-            metrics: Metrics {
-                cell_width: font.cell_width as u16,
-                cell_height: font.cell_height as u16,
-                padding,
-                scale: site.scale,
-            },
+        let metrics = Metrics {
+            cell_width: font.cell_width as u16,
+            cell_height: font.cell_height as u16,
+            padding: PADDING_POINTS * site.scale,
+            scale: site.scale,
         };
+        let surface = Surface::fit((rect[2], rect[3]), metrics);
         // Hidden tabs share the visible area, as closed tray processes share the drawer's, so they are sized too.
         let workspace = &state.workspace;
         let session = if site.mark == crate::OVERLAY_MARK {
@@ -615,7 +600,7 @@ impl TerminalCompositor {
             build_quads(
                 &grid,
                 rect,
-                padding,
+                metrics,
                 font,
                 site.srgb_blend,
                 &mut slot.scratch,
@@ -625,8 +610,7 @@ impl TerminalCompositor {
                 },
             );
             if let Some(scrollbar) = grid.scrollbar
-                && let Some(thumb) =
-                    scrollbar_thumb(&grid, rect, padding, site.scale, font.cell_height as f32)
+                && let Some(thumb) = scrollbar_thumb(&grid, rect, metrics)
             {
                 slot.scratch.push(solid(
                     thumb,
@@ -703,13 +687,22 @@ mod tests {
         }
     }
 
+    fn metrics(font: &Font, padding: f32, scale: f32) -> Metrics {
+        Metrics {
+            cell_width: font.cell_width as u16,
+            cell_height: font.cell_height as u16,
+            padding,
+            scale,
+        }
+    }
+
     fn quads_for(grid: &Grid, scale: f32) -> (Vec<Quad>, Font) {
         let font = Font::new(crate::config::DEFAULT_FONT_FAMILY, 18.0, scale).unwrap();
         let mut quads = Vec::new();
         build_quads(
             grid,
             [0.0, 0.0, 800.0, 600.0],
-            0.0,
+            metrics(&font, 0.0, scale),
             &font,
             true,
             &mut quads,
@@ -824,21 +817,23 @@ mod tests {
     #[test]
     fn the_thumb_sits_in_the_right_padding_at_the_bottom_of_the_rows() {
         let rect = [0.0, 0.0, 300.0, 200.0];
+        let metrics = Metrics {
+            cell_width: 10,
+            cell_height: 20,
+            padding: 12.0,
+            scale: 2.0,
+        };
         assert_eq!(
-            scrollbar_thumb(&Grid::from_vt(b"hi", 20, 5).unwrap(), rect, 12.0, 2.0, 20.0),
+            scrollbar_thumb(&Grid::from_vt(b"hi", 20, 5).unwrap(), rect, metrics),
             None
         );
         let mut grid = Grid::from_vt("line\r\n".repeat(30).as_bytes(), 20, 5).unwrap();
-        assert_eq!(
-            scrollbar_thumb(&grid, rect, 12.0, 2.0, 20.0),
-            None,
-            "hidden"
-        );
+        assert_eq!(scrollbar_thumb(&grid, rect, metrics), None, "hidden");
         let mut thumb = |opacity, wide| {
             if let Some(scrollbar) = &mut grid.scrollbar {
                 (scrollbar.opacity, scrollbar.wide) = (opacity, wide);
             }
-            scrollbar_thumb(&grid, rect, 12.0, 2.0, 20.0).unwrap()
+            scrollbar_thumb(&grid, rect, metrics).unwrap()
         };
         let [left, top, width, height] = thumb(0.5, false);
         assert!(left >= 300.0 - 12.0 && left + width <= 300.0);
@@ -864,7 +859,7 @@ mod tests {
         build_quads(
             &grid,
             [0.0, 0.0, 800.0, 600.0],
-            0.0,
+            metrics(&font, 0.0, 1.0),
             &font,
             true,
             &mut quads,
