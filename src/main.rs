@@ -686,7 +686,6 @@ fn view(state: &State, cx: &mut Cx<State>) -> El {
     let accent = cx.accent();
     let attention_dot = |attention: Attention| match attention {
         Attention::None => None,
-        Attention::Activity => Some(dot(theme.text_secondary)),
         Attention::Alert => Some(dot(accent)),
     };
     let status_dot = |status: &Status| {
@@ -1340,7 +1339,6 @@ fn show_tray_scene(state: &mut State) {
     show_workspace_scene(state);
     add_scene_tray(state);
     state.workspace.projects[0].tabs[1].attention = Attention::Alert;
-    state.workspace.projects[0].tabs[2].attention = Attention::Activity;
     state.workspace.toggle_drawer(0);
 }
 
