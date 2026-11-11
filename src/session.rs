@@ -34,6 +34,28 @@ use crate::config::{Config, Theme};
 use crate::input::KeyInput;
 use crate::link;
 
+/// A waker whose target can change, so a session keeps waking the window that shows it after a move.
+#[derive(Clone)]
+pub struct Retarget(Arc<Mutex<Waker>>);
+
+impl Retarget {
+    pub fn new(waker: Waker) -> Self {
+        Self(Arc::new(Mutex::new(waker)))
+    }
+
+    pub fn waker(&self) -> Waker {
+        let target = self.clone();
+        Arc::new(move || {
+            let waker = target
+                .0
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clone();
+            waker();
+        })
+    }
+}
+
 const FRAME: Duration = Duration::from_millis(8);
 /// How long the size must hold before the program sees it, as each SIGWINCH makes inline TUIs reprint.
 const RESIZE_SETTLE: Duration = Duration::from_millis(100);

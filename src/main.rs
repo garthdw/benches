@@ -24,7 +24,7 @@ use rune::{
 
 use anyhow::Context;
 use session::LogErr;
-use session::{Attention, Event, Grid, PointerInput, PointerPhase, Session, WheelInput};
+use session::{Attention, Event, Grid, PointerInput, PointerPhase, Retarget, Session, WheelInput};
 use workspace::{Project, SavedWorkspace, Slot, Status, Tab, Workspace};
 
 const TERMINAL_MARK: u32 = 1;
@@ -163,11 +163,19 @@ impl State {
         self.workspace.focused_session()
     }
 
-    fn spawn_tab(&self, title: &str, command: Option<&str>, cwd: &Path) -> Tab {
+    fn window_waker(&self) -> Waker {
         let waker = self.waker.clone().unwrap_or_else(|| Arc::new(|| {}));
-        let waker = self.repaint.waker(waker);
-        let mut tab = match Session::spawn(command, cwd, &self.config, waker) {
-            Ok(session) => Tab::new(title, session),
+        self.repaint.waker(waker)
+    }
+
+    fn spawn_tab(&self, title: &str, command: Option<&str>, cwd: &Path) -> Tab {
+        let retarget = Retarget::new(self.window_waker());
+        let mut tab = match Session::spawn(command, cwd, &self.config, retarget.waker()) {
+            Ok(session) => {
+                let mut tab = Tab::new(title, session);
+                tab.retarget = Some(retarget);
+                tab
+            }
             Err(error) => {
                 let message = format!("failed to start {title}: {error:#}");
                 let mut tab = Tab::new(title, Session::fixture(Grid::message(&message)));

@@ -4,7 +4,7 @@ use std::process::ExitStatus;
 
 use serde::{Deserialize, Serialize};
 
-use crate::session::{Attention, Grid, Session, Visibility};
+use crate::session::{Attention, Grid, Retarget, Session, Visibility};
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Status {
@@ -26,6 +26,8 @@ pub struct Tab {
     /// Where the process started, so a restart runs there again.
     pub cwd: Option<PathBuf>,
     pub session: Session,
+    /// Absent for placeholders and fixtures, which have no process to wake the window.
+    pub retarget: Option<Retarget>,
     pub status: Status,
     /// Respawn once the stopped process has exited, so the new one can take its port.
     pub restart: bool,
@@ -40,6 +42,7 @@ impl Tab {
             command: None,
             cwd: None,
             session,
+            retarget: None,
             status: Status::Running,
             restart: false,
             stopping: false,
@@ -115,6 +118,13 @@ impl Project {
             || root.display().to_string(),
             |name| name.to_string_lossy().into_owned(),
         )
+    }
+
+    pub fn tabs_mut(&mut self) -> impl Iterator<Item = &mut Tab> {
+        self.tabs
+            .iter_mut()
+            .chain(&mut self.tray)
+            .chain(&mut self.overlay)
     }
 
     pub fn drawer_tab(&self) -> Option<&Tab> {
@@ -247,13 +257,7 @@ impl Workspace {
     }
 
     pub fn tabs_mut(&mut self) -> impl Iterator<Item = &mut Tab> {
-        self.projects.iter_mut().flat_map(|project| {
-            project
-                .tabs
-                .iter_mut()
-                .chain(&mut project.tray)
-                .chain(&mut project.overlay)
-        })
+        self.projects.iter_mut().flat_map(Project::tabs_mut)
     }
 
     pub fn project_index(&self, root: &std::path::Path) -> Option<usize> {
@@ -335,15 +339,21 @@ impl Workspace {
 
     /// Closes project `index` with all its tabs and tray processes, keeping the selected project selected.
     pub fn close_project(&mut self, index: usize) {
+        self.take_project(index);
+    }
+
+    /// Removes project `index` with its processes still running, keeping the selected project selected.
+    pub fn take_project(&mut self, index: usize) -> Option<Project> {
         if index >= self.projects.len() {
-            return;
+            return None;
         }
-        self.projects.remove(index);
+        let project = self.projects.remove(index);
         if index < self.active {
             self.active -= 1;
         }
         self.active = self.active.min(self.projects.len().saturating_sub(1));
         self.show_active();
+        Some(project)
     }
 
     pub fn add_tray(&mut self, tab: Tab) {
