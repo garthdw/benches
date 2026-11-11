@@ -153,6 +153,9 @@ impl Hasher for Fnv {
     }
 }
 
+/// The most cells a ligature is assumed to span on either side of one of its cells.
+const LIGATURE_REACH: usize = 8;
+
 /// Runs cached before the cache is emptied; words are the usual run, so this bounds memory.
 const RUN_CACHE_LIMIT: usize = 4096;
 
@@ -579,9 +582,10 @@ impl Font {
     ) -> Option<GlyphKind> {
         let font = &self.faces[Self::face_index(style)];
         let shaped = shape(font, run)?;
-        // A glyph spills at most into its neighbours, so a long token needs only three cells drawn.
-        let first = index.saturating_sub(1);
-        let cells = (index + 2).min(run.chars().count()) - first;
+        // A ligature glyph can be drawn several cells away from the cells it paints, so a long
+        // token draws a window around `index` rather than every cell.
+        let first = index.saturating_sub(LIGATURE_REACH);
+        let cells = (index + LIGATURE_REACH + 1).min(run.chars().count()) - first;
         let row = (self.cell_width * 4) as usize;
         let mut window = vec![0u8; row * cells * self.cell_height as usize];
         let context = self.bitmap_context(&mut window, self.cell_width * cells as u32)?;
@@ -982,6 +986,18 @@ mod tests {
         assert_eq!(shaped.len(), 4);
         assert_eq!(&shaped[2..], [true, true]);
         assert_eq!(cells(&font, "→é!=").len(), 4);
+    }
+
+    #[test]
+    fn every_cell_of_a_multi_cell_ligature_keeps_its_ink() {
+        let font = with_features(&[]);
+        let dots = |text: &str| cells(&font, text);
+        // The font draws all three dots with the last glyph, so cells need glyphs beyond neighbours.
+        for (cell, pixels) in dots("...").iter().enumerate() {
+            assert!(ink_height(&font, pixels, 1) > 0, "cell {cell}");
+        }
+        let long = dots("abcdefghijklmnopqrstuvwxyz...");
+        assert_eq!(&long[26..], &dots("...")[..]);
     }
 
     #[test]
