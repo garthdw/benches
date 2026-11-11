@@ -7,7 +7,7 @@ use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::rc::Rc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -75,8 +75,6 @@ pub enum Event {
     /// The program's title (OSC 0 or 2); empty when it clears it.
     Title(String),
     Exited(ExitStatus),
-    /// Sent while not shown, once for each level raised since the session was last shown.
-    Attention(Attention),
     /// A bell or desktop notification while not shown with keys, once until it next is.
     /// A bell has an empty title and body; OSC 9 has no title.
     Notify {
@@ -101,11 +99,49 @@ pub struct Metrics {
     pub scale: f32,
 }
 
+impl Metrics {
+    /// The first cell's top-left in pixels, whole so every cell edge lands on a pixel.
+    pub fn origin(self, rect: [f32; 4]) -> (f32, f32) {
+        (
+            (rect[0] + self.padding).round(),
+            (rect[1] + self.padding).round(),
+        )
+    }
+
+    pub fn cell_rect(self, origin: (f32, f32), col: u16, row: u16) -> [f32; 4] {
+        let (width, height) = (f32::from(self.cell_width), f32::from(self.cell_height));
+        [
+            origin.0 + f32::from(col) * width,
+            origin.1 + f32::from(row) * height,
+            width,
+            height,
+        ]
+    }
+
+    pub fn to_points(self, rect: [f32; 4]) -> [f32; 4] {
+        rect.map(|pixels| pixels / self.scale)
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Surface {
     pub cols: u16,
     pub rows: u16,
     pub metrics: Metrics,
+}
+
+impl Surface {
+    /// The whole cells that fit a pixel `size` inside the padding, at least one each way.
+    pub fn fit((width, height): (f32, f32), metrics: Metrics) -> Self {
+        let fit = |extent: f32, cell: u16| {
+            (((extent - 2.0 * metrics.padding) / f32::from(cell)) as u16).max(1)
+        };
+        Self {
+            cols: fit(width, metrics.cell_width),
+            rows: fit(height, metrics.cell_height),
+            metrics,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -776,24 +812,20 @@ impl TerminalInput {
     }
 
     fn viewport_point(surface: Surface, (x, y): (f32, f32)) -> PointCoordinate {
-        let Metrics {
-            cell_width,
-            cell_height,
-            padding,
-            ..
-        } = surface.metrics;
-        let cell = |position: f32, size: u16, count: u16| {
-            ((position - padding) / f32::from(size)).clamp(0.0, f32::from(count.saturating_sub(1)))
+        let metrics = surface.metrics;
+        let origin = metrics.origin([0.0; 4]);
+        let cell = |position: f32, origin: f32, size: u16, count: u16| {
+            ((position - origin) / f32::from(size)).clamp(0.0, f32::from(count.saturating_sub(1)))
         };
         PointCoordinate {
-            x: cell(x, cell_width, surface.cols) as u16,
-            y: cell(y, cell_height, surface.rows) as u32,
+            x: cell(x, origin.0, metrics.cell_width, surface.cols) as u16,
+            y: cell(y, origin.1, metrics.cell_height, surface.rows) as u32,
         }
     }
 
     fn geometry(surface: Surface) -> Geometry {
         let metrics = surface.metrics;
-        let padding = metrics.padding.round() as u32;
+        let padding = metrics.origin([0.0; 4]).0 as u32;
         Geometry {
             columns: surface.cols.into(),
             cell_width: metrics.cell_width.into(),
@@ -883,7 +915,7 @@ impl TerminalInput {
             metrics.cell_height.into(),
             metrics.scale,
         );
-        let y = y * metrics.scale - metrics.padding;
+        let y = y * metrics.scale - metrics.origin([0.0; 4]).1;
         let grab = match (phase, self.scrollbar_grab) {
             (PointerPhase::Drag, Some(grab)) => grab,
             (PointerPhase::Drag, None) => return Ok(()),
@@ -1107,6 +1139,8 @@ pub struct Session {
     pid: Arc<Mutex<Option<i32>>>,
     commands: Option<Sender<Msg>>,
     grid: Arc<Mutex<Arc<Grid>>>,
+    /// Set by the actor when an alert arrives while not shown; cleared when it is shown.
+    alerted: Arc<AtomicBool>,
     events: Receiver<Event>,
     sent_surface: std::cell::Cell<Option<Surface>>,
     visibility: std::cell::Cell<Visibility>,
@@ -1179,6 +1213,7 @@ impl Session {
 
         let (commands, commands_rx) = unbounded();
         let grid = Arc::new(Mutex::new(Arc::new(Grid::default())));
+        let alerted = Arc::new(AtomicBool::new(false));
         let (events_tx, events) = unbounded();
         let (finished_tx, finished) = bounded::<()>(0);
         let mut actor = Actor {
@@ -1191,6 +1226,7 @@ impl Session {
             pid: pid.clone(),
             master,
             slot: grid.clone(),
+            alerted: alerted.clone(),
             events: events_tx,
             waker,
             theme: config.theme.clone(),
@@ -1211,6 +1247,7 @@ impl Session {
             pid,
             commands: Some(commands),
             grid,
+            alerted,
             events,
             sent_surface: std::cell::Cell::new(None),
             visibility: std::cell::Cell::new(Visibility::Shown),
@@ -1226,6 +1263,7 @@ impl Session {
             pid: Arc::default(),
             commands: None,
             grid: Arc::new(Mutex::new(Arc::new(grid))),
+            alerted: Arc::default(),
             events: unbounded().1,
             sent_surface: std::cell::Cell::new(None),
             visibility: std::cell::Cell::new(Visibility::Shown),
@@ -1336,6 +1374,20 @@ impl Session {
         }
     }
 
+    /// A shown session has been seen, so it reads as none.
+    pub fn attention(&self) -> Attention {
+        if self.visibility.get() != Visibility::Shown && self.alerted.load(Ordering::Acquire) {
+            Attention::Alert
+        } else {
+            Attention::None
+        }
+    }
+
+    /// For fixtures, which have no actor to raise it.
+    pub fn alert(&self) {
+        self.alerted.store(true, Ordering::Release);
+    }
+
     #[cfg(test)]
     pub fn visibility(&self) -> Visibility {
         self.visibility.get()
@@ -1420,6 +1472,7 @@ struct Actor {
     pid: Arc<Mutex<Option<i32>>>,
     master: OwnedFd,
     slot: Arc<Mutex<Arc<Grid>>>,
+    alerted: Arc<AtomicBool>,
     events: Sender<Event>,
     waker: Waker,
     theme: Theme,
@@ -1507,7 +1560,6 @@ impl Actor {
                 ));
             }
         })?;
-        let mut attention = Attention::None;
         let mut notified = false;
 
         let mut input = TerminalInput::new()?;
@@ -1542,9 +1594,11 @@ impl Actor {
                         dirty = true;
                         let alerted = alerted.replace(false);
                         let notice = notice.borrow_mut().take();
-                        if alerted && !publisher.borrow().visible() && attention == Attention::None {
-                            attention = Attention::Alert;
-                            self.emit(Event::Attention(Attention::Alert));
+                        if alerted
+                            && !publisher.borrow().visible()
+                            && !self.alerted.swap(true, Ordering::AcqRel)
+                        {
+                            (self.waker)();
                         }
                         let seen = {
                             let publisher = publisher.borrow();
@@ -1634,7 +1688,7 @@ impl Actor {
                     Ok(Msg::Stop) => terminate(&mut self.child, &self.pid),
                     Ok(Msg::Visibility(visibility)) => {
                         if visibility == Visibility::Shown {
-                            attention = Attention::None;
+                            self.alerted.store(false, Ordering::Release);
                         }
                         // The UI's hover and pointer move to whichever session takes this one's place.
                         if visibility != Visibility::Shown {
@@ -2011,6 +2065,58 @@ mod tests {
         publisher.visibility = Visibility::Hidden;
         assert!(publisher.deadline(true, now) > now + Duration::from_secs(60));
         assert!(!publisher.tick_blink(now));
+    }
+
+    fn fractional_metrics(scale: f32) -> Metrics {
+        Metrics {
+            cell_width: 9,
+            cell_height: 19,
+            padding: 12.0 * scale,
+            scale,
+        }
+    }
+
+    #[test]
+    fn hit_testing_finds_the_cell_drawn_at_any_scale() {
+        for scale in [1.0, 1.25, 1.5, 2.0] {
+            let metrics = fractional_metrics(scale);
+            let surface = Surface::fit((700.0, 500.0), metrics);
+            let origin = metrics.origin([0.0; 4]);
+            for (col, row) in [(0, 0), (1, 3), (surface.cols - 1, surface.rows - 1)] {
+                let [left, top, width, height] = metrics.cell_rect(origin, col, row);
+                for (x, y) in [(left, top), (left + width / 2.0, top + height / 2.0)] {
+                    let point = TerminalInput::viewport_point(surface, (x, y));
+                    assert_eq!((point.x, u16::try_from(point.y)), (col, Ok(row)), "{scale}");
+                }
+                let just_before = TerminalInput::viewport_point(surface, (left - 0.01, top - 0.01));
+                assert_eq!(just_before.x, col.saturating_sub(1), "{scale}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_cell_origin_is_whole_pixels_within_the_rect() {
+        let metrics = fractional_metrics(1.5);
+        assert_eq!(metrics.origin([0.0; 4]), (18.0, 18.0));
+        assert_eq!(metrics.origin([10.4, 20.6, 0.0, 0.0]), (28.0, 39.0));
+    }
+
+    #[test]
+    fn fit_keeps_whole_cells_inside_the_padding_and_at_least_one() {
+        let metrics = fractional_metrics(2.0);
+        let surface = Surface::fit((48.0 + 9.0 * 4.0 + 8.0, 48.0 + 19.0 * 2.0 + 5.0), metrics);
+        assert_eq!((surface.cols, surface.rows), (4, 2));
+        let tiny = Surface::fit((1.0, 1.0), metrics);
+        assert_eq!((tiny.cols, tiny.rows), (1, 1));
+    }
+
+    #[test]
+    fn rects_convert_to_points_by_the_scale() {
+        let metrics = fractional_metrics(2.0);
+        assert_eq!(
+            metrics.to_points([10.0, 20.0, 30.0, 40.0]),
+            [5.0, 10.0, 15.0, 20.0]
+        );
     }
 
     const TEST_SURFACE: Surface = Surface {
@@ -3174,33 +3280,40 @@ mod tests {
         wait_for_line(&session, "[process exited]");
     }
 
-    fn attention_events(session: &Session) -> Vec<Attention> {
-        std::iter::from_fn(|| session.next_event())
-            .filter_map(|event| match event {
-                Event::Attention(attention) => Some(attention),
-                _ => None,
-            })
-            .collect()
+    fn wait_for_alert(session: &Session) {
+        wait_until(
+            Duration::from_secs(15),
+            || "no alert while unseen".to_owned(),
+            || (session.attention() == Attention::Alert).then_some(()),
+        );
     }
 
     #[test]
-    fn an_unseen_session_asks_for_attention_once_per_alert() {
+    fn an_unseen_session_raises_attention_until_shown() {
         let session = spawn_shell();
         session.set_visibility(Visibility::Listed);
-        type_line(
-            &session,
-            "echo one; printf '\\a'; echo two; printf '\\a'; echo three",
-        );
-        thread::sleep(Duration::from_millis(1500));
-        assert_eq!(attention_events(&session), [Attention::Alert]);
+        type_line(&session, "printf '\\a'");
+        wait_for_alert(&session);
         session.set_visibility(Visibility::Shown);
+        assert_eq!(session.attention(), Attention::None);
         type_line(&session, "printf '\\a'; echo shown");
         wait_for_line(&session, "shown");
-        assert_eq!(attention_events(&session), []);
+        assert_eq!(session.attention(), Attention::None);
         session.set_visibility(Visibility::Hidden);
         type_line(&session, "printf '\\a'");
-        thread::sleep(Duration::from_millis(1000));
-        assert!(attention_events(&session).contains(&Attention::Alert));
+        wait_for_alert(&session);
+    }
+
+    #[test]
+    fn an_alert_landing_as_the_session_is_shown_leaves_no_dot() {
+        let session = Session::fixture(Grid::default());
+        session.set_visibility(Visibility::Listed);
+        session.alert();
+        assert_eq!(session.attention(), Attention::Alert);
+        // The actor may raise the flag before it handles the visibility change.
+        session.set_visibility(Visibility::Shown);
+        session.alert();
+        assert_eq!(session.attention(), Attention::None);
     }
 
     fn notify_events(session: &Session) -> Vec<(String, String)> {
