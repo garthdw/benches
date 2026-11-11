@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::mem::size_of;
+use std::rc::Rc;
 
 use bytemuck::{Pod, Zeroable, cast_slice};
 use libghostty_vt::render::CursorVisualStyle;
@@ -47,6 +48,11 @@ fn color(rgb: [u8; 3], srgb_blend: bool) -> [f32; 3] {
 enum GlyphText {
     Character(char),
     Cluster(String),
+    /// Cell `index` of a run of characters shaped together, for cells that differ from standing alone.
+    Shaped {
+        run: Rc<str>,
+        index: u8,
+    },
     Underline(Underline),
 }
 
@@ -114,6 +120,9 @@ impl Atlas {
             GlyphText::Cluster(cluster) => {
                 font.rasterize(cluster, key.style, key.cells, &mut self.scratch)
             }
+            GlyphText::Shaped { run, index } => {
+                font.rasterize_shaped(run, key.style, usize::from(*index), &mut self.scratch)
+            }
             GlyphText::Underline(underline) => {
                 font.rasterize_underline(*underline, &mut self.scratch);
                 Some(GlyphKind::Coverage)
@@ -167,6 +176,55 @@ fn glyph_key(grid: &Grid, cell: &Cell) -> Option<GlyphKey> {
         },
         cells: if cell.wide { 2 } else { 1 },
     })
+}
+
+/// Longer runs are shaped in pieces, which keeps each one small enough to cache.
+const MAX_RUN: usize = 16;
+
+/// Neighbouring cells shaped together: the same style, on one row, and not the cursor, which
+/// splits a ligature as Ghostty does.
+struct Run {
+    start: usize,
+    end: usize,
+    /// `None` for a lone cell, which has nothing to shape with.
+    shaped: Option<Rc<[bool]>>,
+    text: Option<Rc<str>>,
+}
+
+fn joins_run(cell: &Cell) -> bool {
+    cell.cluster.is_none() && !cell.wide && !cell.spacer && crate::font::joins_run(cell.character)
+}
+
+fn find_run(
+    grid: &Grid,
+    start: usize,
+    cursor: Option<usize>,
+    font: &Font,
+    text: &mut String,
+) -> Run {
+    let cols = usize::from(grid.cols).max(1);
+    let first = &grid.cells[start];
+    let end = (start + 1..grid.cells.len().min(start + MAX_RUN))
+        .find(|&index| {
+            let cell = &grid.cells[index];
+            index % cols == 0
+                || Some(index) == cursor
+                || !joins_run(cell)
+                || (cell.bold, cell.italic) != (first.bold, first.italic)
+        })
+        .unwrap_or(grid.cells.len().min(start + MAX_RUN));
+    text.clear();
+    text.extend(grid.cells[start..end].iter().map(|cell| cell.character));
+    let style = FontStyle {
+        bold: first.bold,
+        italic: first.italic,
+    };
+    Run {
+        start,
+        end,
+        shaped: (end - start > 1).then(|| font.shaped_cells(text, style)),
+        text: None,
+    }
 }
 
 fn solid(rect: [f32; 4], fill: [u8; 3], srgb_blend: bool) -> Quad {
@@ -258,6 +316,8 @@ fn build_quads(
         quads.truncate(glyphs_start);
         let mut first_epoch = None;
         let mut reset = false;
+        let mut run: Option<Run> = None;
+        let mut run_text = String::new();
         let mut lookup = |key| {
             let (slot, epoch) = glyph(key);
             reset |= *first_epoch.get_or_insert(epoch) != epoch;
@@ -296,7 +356,36 @@ fn build_quads(
             if cell.overline {
                 quads.push(line(0.0, fg));
             }
-            let Some(key) = glyph_key(grid, cell) else {
+            if Some(index) != cursor
+                && joins_run(cell)
+                && run.as_ref().is_none_or(|run| index >= run.end)
+            {
+                run = Some(find_run(grid, index, cursor, font, &mut run_text));
+            }
+            let shaped = run
+                .as_mut()
+                .filter(|run| (run.start..run.end).contains(&index))
+                .filter(|run| {
+                    run.shaped
+                        .as_ref()
+                        .and_then(|shaped| shaped.get(index - run.start))
+                        == Some(&true)
+                })
+                .map(|run| GlyphKey {
+                    text: GlyphText::Shaped {
+                        run: run
+                            .text
+                            .get_or_insert_with(|| run_text.as_str().into())
+                            .clone(),
+                        index: (index - run.start) as u8,
+                    },
+                    style: FontStyle {
+                        bold: cell.bold,
+                        italic: cell.italic,
+                    },
+                    cells: 1,
+                });
+            let Some(key) = shaped.or_else(|| glyph_key(grid, cell)) else {
                 continue;
             };
             let cells = key.cells as f32;
@@ -716,6 +805,58 @@ mod tests {
             |_| (Some(fake_glyph([0, 0])), 0),
         );
         (quads, font)
+    }
+
+    /// The run cells `build_quads` asks the atlas for, as `(run, index)`.
+    fn shaped_keys(bytes: &[u8], features: &[&str]) -> Vec<(String, u8)> {
+        let features: Vec<String> = features
+            .iter()
+            .map(|feature| (*feature).to_owned())
+            .collect();
+        let font = Font::with_symbols(
+            crate::config::DEFAULT_FONT_FAMILY,
+            18.0,
+            2.0,
+            None,
+            &[],
+            &features,
+        )
+        .unwrap();
+        let grid = Grid::from_vt(bytes, 8, 2).unwrap();
+        let mut keys = Vec::new();
+        build_quads(
+            &grid,
+            [0.0, 0.0, 800.0, 600.0],
+            metrics(&font, 0.0, 2.0),
+            &font,
+            true,
+            &mut Vec::new(),
+            |key| {
+                if let GlyphText::Shaped { run, index } = key.text {
+                    keys.push((run.to_string(), index));
+                }
+                (Some(fake_glyph([0, 0])), 0)
+            },
+        );
+        keys
+    }
+
+    #[test]
+    fn a_ligature_asks_for_its_cells_shaped_with_their_neighbours() {
+        let keys = shaped_keys(b"a != b\x1b[2;1H", &[]);
+        assert_eq!(keys, [("!=".to_owned(), 0), ("!=".to_owned(), 1)]);
+        assert!(shaped_keys(b"a != b\x1b[2;1H", &["-liga"]).is_empty());
+    }
+
+    #[test]
+    fn the_cursor_breaks_a_ligature() {
+        assert!(shaped_keys(b"a != b\x1b[1;3H", &[]).is_empty());
+        assert!(shaped_keys(b"a != b\x1b[1;4H", &[]).is_empty());
+    }
+
+    #[test]
+    fn a_run_stops_at_the_end_of_a_row() {
+        assert!(shaped_keys(b"      !=", &[]).is_empty());
     }
 
     #[test]
