@@ -3095,6 +3095,38 @@ mod tests {
         );
     }
 
+    fn command_k() -> crate::input::KeyInput {
+        let command = rune::Mods {
+            cmd: true,
+            logo: true,
+            ..rune::Mods::default()
+        };
+        crate::input::map_key(
+            &rune::KeyEvent {
+                key: rune::Key::Command('k'),
+                mods: command,
+            },
+            Some(rune::PhysicalKeyCode::KeyK),
+            Some('k'),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn an_unbound_command_chord_types_nothing_in_legacy_mode() {
+        let mut terminal = new_terminal(20, 5).unwrap();
+        let bytes = input_for_test().key(&mut terminal, command_k()).unwrap();
+        assert_eq!(bytes, b"");
+    }
+
+    #[test]
+    fn an_unbound_command_chord_reports_super_under_the_kitty_protocol() {
+        let mut terminal = new_terminal(20, 5).unwrap();
+        terminal.vt_write(b"\x1b[>1u");
+        let bytes = input_for_test().key(&mut terminal, command_k()).unwrap();
+        assert_eq!(bytes, b"\x1b[107;9u");
+    }
+
     #[test]
     fn a_paste_reaches_a_real_shell() {
         let session = spawn_shell();

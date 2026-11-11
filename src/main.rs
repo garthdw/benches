@@ -2102,7 +2102,7 @@ mod tests {
     }
 
     #[test]
-    fn command_shift_digits_are_left_to_macos() {
+    fn command_shift_digits_do_not_switch_tabs() {
         let mut runtime = workspace_runtime();
         press(&mut runtime, Key::Command('2'), command_shift());
         press(&mut runtime, Key::Command('@'), command_shift());
