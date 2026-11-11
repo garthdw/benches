@@ -19,13 +19,15 @@ use rune::tok;
 use rune::{
     App, AppSpec, Chord, ClipboardContent, Color, Cursor, Cx, Drag, El, FileDialogOptions, Icon,
     Ime, Key, KeyEvent, Live, Mods, Phase, PointerButton, PointerEvent, PopupItem, PopupMenu,
-    TextEdit, Tx, Waker, WheelEvent, col, effect, el, icon, row, text, text_input,
+    TextEdit, Tx, Waker, WheelEvent, WindowSpec, col, effect, el, icon, row, text, text_input,
 };
 
 use anyhow::Context;
 use session::LogErr;
-use session::{Attention, Event, Grid, PointerInput, PointerPhase, Session, WheelInput};
-use workspace::{Project, SavedWorkspace, Slot, Status, Tab, Workspace};
+use session::{Attention, Event, Grid, PointerInput, PointerPhase, Retarget, Session, WheelInput};
+use workspace::{
+    Fleet, MAIN_WINDOW, Project, SavedWorkspace, Slot, Status, Tab, WindowId, Workspace,
+};
 
 const TERMINAL_MARK: u32 = 1;
 const DRAWER_MARK: u32 = 2;
@@ -38,6 +40,7 @@ const OVERLAY_PADDING: f32 = 6.0;
 const DOT: f32 = 7.0;
 /// Wider than the traffic lights, which sit over the sidebar.
 const SIDEBAR_WIDTH: f32 = 200.0;
+const TEAR_OFF_DISTANCE: f32 = 48.0;
 /// The sidebar's top padding too, so the traffic lights clear the first project.
 const TAB_STRIP_HEIGHT: f32 = 36.0;
 const TAB_MAX_WIDTH: f32 = 220.0;
@@ -103,6 +106,8 @@ impl Repaint {
 pub struct State {
     waker: Option<Waker>,
     repaint: Repaint,
+    fleet: Fleet,
+    window: WindowId,
     workspace: Workspace,
     started: bool,
     /// Session id and scrollbar presence last built for the tab, the drawer and the overlay.
@@ -130,9 +135,29 @@ pub struct State {
     palette_error: Option<String>,
     sidebar_hidden: bool,
     config: config::Config,
+    /// Points added to the configured font size by ⌘= and ⌘-; never written to disk.
+    font_zoom: f64,
     /// Unset in tests and scenes, which then read and write no files.
     paths: Option<config::Paths>,
 }
+
+impl State {
+    fn font(&self) -> config::FontConfig {
+        let font = &self.config.font;
+        config::FontConfig {
+            size: (font.size + self.font_zoom).clamp(MIN_FONT_SIZE, MAX_FONT_SIZE),
+            ..font.clone()
+        }
+    }
+
+    fn zoom(&mut self, points: f64) {
+        let size = (self.font().size + points).clamp(MIN_FONT_SIZE, MAX_FONT_SIZE);
+        self.font_zoom = size - self.config.font.size;
+    }
+}
+
+const MIN_FONT_SIZE: f64 = 6.0;
+const MAX_FONT_SIZE: f64 = 72.0;
 
 /// The jump command's folder for the command centre's query.
 #[derive(Default)]
@@ -163,11 +188,19 @@ impl State {
         self.workspace.focused_session()
     }
 
-    fn spawn_tab(&self, title: &str, command: Option<&str>, cwd: &Path) -> Tab {
+    fn window_waker(&self) -> Waker {
         let waker = self.waker.clone().unwrap_or_else(|| Arc::new(|| {}));
-        let waker = self.repaint.waker(waker);
-        let mut tab = match Session::spawn(command, cwd, &self.config, waker) {
-            Ok(session) => Tab::new(title, session),
+        self.repaint.waker(waker)
+    }
+
+    fn spawn_tab(&self, title: &str, command: Option<&str>, cwd: &Path) -> Tab {
+        let retarget = Retarget::new(self.window_waker());
+        let mut tab = match Session::spawn(command, cwd, &self.config, retarget.waker()) {
+            Ok(session) => {
+                let mut tab = Tab::new(title, session);
+                tab.retarget = Some(retarget);
+                tab
+            }
             Err(error) => {
                 let message = format!("failed to start {title}: {error:#}");
                 let mut tab = Tab::new(title, Session::fixture(Grid::message(&message)));
@@ -284,13 +317,36 @@ fn save_layout(state: &State) -> anyhow::Result<()> {
         return Ok(());
     };
     let path = paths.state();
-    let json = serde_json::to_string_pretty(&state.workspace.snapshot(state.sidebar_hidden))?;
+    let layout = state.workspace.snapshot(state.sidebar_hidden);
+    let Some(layout) = state.fleet.deposit(state.window, layout) else {
+        return Ok(());
+    };
+    let json = serde_json::to_string_pretty(&layout)?;
     std::fs::create_dir_all(&paths.dir)
         .with_context(|| format!("create {}", paths.dir.display()))?;
     let temporary = path.with_extension("json.tmp");
     std::fs::write(&temporary, json).with_context(|| format!("write {}", temporary.display()))?;
     std::fs::rename(&temporary, &path).with_context(|| format!("replace {}", path.display()))?;
     Ok(())
+}
+
+/// Closing the main window quits, as it did when it was the only one. Closing another gives its
+/// projects, still running, back to the main window.
+fn on_close(state: &mut State, tx: &mut Tx) {
+    if rune::quitting() {
+        return;
+    }
+    if state.window == MAIN_WINDOW {
+        tx.quit();
+    } else {
+        merge_into_main(state);
+    }
+}
+
+fn merge_into_main(state: &mut State) {
+    while let Some(project) = state.workspace.take_project(0) {
+        state.fleet.send(MAIN_WINDOW, project);
+    }
 }
 
 /// Saves the layout, then ends every process so none outlives the app.
@@ -410,6 +466,48 @@ fn open_project(state: &mut State, root: PathBuf) {
     state.workspace.add_project(Project::new(root, tabs));
 }
 
+/// Hands project `index` to a new window, with its processes still running. A window's last
+/// project stays, as it would leave that window empty.
+fn move_to_new_window(state: &mut State, index: usize, position: Option<(i32, i32)>) {
+    if state.workspace.projects.len() < 2 {
+        return;
+    }
+    let Some(project) = state.workspace.take_project(index) else {
+        return;
+    };
+    let window = state.fleet.reserve_window();
+    state.fleet.send(window, project);
+    let (config, paths) = (state.config.clone(), state.paths.clone());
+    let app = window_app(&state.fleet, window, move |state| {
+        state.config = config;
+        state.paths = paths;
+        state.started = true;
+    });
+    let mut spec = WindowSpec::from_app(format!("agentd-{window}"), app);
+    spec.options.position = position;
+    rune::open_window(spec);
+}
+
+/// Whether a project dragged from the sidebar was let go far enough outside it, or off the
+/// window's top or left edge, to leave for a window of its own.
+fn torn_off([x, y]: [f32; 2], sidebar_width: f32) -> bool {
+    x < 0.0 || y < 0.0 || x > sidebar_width + TEAR_OFF_DISTANCE
+}
+
+/// Takes the projects other windows handed over, pointing their sessions at this window.
+fn adopt_projects(state: &mut State) -> bool {
+    let projects = state.fleet.take(state.window);
+    let adopted = !projects.is_empty();
+    for mut project in projects {
+        let waker = state.window_waker();
+        for retarget in project.tabs_mut().filter_map(|tab| tab.retarget.as_ref()) {
+            retarget.set(waker.clone());
+        }
+        state.workspace.add_project(project);
+    }
+    adopted
+}
+
 fn pick_folder(tx: &mut Tx, replace_active: bool) {
     let options = FileDialogOptions {
         title: if replace_active {
@@ -443,6 +541,7 @@ enum Action {
     Lazygit,
     OpenProject,
     ChangeFolder,
+    MoveToNewWindow,
     Jump(PathBuf),
     SwitchProject(usize, String),
     SwitchTab(usize, usize, String),
@@ -460,6 +559,7 @@ impl Action {
             Action::Lazygit => "Toggle lazygit".to_owned(),
             Action::OpenProject => "Open project…".to_owned(),
             Action::ChangeFolder => "Change project folder…".to_owned(),
+            Action::MoveToNewWindow => "Move project to new window".to_owned(),
             Action::Jump(root) => format!("Open project {}", root.display()),
             Action::SwitchProject(_, name) => format!("Switch to project {name}"),
             Action::SwitchTab(_, _, name) => format!("Switch to tab {name}"),
@@ -525,9 +625,11 @@ fn palette_actions(query: &str, jump: Option<&Path>, workspace: &Workspace) -> V
             Action::Lazygit,
             Action::OpenProject,
             Action::ChangeFolder,
+            Action::MoveToNewWindow,
         ]
         .into_iter()
         .filter(|action| *action != Action::ChangeFolder || workspace.project().is_some())
+        .filter(|action| *action != Action::MoveToNewWindow || workspace.projects.len() > 1)
         .filter(|action| letters_in_order(&action.label(), &needle)),
     );
     actions.extend(jump.map(|root| Action::Jump(root.to_owned())));
@@ -634,6 +736,7 @@ fn run_action(state: &mut State, action: &Action, tx: &mut Tx) {
         Action::Lazygit => toggle_lazygit(state),
         Action::OpenProject => pick_folder(tx, false),
         Action::ChangeFolder => pick_folder(tx, true),
+        Action::MoveToNewWindow => move_to_new_window(state, state.workspace.active, None),
         Action::Jump(root) => open_project(state, root.clone()),
         Action::SwitchProject(project, _) => state.workspace.select_project(*project),
         Action::SwitchTab(project, tab, _) => {
@@ -832,6 +935,12 @@ fn shortcut(state: &mut State, event: &KeyEvent, tx: &mut Tx) -> bool {
         run_action(state, &Action::Shell, tx);
     } else if pressed("mod+w") {
         request_close(state);
+    } else if pressed("mod+=") {
+        state.zoom(1.0);
+    } else if pressed("mod+-") {
+        state.zoom(-1.0);
+    } else if pressed("mod+0") {
+        state.font_zoom = 0.0;
     } else if pressed("mod+shift+[") {
         state.workspace.cycle_tab(-1);
     } else if pressed("mod+shift+]") {
@@ -1079,6 +1188,7 @@ fn view(state: &State, cx: &mut Cx<State>) -> El {
         .filter(|_| sidebar_width > 0.0)
         .map(|(index, project)| {
             let key = format!("project-{index}");
+            let menu_key = key.clone();
             let active = index == state.workspace.active;
             let shows_close = active || state.hovered_project == Some(index);
             let project_tab = if rail {
@@ -1125,6 +1235,22 @@ fn view(state: &State, cx: &mut Cx<State>) -> El {
                     }
                 })
                 .on_press(move |state: &mut State| state.workspace.select_project(index))
+                .on_drag(move |state: &mut State, drag: &mut Drag, _: &mut Tx| {
+                    if drag.phase == Phase::Up
+                        && !drag.cancelled()
+                        && torn_off(drag.window_point(), sidebar_width)
+                    {
+                        move_to_new_window(state, index, drag.screen_point());
+                    }
+                })
+                .on_secondary_press(move |_: &mut State, _, tx: &mut Tx| {
+                    let menu = PopupMenu::new().item(PopupItem::new("move", "Move to new window"));
+                    tx.popup_menu(menu, &menu_key, move |state: &mut State, picked, _| {
+                        if picked == Some("move") {
+                            move_to_new_window(state, index, None);
+                        }
+                    });
+                })
         });
     // Stays in the tree so its width springs between expanded, rail and gone.
     let sidebar = col()
@@ -1564,6 +1690,13 @@ fn view(state: &State, cx: &mut Cx<State>) -> El {
         .children(palette)
 }
 
+fn window_title(workspace: &Workspace) -> String {
+    workspace.project().map_or_else(
+        || "agentd".to_owned(),
+        |project| format!("{} — agentd", project.name),
+    )
+}
+
 fn poll(state: &mut State, now: f64, tx: &mut Tx) -> bool {
     if !state.started {
         state.started = true;
@@ -1574,9 +1707,14 @@ fn poll(state: &mut State, now: f64, tx: &mut Tx) -> bool {
             state.workspace.add_project(Project::new(home, vec![tab]));
         }
     }
+    let mut changed = adopt_projects(state);
+    tx.set_title(window_title(&state.workspace));
+    if state.window != MAIN_WINDOW && state.workspace.projects.is_empty() {
+        tx.close_window();
+    }
     launch_active(state);
     let active = state.session().map(Session::id);
-    let mut changed = poll_jump(state, now, tx);
+    changed |= poll_jump(state, now, tx);
     changed |= poll_worktrees(state);
     changed |= poll_creation(state);
     if state
@@ -1909,6 +2047,57 @@ const SCENES: &[Scene] = &[
     }),
 ];
 
+/// One window's app, with its state made by `init`.
+fn window_app(
+    fleet: &Fleet,
+    window: WindowId,
+    configure: impl FnOnce(&mut State) + 'static,
+) -> App<State> {
+    let spec = AppSpec::<State> {
+        scenes: SCENES,
+        setup: Some(|state, waker| {
+            state.fleet.register(state.window, waker.clone());
+            state.waker = Some(waker);
+        }),
+        poll: Some(poll),
+        on_key: Some(on_key),
+        ..AppSpec::new("agentd", (960.0, 640.0), State::default, view)
+    };
+    let init_fleet = fleet.clone();
+    let app = App::new(spec)
+        .init(move || {
+            let mut state = State {
+                fleet: init_fleet,
+                window,
+                ..State::default()
+            };
+            configure(&mut state);
+            state
+        })
+        .compositor(render::TerminalCompositor::default())
+        .on_ime(on_ime)
+        .on_modifiers(|state, mods, _| {
+            state.option_held = mods.alt;
+            for tab in state.workspace.tabs_mut() {
+                tab.session.command_held(mods.logo);
+            }
+        })
+        .on_quit(on_quit)
+        .on_close(on_close)
+        .on_focus(|state, focused, _| state.workspace.set_window_focused(focused));
+    let handle = app.handle();
+    fleet.on_reveal(window, move |session| {
+        let opener = handle.clone();
+        handle.update(move |state, _| {
+            if state.workspace.locate(session).is_some() {
+                state.workspace.reveal(session);
+                opener.open();
+            }
+        });
+    });
+    app
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if let Some((_, config_args)) = args.split_first().filter(|(name, _)| *name == "config") {
@@ -1922,38 +2111,19 @@ fn main() {
         return;
     }
     log_to_file_in_bundle().log_err("log file");
-    let spec = AppSpec::<State> {
-        scenes: SCENES,
-        setup: Some(|state, waker| state.waker = Some(waker)),
-        poll: Some(poll),
-        on_key: Some(on_key),
-        ..AppSpec::new("agentd", (960.0, 640.0), State::default, view)
-    };
-    let app = App::new(spec)
-        .init(|| {
-            let paths = config::Paths::from_home();
-            State {
-                config: paths.as_ref().map(config::Config::load).unwrap_or_default(),
-                paths,
-                ..State::default()
-            }
-        })
-        .compositor(render::TerminalCompositor::default())
-        .on_ime(on_ime)
-        .on_modifiers(|state, mods, _| {
-            state.option_held = mods.alt;
-            for tab in state.workspace.tabs_mut() {
-                tab.session.command_held(mods.logo);
-            }
-        })
-        .on_quit(on_quit)
-        .on_focus(|state, focused, _| state.workspace.set_window_focused(focused));
+    let fleet = Fleet::default();
+    let app = window_app(&fleet, MAIN_WINDOW, |state| {
+        state.paths = config::Paths::from_home();
+        state.config = state
+            .paths
+            .as_ref()
+            .map(config::Config::load)
+            .unwrap_or_default();
+    });
     let handle = app.handle();
-    notify::start(move |session| {
-        if let Some(session) = session {
-            handle.update(move |state, _| state.workspace.reveal(session));
-        }
-        handle.open();
+    notify::start(move |session| match session {
+        Some(session) => fleet.reveal(session),
+        None => handle.open(),
     });
     app.run();
 }
@@ -2271,6 +2441,47 @@ mod tests {
         runtime
             .presented("sidebar")
             .map_or(-1.0, |(rect, _)| rect[2])
+    }
+
+    fn zoomed(chords: &[char]) -> Runtime<State> {
+        let mut state = State::default();
+        show_scene(&mut state, SCENE_FIXTURE);
+        let mut runtime = runtime_with(state);
+        runtime.on_key = Some(on_key);
+        for chord in chords {
+            press(&mut runtime, Key::Command(*chord), command());
+        }
+        runtime
+    }
+
+    #[test]
+    fn command_equals_and_minus_zoom_the_font_by_one_point() {
+        let base = State::default().font().size;
+        assert_eq!(zoomed(&['=']).state.font().size, base + 1.0);
+        assert_eq!(zoomed(&['=', '=', '-']).state.font().size, base + 1.0);
+        assert_eq!(zoomed(&['-']).state.font().size, base - 1.0);
+    }
+
+    #[test]
+    fn command_zero_restores_the_configured_size() {
+        let base = State::default().font().size;
+        assert_eq!(zoomed(&['=', '=', '0']).state.font().size, base);
+        assert_eq!(zoomed(&['-', '0']).state.font().size, base);
+    }
+
+    #[test]
+    fn zoom_stops_at_the_limits() {
+        assert_eq!(zoomed(&['='; 80]).state.font().size, MAX_FONT_SIZE);
+        assert_eq!(zoomed(&['-'; 80]).state.font().size, MIN_FONT_SIZE);
+        let mut runtime = zoomed(&['-'; 80]);
+        press(&mut runtime, Key::Command('='), command());
+        assert_eq!(runtime.state.font().size, MIN_FONT_SIZE + 1.0);
+    }
+
+    #[test]
+    fn zoom_leaves_the_configured_size_alone() {
+        let base = State::default().config.font.size;
+        assert_eq!(zoomed(&['=']).state.config.font.size, base);
     }
 
     #[test]
@@ -2822,7 +3033,7 @@ mod tests {
         for _ in 0..5 {
             press(&mut runtime, Key::Down, Mods::default());
         }
-        assert_eq!(runtime.state.palette_selected, 3);
+        assert_eq!(runtime.state.palette_selected, 4);
     }
 
     fn tray_runtime() -> Runtime<State> {
@@ -3483,5 +3694,298 @@ mod tests {
         assert_ne!(Some(tab.session.id()), old);
         assert_eq!(tab.status, Status::Running);
         assert_eq!(tab.command.as_deref(), Some("sh -c 'exit 0'"));
+    }
+    fn counting_waker() -> (Waker, Arc<AtomicUsize>) {
+        let count = Arc::new(AtomicUsize::new(0));
+        let waker: Waker = {
+            let count = count.clone();
+            Arc::new(move || {
+                count.fetch_add(1, Ordering::Relaxed);
+            })
+        };
+        (waker, count)
+    }
+
+    fn second_window(fleet: &Fleet, window: WindowId) -> Runtime<State> {
+        let state = State {
+            fleet: fleet.clone(),
+            window,
+            started: true,
+            ..State::default()
+        };
+        state.fleet.register(window, Arc::new(|| {}));
+        let mut runtime = runtime_with(state);
+        runtime.poll = Some(poll);
+        runtime
+    }
+
+    #[test]
+    fn moving_a_project_is_offered_only_beside_another_project() {
+        let moves = |workspace: &Workspace| {
+            palette_actions("", None, workspace).contains(&Action::MoveToNewWindow)
+        };
+        assert!(!moves(&one_project()));
+        assert!(moves(&workspace_state().workspace));
+        assert_eq!(
+            Action::MoveToNewWindow.label(),
+            "Move project to new window"
+        );
+    }
+
+    #[test]
+    fn the_palette_hands_the_active_project_to_a_new_window() {
+        let mut runtime = workspace_runtime();
+        runtime.state.workspace.select_project(1);
+        press(&mut runtime, Key::Command('p'), command());
+        press(
+            &mut runtime,
+            Key::Text("move project".into()),
+            Mods::default(),
+        );
+        runtime.state.palette_selected = 0;
+        press(&mut runtime, Key::Enter, Mods::default());
+        let workspace = &runtime.state.workspace;
+        assert_eq!(workspace.projects.len(), 1);
+        assert_eq!(
+            workspace.project().map(|project| project.name.as_str()),
+            Some("agentd")
+        );
+
+        let mut second = second_window(&runtime.state.fleet, 1);
+        second.frame(3.0 / 60.0);
+        let adopted = &second.state.workspace;
+        assert_eq!(adopted.projects.len(), 1);
+        assert_eq!(
+            adopted.project().map(|project| project.name.as_str()),
+            Some("site")
+        );
+        assert_eq!(
+            adopted.active_tab().map(|tab| tab.title.as_str()),
+            Some("claude")
+        );
+    }
+
+    #[test]
+    fn a_window_keeps_its_last_project() {
+        let mut state = State::default();
+        state
+            .workspace
+            .add_project(Project::new("/tmp".into(), vec![]));
+        move_to_new_window(&mut state, 0, None);
+        assert_eq!(state.workspace.projects.len(), 1);
+        assert!(state.fleet.take(1).is_empty());
+    }
+
+    #[test]
+    fn each_window_shows_only_its_own_active_session() {
+        let mut runtime = workspace_runtime();
+        move_to_new_window(&mut runtime.state, 1, None);
+        let mut second = second_window(&runtime.state.fleet, 1);
+        second.frame(3.0 / 60.0);
+        let shown = |runtime: &Runtime<State>| {
+            runtime
+                .state
+                .workspace
+                .active_session()
+                .map(|session| session.visibility())
+        };
+        assert_eq!(shown(&runtime), Some(session::Visibility::Shown));
+        assert_eq!(shown(&second), Some(session::Visibility::Shown));
+    }
+
+    #[test]
+    fn a_moved_session_keeps_running_and_wakes_its_new_window() {
+        let (first_waker, first_wakes) = counting_waker();
+        let mut state = State {
+            waker: Some(first_waker),
+            ..State::default()
+        };
+        state
+            .workspace
+            .add_project(Project::new("/tmp".into(), vec![]));
+        open_tab(&mut state, "slow", Some("sh -c 'sleep 0.5; echo moved'"));
+        state
+            .workspace
+            .add_project(Project::new("/dev/site".into(), vec![]));
+        state.workspace.select_project(0);
+        move_to_new_window(&mut state, 0, None);
+
+        let (second_waker, second_wakes) = counting_waker();
+        let mut second = second_window(&state.fleet, 1);
+        second.state.waker = Some(second_waker);
+        second.frame(1.0 / 60.0);
+        assert_eq!(second.state.workspace.projects.len(), 1);
+        let before = first_wakes.load(Ordering::Relaxed);
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        let mut frame = 1.0;
+        while !second
+            .state
+            .workspace
+            .active_session()
+            .is_some_and(|session| {
+                let grid = session.grid();
+                let text: String = grid.cells.iter().map(|cell| cell.character).collect();
+                text.contains("moved")
+            })
+        {
+            assert!(std::time::Instant::now() < deadline, "timed out");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            frame += 1.0;
+            second.frame(frame / 60.0);
+        }
+        assert!(second_wakes.load(Ordering::Relaxed) > 0);
+        assert_eq!(first_wakes.load(Ordering::Relaxed), before);
+    }
+
+    #[test]
+    fn a_project_menu_moves_it_to_a_new_window() {
+        let mut runtime = workspace_runtime();
+        let (x, y) = runtime.find("project-1").unwrap();
+        runtime.secondary_down(x, y);
+        runtime.secondary_up(x, y);
+        runtime.frame(1.0 / 60.0);
+        runtime.resolve_popup(Some("move")).unwrap();
+        runtime.frame(2.0 / 60.0);
+        assert_eq!(runtime.state.workspace.projects.len(), 1);
+        assert_eq!(runtime.state.fleet.take(1).len(), 1);
+    }
+
+    #[test]
+    fn closing_a_window_gives_its_running_projects_back_to_the_main_window() {
+        let (main_waker, _) = counting_waker();
+        let mut main = State {
+            waker: Some(main_waker),
+            ..State::default()
+        };
+        main.workspace
+            .add_project(Project::new("/dev/site".into(), vec![]));
+        let mut second = State {
+            fleet: main.fleet.clone(),
+            window: 1,
+            started: true,
+            ..State::default()
+        };
+        second
+            .workspace
+            .add_project(Project::new("/tmp".into(), vec![]));
+        open_tab(&mut second, "slow", Some("sh -c 'sleep 0.5; echo back'"));
+        let session = second.workspace.active_session().map(Session::id);
+        merge_into_main(&mut second);
+        assert!(second.workspace.projects.is_empty());
+
+        assert!(adopt_projects(&mut main));
+        assert_eq!(main.workspace.projects.len(), 2);
+        assert_eq!(main.workspace.active_session().map(Session::id), session);
+        assert_eq!(
+            main.workspace.active_session().map(Session::visibility),
+            Some(session::Visibility::Shown)
+        );
+        assert!(!adopt_projects(&mut main));
+    }
+
+    #[test]
+    fn the_last_window_to_quit_saves_every_windows_projects() {
+        let directory = tempfile::tempdir().unwrap();
+        let paths = config::Paths {
+            dir: directory.path().join("agentd"),
+            ghostty_dir: directory.path().join("ghostty"),
+        };
+        let fleet = Fleet::default();
+        let window = |window, root: &str| {
+            let mut state = State {
+                fleet: fleet.clone(),
+                window,
+                paths: Some(paths.clone()),
+                ..State::default()
+            };
+            let tabs = vec![fixture_tab("shell", b"$ ")];
+            state.workspace.add_project(Project::new(root.into(), tabs));
+            state
+        };
+        let (main, second) = (window(MAIN_WINDOW, "/"), window(1, "/usr"));
+        save_layout(&second).unwrap();
+        assert!(!paths.state().exists());
+        save_layout(&main).unwrap();
+        let mut loaded = State {
+            paths: Some(paths),
+            ..State::default()
+        };
+        load_layout(&mut loaded);
+        let roots: Vec<_> = loaded
+            .workspace
+            .projects
+            .iter()
+            .map(|project| project.root.clone())
+            .collect();
+        assert_eq!(roots, [PathBuf::from("/"), PathBuf::from("/usr")]);
+    }
+
+    #[test]
+    fn a_torn_off_window_closes_when_its_last_project_goes() {
+        let fleet = Fleet::default();
+        let mut second = second_window(&fleet, 1);
+        second.frame(2.0 / 60.0);
+        assert_eq!(second.shell_request, Some(rune::Shell::Close));
+    }
+
+    #[test]
+    fn a_torn_off_window_with_a_project_stays_open() {
+        let fleet = Fleet::default();
+        let mut second = second_window(&fleet, 1);
+        second
+            .state
+            .workspace
+            .add_project(Project::new("/tmp".into(), vec![]));
+        second.frame(2.0 / 60.0);
+        assert_eq!(second.shell_request, None);
+    }
+
+    #[test]
+    fn the_main_window_stays_open_with_no_projects() {
+        let mut main = second_window(&Fleet::default(), MAIN_WINDOW);
+        main.frame(2.0 / 60.0);
+        assert_eq!(main.shell_request, None);
+    }
+
+    #[test]
+    fn the_window_title_names_the_active_project() {
+        assert_eq!(window_title(&Workspace::default()), "agentd");
+        let mut workspace = workspace_state().workspace;
+        assert_eq!(window_title(&workspace), "agentd — agentd");
+        workspace.select_project(1);
+        assert_eq!(window_title(&workspace), "site — agentd");
+    }
+
+    fn drag_project(runtime: &mut Runtime<State>, key: &str, to: (f32, f32)) {
+        let (x, y) = runtime.find(key).unwrap();
+        runtime.pointer_down(x, y);
+        runtime.pointer_move((x + to.0) / 2.0, (y + to.1) / 2.0);
+        runtime.pointer_move(to.0, to.1);
+        runtime.pointer_up(to.0, to.1);
+        runtime.frame(2.0 / 60.0);
+    }
+
+    #[test]
+    fn dragging_a_project_out_of_the_sidebar_tears_it_off() {
+        let mut runtime = workspace_runtime();
+        drag_project(&mut runtime, "project-1", (SIDEBAR_WIDTH + 200.0, 300.0));
+        assert_eq!(runtime.state.workspace.projects.len(), 1);
+        assert_eq!(runtime.state.fleet.take(1).len(), 1);
+    }
+
+    #[test]
+    fn dragging_a_project_within_the_sidebar_keeps_it() {
+        let mut runtime = workspace_runtime();
+        drag_project(&mut runtime, "project-1", (SIDEBAR_WIDTH - 20.0, 300.0));
+        assert_eq!(runtime.state.workspace.projects.len(), 2);
+        assert!(runtime.state.fleet.take(1).is_empty());
+    }
+
+    #[test]
+    fn a_project_released_off_the_windows_edge_is_torn_off() {
+        assert!(torn_off([-4.0, 100.0], SIDEBAR_WIDTH));
+        assert!(torn_off([40.0, -4.0], SIDEBAR_WIDTH));
+        assert!(!torn_off([SIDEBAR_WIDTH + 10.0, 100.0], SIDEBAR_WIDTH));
     }
 }

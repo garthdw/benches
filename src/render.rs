@@ -669,13 +669,13 @@ impl TerminalCompositor {
         let Some(gpu) = self.gpu.as_mut() else {
             return;
         };
-        let wanted = (site.scale, &state.config.font);
+        let config = state.font();
+        let wanted = (site.scale, &config);
         if self
             .font
             .as_ref()
-            .is_none_or(|(scale, config, _)| (*scale, config) != wanted)
+            .is_none_or(|(scale, current, _)| (*scale, current) != wanted)
         {
-            let config = &state.config.font;
             match Font::with_symbols(
                 &config.family,
                 config.size,
@@ -687,7 +687,7 @@ impl TerminalCompositor {
                 Ok(mut font) => {
                     font.break_runs_at_cursor = config.shaping_breaks_at_cursor;
                     gpu.atlas.reset();
-                    self.font = Some((site.scale, config.clone(), font));
+                    self.font = Some((site.scale, config, font));
                 }
                 Err(error) => {
                     eprintln!("agentd: load font: {error:#}");
