@@ -5,7 +5,7 @@ description: Rune's custom GPU drawing contract as used by agentd - Compositor, 
 
 # Rune compositor and effect slots
 
-Verified against Rune rev `268ac7c` (wgpu `~30.0.1`). If the pin has moved, check anything you rely on.
+Verified against Rune rev `ba5e7c8` (wgpu `~30.0.1`). If the pin has moved, check anything you rely on.
 
 ## Pattern
 
@@ -31,7 +31,7 @@ Register with `App::new(spec).compositor(..)`. It runs in the window and in head
 ## Compositor trait
 
 - `render(&mut self, &mut Frame<S>)`, required. Runs after `Runtime::frame` built the instances.
-- `features() -> wgpu::Features`, optional device features.
+- `features() -> wgpu::Features`, optional device features. Default empty; keep it so on macOS (see Backend).
 - `animating() -> bool`, default false. True keeps the display link running. Leave it false for a terminal: frames come from `poll` and wakes.
 - `summary(&mut self, &Device) -> Option<String>`, printed after a headless run.
 
@@ -58,6 +58,7 @@ Register with `App::new(spec).compositor(..)`. It runs in the window and in head
 | `in_layer` | Drawing into an isolated layer |
 | `srgb_blend` | How to encode colours |
 | `index` | Position in the painter stream |
+| `backdrop` | `Option<&TextureView>`, a copy of the target so far; only when the slot set `effect_backdrop(true)` |
 
 ## Rules
 
@@ -67,6 +68,19 @@ Register with `App::new(spec).compositor(..)`. It runs in the window and in head
 - `.effect_bleed(pt)` lets a slot paint past its rect. `.effect_backdrop(true)` requests a backdrop copy.
 - `effect()` returns a normal `El`, so handlers, keys, sizing and children chain as usual.
 - `draw` receives only `&State`. Cell metrics known only in the compositor must travel by message or interior mutability; agentd sends them to the session actor.
+
+## Backend (macOS)
+
+agentd takes Rune's defaults, so `metal-backend` is on and nothing calls `App::gpu_backend` or sets `RUNE_GPU_BACKEND`: it runs on **Rune's native Metal backend**, not wgpu-hal. It plugs in through wgpu's `custom` backend, so `f.device`/`f.queue`/`RenderPass` are ordinary wgpu types and render.rs needs no change. The adapter reports `Backend::Metal`, driver `"rune metal"`. `rune::describe_gpu(f.device)` names the backend and why; `RUNE_GPU_LOG=1` prints it per window.
+
+- **Headless `--snap`** uses `Gpu::headless()`, the same native backend, so snaps exercise the same path as the window.
+- **Fallback:** if `features()` asks for anything beyond `TIMESTAMP_QUERY | IMMEDIATES` (the native set) and the backend is only the default, Rune logs once and draws with wgpu instead. An explicit `RUNE_GPU_BACKEND=metal` skips the fallback.
+- **Switch to wgpu-hal** to compare or debug: `RUNE_GPU_BACKEND=wgpu cargo run` (env beats `App::gpu_backend`).
+- **WGSL only:** naga translates each entry point to MSL per pipeline. Other shader sources panic. WGSL that naga rejects panics at first use with the naga message.
+- **Unsupported, panics** naming the way back to wgpu: depth/stencil, multisampling and resolves, more than 4 colour attachments, more than 8 bind groups, binding arrays, render bundles, indirect draws, query sets (except `TIMESTAMP_QUERY` at pass boundaries), `clear_texture`. agentd uses none; the quad pass is plain instanced triangles.
+- **Formats/sRGB:** no change to the sRGB rules below. The frame target and layer formats come from Rune; agentd builds a pipeline per `site.format` and its atlas is `Rgba8Unorm`.
+- **Buffers** are shared-storage and CPU-written in place; `Frame::write_buffer` and `Queue::write_buffer` both work, the former avoids an extra command buffer. `IMMEDIATES` (per-draw bytes up to 4 KB) is available if `features()` requests it.
+- **Lost device:** a device can die and be replaced; the `device_key` rebuild rule covers it.
 
 ## Pipeline requirements in agentd
 

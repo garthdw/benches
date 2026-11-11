@@ -5,7 +5,7 @@ description: Testing and verifying Rune apps in agentd - the headless Runtime ha
 
 # Testing Rune apps
 
-Verified against Rune rev `268ac7c`. If the pin has moved, check anything you rely on.
+Verified against Rune rev `ba5e7c8`. If the pin has moved, check anything you rely on.
 
 ## Unit tests with `Runtime`
 
@@ -32,13 +32,21 @@ Driving input (points, window space):
 - Text: `ime(Ime), cancel_composition(), paste(text), paste_content(content)`.
 - Gestures: `magnify_event, rotate_event, smart_magnify`.
 
-Inspect with `find(key) -> Option<(f32, f32)>`, `pointer()`, `cursor()`, `pressing()`, `has_focus()`, `has_pending_input()`, `wake_deadline()`.
+Inspect with:
+
+- `find(key) -> Option<(f32, f32)>`: element centre in points, `None` once exiting.
+- `presented(key) -> Option<([x, y, w, h], opacity)>`: drawn rect as of the last frame, exiting elements included.
+- `pointer()`, `cursor()`, `pressing()`, `has_focus()`, `has_pending_input()`, `wake_deadline()`.
+- `stats.commits`: view re-runs. Unchanged across a `frame` means a paint-only frame. `live_pending()` is true while a live source has an update waiting.
+- `file_dialog()` shows the pending `Tx::open_file`/`save_file`/`open_folder` request; `resolve_file_dialog(Some(path))` or `None` (cancel) answers it, and the callback runs on the next frame. Errors if none is open.
+
+`pointer_move` then one `frame` is enough for hover state. `El::hover_delays` elements also need frames past their delay.
 
 Function-pointer hooks can't capture, so count calls with a `static` atomic, as `main.rs` does.
 
 ## Headless CLI
 
-Rune intercepts these flags on the app binary and renders with no window. The compositor still runs.
+Rune intercepts these flags on the app binary and renders with no window. The compositor still runs, on the same native Metal backend as the window; `RUNE_GPU_BACKEND=wgpu` forces wgpu-hal. At `ba5e7c8` the `fixture`, `unicode` and `tray` scenes snap byte-identical on both.
 
 ```sh
 cargo run -- --snap "$SCRATCH/out.png" --scene fixture --size 960x640 --scale 2
@@ -48,7 +56,7 @@ cargo run -- --snap "$SCRATCH/out.png" --scene fixture --size 960x640 --scale 2
 |---|---|
 | `--snap out.png` | Render offscreen at `--at SECONDS` |
 | `--scene NAME`, `--list-scenes` | Start from an `AppSpec::scenes` entry |
-| `--crop KEY` | Crop `--snap` to an element's key |
+| `--crop KEY\|x,y,w,h` | Crop `--snap` to an element's key or path, or a rect in points |
 | `--size WxH`, `--scale N`, `--theme dark\|light` | Viewport in points, device scale (default 2), appearance |
 | `--script FILE.json` | Replay timestamped input |
 | `--tree out.json` | Element tree with animated values |
@@ -56,17 +64,19 @@ cargo run -- --snap "$SCRATCH/out.png" --scene fixture --size 960x640 --scale 2
 | `--strip out.png --crop x,y,w,h --every K` | Tile dumped frames |
 | `--trace out.jsonl` | Per-frame rects and motion |
 | `--pointer`, `--keys [CORNER]` | Draw presses or keycaps on dumped frames |
+| `--realtime` | Hold frames to the wall clock, print `rune-mark NAME T`, run `on_ready` after frame one |
 
 `--help` on the binary prints the full list.
 
 `--script` takes a JSON array or `{"events": [...]}`. Each event has `t` (seconds). Forms confirmed:
 
-- `{"focus": false}`, `{"menu": "item"}`, `{"reopen": true}`
+- `{"focus": false}`, `{"menu": "item"}`, `{"reopen": true}`, `{"open_url": "myapp://..."}`
 - `{"physical": "alt+e", "repeat": false}`: press, release, then modifiers up
 - `{"hold": "alt"}` until `{"hold": ""}`
 - `{"type": "mark", "name": N}`, `{"type": "shortcut", "chord": "cmd+space"}`
 - `paste` content takes `{"text", "html", "rtf", "png"}`
-- Pointer events (`move`, `down`, `up`, `tap`, `drag`) and keys: read `src/tooling/script.rs` for exact field names.
+- Pointer: `{"t": 0.5, "type": "move", "key": "project-1"}` (or `"x"`, `"y"` in points) hovers an element, so a hover state snapshots with `--snap --at 1`. Also `down`, `up`, `tap`/`click`, `double-click`, `drag`, `wheel`, `scroll`, `secondary-click`, `"button": "middle"`.
+- Keys and the rest: read `src/tooling/script.rs` for exact field names.
 
 ## agentd specifics
 

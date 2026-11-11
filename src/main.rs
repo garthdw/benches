@@ -104,6 +104,8 @@ pub struct State {
     started: bool,
     /// Session id and scrollbar presence last built for the tab, the drawer and the overlay.
     drawn: [(u64, bool); 3],
+    /// Sessions showing an attention dot, as the actors raise it without an event.
+    alerting: Vec<u64>,
     /// The session that refused a paste, and the text; dismissed when keys move elsewhere.
     pending_paste: Option<(u64, String)>,
     /// The session whose close waits for confirmation; dismissed when keys move elsewhere.
@@ -740,15 +742,8 @@ fn caret_rect(grid: &Grid) -> Option<[f32; 4]> {
     if metrics.cell_width == 0 {
         return None;
     }
-    let width = f32::from(metrics.cell_width) / metrics.scale;
-    let height = f32::from(metrics.cell_height) / metrics.scale;
-    let padding = metrics.padding / metrics.scale;
-    Some([
-        padding + f32::from(x) * width,
-        padding + f32::from(y) * height,
-        width,
-        height,
-    ])
+    let origin = metrics.origin([0.0; 4]);
+    Some(metrics.to_points(metrics.cell_rect(origin, x, y)))
 }
 
 fn resolve_paste(state: &mut State, confirmed: bool) {
@@ -1009,7 +1004,7 @@ fn view(state: &State, cx: &mut Cx<State>) -> El {
                     format!("tab-{index}"),
                     tab.label(),
                     index == project.active_tab,
-                    attention_dot(tab.attention),
+                    attention_dot(tab.session.attention()),
                 )
                 .max_w(TAB_MAX_WIDTH)
                 .on_press(move |state: &mut State| state.workspace.select_tab(index))
@@ -1432,7 +1427,6 @@ fn poll(state: &mut State, now: f64, tx: &mut Tx) -> bool {
     }
     launch_active(state);
     let active = state.session().map(Session::id);
-    let shown = state.workspace.active_session().map(Session::id);
     let mut changed = poll_jump(state, now, tx);
     changed |= poll_worktrees(state);
     if state
@@ -1472,12 +1466,6 @@ fn poll(state: &mut State, now: f64, tx: &mut Tx) -> bool {
                     if tab.restart {
                         restarts.push(tab.session.id());
                     }
-                    changed = true;
-                }
-                // Sent before the tab was shown, which already cleared it.
-                Event::Attention(_) if Some(tab.session.id()) == shown => {}
-                Event::Attention(attention) => {
-                    tab.attention = tab.attention.max(attention);
                     changed = true;
                 }
                 Event::Notify { title, body } => notices.push((tab.session.id(), title, body)),
@@ -1523,6 +1511,14 @@ fn poll(state: &mut State, now: f64, tx: &mut Tx) -> bool {
     ];
     changed |= drawn != state.drawn;
     state.drawn = drawn;
+    let alerting: Vec<u64> = state
+        .workspace
+        .sessions()
+        .filter(|session| session.attention() == Attention::Alert)
+        .map(Session::id)
+        .collect();
+    changed |= alerting != state.alerting;
+    state.alerting = alerting;
     changed
 }
 
@@ -1668,7 +1664,7 @@ fn add_scene_tray(state: &mut State) {
 fn show_tray_scene(state: &mut State) {
     show_workspace_scene(state);
     add_scene_tray(state);
-    state.workspace.projects[0].tabs[1].attention = Attention::Alert;
+    state.workspace.projects[0].tabs[1].session.alert();
     state.workspace.toggle_drawer(0);
 }
 
@@ -1965,6 +1961,23 @@ mod tests {
             scale: 2.0,
         };
         assert_eq!(caret_rect(&grid), Some([22.0, 6.0, 8.0, 16.0]));
+    }
+
+    #[test]
+    fn the_caret_is_the_drawn_cell_in_points_at_fractional_scales() {
+        for scale in [1.0, 1.25, 1.5, 2.0] {
+            let mut grid = Grid::from_vt(b"ab", 10, 2).unwrap();
+            grid.metrics = session::Metrics {
+                cell_width: 9,
+                cell_height: 19,
+                padding: 12.0 * scale,
+                scale,
+            };
+            let metrics = grid.metrics;
+            let (x, y) = grid.cursor.unwrap();
+            let drawn = metrics.cell_rect(metrics.origin([0.0; 4]), x, y);
+            assert_eq!(caret_rect(&grid), Some(metrics.to_points(drawn)), "{scale}");
+        }
     }
 
     fn workspace_state() -> State {
