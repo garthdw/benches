@@ -27,9 +27,12 @@ use workspace::{Project, SavedWorkspace, Slot, Status, Tab, Workspace};
 
 const TERMINAL_MARK: u32 = 1;
 const DRAWER_MARK: u32 = 2;
+const OVERLAY_MARK: u32 = 3;
 const TRAY_BAR_HEIGHT: f32 = 34.0;
 /// Fixed, so the drawer's terminal keeps its size while the drawer slides.
 const DRAWER_HEIGHT: f32 = 300.0;
+const OVERLAY_INSET: f32 = 40.0;
+const OVERLAY_PADDING: f32 = 6.0;
 const DOT: f32 = 7.0;
 /// Wider than the traffic lights, which sit over the sidebar.
 const SIDEBAR_WIDTH: f32 = 200.0;
@@ -69,8 +72,8 @@ pub struct State {
     waker: Option<Waker>,
     workspace: Workspace,
     started: bool,
-    /// Session id and generation last drawn for the tab and the drawer.
-    drawn: [(u64, u64); 2],
+    /// Session id and generation last drawn for the tab, the drawer and the overlay.
+    drawn: [(u64, u64); 3],
     /// The session that refused a paste, and the text; dismissed when keys move elsewhere.
     pending_paste: Option<(u64, String)>,
     /// The session whose close waits for confirmation; dismissed when keys move elsewhere.
@@ -266,6 +269,10 @@ fn close_focused(state: &mut State) {
     match state.workspace.focused_tab() {
         Some((Slot::Tab(_), _)) => state.workspace.close_tab(),
         Some((Slot::Tray(index), _)) => state.workspace.remove_tray(index),
+        Some((Slot::Overlay, tab)) => {
+            let session = tab.session.id();
+            state.workspace.drop_overlay(session);
+        }
         None => {}
     }
 }
@@ -275,6 +282,23 @@ fn resolve_close(state: &mut State, confirmed: bool) {
     if confirmed && pending == state.session().map(Session::id) {
         close_focused(state);
     }
+}
+
+/// Starts lazygit in the project's folder the first time, and after it has ended.
+fn toggle_lazygit(state: &mut State) {
+    let Some(project) = state.workspace.project() else {
+        return;
+    };
+    if project.overlay_open {
+        state.workspace.hide_overlay();
+        return;
+    }
+    let running = project
+        .overlay
+        .as_ref()
+        .is_some_and(|tab| tab.status == Status::Running);
+    let tab = (!running).then(|| state.spawn_tab("lazygit", Some("lazygit"), &project.root));
+    state.workspace.show_overlay(tab);
 }
 
 fn toggle_last_drawer(state: &mut State) {
@@ -333,7 +357,7 @@ impl Action {
     fn label(&self) -> String {
         match self {
             Action::Shell => "New shell tab".to_owned(),
-            Action::Lazygit => "New lazygit tab".to_owned(),
+            Action::Lazygit => "Toggle lazygit".to_owned(),
             Action::OpenProject => "Open project…".to_owned(),
             Action::Jump(root) => format!("Open project {}", root.display()),
             Action::Run(command) => format!("Run “{command}” in a new tab"),
@@ -384,7 +408,7 @@ fn run_palette(state: &mut State, index: usize, tx: &mut Tx) {
 fn run_action(state: &mut State, action: &Action, tx: &mut Tx) {
     match action {
         Action::Shell => open_tab(state, "shell", None),
-        Action::Lazygit => open_tab(state, "lazygit", Some("lazygit")),
+        Action::Lazygit => toggle_lazygit(state),
         Action::OpenProject => pick_folder(tx),
         Action::Jump(root) => open_project(state, root.clone()),
         Action::Run(command) => open_tab(state, command, Some(command)),
@@ -486,6 +510,8 @@ fn shortcut(state: &mut State, event: &KeyEvent, tx: &mut Tx) -> bool {
         state.sidebar_hidden = !state.sidebar_hidden;
     } else if pressed("mod+j") {
         toggle_last_drawer(state);
+    } else if pressed("mod+g") {
+        toggle_lazygit(state);
     } else if pressed("mod+t") {
         run_action(state, &Action::Shell, tx);
     } else if pressed("mod+w") {
@@ -572,13 +598,15 @@ fn pointer_phase(phase: Phase) -> PointerPhase {
 }
 
 /// Pressing the drawer's terminal gives it the keys, and pressing the tab's takes them back.
-fn focus_on_press(state: &mut State, drawer: bool, phase: PointerPhase, tx: &mut Tx) {
-    let focus_moves = phase == PointerPhase::Press
+/// The overlay (`None`) always has them while shown.
+fn focus_on_press(state: &mut State, drawer: Option<bool>, phase: PointerPhase, tx: &mut Tx) {
+    if phase == PointerPhase::Press
+        && let Some(drawer) = drawer
         && state
             .workspace
             .project()
-            .is_some_and(|project| project.drawer_focused != drawer);
-    if focus_moves {
+            .is_some_and(|project| project.drawer_focused != drawer)
+    {
         state.workspace.focus_drawer(drawer);
     } else {
         tx.live_only();
@@ -586,7 +614,11 @@ fn focus_on_press(state: &mut State, drawer: bool, phase: PointerPhase, tx: &mut
 }
 
 /// The right padding, where the thumb is drawn, while there is history to scroll.
-fn scrollbar_strip(key: &str, drawer: bool, pick: fn(&Workspace) -> Option<&Session>) -> El {
+fn scrollbar_strip(
+    key: &str,
+    drawer: Option<bool>,
+    pick: fn(&Workspace) -> Option<&Session>,
+) -> El {
     el().key(format!("{key}-scrollbar"))
         .pin(None, Some(0.0), Some(0.0), Some(0.0))
         .w(render::PADDING_POINTS)
@@ -614,7 +646,10 @@ fn terminal_surface(
     workspace: &Workspace,
     pick: fn(&Workspace) -> Option<&Session>,
 ) -> El {
-    let drawer = mark == DRAWER_MARK;
+    let drawer = match mark {
+        OVERLAY_MARK => None,
+        _ => Some(mark == DRAWER_MARK),
+    };
     let scrollable = pick(workspace).is_some_and(|session| session.grid().scrollbar.is_some());
     effect(mark)
         .key(key)
@@ -905,7 +940,10 @@ fn view(state: &State, cx: &mut Cx<State>) -> El {
     let project = state.workspace.project();
     let drawer_focused = project.is_some_and(|project| project.drawer_focused);
     let mut drawer_overlays = Vec::new();
-    if drawer_focused {
+    let mut overlay_overlays = Vec::new();
+    if project.is_some_and(|project| project.overlay_open) {
+        overlay_overlays = focus_overlays;
+    } else if drawer_focused {
         drawer_overlays = focus_overlays;
     } else {
         overlays.extend(focus_overlays);
@@ -1008,6 +1046,41 @@ fn view(state: &State, cx: &mut Cx<State>) -> El {
                     ),
             )
     });
+    let overlay = project.and_then(Project::overlay_tab).map(|_| {
+        col()
+            .key("overlay-layer")
+            .pin(Some(0.0), Some(TAB_STRIP_HEIGHT), Some(0.0), Some(0.0))
+            .padding(OVERLAY_INSET)
+            .fill(theme.shadow_soft)
+            .on_press(|state: &mut State| state.workspace.hide_overlay())
+            .child(
+                col()
+                    .key("overlay-panel")
+                    .w_full()
+                    .grow(1.0)
+                    .min_h(0.0)
+                    .padding(OVERLAY_PADDING)
+                    .radius(10.0)
+                    .clip_rounded(10.0)
+                    .fill(theme.card)
+                    .border(1.0, theme.card_border)
+                    .shadow(12.0, 40.0, theme.shadow)
+                    // Keeps clicks inside the panel from reaching the layer, which hides it.
+                    .on_press(|_: &mut State| {})
+                    .child(
+                        terminal_surface(
+                            OVERLAY_MARK,
+                            "overlay-terminal",
+                            &state.workspace,
+                            Workspace::overlay_session,
+                        )
+                        .w_full()
+                        .grow(1.0)
+                        .min_h(0.0)
+                        .children(overlay_overlays),
+                    ),
+            )
+    });
     let terminal = col()
         .h_full()
         .grow(1.0)
@@ -1039,7 +1112,8 @@ fn view(state: &State, cx: &mut Cx<State>) -> El {
             .children(overlays),
         )
         .children(tray_bar)
-        .children(drawer);
+        .children(drawer)
+        .children(overlay);
     let palette = state.palette_open.then(|| {
         let actions = palette_actions(&state.palette.text, state.jump_target());
         let selected = state.palette_selected.min(actions.len().saturating_sub(1));
@@ -1135,6 +1209,7 @@ fn poll(state: &mut State, now: f64, tx: &mut Tx) -> bool {
         changed = true;
     }
     let mut restarts = Vec::new();
+    let mut exits = Vec::new();
     let mut notices = Vec::new();
     for tab in state.workspace.tabs_mut() {
         while let Some(event) = tab.session.next_event() {
@@ -1151,6 +1226,9 @@ fn poll(state: &mut State, now: f64, tx: &mut Tx) -> bool {
                 }
                 Event::Exited(status) => {
                     tab.exited(status);
+                    if tab.status == Status::Exited {
+                        exits.push(tab.session.id());
+                    }
                     if tab.restart {
                         restarts.push(tab.session.id());
                     }
@@ -1175,6 +1253,11 @@ fn poll(state: &mut State, now: f64, tx: &mut Tx) -> bool {
             notify::post(session, &notification);
         }
     }
+    for session in exits {
+        if let Some((_, Slot::Overlay)) = state.workspace.locate(session) {
+            state.workspace.drop_overlay(session);
+        }
+    }
     for session in restarts {
         if let Some((project, slot @ Slot::Tray(_))) = state.workspace.locate(session) {
             respawn(state, project, slot);
@@ -1191,6 +1274,7 @@ fn poll(state: &mut State, now: f64, tx: &mut Tx) -> bool {
     let drawn = [
         drawn(state.workspace.active_session()),
         drawn(state.workspace.drawer_session()),
+        drawn(state.workspace.overlay_session()),
     ];
     changed |= drawn != state.drawn;
     state.drawn = drawn;
@@ -1344,6 +1428,15 @@ fn show_tray_scene(state: &mut State) {
     state.workspace.toggle_drawer(0);
 }
 
+const SCENE_LAZYGIT: &[u8] = b"\x1b[1mStatus\x1b[0m\r\n\x1b[32m\xe2\x9c\x93\x1b[0m agentd -> lazygit-overlay\r\n\r\n\x1b[1mFiles\x1b[0m\r\n\x1b[32m M\x1b[0m src/main.rs\r\n\x1b[32m M\x1b[0m src/workspace.rs\r\n\x1b[31m??\x1b[0m notes.txt\r\n";
+
+fn show_lazygit_scene(state: &mut State) {
+    show_workspace_scene(state);
+    state
+        .workspace
+        .show_overlay(Some(fixture_tab("lazygit", SCENE_LAZYGIT)));
+}
+
 /// A bundle launched from Finder has its stderr discarded, so send it to a file instead.
 fn log_to_file_in_bundle() -> anyhow::Result<()> {
     use std::os::fd::AsRawFd;
@@ -1391,6 +1484,7 @@ const SCENES: &[Scene] = &[
         state.palette_open = true;
     }),
     ("tray", show_tray_scene),
+    ("lazygit", show_lazygit_scene),
     ("empty", isolate_scene),
     ("collapsed", |state| {
         show_workspace_scene(state);
@@ -1987,6 +2081,138 @@ mod tests {
         assert_eq!(drawer_id(&runtime), tray_id(&runtime, 2));
         press(&mut runtime, Key::Command('j'), command());
         assert_eq!(drawer_id(&runtime), None);
+    }
+
+    fn overlay_id(runtime: &Runtime<State>) -> Option<u64> {
+        runtime.state.workspace.overlay_session().map(Session::id)
+    }
+
+    fn overlay_runtime() -> Runtime<State> {
+        let mut state = workspace_state();
+        state
+            .workspace
+            .show_overlay(Some(fixture_tab("lazygit", b"")));
+        state.workspace.hide_overlay();
+        let mut runtime = runtime_with(state);
+        runtime.on_key = Some(on_key);
+        runtime
+    }
+
+    #[test]
+    fn command_g_toggles_the_same_overlay_process() {
+        let mut runtime = overlay_runtime();
+        assert_eq!(overlay_id(&runtime), None);
+        assert_eq!(runtime.find("overlay-panel"), None);
+        let kept = runtime
+            .state
+            .workspace
+            .overlay_sessions()
+            .next()
+            .map(Session::id);
+        press(&mut runtime, Key::Command('g'), command());
+        assert_eq!(overlay_id(&runtime), kept);
+        assert!(runtime.find("overlay-panel").is_some());
+        press(&mut runtime, Key::Command('g'), command());
+        assert_eq!(overlay_id(&runtime), None);
+        press(&mut runtime, Key::Command('g'), command());
+        assert_eq!(overlay_id(&runtime), kept);
+    }
+
+    #[test]
+    fn the_first_command_g_starts_an_overlay_for_the_project() {
+        let mut runtime = runtime_with(workspace_state());
+        runtime.on_key = Some(on_key);
+        press(&mut runtime, Key::Command('g'), command());
+        assert!(overlay_id(&runtime).is_some());
+        let titles: Vec<_> = runtime.state.workspace.projects[0]
+            .tabs
+            .iter()
+            .map(|tab| tab.title.as_str())
+            .collect();
+        assert_eq!(titles, ["claude", "shell", "lazygit"]);
+    }
+
+    #[test]
+    fn the_overlay_takes_keys_and_escape_reaches_it() {
+        let mut runtime = overlay_runtime();
+        press(&mut runtime, Key::Command('g'), command());
+        assert_eq!(
+            runtime.state.session().map(Session::id),
+            overlay_id(&runtime)
+        );
+        press(&mut runtime, Key::Escape, Mods::default());
+        assert_eq!(
+            overlay_id(&runtime),
+            runtime.state.session().map(Session::id)
+        );
+        assert!(overlay_id(&runtime).is_some());
+    }
+
+    #[test]
+    fn clicking_outside_the_overlay_hides_it_and_inside_does_not() {
+        let mut runtime = overlay_runtime();
+        press(&mut runtime, Key::Command('g'), command());
+        click(&mut runtime, "overlay-terminal");
+        assert!(overlay_id(&runtime).is_some());
+        let (rect, _) = runtime.presented("overlay-layer").unwrap();
+        let (x, y) = (rect[0] + 4.0, rect[1] + 4.0);
+        runtime.pointer_down(x, y);
+        runtime.pointer_up(x, y);
+        runtime.frame(2.0 / 60.0);
+        assert_eq!(overlay_id(&runtime), None);
+    }
+
+    #[test]
+    fn a_failing_overlay_process_stays_shown_with_its_status() {
+        let mut state = workspace_state();
+        let tab = state.spawn_tab(
+            "lazygit",
+            Some("sh -c 'sleep 0.2; exit 3'"),
+            Path::new("/tmp"),
+        );
+        state.workspace.show_overlay(Some(tab));
+        let mut runtime = runtime_with(state);
+        runtime.poll = Some(poll);
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        let mut frame = 1.0;
+        while runtime
+            .state
+            .workspace
+            .focused_tab()
+            .is_some_and(|(_, tab)| tab.status == Status::Running)
+        {
+            assert!(std::time::Instant::now() < deadline, "timed out");
+            std::thread::sleep(Duration::from_millis(20));
+            frame += 1.0;
+            runtime.frame(frame / 60.0);
+        }
+        let status = runtime.state.workspace.overlay_session().map(|_| {
+            runtime
+                .state
+                .workspace
+                .focused_tab()
+                .map(|(_, tab)| tab.status.clone())
+        });
+        assert_eq!(status, Some(Some(Status::Failed("exit 3".to_owned()))));
+        assert!(runtime.find("restart-hint").is_some());
+    }
+
+    #[test]
+    fn an_exiting_overlay_process_is_dropped_so_the_next_toggle_starts_afresh() {
+        let mut state = workspace_state();
+        let tab = state.spawn_tab("lazygit", Some("sleep 0.2"), Path::new("/tmp"));
+        state.workspace.show_overlay(Some(tab));
+        let mut runtime = runtime_with(state);
+        runtime.poll = Some(poll);
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        let mut frame = 1.0;
+        while runtime.state.workspace.overlay_sessions().count() > 0 {
+            assert!(std::time::Instant::now() < deadline, "timed out");
+            std::thread::sleep(Duration::from_millis(20));
+            frame += 1.0;
+            runtime.frame(frame / 60.0);
+        }
+        assert_eq!(overlay_id(&runtime), None);
     }
 
     #[test]
