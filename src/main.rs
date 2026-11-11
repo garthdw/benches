@@ -1759,6 +1759,17 @@ const SCENES: &[Scene] = &[
 ];
 
 fn main() {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if let Some((_, config_args)) = args.split_first().filter(|(name, _)| *name == "config") {
+        let result = config::Paths::from_home()
+            .context("HOME is not set")
+            .and_then(|paths| config::command(config_args, &paths, &mut std::io::stdout()));
+        if let Err(error) = result {
+            eprintln!("agentd: {error:#}");
+            std::process::exit(1);
+        }
+        return;
+    }
     log_to_file_in_bundle().log_err("log file");
     let spec = AppSpec::<State> {
         scenes: SCENES,

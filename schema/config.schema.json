@@ -1,0 +1,93 @@
+{
+  "$defs": {
+    "FontFile": {
+      "additionalProperties": false,
+      "properties": {
+        "family": {
+          "description": "The font family. Falls back to Ghostty's first `font-family`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "size": {
+          "description": "The font size in points. Falls back to Ghostty's `font-size`.",
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "symbols-family": {
+          "description": "The face for private-use icons; unset tries Ghostty's other `font-family` lines, then\nthe main font.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "TabSpec": {
+      "properties": {
+        "command": {
+          "description": "The command to run through the launch shell; omit to open the shell itself.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "title": {
+          "description": "The tab's label.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "title"
+      ],
+      "type": "object"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "description": "The `config.toml` format. Every key is optional.",
+  "properties": {
+    "font": {
+      "$ref": "#/$defs/FontFile",
+      "description": "The terminal font. Each key falls back to Ghostty's config."
+    },
+    "jump-command": {
+      "description": "A command such as `j` or `zoxide query` that the command centre runs through `shell`\nwith the query to find a folder to open as a project.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "shell": {
+      "description": "The shell new tabs run, as an absolute path.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "tabs": {
+      "description": "The tabs a new project opens with.",
+      "items": {
+        "$ref": "#/$defs/TabSpec"
+      },
+      "type": [
+        "array",
+        "null"
+      ]
+    },
+    "theme": {
+      "description": "A Ghostty theme name or absolute path; `light:X,dark:Y` picks the dark one.\nFalls back to Ghostty's theme.",
+      "type": [
+        "string",
+        "null"
+      ]
+    }
+  },
+  "title": "File",
+  "type": "object"
+}
