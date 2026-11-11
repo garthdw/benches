@@ -2139,6 +2139,7 @@ fn terminate(child: &mut Child, pid: &Mutex<Option<i32>>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::wait_until;
 
     #[test]
     fn parses_text_and_colour_into_the_grid() {
@@ -2265,21 +2266,6 @@ mod tests {
             )
             .unwrap(),
         );
-    }
-
-    fn wait_until<T>(
-        timeout: Duration,
-        describe: impl Fn() -> String,
-        mut found: impl FnMut() -> Option<T>,
-    ) -> T {
-        let deadline = Instant::now() + timeout;
-        loop {
-            if let Some(value) = found() {
-                return value;
-            }
-            assert!(Instant::now() < deadline, "{}", describe());
-            thread::sleep(Duration::from_millis(10));
-        }
     }
 
     fn wait_for_line(session: &Session, want: &str) {

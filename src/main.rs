@@ -7,6 +7,8 @@ mod notify;
 mod render;
 mod session;
 mod sprite;
+#[cfg(test)]
+mod test_support;
 mod workspace;
 
 use std::path::{Path, PathBuf};
@@ -2131,21 +2133,12 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rune::{Env, Runtime};
+    use crate::test_support::*;
+    use rune::Runtime;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     static WINDOW_KEYS: AtomicUsize = AtomicUsize::new(0);
     static KEYS_AFTER_TERMINAL_CLICK: AtomicUsize = AtomicUsize::new(0);
-
-    fn runtime_with(state: State) -> Runtime<State> {
-        let env = Env {
-            system_dark: true,
-            scale: 2.0,
-        };
-        let mut runtime = Runtime::new(state, view, (960.0, 640.0), env);
-        runtime.frame(0.0);
-        runtime
-    }
 
     fn output(bytes: &[u8], generation: u64) -> Grid {
         Grid {
@@ -2342,19 +2335,6 @@ mod tests {
         }
     }
 
-    fn workspace_state() -> State {
-        let mut state = State::default();
-        show_workspace_scene(&mut state);
-        state
-    }
-
-    fn click(runtime: &mut Runtime<State>, key: &str) {
-        let (x, y) = runtime.find(key).unwrap();
-        runtime.pointer_down(x, y);
-        runtime.pointer_up(x, y);
-        runtime.frame(1.0 / 60.0);
-    }
-
     #[test]
     fn clicking_a_project_and_a_tab_selects_them() {
         let mut runtime = runtime_with(workspace_state());
@@ -2363,39 +2343,6 @@ mod tests {
         let workspace = &runtime.state.workspace;
         assert_eq!(workspace.active, 1);
         assert_eq!(workspace.projects[1].active_tab, 1);
-    }
-
-    fn press(runtime: &mut Runtime<State>, key: Key, mods: Mods) {
-        runtime.key(KeyEvent { key, mods });
-        runtime.frame(1.0 / 60.0);
-    }
-
-    fn command() -> Mods {
-        Mods {
-            cmd: true,
-            logo: true,
-            ..Mods::default()
-        }
-    }
-
-    fn command_shift() -> Mods {
-        Mods {
-            shift: true,
-            ..command()
-        }
-    }
-
-    fn control() -> Mods {
-        Mods {
-            ctrl: true,
-            ..Mods::default()
-        }
-    }
-
-    fn workspace_runtime() -> Runtime<State> {
-        let mut runtime = runtime_with(workspace_state());
-        runtime.on_key = Some(on_key);
-        runtime
     }
 
     #[test]
@@ -2429,12 +2376,6 @@ mod tests {
         press(&mut runtime, Key::Command('@'), command_shift());
         let workspace = &runtime.state.workspace;
         assert_eq!((workspace.active, workspace.projects[0].active_tab), (0, 0));
-    }
-
-    fn settle(runtime: &mut Runtime<State>) {
-        for frame in 2..120 {
-            runtime.frame(frame as f64 / 60.0);
-        }
     }
 
     fn sidebar_width(runtime: &Runtime<State>) -> f32 {
@@ -2531,12 +2472,6 @@ mod tests {
             .map(|tab| tab.title.as_str())
             .collect();
         assert_eq!(titles, ["shell", "lazygit"]);
-    }
-
-    fn hover(runtime: &mut Runtime<State>, key: &str) {
-        let (x, y) = runtime.find(key).unwrap();
-        runtime.pointer_move(x, y);
-        runtime.frame(1.0 / 60.0);
     }
 
     #[test]
@@ -2667,13 +2602,6 @@ mod tests {
             Path::new("/dev/moved")
         );
         assert_eq!(workspace.projects[workspace.active].name, "moved");
-    }
-
-    fn palette_runtime() -> Runtime<State> {
-        let mut runtime = workspace_runtime();
-        press(&mut runtime, Key::Command('p'), command());
-        runtime.frame(2.0 / 60.0);
-        runtime
     }
 
     #[test]
@@ -3263,14 +3191,19 @@ mod tests {
     }
 
     fn poll_until(runtime: &mut Runtime<State>, done: impl Fn(&Tab) -> bool) {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
         let mut frame = 1.0;
-        while !done(&runtime.state.workspace.projects[0].tray[0]) {
-            assert!(std::time::Instant::now() < deadline, "timed out");
-            std::thread::sleep(std::time::Duration::from_millis(20));
-            frame += 1.0;
-            runtime.frame(frame / 60.0);
-        }
+        wait_until(
+            std::time::Duration::from_secs(15),
+            || "timed out".to_owned(),
+            || {
+                if done(&runtime.state.workspace.projects[0].tray[0]) {
+                    return Some(());
+                }
+                frame += 1.0;
+                runtime.frame(frame / 60.0);
+                None
+            },
+        );
     }
 
     #[test]
@@ -3327,21 +3260,6 @@ mod tests {
         assert!(!none.contains(&create));
     }
 
-    /// Stands in for the login shell, so no real `wt` runs. It records its arguments and runs `body`.
-    fn stub_shell(body: &str) -> (tempfile::TempDir, PathBuf, PathBuf) {
-        use std::os::unix::fs::PermissionsExt;
-        let directory = tempfile::tempdir().unwrap();
-        let record = directory.path().join("args");
-        let shell = directory.path().join("stub-shell");
-        let script = format!(
-            "#!/bin/sh\nprintf '%s\\n' \"$@\" >> '{}'\n{body}\n",
-            record.display()
-        );
-        std::fs::write(&shell, script).unwrap();
-        std::fs::set_permissions(&shell, std::fs::Permissions::from_mode(0o755)).unwrap();
-        (directory, shell, record)
-    }
-
     fn create_worktree_from_palette(shell: PathBuf, branch: &str) -> Runtime<State> {
         let mut state = workspace_state();
         state.config.shell = shell;
@@ -3360,14 +3278,19 @@ mod tests {
     }
 
     fn poll_until_created(runtime: &mut Runtime<State>) {
-        let deadline = std::time::Instant::now() + Duration::from_secs(15);
         let mut frame = 1.0;
-        while runtime.state.creation.is_some() {
-            assert!(std::time::Instant::now() < deadline, "timed out");
-            std::thread::sleep(Duration::from_millis(20));
-            frame += 1.0;
-            runtime.frame(frame / 60.0);
-        }
+        wait_until(
+            Duration::from_secs(15),
+            || "timed out".to_owned(),
+            || {
+                if runtime.state.creation.is_none() {
+                    return Some(());
+                }
+                frame += 1.0;
+                runtime.frame(frame / 60.0);
+                None
+            },
+        );
     }
 
     #[test]
@@ -3695,30 +3618,6 @@ mod tests {
         assert_eq!(tab.status, Status::Running);
         assert_eq!(tab.command.as_deref(), Some("sh -c 'exit 0'"));
     }
-    fn counting_waker() -> (Waker, Arc<AtomicUsize>) {
-        let count = Arc::new(AtomicUsize::new(0));
-        let waker: Waker = {
-            let count = count.clone();
-            Arc::new(move || {
-                count.fetch_add(1, Ordering::Relaxed);
-            })
-        };
-        (waker, count)
-    }
-
-    fn second_window(fleet: &Fleet, window: WindowId) -> Runtime<State> {
-        let state = State {
-            fleet: fleet.clone(),
-            window,
-            started: true,
-            ..State::default()
-        };
-        state.fleet.register(window, Arc::new(|| {}));
-        let mut runtime = runtime_with(state);
-        runtime.poll = Some(poll);
-        runtime
-    }
-
     #[test]
     fn moving_a_project_is_offered_only_beside_another_project() {
         let moves = |workspace: &Workspace| {
