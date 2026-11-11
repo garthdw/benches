@@ -3885,7 +3885,7 @@ mod tests {
     fn the_window_title_names_the_active_project() {
         assert_eq!(window_title(&Workspace::default()), "agentd");
         let mut workspace = workspace_state().workspace;
-        assert_eq!(window_title(&workspace), "agentd - agentd");
+        assert_eq!(window_title(&workspace), "agentd — agentd");
         workspace.select_project(1);
         assert_eq!(window_title(&workspace), "site — agentd");
     }
