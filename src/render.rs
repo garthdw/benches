@@ -188,8 +188,8 @@ struct Run {
     text: Option<Rc<str>>,
 }
 
-fn joins_run(cell: &Cell) -> bool {
-    cell.cluster.is_none() && !cell.wide && !cell.spacer && crate::font::joins_run(cell.character)
+fn joins_run(cell: &Cell, font: &Font) -> bool {
+    cell.cluster.is_none() && !cell.wide && !cell.spacer && font.joins_run(cell.character)
 }
 
 fn find_run(
@@ -206,7 +206,7 @@ fn find_run(
             let cell = &grid.cells[index];
             index % cols == 0
                 || Some(index) == cursor
-                || !joins_run(cell)
+                || !joins_run(cell, font)
                 || (cell.bold, cell.italic, cell.selected)
                     != (first.bold, first.italic, first.selected)
         })
@@ -355,7 +355,7 @@ fn build_quads(
                 quads.push(line(0.0, fg));
             }
             if Some(index) != cursor
-                && joins_run(cell)
+                && joins_run(cell, font)
                 && run.as_ref().is_none_or(|run| index >= run.end)
             {
                 run = Some(find_run(grid, index, cursor, font, &mut run_text));
@@ -863,6 +863,14 @@ mod tests {
         let keys = shaped_keys_in(token, 40, &[]);
         let run = String::from_utf8_lossy(token).into_owned();
         assert!(keys.contains(&(run.clone(), 15)) && keys.contains(&(run, 16)));
+    }
+
+    #[test]
+    fn non_ascii_cells_join_a_run_and_are_indexed_by_cell() {
+        let keys = shaped_keys("→é!=".as_bytes(), &[]);
+        for index in [2, 3] {
+            assert!(keys.contains(&("→é!=".to_owned(), index)), "{keys:?}");
+        }
     }
 
     #[test]

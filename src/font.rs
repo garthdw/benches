@@ -107,12 +107,6 @@ fn with_features(font: CFRetained<CTFont>, features: &[FontFeature]) -> CFRetain
     }
 }
 
-/// Characters that can join a shaped run: ligatures and contextual alternates are written in
-/// ASCII, and a run holds one UTF-16 unit and one cell per character.
-pub fn joins_run(character: char) -> bool {
-    character.is_ascii_graphic()
-}
-
 /// A monospaced face rasterised into whole-cell RGBA bitmaps, in device pixels.
 pub struct Font {
     /// Indexed by `bold + 2 * italic`.
@@ -130,7 +124,8 @@ pub struct Font {
     /// Per style, which cells of a run shape differently from standing alone.
     runs: RefCell<[HashMap<String, Rc<[bool]>>; 4]>,
     /// The glyph a character shapes to alone, per style index.
-    alone: RefCell<HashMap<(usize, u8), Option<u16>>>,
+    alone: RefCell<HashMap<(usize, char), Option<u16>>>,
+    joins: RefCell<HashMap<char, bool>>,
 }
 
 /// Runs cached before the cache is emptied; words are the usual run, so this bounds memory.
@@ -369,6 +364,7 @@ impl Font {
             advance,
             runs: RefCell::default(),
             alone: RefCell::default(),
+            joins: RefCell::default(),
             faces,
             symbols,
             color_space: CGColorSpace::new_device_rgb(),
@@ -455,14 +451,44 @@ impl Font {
         })
     }
 
-    fn glyph_alone(&self, face: usize, character: u8) -> Option<u16> {
+    /// Whether `character` may be shaped with its neighbours. Only characters the main face draws
+    /// itself qualify, which keeps a run in one font, and only those in the BMP, so a character
+    /// is one UTF-16 unit and CoreText's string indices are cell offsets. Spaces, procedural
+    /// glyphs and icons are drawn on their own.
+    pub fn joins_run(&self, character: char) -> bool {
+        if character.is_ascii() {
+            return character.is_ascii_graphic();
+        }
+        *self.joins.borrow_mut().entry(character).or_insert_with(|| {
+            let mut unit = [u16::try_from(u32::from(character)).unwrap_or(0)];
+            let mut glyph = 0u16;
+            let mut scratch = vec![0; (self.cell_width * self.cell_height * 4) as usize];
+            !character.is_whitespace()
+                && !character.is_control()
+                && !is_private_use(character)
+                && character.len_utf16() == 1
+                // SAFETY: both pointers are to one element, matching the count.
+                && unsafe {
+                    self.faces[0]
+                        .glyphs_for_characters(NonNull::from(&mut unit[0]), NonNull::from(&mut glyph), 1)
+                }
+                && !sprite::draw(
+                    character,
+                    self.cell_width,
+                    self.cell_height,
+                    self.line_thickness,
+                    &mut scratch,
+                )
+        })
+    }
+
+    fn glyph_alone(&self, face: usize, character: char) -> Option<u16> {
         *self
             .alone
             .borrow_mut()
             .entry((face, character))
             .or_insert_with(|| {
-                let text = char::from(character).to_string();
-                let shaped = shape(&self.faces[face], &text)?;
+                let shaped = shape(&self.faces[face], &character.to_string())?;
                 (shaped.glyphs.len() == 1).then(|| shaped.glyphs[0])
             })
     }
@@ -484,26 +510,27 @@ impl Font {
     }
 
     fn shaped_differences(&self, run: &str, face: usize) -> Vec<bool> {
-        let unchanged = vec![false; run.len()];
+        let length = run.chars().count();
+        let unchanged = vec![false; length];
         let Some(shaped) = shape(&self.faces[face], run) else {
             return unchanged;
         };
         // Fewer glyphs than characters is a true ligature, so no cell stands alone.
-        let in_order = shaped.glyphs.len() == run.len()
+        let in_order = shaped.glyphs.len() == length
             && shaped
                 .indices
                 .iter()
                 .zip(0..)
                 .all(|(index, cell)| *index == cell);
         if !in_order {
-            return vec![true; run.len()];
+            return vec![true; length];
         }
-        run.bytes()
+        run.chars()
             .zip(shaped.glyphs.iter().zip(&shaped.positions))
             .zip(0..)
             .map(
-                |((byte, (glyph, position)), cell): ((_, (&u16, &CGPoint)), u32)| {
-                    self.glyph_alone(face, byte) != Some(*glyph)
+                |((character, (glyph, position)), cell): ((_, (&u16, &CGPoint)), u32)| {
+                    self.glyph_alone(face, character) != Some(*glyph)
                         || (position.x - f64::from(cell) * self.advance).abs() > 0.5
                 },
             )
@@ -523,7 +550,7 @@ impl Font {
         let shaped = shape(font, run)?;
         // A glyph spills at most into its neighbours, so a long token needs only three cells drawn.
         let first = index.saturating_sub(1);
-        let cells = (index + 2).min(run.len()) - first;
+        let cells = (index + 2).min(run.chars().count()) - first;
         let row = (self.cell_width * 4) as usize;
         let mut window = vec![0u8; row * cells * self.cell_height as usize];
         let context = self.bitmap_context(&mut window, self.cell_width * cells as u32)?;
@@ -846,7 +873,7 @@ mod tests {
     }
 
     fn cells(font: &Font, text: &str) -> Vec<Vec<u8>> {
-        (0..text.len())
+        (0..text.chars().count())
             .map(|index| {
                 let mut pixels = Vec::new();
                 font.rasterize_shaped(text, REGULAR, index, &mut pixels)
@@ -903,6 +930,27 @@ mod tests {
             &*with_features(&["ss01"]).shaped_cells("==", REGULAR),
             [true, true]
         );
+    }
+
+    #[test]
+    fn runs_hold_single_codepoints_the_main_face_draws_itself() {
+        let font = with_features(&[]);
+        for joins in ['a', '!', 'é', '→'] {
+            assert!(font.joins_run(joins), "{joins}");
+        }
+        // Spaces, procedural box drawing, icons and glyphs only a fallback face has.
+        for apart in [' ', '│', '\u{E0B0}', '世', '\u{1F600}'] {
+            assert!(!font.joins_run(apart), "{apart:?}");
+        }
+    }
+
+    #[test]
+    fn a_run_with_non_ascii_cells_is_indexed_by_character() {
+        let font = with_features(&[]);
+        let shaped = font.shaped_cells("→é!=", REGULAR);
+        assert_eq!(shaped.len(), 4);
+        assert_eq!(&shaped[2..], [true, true]);
+        assert_eq!(cells(&font, "→é!=").len(), 4);
     }
 
     #[test]
