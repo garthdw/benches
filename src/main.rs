@@ -40,6 +40,7 @@ const OVERLAY_PADDING: f32 = 6.0;
 const DOT: f32 = 7.0;
 /// Wider than the traffic lights, which sit over the sidebar.
 const SIDEBAR_WIDTH: f32 = 200.0;
+const TEAR_OFF_DISTANCE: f32 = 48.0;
 /// The sidebar's top padding too, so the traffic lights clear the first project.
 const TAB_STRIP_HEIGHT: f32 = 36.0;
 const TAB_MAX_WIDTH: f32 = 220.0;
@@ -447,7 +448,7 @@ fn open_project(state: &mut State, root: PathBuf) {
 
 /// Hands project `index` to a new window, with its processes still running. A window's last
 /// project stays, as it would leave that window empty.
-fn move_to_new_window(state: &mut State, index: usize) {
+fn move_to_new_window(state: &mut State, index: usize, position: Option<(i32, i32)>) {
     if state.workspace.projects.len() < 2 {
         return;
     }
@@ -462,7 +463,15 @@ fn move_to_new_window(state: &mut State, index: usize) {
         state.paths = paths;
         state.started = true;
     });
-    rune::open_window(WindowSpec::from_app(format!("agentd-{window}"), app));
+    let mut spec = WindowSpec::from_app(format!("agentd-{window}"), app);
+    spec.options.position = position;
+    rune::open_window(spec);
+}
+
+/// Whether a project dragged from the sidebar was let go far enough outside it, or off the
+/// window's top or left edge, to leave for a window of its own.
+fn torn_off([x, y]: [f32; 2], sidebar_width: f32) -> bool {
+    x < 0.0 || y < 0.0 || x > sidebar_width + TEAR_OFF_DISTANCE
 }
 
 /// Takes the projects other windows handed over, pointing their sessions at this window.
@@ -707,7 +716,7 @@ fn run_action(state: &mut State, action: &Action, tx: &mut Tx) {
         Action::Lazygit => toggle_lazygit(state),
         Action::OpenProject => pick_folder(tx, false),
         Action::ChangeFolder => pick_folder(tx, true),
-        Action::MoveToNewWindow => move_to_new_window(state, state.workspace.active),
+        Action::MoveToNewWindow => move_to_new_window(state, state.workspace.active, None),
         Action::Jump(root) => open_project(state, root.clone()),
         Action::SwitchProject(project, _) => state.workspace.select_project(*project),
         Action::SwitchTab(project, tab, _) => {
@@ -1200,11 +1209,19 @@ fn view(state: &State, cx: &mut Cx<State>) -> El {
                     }
                 })
                 .on_press(move |state: &mut State| state.workspace.select_project(index))
+                .on_drag(move |state: &mut State, drag: &mut Drag, _: &mut Tx| {
+                    if drag.phase == Phase::Up
+                        && !drag.cancelled()
+                        && torn_off(drag.window_point(), sidebar_width)
+                    {
+                        move_to_new_window(state, index, drag.screen_point());
+                    }
+                })
                 .on_secondary_press(move |_: &mut State, _, tx: &mut Tx| {
                     let menu = PopupMenu::new().item(PopupItem::new("move", "Move to new window"));
                     tx.popup_menu(menu, &menu_key, move |state: &mut State, picked, _| {
                         if picked == Some("move") {
-                            move_to_new_window(state, index);
+                            move_to_new_window(state, index, None);
                         }
                     });
                 })
@@ -3687,7 +3704,7 @@ mod tests {
         state
             .workspace
             .add_project(Project::new("/tmp".into(), vec![]));
-        move_to_new_window(&mut state, 0);
+        move_to_new_window(&mut state, 0, None);
         assert_eq!(state.workspace.projects.len(), 1);
         assert!(state.fleet.take(1).is_empty());
     }
@@ -3695,7 +3712,7 @@ mod tests {
     #[test]
     fn each_window_shows_only_its_own_active_session() {
         let mut runtime = workspace_runtime();
-        move_to_new_window(&mut runtime.state, 1);
+        move_to_new_window(&mut runtime.state, 1, None);
         let mut second = second_window(&runtime.state.fleet, 1);
         second.frame(3.0 / 60.0);
         let shown = |runtime: &Runtime<State>| {
@@ -3724,7 +3741,7 @@ mod tests {
             .workspace
             .add_project(Project::new("/dev/site".into(), vec![]));
         state.workspace.select_project(0);
-        move_to_new_window(&mut state, 0);
+        move_to_new_window(&mut state, 0, None);
 
         let (second_waker, second_wakes) = counting_waker();
         let mut second = second_window(&state.fleet, 1);
@@ -3871,5 +3888,37 @@ mod tests {
         assert_eq!(window_title(&workspace), "agentd — agentd");
         workspace.select_project(1);
         assert_eq!(window_title(&workspace), "agentd — site");
+    }
+
+    fn drag_project(runtime: &mut Runtime<State>, key: &str, to: (f32, f32)) {
+        let (x, y) = runtime.find(key).unwrap();
+        runtime.pointer_down(x, y);
+        runtime.pointer_move((x + to.0) / 2.0, (y + to.1) / 2.0);
+        runtime.pointer_move(to.0, to.1);
+        runtime.pointer_up(to.0, to.1);
+        runtime.frame(2.0 / 60.0);
+    }
+
+    #[test]
+    fn dragging_a_project_out_of_the_sidebar_tears_it_off() {
+        let mut runtime = workspace_runtime();
+        drag_project(&mut runtime, "project-1", (SIDEBAR_WIDTH + 200.0, 300.0));
+        assert_eq!(runtime.state.workspace.projects.len(), 1);
+        assert_eq!(runtime.state.fleet.take(1).len(), 1);
+    }
+
+    #[test]
+    fn dragging_a_project_within_the_sidebar_keeps_it() {
+        let mut runtime = workspace_runtime();
+        drag_project(&mut runtime, "project-1", (SIDEBAR_WIDTH - 20.0, 300.0));
+        assert_eq!(runtime.state.workspace.projects.len(), 2);
+        assert!(runtime.state.fleet.take(1).is_empty());
+    }
+
+    #[test]
+    fn a_project_released_off_the_windows_edge_is_torn_off() {
+        assert!(torn_off([-4.0, 100.0], SIDEBAR_WIDTH));
+        assert!(torn_off([40.0, -4.0], SIDEBAR_WIDTH));
+        assert!(!torn_off([SIDEBAR_WIDTH + 10.0, 100.0], SIDEBAR_WIDTH));
     }
 }
