@@ -542,6 +542,7 @@ impl TerminalCompositor {
                 site.scale,
                 config.symbols_family.as_deref(),
                 &config.fallback_families,
+                &config.features,
             ) {
                 Ok(font) => {
                     gpu.atlas.reset();

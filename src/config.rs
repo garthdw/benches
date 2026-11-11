@@ -388,7 +388,10 @@ mod tests {
             Config::load(&paths).font.features
         };
         assert_eq!(features(None), ["-calt", "ss01"]);
-        assert_eq!(features(Some("[font]\nfeatures = [\"+liga\"]\n")), ["+liga"]);
+        assert_eq!(
+            features(Some("[font]\nfeatures = [\"+liga\"]\n")),
+            ["+liga"]
+        );
         assert!(features(Some("[font]\nfeatures = []\n")).is_empty());
     }
 

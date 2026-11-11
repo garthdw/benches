@@ -1,16 +1,22 @@
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::ptr::NonNull;
+use std::rc::Rc;
 
 use anyhow::{Context, Result, ensure};
 use libghostty_vt::style::Underline;
 use objc2_core_foundation::{
-    CFAttributedString, CFData, CFDictionary, CFRetained, CFString, CFType, kCFBooleanTrue,
+    CFArray, CFAttributedString, CFData, CFDictionary, CFNumber, CFRange, CFRetained, CFString,
+    CFType, CGPoint, kCFBooleanTrue,
 };
 use objc2_core_graphics::{
     CGBitmapContextCreate, CGColorSpace, CGContext, CGImageAlphaInfo, CGImageByteOrderInfo,
 };
 use objc2_core_text::{
-    CTFont, CTFontManagerCreateFontDescriptorFromData, CTFontOrientation, CTFontSymbolicTraits,
-    CTLine, kCTFontAttributeName, kCTForegroundColorFromContextAttributeName,
+    CTFont, CTFontDescriptor, CTFontManagerCreateFontDescriptorFromData, CTFontOrientation,
+    CTFontSymbolicTraits, CTLine, CTRun, kCTFontAttributeName, kCTFontFeatureSettingsAttribute,
+    kCTFontOpenTypeFeatureTag, kCTFontOpenTypeFeatureValue,
+    kCTForegroundColorFromContextAttributeName,
 };
 
 use crate::config::DEFAULT_FONT_FAMILY;
@@ -28,6 +34,85 @@ pub enum GlyphKind {
     Color,
 }
 
+/// One OpenType feature setting, as Ghostty's `font-feature` writes it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FontFeature {
+    tag: [u8; 4],
+    value: i32,
+}
+
+impl FontFeature {
+    /// `calt`, `+calt`, `-calt`, `ss01=2`, each optionally quoted.
+    fn parse(spec: &str) -> Option<Self> {
+        let spec = spec.trim().trim_matches('"');
+        let (spec, default) = match spec.strip_prefix('-') {
+            Some(rest) => (rest, 0),
+            None => (spec.strip_prefix('+').unwrap_or(spec), 1),
+        };
+        let (tag, value) = match spec.split_once('=') {
+            Some((tag, value)) => (tag, value.trim().parse().ok()?),
+            None => (spec, default),
+        };
+        let tag: [u8; 4] = tag.trim().trim_matches('"').as_bytes().try_into().ok()?;
+        tag.is_ascii().then_some(Self { tag, value })
+    }
+}
+
+/// Every feature in `specs`, whose entries may also hold comma-separated lists.
+/// Entries that aren't valid are reported and skipped.
+pub fn parse_features(specs: &[String]) -> Vec<FontFeature> {
+    specs
+        .iter()
+        .flat_map(|spec| spec.split(','))
+        .filter(|spec| !spec.trim().is_empty())
+        .filter_map(|spec| {
+            let feature = FontFeature::parse(spec);
+            if feature.is_none() {
+                eprintln!("agentd: ignoring invalid font feature {spec:?}");
+            }
+            feature
+        })
+        .collect()
+}
+
+fn feature_dictionary(feature: FontFeature) -> CFRetained<CFDictionary<CFString, CFType>> {
+    let tag = CFString::from_str(&String::from_utf8_lossy(&feature.tag));
+    let value = CFNumber::new_i32(feature.value);
+    let values: [&CFType; 2] = [tag.as_ref(), value.as_ref()];
+    // SAFETY: the extern statics are immutable CoreFoundation constants.
+    let keys = unsafe { [kCTFontOpenTypeFeatureTag, kCTFontOpenTypeFeatureValue] };
+    CFDictionary::from_slices(&keys, &values)
+}
+
+/// `font` with `features` on top of CoreText's defaults, which already enable `calt` and `liga`.
+fn with_features(font: CFRetained<CTFont>, features: &[FontFeature]) -> CFRetained<CTFont> {
+    if features.is_empty() {
+        return font;
+    }
+    let settings = CFArray::from_retained_objects(
+        &features
+            .iter()
+            .map(|feature| feature_dictionary(*feature))
+            .collect::<Vec<_>>(),
+    );
+    let values: [&CFType; 1] = [settings.as_ref()];
+    // SAFETY: the extern static is an immutable CoreFoundation constant.
+    let key = unsafe { kCTFontFeatureSettingsAttribute };
+    let attributes = CFDictionary::<CFString, CFType>::from_slices(&[key], &values);
+    // SAFETY: the dictionary holds the settings array CoreText documents for this key, a zero
+    // size keeps the font's size and a null matrix means identity.
+    unsafe {
+        let descriptor = CTFontDescriptor::with_attributes(attributes.as_opaque());
+        font.copy_with_attributes(0.0, std::ptr::null(), Some(&descriptor))
+    }
+}
+
+/// Characters that can join a shaped run: ligatures and contextual alternates are written in
+/// ASCII, and a run holds one UTF-16 unit and one cell per character.
+pub fn joins_run(character: char) -> bool {
+    character.is_ascii_graphic()
+}
+
 /// A monospaced face rasterised into whole-cell RGBA bitmaps, in device pixels.
 pub struct Font {
     /// Indexed by `bold + 2 * italic`.
@@ -40,7 +125,16 @@ pub struct Font {
     pub underline_top: u32,
     pub strike_top: u32,
     baseline: f64,
+    /// A cell's advance before rounding up to whole pixels.
+    advance: f64,
+    /// Per style, which cells of a run shape differently from standing alone.
+    runs: RefCell<[HashMap<String, Rc<[bool]>>; 4]>,
+    /// The glyph a character shapes to alone, per style index.
+    alone: RefCell<HashMap<(usize, u8), Option<u16>>>,
 }
+
+/// Runs cached before the cache is emptied; words are the usual run, so this bounds memory.
+const RUN_CACHE_LIMIT: usize = 4096;
 
 const SYMBOLS_FONT: &[u8] = include_bytes!("../assets/SymbolsNerdFontMono-Regular.ttf");
 
@@ -155,10 +249,54 @@ fn shaped_line(font: &CTFont, text: &str) -> Option<CFRetained<CTLine>> {
     Some(unsafe { CTLine::with_attributed_string(&string) })
 }
 
+struct Shaped {
+    glyphs: Vec<u16>,
+    positions: Vec<CGPoint>,
+    /// The character each glyph came from.
+    indices: Vec<isize>,
+}
+
+fn shape(font: &CTFont, text: &str) -> Option<Shaped> {
+    let line = shaped_line(font, text)?;
+    // SAFETY: a plain getter on a live line.
+    let runs = unsafe { line.glyph_runs() };
+    // SAFETY: a line's glyph runs are `CTRun`s.
+    let runs = unsafe { runs.cast_unchecked::<CTRun>() };
+    let mut shaped = Shaped {
+        glyphs: Vec::new(),
+        positions: Vec::new(),
+        indices: Vec::new(),
+    };
+    for run in runs.iter() {
+        // SAFETY: plain getter.
+        let count = unsafe { run.glyph_count() };
+        let length = usize::try_from(count).ok()?;
+        let range = CFRange {
+            location: 0,
+            length: count,
+        };
+        let (mut glyphs, mut positions, mut indices) = (
+            vec![0u16; length],
+            vec![CGPoint { x: 0.0, y: 0.0 }; length],
+            vec![0isize; length],
+        );
+        // SAFETY: each buffer holds the `count` elements the range names.
+        unsafe {
+            run.glyphs(range, NonNull::new(glyphs.as_mut_ptr())?);
+            run.positions(range, NonNull::new(positions.as_mut_ptr())?);
+            run.string_indices(range, NonNull::new(indices.as_mut_ptr())?);
+        }
+        shaped.glyphs.append(&mut glyphs);
+        shaped.positions.append(&mut positions);
+        shaped.indices.append(&mut indices);
+    }
+    Some(shaped)
+}
+
 impl Font {
     #[cfg(test)]
     pub fn new(family: &str, points: f64, scale: f32) -> Result<Self> {
-        Self::with_symbols(family, points, scale, None, &[])
+        Self::with_symbols(family, points, scale, None, &[], &[])
     }
 
     pub fn with_symbols(
@@ -167,6 +305,7 @@ impl Font {
         scale: f32,
         symbols_family: Option<&str>,
         fallback_families: &[String],
+        features: &[String],
     ) -> Result<Self> {
         let pixels = points * f64::from(scale);
         let faces = family_faces(family, pixels)
@@ -177,6 +316,8 @@ impl Font {
                 family_faces(DEFAULT_FONT_FAMILY, pixels)
             })
             .with_context(|| format!("neither {family} nor {DEFAULT_FONT_FAMILY} is installed"))?;
+        let features = parse_features(features);
+        let faces = faces.map(|face| with_features(face, &features));
         let regular = &faces[0];
         let mut character = u16::from(b'M');
         let mut glyph = 0u16;
@@ -225,37 +366,22 @@ impl Font {
                 .min(lowest_underline),
             strike_top: (baseline_from_top - x_height / 2.0 - half_line).round() as u32,
             baseline,
+            advance,
+            runs: RefCell::default(),
+            alone: RefCell::default(),
             faces,
             symbols,
             color_space: CGColorSpace::new_device_rgb(),
         })
     }
 
-    /// Premultiplied RGBA for `text`, `cells * cell_width` by `cell_height` with the top row first.
-    pub fn rasterize(
-        &self,
-        text: &str,
-        style: FontStyle,
-        cells: u32,
-        out: &mut Vec<u8>,
-    ) -> Option<GlyphKind> {
-        // CoreText's cascade never picks an installed font for private-use codepoints.
-        let font = if text.chars().any(is_private_use) {
-            &self.symbols
-        } else {
-            &self.faces[usize::from(style.bold) + 2 * usize::from(style.italic)]
-        };
-        let width = self.cell_width * cells;
-        out.clear();
-        out.resize((width * self.cell_height * 4) as usize, 0);
-        let mut characters = text.chars();
-        if let (Some(character), None, 1) = (characters.next(), characters.next(), cells)
-            && sprite::draw(character, width, self.cell_height, self.line_thickness, out)
-        {
-            return Some(GlyphKind::Coverage);
-        }
-        let line = shaped_line(font, text)?;
-        // SAFETY: `out` holds `4 * width * cell_height` bytes and outlives the context.
+    fn face_index(style: FontStyle) -> usize {
+        usize::from(style.bold) + 2 * usize::from(style.italic)
+    }
+
+    /// A white-on-clear context over `out`, which must hold `4 * width * cell_height` bytes.
+    fn bitmap_context(&self, out: &mut [u8], width: u32) -> Option<CFRetained<CGContext>> {
+        // SAFETY: `out` holds that many bytes and outlives the context.
         let context = unsafe {
             CGBitmapContextCreate(
                 out.as_mut_ptr().cast(),
@@ -270,6 +396,34 @@ impl Font {
         // LCD smoothing would give coverage glyphs unequal channels and read as colour.
         CGContext::set_should_smooth_fonts(Some(&context), false);
         CGContext::set_rgb_fill_color(Some(&context), 1.0, 1.0, 1.0, 1.0);
+        Some(context)
+    }
+
+    /// Premultiplied RGBA for `text`, `cells * cell_width` by `cell_height` with the top row first.
+    pub fn rasterize(
+        &self,
+        text: &str,
+        style: FontStyle,
+        cells: u32,
+        out: &mut Vec<u8>,
+    ) -> Option<GlyphKind> {
+        // CoreText's cascade never picks an installed font for private-use codepoints.
+        let font = if text.chars().any(is_private_use) {
+            &self.symbols
+        } else {
+            &self.faces[Self::face_index(style)]
+        };
+        let width = self.cell_width * cells;
+        out.clear();
+        out.resize((width * self.cell_height * 4) as usize, 0);
+        let mut characters = text.chars();
+        if let (Some(character), None, 1) = (characters.next(), characters.next(), cells)
+            && sprite::draw(character, width, self.cell_height, self.line_thickness, out)
+        {
+            return Some(GlyphKind::Coverage);
+        }
+        let line = shaped_line(font, text)?;
+        let context = self.bitmap_context(out, width)?;
         // SAFETY: null out-parameters are allowed when only the width is needed.
         let line_width = unsafe {
             line.typographic_bounds(
@@ -299,6 +453,100 @@ impl Font {
         } else {
             GlyphKind::Coverage
         })
+    }
+
+    fn glyph_alone(&self, face: usize, character: u8) -> Option<u16> {
+        *self
+            .alone
+            .borrow_mut()
+            .entry((face, character))
+            .or_insert_with(|| {
+                let text = char::from(character).to_string();
+                let shaped = shape(&self.faces[face], &text)?;
+                (shaped.glyphs.len() == 1).then(|| shaped.glyphs[0])
+            })
+    }
+
+    /// Which cells of `run` (see `joins_run`) come out differently from standing alone, such as
+    /// the cells of a ligature. The rest can be drawn as plain cells, so the atlas stores nothing for them.
+    pub fn shaped_cells(&self, run: &str, style: FontStyle) -> Rc<[bool]> {
+        let face = Self::face_index(style);
+        if let Some(cells) = self.runs.borrow()[face].get(run) {
+            return cells.clone();
+        }
+        let cells: Rc<[bool]> = self.shaped_differences(run, face).into();
+        let mut runs = self.runs.borrow_mut();
+        if runs[face].len() >= RUN_CACHE_LIMIT {
+            runs[face].clear();
+        }
+        runs[face].insert(run.to_owned(), cells.clone());
+        cells
+    }
+
+    fn shaped_differences(&self, run: &str, face: usize) -> Vec<bool> {
+        let unchanged = vec![false; run.len()];
+        let Some(shaped) = shape(&self.faces[face], run) else {
+            return unchanged;
+        };
+        // Fewer glyphs than characters is a true ligature, so no cell stands alone.
+        let in_order = shaped.glyphs.len() == run.len()
+            && shaped
+                .indices
+                .iter()
+                .zip(0..)
+                .all(|(index, cell)| *index == cell);
+        if !in_order {
+            return vec![true; run.len()];
+        }
+        run.bytes()
+            .zip(shaped.glyphs.iter().zip(&shaped.positions))
+            .zip(0..)
+            .map(
+                |((byte, (glyph, position)), cell): ((_, (&u16, &CGPoint)), u32)| {
+                    self.glyph_alone(face, byte) != Some(*glyph)
+                        || (position.x - f64::from(cell) * self.advance).abs() > 0.5
+                },
+            )
+            .collect()
+    }
+
+    /// The bitmap of cell `index` of `run`, shaped together with its neighbours, in the format
+    /// of `rasterize`. Ink a glyph spills into a neighbouring cell goes with that cell.
+    pub fn rasterize_shaped(
+        &self,
+        run: &str,
+        style: FontStyle,
+        index: usize,
+        out: &mut Vec<u8>,
+    ) -> Option<GlyphKind> {
+        let font = &self.faces[Self::face_index(style)];
+        let shaped = shape(font, run)?;
+        let cells = run.len();
+        let row = (self.cell_width * 4) as usize;
+        let mut whole = vec![0u8; row * cells * self.cell_height as usize];
+        let context = self.bitmap_context(&mut whole, self.cell_width * cells as u32)?;
+        // A cell's glyph is centred in it and CoreText advances by the unrounded width.
+        let ratio = f64::from(self.cell_width) / self.advance;
+        let centred = (f64::from(self.cell_width) - self.advance) / 2.0;
+        let mut positions = shaped.positions;
+        for position in &mut positions {
+            position.x = position.x * ratio + centred;
+            position.y += self.baseline;
+        }
+        // SAFETY: both buffers hold `glyphs.len()` elements and `context` is live.
+        unsafe {
+            font.draw_glyphs(
+                NonNull::new(shaped.glyphs.as_ptr().cast_mut())?,
+                NonNull::new(positions.as_mut_ptr())?,
+                shaped.glyphs.len(),
+                &context,
+            );
+        }
+        out.clear();
+        for line in whole.chunks_exact(row * cells) {
+            out.extend_from_slice(line.get(index * row..(index + 1) * row)?);
+        }
+        Some(GlyphKind::Coverage)
     }
 
     /// One cell of a tiling underline, in the same format as `rasterize`.
@@ -461,22 +709,36 @@ mod tests {
         if !nerd_family_installed() {
             return;
         }
-        let font =
-            Font::with_symbols(DEFAULT_FONT_FAMILY, 13.0, 2.0, Some(NERD_FAMILY), &[]).unwrap();
+        let font = Font::with_symbols(DEFAULT_FONT_FAMILY, 13.0, 2.0, Some(NERD_FAMILY), &[], &[])
+            .unwrap();
         assert_eq!(symbols_name(&font), "CaskaydiaMonoNFM-Regular");
     }
 
     #[test]
     fn a_missing_configured_family_falls_back_to_the_embedded_face() {
-        let font = Font::with_symbols(DEFAULT_FONT_FAMILY, 13.0, 2.0, Some("No Such Family"), &[])
-            .unwrap();
+        let font = Font::with_symbols(
+            DEFAULT_FONT_FAMILY,
+            13.0,
+            2.0,
+            Some("No Such Family"),
+            &[],
+            &[],
+        )
+        .unwrap();
         assert_eq!(symbols_name(&font), "SymbolsNFM");
     }
 
     #[test]
     fn a_family_without_icons_is_not_used_for_them() {
-        let font =
-            Font::with_symbols(DEFAULT_FONT_FAMILY, 13.0, 2.0, Some("Andale Mono"), &[]).unwrap();
+        let font = Font::with_symbols(
+            DEFAULT_FONT_FAMILY,
+            13.0,
+            2.0,
+            Some("Andale Mono"),
+            &[],
+            &[],
+        )
+        .unwrap();
         assert_eq!(symbols_name(&font), "SymbolsNFM");
     }
 
@@ -486,7 +748,8 @@ mod tests {
             return;
         }
         let fallbacks = ["No Such Family", "Andale Mono", NERD_FAMILY].map(str::to_owned);
-        let font = Font::with_symbols(DEFAULT_FONT_FAMILY, 13.0, 2.0, None, &fallbacks).unwrap();
+        let font =
+            Font::with_symbols(DEFAULT_FONT_FAMILY, 13.0, 2.0, None, &fallbacks, &[]).unwrap();
         assert_eq!(symbols_name(&font), "CaskaydiaMonoNFM-Regular");
     }
 
@@ -502,6 +765,7 @@ mod tests {
             2.0,
             Some("Andale Mono"),
             &fallbacks,
+            &[],
         )
         .unwrap();
         assert_eq!(symbols_name(&font), "CaskaydiaMonoNFM-Regular");
@@ -525,5 +789,111 @@ mod tests {
             pixels.len(),
             (font.cell_width * 2 * font.cell_height * 4) as usize
         );
+    }
+
+    fn parsed(spec: &str) -> Vec<FontFeature> {
+        parse_features(&[spec.to_owned()])
+    }
+
+    fn feature(tag: &[u8; 4], value: i32) -> FontFeature {
+        FontFeature { tag: *tag, value }
+    }
+
+    #[test]
+    fn features_parse_in_ghostty_syntax() {
+        assert_eq!(parsed("calt"), [feature(b"calt", 1)]);
+        assert_eq!(parsed("+liga"), [feature(b"liga", 1)]);
+        assert_eq!(parsed("-calt"), [feature(b"calt", 0)]);
+        assert_eq!(parsed("ss01=2"), [feature(b"ss01", 2)]);
+        assert_eq!(parsed("\"ss02\""), [feature(b"ss02", 1)]);
+        assert_eq!(
+            parsed("-calt, ss01"),
+            [feature(b"calt", 0), feature(b"ss01", 1)]
+        );
+    }
+
+    #[test]
+    fn invalid_features_are_skipped() {
+        assert!(parsed("ligature").is_empty());
+        assert!(parsed("ss01=x").is_empty());
+        assert!(parsed("").is_empty());
+        assert_eq!(parsed("nopes, -liga"), [feature(b"liga", 0)]);
+    }
+
+    #[test]
+    fn a_feature_becomes_a_coretext_tag_and_value_dictionary() {
+        let dictionary = feature_dictionary(feature(b"liga", 0));
+        // SAFETY: the extern statics are immutable CoreFoundation constants.
+        let (tag, value) = unsafe { (kCTFontOpenTypeFeatureTag, kCTFontOpenTypeFeatureValue) };
+        let tag = dictionary.get(tag).unwrap();
+        let value = dictionary.get(value).unwrap();
+        assert_eq!(tag.downcast_ref::<CFString>().unwrap().to_string(), "liga");
+        assert_eq!(value.downcast_ref::<CFNumber>().unwrap().as_i32(), Some(0));
+    }
+
+    fn cells(font: &Font, text: &str) -> Vec<Vec<u8>> {
+        (0..text.len())
+            .map(|index| {
+                let mut pixels = Vec::new();
+                font.rasterize_shaped(text, REGULAR, index, &mut pixels)
+                    .unwrap();
+                pixels
+            })
+            .collect()
+    }
+
+    fn alone(font: &Font, text: &str) -> Vec<Vec<u8>> {
+        text.chars()
+            .map(|character| {
+                let mut pixels = Vec::new();
+                font.rasterize(&character.to_string(), REGULAR, 1, &mut pixels);
+                pixels
+            })
+            .collect()
+    }
+
+    fn with_features(features: &[&str]) -> Font {
+        let features: Vec<String> = features
+            .iter()
+            .map(|feature| (*feature).to_owned())
+            .collect();
+        Font::with_symbols(DEFAULT_FONT_FAMILY, 13.0, 2.0, None, &[], &features).unwrap()
+    }
+
+    #[test]
+    fn a_ligature_changes_both_of_its_cells() {
+        let font = with_features(&[]);
+        assert_eq!(&*font.shaped_cells("!=", REGULAR), [true, true]);
+        let (shaped, plain) = (cells(&font, "!="), alone(&font, "!="));
+        assert_ne!(shaped[0], plain[0]);
+        assert_ne!(shaped[1], plain[1]);
+        assert_eq!(shaped[0].len(), plain[0].len());
+    }
+
+    #[test]
+    fn disabling_liga_leaves_a_run_unshaped_and_enabling_a_set_shapes_it() {
+        let font = with_features(&["-liga"]);
+        assert_eq!(&*font.shaped_cells("!=", REGULAR), [false, false]);
+        assert_eq!(cells(&font, "!="), alone(&font, "!="));
+        // Monaspace builds `!=` from `liga`, so `calt` alone doesn't change it.
+        assert_eq!(
+            &*with_features(&["-calt"]).shaped_cells("!=", REGULAR),
+            [true, true]
+        );
+        // `ss01` redraws `==`, which is plain by default.
+        assert_eq!(
+            &*with_features(&[]).shaped_cells("==", REGULAR),
+            [false, false]
+        );
+        assert_eq!(
+            &*with_features(&["ss01"]).shaped_cells("==", REGULAR),
+            [true, true]
+        );
+    }
+
+    #[test]
+    fn unrelated_neighbours_leave_a_run_as_plain_cells() {
+        let font = with_features(&[]);
+        assert!(!font.shaped_cells("{}", REGULAR).contains(&true));
     }
 }
