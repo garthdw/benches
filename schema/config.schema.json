@@ -10,6 +10,26 @@
             "null"
           ]
         },
+        "features": {
+          "description": "OpenType features in Ghostty's `font-feature` syntax, such as `-calt` or `ss01`; replaces\nGhostty's list, and `[]` turns them all off.",
+          "items": {
+            "type": "string"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
+        "shaping-break": {
+          "description": "Where to split ligatures, in Ghostty's `font-shaping-break` syntax: `cursor` (the default)\nor `no-cursor`. Replaces Ghostty's setting.",
+          "items": {
+            "type": "string"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
         "size": {
           "description": "The font size in points. Falls back to Ghostty's `font-size`.",
           "format": "double",

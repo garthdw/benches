@@ -214,8 +214,36 @@ pub struct Cell {
     pub underline_color: Option<[u8; 3]>,
     pub wide: bool,
     pub spacer: bool,
+    /// In the selection, which splits ligatures as the cursor does.
+    pub selected: bool,
     /// Index into `Grid::clusters` when the cell holds more than one codepoint.
     pub cluster: Option<u32>,
+}
+
+impl Cell {
+    /// Whether two neighbours may be shaped together, which every style difference
+    /// except the background forbids, as in Ghostty, so a ligature never changes colour midway.
+    pub fn shapes_with(&self, other: &Cell) -> bool {
+        (
+            self.fg,
+            self.bold,
+            self.italic,
+            self.selected,
+            self.strikethrough,
+            self.overline,
+            self.underline,
+            self.underline_color,
+        ) == (
+            other.fg,
+            other.bold,
+            other.italic,
+            other.selected,
+            other.strikethrough,
+            other.overline,
+            other.underline,
+            other.underline_color,
+        )
+    }
 }
 
 impl Default for Cell {
@@ -232,6 +260,7 @@ impl Default for Cell {
             underline_color: None,
             wide: false,
             spacer: false,
+            selected: false,
             cluster: None,
         }
     }
@@ -504,6 +533,7 @@ fn read_cell(
     let mut invisible = false;
     let mut is_faint = false;
     let selected = cell.is_selected()?;
+    output.selected = selected;
     let mut inverted = selected && selection_background.is_none();
     if cell.has_styling()? {
         let style = cell.style()?;
@@ -2703,6 +2733,8 @@ mod tests {
         assert_eq!(grid.cells[0].bg, Some(rgb(DEFAULT_FG)));
         assert_eq!(grid.cells[0].fg, rgb(DEFAULT_BG));
         assert_eq!(grid.cells[6].bg, None);
+        assert!(grid.cells[0].selected && grid.cells[4].selected);
+        assert!(!grid.cells[5].selected && !grid.cells[6].selected);
     }
 
     #[test]

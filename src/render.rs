@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::mem::size_of;
+use std::rc::Rc;
 
 use bytemuck::{Pod, Zeroable, cast_slice};
 use libghostty_vt::render::CursorVisualStyle;
@@ -9,7 +10,7 @@ use rune::compose::{Compositor, DeviceKey, Frame};
 use rune::render::EffectSite;
 
 use crate::State;
-use crate::font::{Font, FontStyle, GlyphKind};
+use crate::font::{Font, FontStyle, GlyphKind, ShapedRun};
 use crate::session::{Cell, Grid, Metrics, Scrollbar, Session, Surface};
 
 /// Also the width of the scrollbar's strip, which takes the right padding.
@@ -43,10 +44,34 @@ fn color(rgb: [u8; 3], srgb_blend: bool) -> [f32; 3] {
     })
 }
 
+/// Cell `index` of a run shaped together, for a cell that differs from standing alone. Cells
+/// are the same when their glyphs are, wherever the run sits, so the signature alone is the key.
+#[derive(Clone)]
+struct ShapedCell {
+    run: Rc<str>,
+    index: u16,
+    signature: u64,
+}
+
+impl PartialEq for ShapedCell {
+    fn eq(&self, other: &Self) -> bool {
+        self.signature == other.signature
+    }
+}
+
+impl Eq for ShapedCell {}
+
+impl std::hash::Hash for ShapedCell {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.signature.hash(state);
+    }
+}
+
 #[derive(Clone, PartialEq, Eq, Hash)]
 enum GlyphText {
     Character(char),
     Cluster(String),
+    Shaped(ShapedCell),
     Underline(Underline),
 }
 
@@ -114,6 +139,12 @@ impl Atlas {
             GlyphText::Cluster(cluster) => {
                 font.rasterize(cluster, key.style, key.cells, &mut self.scratch)
             }
+            GlyphText::Shaped(cell) => font.rasterize_shaped(
+                &cell.run,
+                key.style,
+                usize::from(cell.index),
+                &mut self.scratch,
+            ),
             GlyphText::Underline(underline) => {
                 font.rasterize_underline(*underline, &mut self.scratch);
                 Some(GlyphKind::Coverage)
@@ -167,6 +198,74 @@ fn glyph_key(grid: &Grid, cell: &Cell) -> Option<GlyphKey> {
         },
         cells: if cell.wide { 2 } else { 1 },
     })
+}
+
+/// Neighbouring cells shaped together: the same style, on one row, identical but for the background (selection included), and
+/// not the cursor, which splits a ligature as Ghostty does.
+struct Run {
+    start: usize,
+    end: usize,
+    /// `None` for a lone cell, which has nothing to shape with.
+    shaped: Option<Rc<ShapedRun>>,
+}
+
+fn joins_run(cell: &Cell, font: &Font) -> bool {
+    cell.cluster.is_none() && !cell.wide && !cell.spacer && font.joins_run(cell.character)
+}
+
+/// The end of the row `start` is on, without its trailing blanks: runs never reach past it.
+fn text_end(grid: &Grid, start: usize) -> usize {
+    let cols = usize::from(grid.cols).max(1);
+    let row_end = ((start / cols + 1) * cols).min(grid.cells.len());
+    let blanks = grid.cells[start..row_end]
+        .iter()
+        .rev()
+        .take_while(|cell| cell.character == ' ' && cell.cluster.is_none())
+        .count();
+    row_end - blanks
+}
+
+fn find_run(
+    grid: &Grid,
+    start: usize,
+    mut limit: usize,
+    cursor: Option<usize>,
+    font: &Font,
+    text: &mut String,
+) -> Run {
+    let first = &grid.cells[start];
+    if let Some(cursor) = cursor.filter(|&cursor| cursor > start && cursor < limit) {
+        limit = cursor;
+    }
+    let mut end = grid.cells[start..limit]
+        .windows(2)
+        .position(|pair| {
+            !joins_run(&pair[1], font)
+                || !pair[0].shapes_with(&pair[1])
+                // Ghostty never ligates these, whatever the font says.
+                || matches!(
+                    (pair[0].character, pair[1].character),
+                    ('f', 'l' | 'i') | ('s', 't')
+                )
+        })
+        .map_or(limit, |offset| start + 1 + offset);
+    // Trailing blanks add nothing to shape, and would give every line its own cache entry.
+    while end - start > 1 && grid.cells[end - 1].character == ' ' {
+        end -= 1;
+    }
+    if end - start > 1 {
+        text.clear();
+        text.extend(grid.cells[start..end].iter().map(|cell| cell.character));
+    }
+    let style = FontStyle {
+        bold: first.bold,
+        italic: first.italic,
+    };
+    Run {
+        start,
+        end,
+        shaped: (end - start > 1).then(|| font.shaped_cells(text, style)),
+    }
 }
 
 fn solid(rect: [f32; 4], fill: [u8; 3], srgb_blend: bool) -> Quad {
@@ -232,6 +331,7 @@ fn build_quads(
             quads.push(solid(*edge, grid.cursor_color));
         }
     }
+    let run_cursor = cursor.filter(|_| font.break_runs_at_cursor);
     let inverted = cursor.filter(|_| grid.cursor_style == CursorVisualStyle::Block);
     let glyphs_start = quads.len();
     let underline_top = font.underline_top as f32;
@@ -258,6 +358,9 @@ fn build_quads(
         quads.truncate(glyphs_start);
         let mut first_epoch = None;
         let mut reset = false;
+        let mut run: Option<Run> = None;
+        let mut run_text = String::new();
+        let mut row_text_end = (usize::MAX, 0);
         let mut lookup = |key| {
             let (slot, epoch) = glyph(key);
             reset |= *first_epoch.get_or_insert(epoch) != epoch;
@@ -296,7 +399,44 @@ fn build_quads(
             if cell.overline {
                 quads.push(line(0.0, fg));
             }
-            let Some(key) = glyph_key(grid, cell) else {
+            if run.as_ref().is_none_or(|run| index >= run.end)
+                && Some(index) != run_cursor
+                && cell.character != ' '
+                && joins_run(cell, font)
+            {
+                let cols = usize::from(grid.cols).max(1);
+                if row_text_end.0 != index / cols {
+                    row_text_end = (index / cols, text_end(grid, index));
+                }
+                run = Some(find_run(
+                    grid,
+                    index,
+                    row_text_end.1,
+                    run_cursor,
+                    font,
+                    &mut run_text,
+                ));
+            }
+            let shaped = run
+                .as_ref()
+                .filter(|run| (run.start..run.end).contains(&index))
+                .and_then(|run| {
+                    let shaped = run.shaped.as_ref()?;
+                    let signature = shaped.signature(index - run.start)?;
+                    Some(GlyphKey {
+                        text: GlyphText::Shaped(ShapedCell {
+                            run: shaped.text.clone(),
+                            index: (index - run.start) as u16,
+                            signature,
+                        }),
+                        style: FontStyle {
+                            bold: cell.bold,
+                            italic: cell.italic,
+                        },
+                        cells: 1,
+                    })
+                });
+            let Some(key) = shaped.or_else(|| glyph_key(grid, cell)) else {
                 continue;
             };
             let cells = key.cells as f32;
@@ -542,8 +682,10 @@ impl TerminalCompositor {
                 site.scale,
                 config.symbols_family.as_deref(),
                 &config.fallback_families,
+                &config.features,
             ) {
-                Ok(font) => {
+                Ok(mut font) => {
+                    font.break_runs_at_cursor = config.shaping_breaks_at_cursor;
                     gpu.atlas.reset();
                     self.font = Some((site.scale, config, font));
                 }
@@ -715,6 +857,168 @@ mod tests {
             |_| (Some(fake_glyph([0, 0])), 0),
         );
         (quads, font)
+    }
+
+    /// The run cells `build_quads` asks the atlas for, as `(run, index)`.
+    fn shaped_keys(bytes: &[u8], features: &[&str]) -> Vec<(String, u16)> {
+        shaped_keys_in(bytes, 8, features)
+    }
+
+    fn shaped_keys_in(bytes: &[u8], cols: u16, features: &[&str]) -> Vec<(String, u16)> {
+        shaped_keys_with(bytes, cols, features, true)
+    }
+
+    fn shaped_keys_with(
+        bytes: &[u8],
+        cols: u16,
+        features: &[&str],
+        break_at_cursor: bool,
+    ) -> Vec<(String, u16)> {
+        let features: Vec<String> = features
+            .iter()
+            .map(|feature| (*feature).to_owned())
+            .collect();
+        let mut font = Font::with_symbols(
+            crate::config::DEFAULT_FONT_FAMILY,
+            18.0,
+            2.0,
+            None,
+            &[],
+            &features,
+        )
+        .unwrap();
+        font.break_runs_at_cursor = break_at_cursor;
+        let grid = Grid::from_vt(bytes, cols, 2).unwrap();
+        let mut keys = Vec::new();
+        build_quads(
+            &grid,
+            [0.0, 0.0, 800.0, 600.0],
+            metrics(&font, 0.0, 2.0),
+            &font,
+            true,
+            &mut Vec::new(),
+            |key| {
+                if let GlyphText::Shaped(cell) = key.text {
+                    keys.push((cell.run.to_string(), cell.index));
+                }
+                (Some(fake_glyph([0, 0])), 0)
+            },
+        );
+        keys
+    }
+
+    #[test]
+    fn a_ligature_asks_for_its_cells_shaped_with_their_neighbours() {
+        let keys = shaped_keys(b"a != b\x1b[2;1H", &[]);
+        assert_eq!(keys, [("a != b".to_owned(), 2), ("a != b".to_owned(), 3)]);
+        assert!(shaped_keys(b"a != b\x1b[2;1H", &["-liga"]).is_empty());
+    }
+
+    #[test]
+    fn the_cursor_breaks_a_ligature() {
+        assert!(shaped_keys(b"a != b\x1b[1;3H", &[]).is_empty());
+        assert!(shaped_keys(b"a != b\x1b[1;4H", &[]).is_empty());
+    }
+
+    #[test]
+    fn a_ligature_inside_a_long_token_still_shapes() {
+        // The cells at 15 and 16 once fell either side of a fixed chunk boundary.
+        let token = b"abcdeghjklmnoqr!=uvwxyz";
+        let keys = shaped_keys_in(token, 40, &[]);
+        let run = String::from_utf8_lossy(token).into_owned();
+        assert!(keys.contains(&(run.clone(), 15)) && keys.contains(&(run, 16)));
+    }
+
+    #[test]
+    fn non_ascii_cells_join_a_run_and_are_indexed_by_cell() {
+        let keys = shaped_keys("→é!=".as_bytes(), &[]);
+        for index in [2, 3] {
+            assert!(keys.contains(&("→é!=".to_owned(), index)), "{keys:?}");
+        }
+    }
+
+    #[test]
+    fn a_style_change_breaks_a_ligature_but_a_background_change_does_not() {
+        assert!(shaped_keys(b"\x1b[31m!\x1b[32m=\x1b[0m\x1b[2;1H", &[]).is_empty());
+        assert!(shaped_keys(b"\x1b[4m!\x1b[4:3m=\x1b[0m\x1b[2;1H", &[]).is_empty());
+        assert!(shaped_keys(b"\x1b[9m!\x1b[0m=\x1b[2;1H", &[]).is_empty());
+        assert_eq!(
+            shaped_keys(b"\x1b[41m!\x1b[42m=\x1b[0m\x1b[2;1H", &[]).len(),
+            2
+        );
+    }
+
+    #[test]
+    fn fl_fi_and_st_are_never_shaped_together() {
+        let font = Font::new(crate::config::DEFAULT_FONT_FAMILY, 18.0, 2.0).unwrap();
+        let grid = Grid::from_vt(b"flfist", 8, 1).unwrap();
+        let mut text = String::new();
+        let ends: Vec<usize> = (0..6)
+            .step_by(2)
+            .map(|start| find_run(&grid, start, text_end(&grid, start), None, &font, &mut text).end)
+            .collect();
+        assert_eq!(ends, [1, 3, 5]);
+    }
+
+    fn run_end(bytes: &[u8], start: usize) -> usize {
+        let font = Font::new(crate::config::DEFAULT_FONT_FAMILY, 18.0, 2.0).unwrap();
+        let grid = Grid::from_vt(bytes, 10, 1).unwrap();
+        find_run(
+            &grid,
+            start,
+            text_end(&grid, start),
+            None,
+            &font,
+            &mut String::new(),
+        )
+        .end
+    }
+
+    #[test]
+    fn a_run_spans_spaces_but_drops_the_trailing_ones() {
+        assert_eq!(run_end(b"ab cd  ef", 0), 9);
+        assert_eq!(run_end(b"ab cd   ", 0), 5);
+        assert_eq!(run_end(b"ab", 0), 2);
+    }
+
+    #[test]
+    fn a_run_starts_at_its_first_character_so_indentation_doesnt_matter() {
+        let keys = shaped_keys(b"  a != b\x1b[2;1H", &[]);
+        assert_eq!(keys, [("a != b".to_owned(), 2), ("a != b".to_owned(), 3)]);
+    }
+
+    #[test]
+    fn a_selection_edge_breaks_a_ligature() {
+        let font = Font::new(crate::config::DEFAULT_FONT_FAMILY, 18.0, 2.0).unwrap();
+        let mut grid = Grid::from_vt(b"a != b\x1b[2;1H", 8, 2).unwrap();
+        let mut cells = grid.cells.to_vec();
+        cells[2].selected = true;
+        grid.cells = cells.into();
+        let mut keys = 0;
+        build_quads(
+            &grid,
+            [0.0, 0.0, 800.0, 600.0],
+            metrics(&font, 0.0, 2.0),
+            &font,
+            true,
+            &mut Vec::new(),
+            |key| {
+                keys += usize::from(matches!(key.text, GlyphText::Shaped { .. }));
+                (Some(fake_glyph([0, 0])), 0)
+            },
+        );
+        assert_eq!(keys, 0);
+    }
+
+    #[test]
+    fn without_shaping_break_the_cursor_leaves_a_ligature_whole() {
+        let keys = shaped_keys_with(b"a != b\x1b[1;3H", 8, &[], false);
+        assert_eq!(keys, [("a != b".to_owned(), 2), ("a != b".to_owned(), 3)]);
+    }
+
+    #[test]
+    fn a_run_stops_at_the_end_of_a_row() {
+        assert!(shaped_keys(b"      !=", &[]).is_empty());
     }
 
     #[test]
