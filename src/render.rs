@@ -873,7 +873,7 @@ mod tests {
             build_quads(
                 &grid,
                 [0.0, 0.0, 2000.0, 1500.0],
-                0.0,
+                metrics(&font, 0.0, 2.0),
                 &font,
                 true,
                 &mut quads,
