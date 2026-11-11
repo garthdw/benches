@@ -233,8 +233,8 @@ fn default_config_text() -> String {
          # jump-command = \"zoxide query\"\n\
          \n\
          [font]\n\
-         family = {family}\n\
-         size = {size:?}\n\
+         # family = {family}\n\
+         # size = {size:?}\n\
          # The face for private-use icons.\n\
          # symbols-family = \"Symbols Nerd Font Mono\"\n\
          {tabs}",
@@ -571,6 +571,21 @@ mod schema_tests {
         run(&paths, &["init"]).unwrap();
         toml::from_str::<File>(&read(&paths, "config.toml")).unwrap();
         assert_eq!(Config::load(&paths), Config::default());
+    }
+
+    #[test]
+    fn init_output_keeps_the_ghostty_fallbacks() {
+        let (_root, paths) = dir_paths();
+        std::fs::create_dir_all(&paths.ghostty_dir).unwrap();
+        std::fs::write(
+            paths.ghostty_dir.join("config"),
+            "font-family = Iosevka\nfont-size = 14\n",
+        )
+        .unwrap();
+        let without_config = Config::load(&paths);
+        run(&paths, &["init"]).unwrap();
+        assert_eq!(Config::load(&paths), without_config);
+        assert_eq!(without_config.font.family, "Iosevka");
     }
 
     #[test]
