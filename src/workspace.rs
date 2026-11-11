@@ -64,6 +64,10 @@ impl Tab {
         };
     }
 
+    pub fn runs_program(&self) -> bool {
+        self.status == Status::Running && (self.command.is_some() || self.session.busy())
+    }
+
     pub fn stop(&mut self) {
         if self.status == Status::Running {
             self.stopping = true;
@@ -83,6 +87,9 @@ pub struct Project {
     pub drawer: usize,
     pub drawer_open: bool,
     pub drawer_focused: bool,
+    /// A floating process above the project's terminals, kept while hidden. Not saved.
+    pub overlay: Option<Tab>,
+    pub overlay_open: bool,
     /// False for a restored project until it is first shown, when its tabs start.
     pub launched: bool,
 }
@@ -90,12 +97,8 @@ pub struct Project {
 impl Project {
     /// A project at `root` with `tabs` in order and the first one active.
     pub fn new(root: PathBuf, tabs: Vec<Tab>) -> Self {
-        let name = root.file_name().map_or_else(
-            || root.display().to_string(),
-            |name| name.to_string_lossy().into_owned(),
-        );
         Self {
-            name,
+            name: Self::name_of(&root),
             root,
             tabs,
             active_tab: 0,
@@ -103,12 +106,25 @@ impl Project {
             drawer: 0,
             drawer_open: false,
             drawer_focused: false,
+            overlay: None,
+            overlay_open: false,
             launched: true,
         }
     }
 
+    fn name_of(root: &std::path::Path) -> String {
+        root.file_name().map_or_else(
+            || root.display().to_string(),
+            |name| name.to_string_lossy().into_owned(),
+        )
+    }
+
     pub fn drawer_tab(&self) -> Option<&Tab> {
         self.tray.get(self.drawer).filter(|_| self.drawer_open)
+    }
+
+    pub fn overlay_tab(&self) -> Option<&Tab> {
+        self.overlay.as_ref().filter(|_| self.overlay_open)
     }
 
     pub fn drawer_shows(&self, index: usize) -> bool {
@@ -119,10 +135,15 @@ impl Project {
         self.tabs.get(self.active_tab)
     }
 
+    pub fn runs_program(&self) -> bool {
+        self.tabs.iter().chain(&self.tray).any(Tab::runs_program)
+    }
+
     pub fn tab(&self, slot: Slot) -> Option<&Tab> {
         match slot {
             Slot::Tab(index) => self.tabs.get(index),
             Slot::Tray(index) => self.tray.get(index),
+            Slot::Overlay => self.overlay.as_ref(),
         }
     }
 
@@ -130,6 +151,7 @@ impl Project {
         match slot {
             Slot::Tab(index) => self.tabs.get_mut(index),
             Slot::Tray(index) => self.tray.get_mut(index),
+            Slot::Overlay => self.overlay.as_mut(),
         }
     }
 
@@ -177,13 +199,20 @@ impl Workspace {
         self.project()?.drawer_tab().map(|tab| &tab.session)
     }
 
+    pub fn overlay_session(&self) -> Option<&Session> {
+        self.project()?.overlay_tab().map(|tab| &tab.session)
+    }
+
     pub fn focused_session(&self) -> Option<&Session> {
         self.focused_tab().map(|(_, tab)| &tab.session)
     }
 
-    /// Where keys go: the open drawer once clicked into, otherwise the active tab.
+    /// Where keys go: the shown overlay, else the open drawer once clicked into, else the active tab.
     pub fn focused_tab(&self) -> Option<(Slot, &Tab)> {
         let project = self.project()?;
+        if let Some(tab) = project.overlay_tab() {
+            return Some((Slot::Overlay, tab));
+        }
         if project.drawer_focused
             && let Some(tab) = project.drawer_tab()
         {
@@ -193,7 +222,9 @@ impl Workspace {
     }
 
     pub fn sessions(&self) -> impl Iterator<Item = &Session> {
-        self.tab_sessions().chain(self.tray_sessions())
+        self.tab_sessions()
+            .chain(self.tray_sessions())
+            .chain(self.overlay_sessions())
     }
 
     pub fn tab_sessions(&self) -> impl Iterator<Item = &Session> {
@@ -210,16 +241,38 @@ impl Workspace {
             .map(|tab| &tab.session)
     }
 
-    pub fn tabs_mut(&mut self) -> impl Iterator<Item = &mut Tab> {
+    pub fn overlay_sessions(&self) -> impl Iterator<Item = &Session> {
         self.projects
-            .iter_mut()
-            .flat_map(|project| project.tabs.iter_mut().chain(&mut project.tray))
+            .iter()
+            .filter_map(|project| project.overlay.as_ref())
+            .map(|tab| &tab.session)
+    }
+
+    pub fn tabs_mut(&mut self) -> impl Iterator<Item = &mut Tab> {
+        self.projects.iter_mut().flat_map(|project| {
+            project
+                .tabs
+                .iter_mut()
+                .chain(&mut project.tray)
+                .chain(&mut project.overlay)
+        })
     }
 
     pub fn project_index(&self, root: &std::path::Path) -> Option<usize> {
         self.projects
             .iter()
             .position(|project| project.root == root)
+    }
+
+    /// Moves the active project to `root`. Open tabs keep their folder. If another project already
+    /// has `root`, that one is selected instead.
+    pub fn change_root(&mut self, root: PathBuf) {
+        if let Some(index) = self.project_index(&root) {
+            self.select_project(index);
+        } else if let Some(project) = self.project_mut() {
+            project.name = Project::name_of(&root);
+            project.root = root;
+        }
     }
 
     pub fn add_project(&mut self, project: Project) {
@@ -282,6 +335,19 @@ impl Workspace {
         self.show_active();
     }
 
+    /// Closes project `index` with all its tabs and tray processes, keeping the selected project selected.
+    pub fn close_project(&mut self, index: usize) {
+        if index >= self.projects.len() {
+            return;
+        }
+        self.projects.remove(index);
+        if index < self.active {
+            self.active -= 1;
+        }
+        self.active = self.active.min(self.projects.len().saturating_sub(1));
+        self.show_active();
+    }
+
     pub fn add_tray(&mut self, tab: Tab) {
         if let Some(project) = self.project_mut() {
             project.tray.push(tab);
@@ -315,6 +381,39 @@ impl Workspace {
         }
     }
 
+    /// Shows the overlay, first replacing its process with `tab` when given.
+    pub fn show_overlay(&mut self, tab: Option<Tab>) {
+        let Some(project) = self.project_mut() else {
+            return;
+        };
+        project.overlay = tab.or(project.overlay.take());
+        project.overlay_open = project.overlay.is_some();
+        self.show_active();
+    }
+
+    /// The process keeps running.
+    pub fn hide_overlay(&mut self) {
+        if let Some(project) = self.project_mut() {
+            project.overlay_open = false;
+        }
+        self.show_active();
+    }
+
+    /// Dropping the session ends its process.
+    pub fn drop_overlay(&mut self, session: u64) {
+        for project in &mut self.projects {
+            if project
+                .overlay
+                .as_ref()
+                .is_some_and(|tab| tab.session.id() == session)
+            {
+                project.overlay = None;
+                project.overlay_open = false;
+            }
+        }
+        self.show_active();
+    }
+
     pub fn tray_mut(&mut self, index: usize) -> Option<&mut Tab> {
         self.project_mut()?.tray.get_mut(index)
     }
@@ -339,7 +438,14 @@ impl Workspace {
             .enumerate()
             .find_map(|(index, project)| {
                 let slot = project.tabs.iter().position(runs).map(Slot::Tab);
-                let slot = slot.or_else(|| project.tray.iter().position(runs).map(Slot::Tray))?;
+                let slot = slot.or_else(|| project.tray.iter().position(runs).map(Slot::Tray));
+                let slot = slot.or_else(|| {
+                    project
+                        .overlay
+                        .as_ref()
+                        .filter(|tab| runs(tab))
+                        .map(|_| Slot::Overlay)
+                })?;
                 Some((index, slot))
             })
     }
@@ -361,6 +467,7 @@ impl Workspace {
                     project.drawer_open = true;
                     project.drawer_focused = true;
                 }
+                Slot::Overlay => project.overlay_open = true,
             }
         }
         self.show_active();
@@ -442,6 +549,14 @@ impl Workspace {
                 };
                 tab.session.set_visibility(visibility);
             }
+            if let Some(tab) = &project.overlay {
+                let visibility = if shown && project.overlay_open {
+                    Visibility::Shown
+                } else {
+                    Visibility::Hidden
+                };
+                tab.session.set_visibility(visibility);
+            }
         }
         self.sync_focus();
     }
@@ -451,6 +566,7 @@ impl Workspace {
 pub enum Slot {
     Tab(usize),
     Tray(usize),
+    Overlay,
 }
 
 /// The layout `state.json` keeps between launches.
@@ -549,6 +665,68 @@ mod tests {
         Tab::new(title, Session::fixture(Grid::default()))
     }
 
+    fn overlay_shows(workspace: &Workspace, title: &str) -> bool {
+        workspace.overlay_session().is_some()
+            && workspace.focused_tab().map(|(_, tab)| tab.title.as_str()) == Some(title)
+    }
+
+    #[test]
+    fn the_overlay_takes_keys_while_shown_and_the_process_survives_hiding() {
+        let mut workspace = workspace();
+        workspace.show_overlay(Some(tab("lazygit")));
+        let id = workspace.overlay_session().map(Session::id);
+        assert!(overlay_shows(&workspace, "lazygit"));
+        assert_eq!(
+            workspace.focused_tab().map(|(slot, _)| slot),
+            Some(Slot::Overlay)
+        );
+        workspace.hide_overlay();
+        assert!(workspace.overlay_session().is_none());
+        assert_eq!(active_title(&workspace), Some("vim"));
+        assert_eq!(workspace.overlay_sessions().count(), 1);
+        workspace.show_overlay(None);
+        assert_eq!(workspace.overlay_session().map(Session::id), id);
+    }
+
+    #[test]
+    fn showing_a_missing_overlay_does_nothing() {
+        let mut workspace = workspace();
+        workspace.show_overlay(None);
+        assert!(workspace.overlay_session().is_none());
+        assert!(
+            !workspace
+                .project()
+                .is_some_and(|project| project.overlay_open)
+        );
+    }
+
+    #[test]
+    fn dropping_the_overlay_forgets_its_process() {
+        let mut workspace = workspace();
+        workspace.show_overlay(Some(tab("lazygit")));
+        let id = workspace
+            .overlay_session()
+            .map(Session::id)
+            .unwrap_or_default();
+        workspace.drop_overlay(id);
+        assert_eq!(workspace.overlay_sessions().count(), 0);
+        assert_eq!(
+            workspace.focused_tab().map(|(slot, _)| slot),
+            Some(Slot::Tab(0))
+        );
+    }
+
+    #[test]
+    fn switching_projects_hides_the_overlay_and_keeps_it_for_return() {
+        let mut workspace = workspace();
+        workspace.select_project(0);
+        workspace.show_overlay(Some(tab("lazygit")));
+        workspace.select_project(1);
+        assert!(workspace.overlay_session().is_none());
+        workspace.select_project(0);
+        assert!(workspace.overlay_session().is_some());
+    }
+
     fn workspace() -> Workspace {
         let mut workspace = Workspace::default();
         workspace.add_project(Project::new("/a".into(), vec![tab("claude"), tab("shell")]));
@@ -593,6 +771,48 @@ mod tests {
         workspace.add_tab(tab("lazygit"));
         assert_eq!(workspace.projects[1].tabs.len(), 2);
         assert_eq!(active_title(&workspace), Some("lazygit"));
+    }
+
+    #[test]
+    fn closing_the_active_project_selects_its_neighbour() {
+        let mut workspace = workspace();
+        workspace.add_project(Project::new("/c".into(), vec![tab("htop")]));
+        workspace.select_project(1);
+        workspace.close_project(1);
+        assert_eq!(workspace.projects.len(), 2);
+        assert_eq!(workspace.active, 1);
+        assert_eq!(active_title(&workspace), Some("htop"));
+        workspace.close_project(1);
+        assert_eq!(active_title(&workspace), Some("claude"));
+    }
+
+    #[test]
+    fn closing_an_earlier_project_keeps_the_selection_and_drops_its_sessions() {
+        let mut workspace = workspace();
+        workspace.projects[0].tray.push(tab("pnpm dev"));
+        assert_eq!(workspace.sessions().count(), 4);
+        workspace.close_project(0);
+        assert_eq!(workspace.active, 0);
+        assert_eq!(active_title(&workspace), Some("vim"));
+        assert_eq!(workspace.sessions().count(), 1);
+    }
+
+    #[test]
+    fn closing_the_only_project_leaves_none() {
+        let mut workspace = Workspace::default();
+        workspace.add_project(Project::new("/a".into(), vec![tab("shell")]));
+        workspace.close_project(0);
+        assert!(workspace.projects.is_empty());
+        workspace.close_project(0);
+    }
+
+    #[test]
+    fn a_project_runs_a_program_when_a_tab_or_tray_process_has_a_command() {
+        let mut workspace = workspace();
+        assert!(!workspace.projects[0].runs_program());
+        workspace.projects[0].tray.push(tab("pnpm dev"));
+        workspace.projects[0].tray[0].command = Some("pnpm dev".to_owned());
+        assert!(workspace.projects[0].runs_program());
     }
 
     #[test]
@@ -906,6 +1126,31 @@ mod tests {
             workspace.projects[1].tabs[0].session.visibility(),
             Visibility::Shown
         );
+    }
+
+    #[test]
+    fn changing_the_root_renames_the_project_and_persists() {
+        let mut workspace = workspace();
+        workspace.change_root("/c/site".into());
+        let project = &workspace.projects[1];
+        assert_eq!(
+            (project.name.as_str(), project.root.as_path()),
+            ("site", std::path::Path::new("/c/site"))
+        );
+        assert_eq!(
+            workspace.snapshot(false).projects[1].root,
+            std::path::Path::new("/c/site")
+        );
+        assert_eq!(workspace.projects[0].root, std::path::Path::new("/a"));
+    }
+
+    #[test]
+    fn changing_to_another_projects_root_selects_it() {
+        let mut workspace = workspace();
+        workspace.select_project(1);
+        workspace.change_root("/a".into());
+        assert_eq!(workspace.active, 0);
+        assert_eq!(workspace.projects[1].root, std::path::Path::new("/b"));
     }
 
     #[test]
