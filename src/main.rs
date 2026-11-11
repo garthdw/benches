@@ -434,6 +434,8 @@ enum Action {
     Jump(PathBuf),
     SwitchProject(usize, String),
     SwitchTab(usize, usize, String),
+    RestartTray(usize, String),
+    StopTray(usize, String),
     Run(String),
     Tray(String),
 }
@@ -448,6 +450,8 @@ impl Action {
             Action::Jump(root) => format!("Open project {}", root.display()),
             Action::SwitchProject(_, name) => format!("Switch to project {name}"),
             Action::SwitchTab(_, _, name) => format!("Switch to tab {name}"),
+            Action::RestartTray(_, title) => format!("Restart {title}"),
+            Action::StopTray(_, title) => format!("Stop {title}"),
             Action::Run(command) => format!("Run “{command}” in a new tab"),
             Action::Tray(command) => format!("Run “{command}” in the tray"),
         }
@@ -491,9 +495,9 @@ fn switch_actions(
 }
 
 /// Exact project and tab names, then the fixed actions whose labels contain the query's letters
-/// in order, then the jump command's folder, then the other projects and tabs, then running the
-/// query. A query that names a project or tab outranks the fixed actions so Enter switches to
-/// it, and the switch actions only appear once something is typed.
+/// in order, then the jump command's folder, then the other projects and tabs, then the active
+/// project's tray restarts and stops, then running the query. A query that names a project or tab outranks the fixed actions so Enter switches to
+/// it, and the switch and tray actions only appear once something is typed.
 fn palette_actions(query: &str, jump: Option<&Path>, workspace: &Workspace) -> Vec<Action> {
     let query = query.trim();
     let needle = query.to_lowercase();
@@ -515,6 +519,19 @@ fn palette_actions(query: &str, jump: Option<&Path>, workspace: &Workspace) -> V
     );
     actions.extend(jump.map(|root| Action::Jump(root.to_owned())));
     actions.extend(partial.into_iter().map(|(_, action)| action));
+    if !query.is_empty() {
+        let tray = workspace.project().map_or(&[][..], |project| &project.tray);
+        for (index, tab) in tray.iter().enumerate() {
+            actions.push(Action::RestartTray(index, tab.label().to_owned()));
+            if tab.status == Status::Running {
+                actions.push(Action::StopTray(index, tab.label().to_owned()));
+            }
+        }
+        actions.retain(|action| {
+            !matches!(action, Action::RestartTray(..) | Action::StopTray(..))
+                || letters_in_order(&action.label(), &needle)
+        });
+    }
     if !query.is_empty() {
         actions.push(Action::Run(query.to_owned()));
         actions.push(Action::Tray(query.to_owned()));
@@ -551,6 +568,8 @@ fn run_action(state: &mut State, action: &Action, tx: &mut Tx) {
             state.workspace.select_project(*project);
             state.workspace.select_tab(*tab);
         }
+        Action::RestartTray(index, _) => tray_action(state, *index, Some("restart")),
+        Action::StopTray(index, _) => tray_action(state, *index, Some("stop")),
         Action::Run(command) => open_tab(state, command, Some(command)),
         Action::Tray(command) => open_tray(state, command),
     }
@@ -2905,6 +2924,65 @@ mod tests {
         let tray = &runtime.state.workspace.projects[0].tray[0];
         assert_eq!(tray.status, Status::Running);
         assert_eq!(tray.command.as_deref(), Some("sleep 100"));
+    }
+
+    #[test]
+    fn tray_restarts_and_stops_are_offered_for_a_matching_query() {
+        let mut state = State::default();
+        let mut workspace = one_project();
+        workspace.add_tray(fixture_tab("pnpm dev", b""));
+        let mut stopped = fixture_tab("storybook", b"");
+        stopped.status = Status::Stopped;
+        workspace.add_tray(stopped);
+        state.workspace = workspace;
+        let actions = palette_actions("stop", None, &state.workspace);
+        assert_eq!(actions[0], Action::StopTray(0, "pnpm dev".to_owned()));
+        assert!(
+            !actions
+                .iter()
+                .any(|action| matches!(action, Action::StopTray(1, _)))
+        );
+        let actions = palette_actions("restart", None, &state.workspace);
+        assert_eq!(
+            actions[..2],
+            [
+                Action::RestartTray(0, "pnpm dev".to_owned()),
+                Action::RestartTray(1, "storybook".to_owned()),
+            ]
+        );
+        let actions = palette_actions("restart sto", None, &state.workspace);
+        assert_eq!(actions[0], Action::RestartTray(1, "storybook".to_owned()));
+        assert!(
+            palette_actions("", None, &state.workspace)
+                .iter()
+                .all(|action| {
+                    !matches!(action, Action::RestartTray(..) | Action::StopTray(..))
+                })
+        );
+    }
+
+    fn run_tray_action_from_palette(runtime: &mut Runtime<State>, query: &str) {
+        runtime.on_key = Some(on_key);
+        press(runtime, Key::Command('p'), command());
+        press(runtime, Key::Text(query.into()), Mods::default());
+        press(runtime, Key::Enter, Mods::default());
+    }
+
+    #[test]
+    fn the_palette_restarts_a_tray_process() {
+        let mut runtime = live_tray("sleep 100");
+        let old = runtime.state.workspace.projects[0].tray[0].session.id();
+        run_tray_action_from_palette(&mut runtime, "restart sleep");
+        poll_until(&mut runtime, |tab| tab.session.id() != old);
+        let tray = &runtime.state.workspace.projects[0].tray[0];
+        assert_eq!(tray.status, Status::Running);
+    }
+
+    #[test]
+    fn the_palette_stops_a_tray_process() {
+        let mut runtime = live_tray("sleep 100");
+        run_tray_action_from_palette(&mut runtime, "stop sleep");
+        poll_until(&mut runtime, |tab| tab.status == Status::Stopped);
     }
 
     #[test]
