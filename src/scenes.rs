@@ -5,10 +5,13 @@ use rune::TextEdit;
 use libghostty_vt::effect::ClipboardLocation;
 
 use crate::app::{Confirm, State};
-use crate::grid::Grid;
+use anyhow::Context;
+
+use crate::grid::{Grid, GridBuilder, Presentation, new_terminal};
 use crate::jump;
 use crate::palette::WorktreeChoice;
 use crate::protocol::{Progress, ProgressKind};
+use crate::search::Searcher;
 use crate::session::Session;
 use crate::workspace::{Project, Status, Tab};
 
@@ -29,6 +32,39 @@ const SCENE_UNICODE: &str = concat!(
 pub(crate) fn fixture_grid(bytes: &[u8]) -> Grid {
     Grid::from_vt(bytes, 60, 12)
         .unwrap_or_else(|error| Grid::message(&format!("failed to build fixture: {error:#}")))
+}
+
+fn searched_grid(bytes: &[u8], query: &str) -> anyhow::Result<Grid> {
+    let mut terminal = new_terminal(60, 12)?;
+    terminal.vt_write(bytes);
+    let mut searcher = Searcher::default();
+    searcher.set(&mut terminal, query)?;
+    let (highlights, found) = searcher.highlights(&mut terminal, 60)?;
+    let mut builder = GridBuilder::new()?;
+    builder.set_search(highlights, found);
+    builder
+        .build(&terminal, 1, Presentation::default())?
+        .context("a new terminal should be dirty")
+}
+
+/// Twenty lines of history, scrolled to the match the search selected.
+fn show_find_scene(state: &mut State) {
+    let lines: String = (1..=20)
+        .map(|line| {
+            format!(
+                "build step {line}: {}\r\n",
+                if line % 4 == 0 { "error: unused" } else { "ok" }
+            )
+        })
+        .collect();
+    let grid = searched_grid(lines.as_bytes(), "error")
+        .unwrap_or_else(|error| Grid::message(&format!("failed to build fixture: {error:#}")));
+    let tab = Tab::new("shell", Session::fixture(grid));
+    let session = tab.session.id();
+    show_tab(state, tab);
+    state.find.edit = TextEdit::new("error");
+    state.find.open = true;
+    state.find.session = session;
 }
 
 pub(crate) fn fixture_tab(title: &str, bytes: &[u8]) -> Tab {
@@ -88,7 +124,9 @@ pub(crate) fn add_scene_tray(state: &mut State) {
     failed.status = Status::Failed("exit 1".to_owned());
     let mut stopped = fixture_tab("storybook", b"");
     stopped.status = Status::Stopped;
-    for tab in [fixture_tab("pnpm dev", SCENE_DEV_SERVER), failed, stopped] {
+    let mut dev = fixture_tab("pnpm dev", SCENE_DEV_SERVER);
+    dev.command_failed = true;
+    for tab in [dev, failed, stopped] {
         state.workspace.add_tray(tab);
     }
 }
@@ -132,6 +170,7 @@ pub(crate) const SCENES: &[Scene] = &[
     ("scrollback-hover", |state| {
         show_tab(state, scrollback_tab(true))
     }),
+    ("find", show_find_scene),
     ("workspace", show_workspace_scene),
     ("palette", |state| {
         show_workspace_scene(state);

@@ -17,9 +17,16 @@ pub(crate) enum Msg {
     ScrollbarHover(bool),
     CommandHeld(bool),
     Copy,
+    /// Scroll to the previous (negative) or next prompt marked by the shell.
+    PromptJump(isize),
+    SelectLastOutput,
     Paste {
         text: String,
         allow_unsafe: bool,
+    },
+    Search(String),
+    SearchStep {
+        older: bool,
     },
     /// The answer to `Event::ClipboardRead`; `None` is a refusal, which the program sees as an
     /// empty clipboard.
@@ -73,6 +80,10 @@ pub enum Event {
     },
     /// The program's progress, or `None` once it removes it, lets it go stale or exits.
     Progress(Option<Progress>),
+    /// A command ended, by the shell's OSC 133 D; `failed` is a non-zero exit code.
+    CommandFinished {
+        failed: bool,
+    },
     /// ⌘ moved onto or off a link; read `Session::link_hovered`.
     LinkHover,
 }
