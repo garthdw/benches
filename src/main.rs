@@ -2,6 +2,7 @@ mod config;
 mod font;
 mod input;
 mod jump;
+mod keymap;
 mod link;
 mod notify;
 mod render;
@@ -20,12 +21,13 @@ use std::time::Duration;
 use libghostty_vt::mouse;
 use rune::tok;
 use rune::{
-    App, AppSpec, Chord, ClipboardContent, Color, Cursor, Cx, Drag, El, FileDialogOptions, Icon,
-    Ime, Key, KeyEvent, Live, Mods, Phase, PointerButton, PointerEvent, PopupItem, PopupMenu,
-    TextEdit, Tx, Waker, WheelEvent, WindowSpec, col, effect, el, icon, row, text, text_input,
+    App, AppSpec, ClipboardContent, Color, Cursor, Cx, Drag, El, FileDialogOptions, Icon, Ime, Key,
+    KeyEvent, Live, Mods, Phase, PointerButton, PointerEvent, PopupItem, PopupMenu, TextEdit, Tx,
+    Waker, WheelEvent, WindowSpec, col, effect, el, icon, row, text, text_input,
 };
 
 use anyhow::Context;
+use keymap::{COMMANDS, Command, pressed, shortcut};
 use session::LogErr;
 use session::{Attention, Event, Grid, PointerInput, PointerPhase, Retarget, Session, WheelInput};
 use workspace::{
@@ -519,8 +521,8 @@ fn pick_folder(tx: &mut Tx, replace_active: bool) {
 
 fn pick_new_tab(state: &mut State, picked: Option<&str>, tx: &mut Tx) {
     match picked {
-        Some("shell") => run_action(state, &Action::Shell, tx),
-        Some("lazygit") => run_action(state, &Action::Lazygit, tx),
+        Some("shell") => run_action(state, &Action::Command(Command::NewShell), tx),
+        Some("lazygit") => run_action(state, &Action::Command(Command::ToggleLazygit), tx),
         Some("palette" | "tray") => open_palette(state, tx),
         _ => {}
     }
@@ -528,11 +530,7 @@ fn pick_new_tab(state: &mut State, picked: Option<&str>, tx: &mut Tx) {
 
 #[derive(Clone, Debug, PartialEq)]
 enum Action {
-    Shell,
-    Lazygit,
-    OpenProject,
-    ChangeFolder,
-    MoveToNewWindow,
+    Command(Command),
     Jump(PathBuf),
     SwitchProject(usize, String),
     SwitchTab(usize, usize, String),
@@ -546,11 +544,7 @@ enum Action {
 impl Action {
     fn label(&self) -> String {
         match self {
-            Action::Shell => "New shell tab".to_owned(),
-            Action::Lazygit => "Toggle lazygit".to_owned(),
-            Action::OpenProject => "Open project…".to_owned(),
-            Action::ChangeFolder => "Change project folder…".to_owned(),
-            Action::MoveToNewWindow => "Move project to new window".to_owned(),
+            Action::Command(command) => command.label().to_owned(),
             Action::Jump(root) => format!("Open project {}", root.display()),
             Action::SwitchProject(_, name) => format!("Switch to project {name}"),
             Action::SwitchTab(_, _, name) => format!("Switch to tab {name}"),
@@ -611,17 +605,11 @@ fn palette_actions(query: &str, jump: Option<&Path>, workspace: &Workspace) -> V
         .into_iter()
         .collect();
     actions.extend(
-        [
-            Action::Shell,
-            Action::Lazygit,
-            Action::OpenProject,
-            Action::ChangeFolder,
-            Action::MoveToNewWindow,
-        ]
-        .into_iter()
-        .filter(|action| *action != Action::ChangeFolder || workspace.project().is_some())
-        .filter(|action| *action != Action::MoveToNewWindow || workspace.projects.len() > 1)
-        .filter(|action| letters_in_order(&action.label(), &needle)),
+        COMMANDS
+            .iter()
+            .filter(|spec| spec.in_palette && (spec.enabled)(workspace))
+            .filter(|spec| letters_in_order(spec.label, &needle))
+            .map(|spec| Action::Command(spec.command)),
     );
     actions.extend(jump.map(|root| Action::Jump(root.to_owned())));
     if query.is_empty() {
@@ -723,11 +711,7 @@ fn run_palette(state: &mut State, index: usize, tx: &mut Tx) {
 
 fn run_action(state: &mut State, action: &Action, tx: &mut Tx) {
     match action {
-        Action::Shell => open_tab(state, "shell", None),
-        Action::Lazygit => toggle_lazygit(state),
-        Action::OpenProject => pick_folder(tx, false),
-        Action::ChangeFolder => pick_folder(tx, true),
-        Action::MoveToNewWindow => move_to_new_window(state, state.workspace.active, None),
+        Action::Command(command) => run_command(state, *command, tx),
         Action::Jump(root) => open_project(state, root.clone()),
         Action::SwitchProject(project, _) => state.workspace.select_project(*project),
         Action::SwitchTab(project, tab, _) => {
@@ -905,53 +889,23 @@ fn poll_jump(state: &mut State, now: f64, tx: &mut Tx) -> bool {
     changed
 }
 
-/// Workspace shortcuts. These keys never reach the terminal.
-fn shortcut(state: &mut State, event: &KeyEvent, tx: &mut Tx) -> bool {
-    if !matches!(event.key, Key::Command(_)) && !event.mods.ctrl {
-        return false;
+fn run_command(state: &mut State, command: Command, tx: &mut Tx) {
+    match command {
+        Command::NewShell => open_tab(state, "shell", None),
+        Command::ToggleLazygit => toggle_lazygit(state),
+        Command::OpenProject => pick_folder(tx, false),
+        Command::ChangeFolder => pick_folder(tx, true),
+        Command::MoveToNewWindow => move_to_new_window(state, state.workspace.active, None),
+        Command::Palette => open_palette(state, tx),
+        Command::ToggleSidebar => state.sidebar_hidden = !state.sidebar_hidden,
+        Command::ToggleDrawer => toggle_last_drawer(state),
+        Command::CloseTab => request_close(state),
+        Command::ZoomIn => state.zoom(1.0),
+        Command::ZoomOut => state.zoom(-1.0),
+        Command::ZoomReset => state.font_zoom = 0.0,
+        Command::PrevTab => state.workspace.cycle_tab(-1),
+        Command::NextTab => state.workspace.cycle_tab(1),
     }
-    let pressed = |binding: &str| pressed(binding, event, tx);
-    let digit = |prefix: &str| (1..=9usize).find(|digit| pressed(&format!("{prefix}{digit}")));
-    if pressed("mod+n") {
-        pick_folder(tx, false);
-    } else if pressed("mod+p") {
-        open_palette(state, tx);
-    } else if pressed("mod+b") {
-        state.sidebar_hidden = !state.sidebar_hidden;
-    } else if pressed("mod+j") {
-        toggle_last_drawer(state);
-    } else if pressed("mod+g") {
-        toggle_lazygit(state);
-    } else if pressed("mod+t") {
-        run_action(state, &Action::Shell, tx);
-    } else if pressed("mod+w") {
-        request_close(state);
-    } else if pressed("mod+=") {
-        state.zoom(1.0);
-    } else if pressed("mod+-") {
-        state.zoom(-1.0);
-    } else if pressed("mod+0") {
-        state.font_zoom = 0.0;
-    } else if pressed("mod+shift+[") {
-        state.workspace.cycle_tab(-1);
-    } else if pressed("mod+shift+]") {
-        state.workspace.cycle_tab(1);
-    } else if let Some(digit) = digit("ctrl+") {
-        let last = state.workspace.projects.len().saturating_sub(1);
-        state.workspace.select_project((digit - 1).min(last));
-    } else if let Some(digit) = digit("mod+") {
-        if let Some(project) = state.workspace.project() {
-            let last = project.tabs.len().saturating_sub(1);
-            state.workspace.select_tab((digit - 1).min(last));
-        }
-    } else {
-        return false;
-    }
-    true
-}
-
-fn pressed(binding: &str, event: &KeyEvent, tx: &Tx) -> bool {
-    Chord::parse(binding).is_ok_and(|chord| chord.matches_tx(event, tx))
 }
 
 fn send_pointer(
@@ -2525,7 +2479,7 @@ mod tests {
         assert_eq!(
             palette_actions("lzg", None, &one_project()),
             [
-                Action::Lazygit,
+                Action::Command(Command::ToggleLazygit),
                 Action::Run("lzg".to_owned()),
                 Action::Tray("lzg".to_owned()),
             ]
@@ -2533,13 +2487,16 @@ mod tests {
         assert_eq!(
             palette_actions("", None, &one_project()),
             [
-                Action::Shell,
-                Action::Lazygit,
-                Action::OpenProject,
-                Action::ChangeFolder
+                Action::Command(Command::NewShell),
+                Action::Command(Command::ToggleLazygit),
+                Action::Command(Command::OpenProject),
+                Action::Command(Command::ChangeFolder)
             ]
         );
-        assert!(!palette_actions("", None, &Workspace::default()).contains(&Action::ChangeFolder));
+        assert!(
+            !palette_actions("", None, &Workspace::default())
+                .contains(&Action::Command(Command::ChangeFolder))
+        );
     }
 
     #[test]
@@ -2593,7 +2550,7 @@ mod tests {
     fn switching_comes_after_running_the_query_and_exact_names_lead_the_switches() {
         let state = workspace_state();
         let actions = palette_actions("shell", None, &state.workspace);
-        assert_eq!(actions[0], Action::Shell);
+        assert_eq!(actions[0], Action::Command(Command::NewShell));
         assert_eq!(actions[1], Action::Run("shell".to_owned()));
         assert_eq!(actions[2], Action::Tray("shell".to_owned()));
         assert_eq!(
@@ -3464,12 +3421,13 @@ mod tests {
     #[test]
     fn moving_a_project_is_offered_only_beside_another_project() {
         let moves = |workspace: &Workspace| {
-            palette_actions("", None, workspace).contains(&Action::MoveToNewWindow)
+            palette_actions("", None, workspace)
+                .contains(&Action::Command(Command::MoveToNewWindow))
         };
         assert!(!moves(&one_project()));
         assert!(moves(&workspace_state().workspace));
         assert_eq!(
-            Action::MoveToNewWindow.label(),
+            Action::Command(Command::MoveToNewWindow).label(),
             "Move project to new window"
         );
     }
