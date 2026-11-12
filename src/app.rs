@@ -62,6 +62,8 @@ pub(crate) struct State {
     pub(crate) drawn: [(u64, bool); 3],
     /// Sessions showing an attention dot, as the actors raise it without an event.
     pub(crate) alerting: Vec<u64>,
+    /// The project name the window title was last set for; `Some(None)` is the title with no project.
+    pub(crate) titled: Option<Option<String>>,
     /// Waiting confirmations, answered newest first; dismissed when keys move elsewhere.
     pub(crate) confirms: Vec<Confirm>,
     pub(crate) hovered_project: Option<usize>,
@@ -471,7 +473,11 @@ pub(crate) fn poll(state: &mut State, now: f64, tx: &mut Tx) -> bool {
         }
     }
     let mut changed = adopt_projects(state);
-    tx.set_title(window_title(&state.workspace));
+    let project_name = state.workspace.project().map(|project| &project.name);
+    if state.titled.as_ref().map(Option::as_ref) != Some(project_name) {
+        tx.set_title(window_title(&state.workspace));
+        state.titled = Some(project_name.cloned());
+    }
     if state.window != MAIN_WINDOW && state.workspace.projects.is_empty() {
         tx.close_window();
     }
@@ -557,14 +563,17 @@ pub(crate) fn poll(state: &mut State, now: f64, tx: &mut Tx) -> bool {
     ];
     changed |= drawn != state.drawn;
     state.drawn = drawn;
-    let alerting: Vec<u64> = state
-        .workspace
-        .sessions()
-        .filter(|session| session.attention() == Attention::Alert)
-        .map(Session::id)
-        .collect();
-    changed |= alerting != state.alerting;
-    state.alerting = alerting;
+    let alerting = || {
+        state
+            .workspace
+            .sessions()
+            .filter(|session| session.attention() == Attention::Alert)
+            .map(Session::id)
+    };
+    if !alerting().eq(state.alerting.iter().copied()) {
+        state.alerting = alerting().collect();
+        changed = true;
+    }
     changed
 }
 
