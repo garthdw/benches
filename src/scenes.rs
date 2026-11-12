@@ -19,7 +19,8 @@ const SCENE_UNICODE: &str = concat!(
     "\x1b[1mbold\x1b[0m \x1b[3mitalic\x1b[0m \x1b[1;3mboth\x1b[0m \x1b[2mfaint\x1b[0m \x1b[9mstrike\x1b[0m \x1b[53mover\x1b[0m\r\n",
     "\x1b[4msingle\x1b[0m \x1b[4:2mdouble\x1b[0m \x1b[4:3;58;2;255;80;80mcurly\x1b[0m \x1b[4:4mdotted\x1b[0m \x1b[4:5mdashed\x1b[0m\r\n",
     "\x1b[41m\u{1F41F}\x1b[31;43m\u{E0C6}\x1b[30m ~ \x1b[33;42m\u{E0C6}\x1b[32;49m\u{E0C6}\x1b[0m\r\n",
-    "\x1b[32m\u{F432}\x1b[0m $ "
+    "\x1b[32m\u{F432}\x1b[0m $ \r\n",
+    "\x1b[44;37m \u{E7A8} \x1b[34;42m\u{E0C6}\x1b[30m \u{F418} main \x1b[32;43m\u{E0C6}\x1b[30m \u{F0E7} \x1b[33;49m\u{E0C6}\x1b[0m \u{F07B} \u{F418}x \u{F07B}\u{F418} \u{F07B}\r\n"
 );
 
 pub(crate) fn fixture_grid(bytes: &[u8]) -> Grid {

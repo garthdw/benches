@@ -21,6 +21,7 @@ use objc2_core_text::{
 };
 
 use crate::config::DEFAULT_FONT_FAMILY;
+use crate::constraint::{Bounds, Constraint, Metrics, Size, is_private_use};
 use crate::sprite;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
@@ -122,6 +123,7 @@ pub struct Font {
     pub underline_top: u32,
     pub strike_top: u32,
     baseline: f64,
+    metrics: Metrics,
     /// A cell's advance before rounding up to whole pixels.
     advance: f64,
     /// Per style, which cells of a run shape differently from standing alone.
@@ -180,7 +182,7 @@ impl Hasher for Fnv {
 /// Runs cached before the cache is emptied; words are the usual run, so this bounds memory.
 const RUN_CACHE_LIMIT: usize = 4096;
 
-const SYMBOLS_FONT: &[u8] = include_bytes!("../assets/SymbolsNerdFontMono-Regular.ttf");
+const SYMBOLS_FONT: &[u8] = include_bytes!("../assets/SymbolsNerdFont-Regular.ttf");
 
 fn symbols_face(pixels: f64) -> Result<CFRetained<CTFont>> {
     // SAFETY: the data is live for the call, and a null matrix means identity.
@@ -261,123 +263,6 @@ fn family_faces(family: &str, pixels: f64) -> Option<[CFRetained<CTFont>; 4]> {
     let italic = styled(CTFontSymbolicTraits::TraitItalic);
     let bold_italic = styled(CTFontSymbolicTraits::TraitBold | CTFontSymbolicTraits::TraitItalic);
     Some([regular, bold, italic, bold_italic])
-}
-
-fn is_private_use(character: char) -> bool {
-    matches!(
-        u32::from(character),
-        0xE000..=0xF8FF | 0xF0000..=0xFFFFD | 0x100000..=0x10FFFD
-    )
-}
-
-#[derive(Clone, Copy, PartialEq)]
-enum Fit {
-    Stretch,
-    /// Fit down, or cover up to one cell (Nerd Fonts' `pa`).
-    FitCover,
-}
-
-#[derive(Clone, Copy, PartialEq)]
-enum Align {
-    Start,
-    End,
-    /// Centred in the first cell even when the glyph may span two.
-    CenterFirst,
-}
-
-/// Ghostty's Nerd Font constraint as generated from font-patcher's Powerline attributes. Those are
-/// all centred vertically on the whole cell and, once stretched, need no padding.
-#[derive(Clone, Copy)]
-struct Constraint {
-    fit: Fit,
-    align: Align,
-    max_cells: u32,
-    max_ratio: Option<f64>,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq)]
-struct Bounds {
-    x: f64,
-    y: f64,
-    width: f64,
-    height: f64,
-}
-
-impl Constraint {
-    /// Powerline and Powerline Extra, apart from the arrows `sprite` draws.
-    fn of(character: char) -> Option<Self> {
-        use {Align::*, Fit::*};
-        let (fit, align, max_cells, max_ratio) = match u32::from(character) {
-            0xE0A0..=0xE0A3 | 0xE0CF => (FitCover, CenterFirst, 2, None),
-            0xE0CE | 0xE0D0 | 0xE0D1 => (FitCover, Start, 2, None),
-            0xE0B4 => (Stretch, Start, 1, Some(0.59)),
-            0xE0B5 => (Stretch, Start, 1, Some(0.5)),
-            0xE0B6 => (Stretch, End, 1, Some(0.59)),
-            0xE0B7 => (Stretch, End, 1, Some(0.5)),
-            0xE0B8 | 0xE0B9 | 0xE0BC | 0xE0BD => (Stretch, Start, 1, None),
-            0xE0BA | 0xE0BB | 0xE0BE | 0xE0BF => (Stretch, End, 1, None),
-            0xE0C0 | 0xE0C1 | 0xE0C8 => (Stretch, Start, 2, None),
-            0xE0C2 | 0xE0C3 | 0xE0CA => (Stretch, End, 2, None),
-            0xE0C4 => (Stretch, Start, 2, Some(0.86)),
-            0xE0C5 => (Stretch, End, 2, Some(0.86)),
-            0xE0C6 => (Stretch, Start, 2, Some(0.78)),
-            0xE0C7 => (Stretch, End, 2, Some(0.78)),
-            0xE0CC => (Stretch, Start, 2, Some(0.85)),
-            0xE0CD => (Stretch, Start, 2, Some(0.865)),
-            0xE0D2 | 0xE0D6 => (Stretch, Start, 1, Some(0.7)),
-            0xE0D4 | 0xE0D7 => (Stretch, End, 1, Some(0.7)),
-            _ => return None,
-        };
-        Some(Self {
-            fit,
-            align,
-            max_cells,
-            max_ratio,
-        })
-    }
-
-    /// Ghostty's `Constraint.constrain`, with the face taken as the whole cell and `y` measured up
-    /// from the cell's bottom. `cells` is how many cells the glyph may use.
-    fn constrain(&self, glyph: Bounds, cell_width: f64, cell_height: f64, cells: u32) -> Bounds {
-        let span = self.max_cells.min(cells).max(1);
-        let factors = |span: u32| {
-            let width = f64::from(span) * cell_width / glyph.width;
-            let height = cell_height / glyph.height;
-            match self.fit {
-                Fit::Stretch => (width, height),
-                Fit::FitCover => {
-                    let factor = width.min(height);
-                    (factor, factor)
-                }
-            }
-        };
-        let (mut width_factor, mut height_factor) = factors(span);
-        if self.fit == Fit::FitCover {
-            // An icon must not shrink when a space opens up after it.
-            if span > 1 && height_factor > 1.0 {
-                height_factor = factors(1).1.max(1.0);
-            }
-            width_factor = height_factor;
-        }
-        if let Some(ratio) = self.max_ratio
-            && glyph.width * width_factor > glyph.height * height_factor * ratio
-        {
-            width_factor = glyph.height * height_factor * ratio / glyph.width;
-        }
-        let width = glyph.width * width_factor;
-        let height = glyph.height * height_factor;
-        let x = match self.align {
-            Align::Start => 0.0,
-            Align::End => (f64::from(span) * cell_width - width).max(0.0),
-            Align::CenterFirst => ((cell_width - width) / 2.0).max(0.0),
-        };
-        Bounds {
-            x,
-            y: (cell_height - height) / 2.0,
-            width,
-            height,
-        }
-    }
 }
 
 fn shaped_line(font: &CTFont, text: &str) -> Option<CFRetained<CTLine>> {
@@ -494,7 +379,15 @@ impl Font {
             )
         };
         // SAFETY: plain metric getters.
-        let (ascent, descent, leading, underline_position, underline_thickness, x_height) = unsafe {
+        let (
+            ascent,
+            descent,
+            leading,
+            underline_position,
+            underline_thickness,
+            x_height,
+            cap_height,
+        ) = unsafe {
             (
                 regular.ascent(),
                 regular.descent(),
@@ -502,9 +395,12 @@ impl Font {
                 regular.underline_position(),
                 regular.underline_thickness(),
                 regular.x_height(),
+                regular.cap_height(),
             )
         };
-        let cell_height = (ascent + descent + leading).ceil() as u32;
+        let face_height = ascent + descent + leading;
+        let cell_height = face_height.ceil() as u32;
+        let cell_width = advance.ceil() as u32;
         let baseline = (descent + leading / 2.0).round();
         let baseline_from_top = f64::from(cell_height) - baseline;
         let line_thickness = (underline_thickness.round() as u32).max(1);
@@ -513,13 +409,22 @@ impl Font {
         let lowest_underline = cell_height.saturating_sub(3 * line_thickness);
         let symbols = icon_face(regular, pixels, symbols_family, fallback_families)?;
         Ok(Self {
-            cell_width: advance.ceil() as u32,
+            cell_width,
             cell_height,
             line_thickness,
             underline_top: ((baseline_from_top - underline_position - half_line).round() as u32)
                 .min(lowest_underline),
             strike_top: (baseline_from_top - x_height / 2.0 - half_line).round() as u32,
             baseline,
+            metrics: Metrics {
+                cell_width: f64::from(cell_width),
+                cell_height: f64::from(cell_height),
+                face_width: advance,
+                face_height,
+                face_y: baseline - (leading / 2.0 + descent),
+                icon_height: face_height,
+                icon_height_single: (2.0 * cap_height + face_height) / 3.0,
+            },
             break_runs_at_cursor: true,
             advance,
             runs: RefCell::default(),
@@ -561,9 +466,9 @@ impl Font {
         is_private_use(character) && !matches!(u32::from(character), 0xE0B0..=0xE0D7)
     }
 
-    /// Whether `character` is a constrained Nerd Font glyph, which may spill into a blank cell after it.
+    /// Whether `character` may use two cells when a blank follows: its constraint allows it.
     pub fn spills(character: char) -> bool {
-        Constraint::of(character).is_some()
+        Constraint::of(character).is_some_and(|constraint| constraint.max_constraint_width > 1)
     }
 
     /// Premultiplied RGBA for `text`, `cells * cell_width` by `cell_height` with the top row first.
@@ -603,12 +508,11 @@ impl Font {
                     width: ink.size.width,
                     height: ink.size.height,
                 };
-                let target = constraint.constrain(
-                    glyph,
-                    f64::from(self.cell_width),
-                    f64::from(self.cell_height),
-                    cells,
-                );
+                let mut target = constraint.constrain(glyph, self.metrics, cells);
+                if constraint.size != Size::Stretch {
+                    // Centre the face in a pixel cell wider than its advance.
+                    target.x += (self.metrics.cell_width - self.metrics.face_width) / 2.0;
+                }
                 let (scale_x, scale_y) = (target.width / glyph.width, target.height / glyph.height);
                 CGContext::translate_ctm(Some(&context), target.x, target.y);
                 CGContext::scale_ctm(Some(&context), scale_x, scale_y);
@@ -963,6 +867,47 @@ mod tests {
         assert!(ink_columns(&font, &pixels, 1).1 + 2 >= font.cell_width as usize);
     }
 
+    fn icon_height_single(font: &Font) -> f64 {
+        // SAFETY: plain metric getters on a live font.
+        let (cap, ascent, descent, leading) = unsafe {
+            let face = &font.faces[0];
+            (
+                face.cap_height(),
+                face.ascent(),
+                face.descent(),
+                face.leading(),
+            )
+        };
+        (2.0 * cap + ascent + descent + leading) / 3.0
+    }
+
+    #[test]
+    fn a_height_limited_icon_is_as_high_as_ghosttys_icon_height() {
+        let font = Font::new(DEFAULT_FONT_FAMILY, 13.0, 2.0).unwrap();
+        let mut pixels = Vec::new();
+        font.rasterize("\u{F0E7}", REGULAR, 1, &mut pixels);
+        let height = ink_height(&font, &pixels, 1) as f64;
+        let expected = icon_height_single(&font);
+        assert!(
+            (height - expected).abs() <= 1.5,
+            "{height} high, expected {expected}"
+        );
+    }
+
+    #[test]
+    fn an_icon_is_larger_with_two_cells_than_when_squeezed_into_one() {
+        let font = Font::new(DEFAULT_FONT_FAMILY, 13.0, 2.0).unwrap();
+        let (mut squeezed, mut roomy) = (Vec::new(), Vec::new());
+        font.rasterize("\u{F418}", REGULAR, 1, &mut squeezed);
+        font.rasterize("\u{F418}", REGULAR, 2, &mut roomy);
+        let width = |pixels: &[u8], cells| {
+            let (first, last) = ink_columns(&font, pixels, cells);
+            last - first
+        };
+        assert!(width(&roomy, 2) > width(&squeezed, 1) + 2);
+        assert!(ink_height(&font, &roomy, 2) > ink_height(&font, &squeezed, 1) + 2);
+    }
+
     #[test]
     fn a_regular_icon_stays_within_its_cell() {
         let font = Font::new(DEFAULT_FONT_FAMILY, 13.0, 2.0).unwrap();
@@ -973,13 +918,6 @@ mod tests {
             pixels.len(),
             (font.cell_width * font.cell_height * 4) as usize
         );
-    }
-
-    #[test]
-    fn constraints_exist_only_for_glyphs_the_font_draws() {
-        assert!(Constraint::of('\u{E0C6}').is_some());
-        assert!(Constraint::of('\u{E0B0}').is_none());
-        assert!(Constraint::of('\u{F432}').is_none());
     }
 
     #[test]
@@ -1048,7 +986,7 @@ mod tests {
         assert_ne!(separator, icon);
         // SAFETY: a plain getter on a live font.
         let name = unsafe { font.symbols.post_script_name() }.to_string();
-        assert_eq!(name, "SymbolsNFM");
+        assert_eq!(name, "SymbolsNF");
     }
 
     fn symbols_name(font: &Font) -> String {
@@ -1084,7 +1022,7 @@ mod tests {
             &[],
         )
         .unwrap();
-        assert_eq!(symbols_name(&font), "SymbolsNFM");
+        assert_eq!(symbols_name(&font), "SymbolsNF");
     }
 
     #[test]
@@ -1098,7 +1036,7 @@ mod tests {
             &[],
         )
         .unwrap();
-        assert_eq!(symbols_name(&font), "SymbolsNFM");
+        assert_eq!(symbols_name(&font), "SymbolsNF");
     }
 
     #[test]

@@ -994,6 +994,10 @@ mod tests {
         assert_eq!(widths("\u{F432}\u{E0C6} "), [1, 1]);
         assert_eq!(widths("abc\u{E0C6}"), [1, 1, 1, 1]);
         assert_eq!(widths("\u{E0B0} "), [1]);
+        assert_eq!(widths("\u{F418} "), [2]);
+        assert_eq!(widths("\u{F418}b"), [1, 1]);
+        assert_eq!(widths("\u{F418}\u{F07B} "), [1, 1]);
+        assert_eq!(widths("\u{4E16} "), [2]);
     }
 
     fn run_end(bytes: &[u8], start: usize) -> usize {
