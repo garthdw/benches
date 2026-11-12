@@ -3,6 +3,13 @@
     "FontFile": {
       "additionalProperties": false,
       "properties": {
+        "adjust-icon-height": {
+          "description": "The maximum height of icons, in Ghostty's `adjust-icon-height` syntax: a percentage such as\n`-10%` or a pixel change such as `-2`. Falls back to Ghostty's setting.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "family": {
           "description": "The font family. Falls back to Ghostty's first `font-family`.",
           "type": [

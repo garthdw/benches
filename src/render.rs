@@ -9,6 +9,7 @@ use rune::color::srgb_decode;
 use rune::compose::{Compositor, DeviceKey, Frame};
 use rune::render::EffectSite;
 
+use crate::constraint::{Constraint, is_graphics_element, is_symbol};
 use crate::font::{Font, FontStyle, GlyphKind, ShapedRun};
 use crate::grid::{Cell, Grid, Metrics, Scrollbar, Surface};
 use crate::session::Session;
@@ -204,18 +205,25 @@ fn glyph_key(grid: &Grid, index: usize, cell: &Cell) -> Option<GlyphKey> {
     })
 }
 
-/// Ghostty lets a constrained glyph use the next cell when that is blank, unless the row ends there
-/// or an icon precedes, so that a run of icons stays aligned.
+/// Ghostty's `constraintWidth`: a symbol may use the next cell when that is blank, unless the row
+/// ends there or a symbol other than a graphics element precedes, so that a run of icons stays
+/// aligned. A rule capped at one cell, as Powerline's is, keeps its one-cell key: Ghostty clamps
+/// the width there, and agentd draws its sprites only in a single cell.
 fn spills_into_next(grid: &Grid, index: usize, cell: &Cell) -> bool {
     let cols = usize::from(grid.cols).max(1);
     cell.cluster.is_none()
-        && Font::spills(cell.character)
+        && is_symbol(cell.character)
+        && Constraint::of(cell.character)
+            .is_some_and(|constraint| constraint.max_constraint_width > 1)
         && !(index + 1).is_multiple_of(cols)
         && grid
             .cells
             .get(index + 1)
-            .is_some_and(|next| next.character == ' ' && !next.spacer)
-        && (index.is_multiple_of(cols) || !Font::is_icon(grid.cells[index - 1].character))
+            .is_some_and(|next| matches!(next.character, ' ' | '\u{2002}'))
+        && (index.is_multiple_of(cols) || {
+            let previous = grid.cells[index - 1].character;
+            !is_symbol(previous) || is_graphics_element(previous)
+        })
 }
 
 /// Neighbouring cells shaped together: the same style, on one row, identical but for the background (selection included), and
@@ -715,6 +723,9 @@ impl TerminalCompositor {
             ) {
                 Ok(mut font) => {
                     font.break_runs_at_cursor = config.shaping_breaks_at_cursor;
+                    if let Some(modifier) = config.adjust_icon_height {
+                        font.adjust_icon_height(modifier);
+                    }
                     gpu.atlas.reset();
                     self.font = Some((site.scale, size, config.clone(), font));
                 }
@@ -1039,6 +1050,30 @@ mod tests {
         assert_eq!(widths("\u{F418}b"), [1, 1]);
         assert_eq!(widths("\u{F418}\u{F07B} "), [1, 1]);
         assert_eq!(widths("\u{4E16} "), [2]);
+    }
+
+    #[test]
+    fn a_symbol_spills_as_ghostty_does() {
+        let widths = |text: &str| -> Vec<u32> {
+            let grid = Grid::from_vt(text.as_bytes(), 4, 1).unwrap();
+            (0..4)
+                .filter_map(|index| {
+                    glyph_key(&grid, index, &grid.cells[index]).map(|key| key.cells)
+                })
+                .collect()
+        };
+        assert_eq!(widths("\u{2192} "), [2]);
+        assert_eq!(widths("a\u{2605} "), [1, 2]);
+        assert_eq!(widths("\u{2713}b"), [1, 1]);
+        assert_eq!(widths("\u{2192}\u{2192} "), [1, 1]);
+        assert_eq!(widths("\u{2192}\u{F418} "), [1, 1]);
+        assert_eq!(widths("\u{F418}\u{2192} "), [1, 1]);
+        assert_eq!(widths("abc\u{2605}"), [1, 1, 1, 1]);
+        assert_eq!(widths("\u{2500}\u{2192} "), [1, 2]);
+        assert_eq!(widths("\u{E0B0}\u{2192} "), [1, 2]);
+        assert_eq!(widths("\u{2500} "), [1]);
+        assert_eq!(widths("\u{23FB} "), [1]);
+        assert_eq!(widths("\u{1F600} "), [2]);
     }
 
     fn run_end(bytes: &[u8], start: usize) -> usize {

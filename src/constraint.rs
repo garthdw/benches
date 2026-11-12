@@ -80,8 +80,8 @@ impl Constraint {
         icon_height: false,
     };
 
-    /// Ghostty's constraint for a private-use glyph: the Nerd Font patcher's rule if it has one,
-    /// else just fitting inside its cells.
+    /// Ghostty's constraint for a glyph: the Nerd Font patcher's rule if it has one, else a symbol
+    /// just fits inside its cells.
     pub fn of(character: char) -> Option<Self> {
         let codepoint = u32::from(character);
         let index = RANGES.partition_point(|&(_, end, _)| end < codepoint);
@@ -89,7 +89,7 @@ impl Constraint {
             Some(&(start, _, constraint)) if start <= codepoint => {
                 CONSTRAINTS.get(usize::from(constraint)).copied()
             }
-            _ => is_private_use(character).then_some(Self {
+            _ => is_symbol(character).then_some(Self {
                 size: Size::Fit,
                 ..Self::NONE
             }),
@@ -243,6 +243,65 @@ pub fn is_private_use(character: char) -> bool {
     )
 }
 
+/// Ghostty's metric modifier: a percentage change such as `20%` or a pixel delta such as `-2`.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum Modifier {
+    /// A factor of the value, where `20%` is 1.2 and `-100%` or less is 0.
+    Percent(f64),
+    Absolute(i32),
+}
+
+impl std::str::FromStr for Modifier {
+    type Err = String;
+
+    fn from_str(input: &str) -> Result<Self, String> {
+        let invalid = || format!("invalid modifier {input:?}: expected a number or a percentage");
+        match input.strip_suffix('%') {
+            Some(percent) => {
+                let change = percent.parse::<f64>().map_err(|_| invalid())? / 100.0;
+                Ok(Self::Percent((1.0 + change).max(0.0)))
+            }
+            None => input.parse().map(Self::Absolute).map_err(|_| invalid()),
+        }
+    }
+}
+
+impl Modifier {
+    pub fn apply(self, value: f64) -> f64 {
+        match self {
+            Self::Percent(factor) => value * factor,
+            Self::Absolute(delta) => value + f64::from(delta),
+        }
+    }
+}
+
+/// Ghostty's `isSymbol`: private use plus the Unicode blocks of arrows, dingbats, emoticons,
+/// miscellaneous symbols (and pictographs), enclosed alphanumerics (and supplement), and
+/// transport and map symbols.
+pub fn is_symbol(character: char) -> bool {
+    is_private_use(character)
+        || matches!(
+            u32::from(character),
+            0x2190..=0x21FF
+                | 0x2460..=0x24FF
+                | 0x2600..=0x26FF
+                | 0x2700..=0x27BF
+                | 0x1F100..=0x1F1FF
+                | 0x1F300..=0x1F5FF
+                | 0x1F600..=0x1F64F
+                | 0x1F680..=0x1F6FF
+        )
+}
+
+/// Ghostty's `isGraphicsElement`: box drawing, blocks, legacy computing and Powerline glyphs,
+/// which sit flush against their neighbours.
+pub fn is_graphics_element(character: char) -> bool {
+    matches!(
+        u32::from(character),
+        0x2500..=0x259F | 0x1FB00..=0x1FBFF | 0x1CC00..=0x1CEBF | 0xE0B0..=0xE0D7
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -343,8 +402,85 @@ mod tests {
         ] {
             assert!(Constraint::of(character).is_some(), "{character:?}");
         }
-        for character in ['a', ' ', '\u{4E16}', '\u{1F600}'] {
+        for character in ['a', ' ', '\u{4E16}', '\u{2500}', '\u{2588}'] {
             assert!(Constraint::of(character).is_none(), "{character:?}");
         }
+    }
+
+    #[test]
+    fn symbols_are_private_use_and_ghosttys_symbol_blocks() {
+        for character in [
+            '\u{2192}',
+            '\u{2605}',
+            '\u{2713}',
+            '\u{2460}',
+            '\u{1F100}',
+            '\u{1F41F}',
+            '\u{1F600}',
+            '\u{1F680}',
+            '\u{E0B0}',
+            '\u{F418}',
+        ] {
+            assert!(is_symbol(character), "{character:?}");
+        }
+        for character in [
+            'a',
+            ' ',
+            '\u{4E16}',
+            '\u{2500}',
+            '\u{2588}',
+            '\u{23FA}',
+            '\u{1FB00}',
+        ] {
+            assert!(!is_symbol(character), "{character:?}");
+        }
+    }
+
+    #[test]
+    fn a_symbol_without_a_nerd_font_rule_just_fits() {
+        for character in ['\u{2192}', '\u{2605}', '\u{2713}', '\u{1F600}'] {
+            let constraint = Constraint::of(character).unwrap();
+            assert_eq!(constraint.size, Size::Fit, "{character:?}");
+            assert_eq!(constraint.align_horizontal, Align::None, "{character:?}");
+            assert_eq!(constraint.max_constraint_width, 2, "{character:?}");
+        }
+    }
+
+    #[test]
+    fn graphics_elements_are_box_drawing_blocks_legacy_computing_and_powerline() {
+        for character in [
+            '\u{2500}',
+            '\u{257F}',
+            '\u{2580}',
+            '\u{259F}',
+            '\u{1FB00}',
+            '\u{1CC00}',
+            '\u{E0B0}',
+            '\u{E0D7}',
+        ] {
+            assert!(is_graphics_element(character), "{character:?}");
+        }
+        for character in ['a', '\u{2192}', '\u{E0D8}', '\u{F418}'] {
+            assert!(!is_graphics_element(character), "{character:?}");
+        }
+    }
+
+    #[test]
+    fn a_modifier_parses_as_ghostty_does() {
+        assert_eq!("20%".parse(), Ok(Modifier::Percent(1.2)));
+        assert_eq!("-20%".parse(), Ok(Modifier::Percent(0.8)));
+        assert_eq!("-100%".parse(), Ok(Modifier::Percent(0.0)));
+        assert_eq!("-150%".parse(), Ok(Modifier::Percent(0.0)));
+        assert_eq!("5".parse(), Ok(Modifier::Absolute(5)));
+        assert_eq!("-5".parse(), Ok(Modifier::Absolute(-5)));
+        for invalid in ["", "%", "x", "1.5", "5px"] {
+            assert!(invalid.parse::<Modifier>().is_err(), "{invalid:?}");
+        }
+    }
+
+    #[test]
+    fn a_modifier_changes_a_value_by_a_delta() {
+        assert_eq!(Modifier::Percent(0.75).apply(100.0), 75.0);
+        assert_eq!(Modifier::Absolute(-5).apply(100.0), 95.0);
     }
 }

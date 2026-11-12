@@ -6,6 +6,7 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 
 use crate::LogErr;
+use crate::constraint::Modifier;
 use crate::grid::{DEFAULT_BG, DEFAULT_FG};
 
 const DEFAULT_SHELL: &str = "/opt/homebrew/bin/fish";
@@ -37,6 +38,8 @@ pub struct FontConfig {
     pub features: Vec<String>,
     /// Ghostty's `font-shaping-break = cursor`: the cursor splits a ligature.
     pub shaping_breaks_at_cursor: bool,
+    /// Ghostty's `adjust-icon-height`: the icons' maximum height, by a percentage or in pixels.
+    pub adjust_icon_height: Option<Modifier>,
 }
 
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq)]
@@ -82,6 +85,7 @@ impl Default for Config {
                 fallback_families: Vec::new(),
                 features: Vec::new(),
                 shaping_breaks_at_cursor: true,
+                adjust_icon_height: None,
             },
             theme: Theme::default(),
             tabs: vec![
@@ -137,6 +141,10 @@ struct FontFile {
     /// or `no-cursor`. Replaces Ghostty's setting.
     #[serde(rename = "shaping-break")]
     shaping_break: Option<Vec<String>>,
+    /// The maximum height of icons, in Ghostty's `adjust-icon-height` syntax: a percentage such as
+    /// `-10%` or a pixel change such as `-2`. Falls back to Ghostty's setting.
+    #[serde(rename = "adjust-icon-height")]
+    adjust_icon_height: Option<String>,
 }
 
 /// Where to look for the files the config names.
@@ -257,6 +265,9 @@ fn default_config_text() -> String {
          # Where to split ligatures, in Ghostty's `font-shaping-break` syntax: `cursor` (the\n\
          # default) shows the characters under the cursor; `no-cursor` keeps the ligature.\n\
          # shaping-break = [\"no-cursor\"]\n\
+         # The maximum height of icons, as a percentage or in pixels, like Ghostty's\n\
+         # `adjust-icon-height`; unset uses Ghostty's.\n\
+         # adjust-icon-height = \"-10%\"\n\
          {tabs}",
         size = defaults.font.size,
     )
@@ -326,6 +337,11 @@ impl Config {
                             .collect()
                     }),
                 ),
+                adjust_icon_height: file
+                    .font
+                    .adjust_icon_height
+                    .or_else(|| ghostty_value("adjust-icon-height"))
+                    .and_then(|value| value.parse().log_err("adjust-icon-height")),
             },
             theme,
             tabs: file.tabs.unwrap_or(defaults.tabs),
@@ -477,6 +493,7 @@ mod tests {
                 fallback_families: vec!["Symbols".to_owned()],
                 features: Vec::new(),
                 shaping_breaks_at_cursor: true,
+                adjust_icon_height: None,
             }
         );
         assert_eq!(
@@ -501,6 +518,30 @@ mod tests {
     }
 
     #[test]
+    fn adjust_icon_height_comes_from_config_toml_then_ghostty() {
+        let adjust = |config: Option<&str>, ghostty: Option<&str>| {
+            let (_root, paths) = paths(config, ghostty);
+            Config::load(&paths).font.adjust_icon_height
+        };
+        assert_eq!(adjust(None, None), None);
+        assert_eq!(
+            adjust(None, Some("adjust-icon-height = -10%\n")),
+            Some(Modifier::Percent(0.9))
+        );
+        assert_eq!(
+            adjust(
+                Some("[font]\nadjust-icon-height = \"3\"\n"),
+                Some("adjust-icon-height = 20%\n")
+            ),
+            Some(Modifier::Absolute(3))
+        );
+        assert_eq!(
+            adjust(Some("[font]\nadjust-icon-height = \"big\"\n"), None),
+            None
+        );
+    }
+
+    #[test]
     fn config_toml_overrides_ghostty_key_by_key() {
         let config = "shell = \"/bin/zsh\"\njump-command = \"j\"\n[font]\nsize = 12\nsymbols-family = \"Icons NF\"\n[[tabs]]\ntitle = \"shell\"\n";
         let (_root, paths) = paths(
@@ -519,6 +560,7 @@ mod tests {
                 fallback_families: Vec::new(),
                 features: Vec::new(),
                 shaping_breaks_at_cursor: true,
+                adjust_icon_height: None,
             }
         );
         assert_eq!(
