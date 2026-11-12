@@ -19,6 +19,7 @@ use libghostty_vt::{RenderState, Terminal};
 
 use crate::LogErr;
 use crate::config::{ClipboardAccess, Theme};
+use crate::images::{ImageReader, Placement};
 
 pub(crate) const FRAME: Duration = Duration::from_millis(8);
 
@@ -166,6 +167,7 @@ pub struct Grid {
     pub metrics: Metrics,
     pub bg: [u8; 3],
     pub scrollbar: Option<Scrollbar>,
+    pub images: Arc<[Placement]>,
     /// The match count while a search is open.
     pub found: Option<Found>,
 }
@@ -211,6 +213,7 @@ impl Default for Grid {
             metrics: Metrics::default(),
             bg: rgb(DEFAULT_BG),
             scrollbar: None,
+            images: Arc::default(),
             found: None,
         }
     }
@@ -219,7 +222,20 @@ impl Default for Grid {
 impl Grid {
     /// Parses `bytes` on the calling thread, for fixtures and tests.
     pub fn from_vt(bytes: &[u8], cols: u16, rows: u16) -> Result<Self> {
+        Self::from_vt_with_cells(bytes, cols, rows, (0, 0))
+    }
+
+    /// As `from_vt`, with cells of `(width, height)` pixels, which sizes images; zero leaves them unset.
+    pub fn from_vt_with_cells(
+        bytes: &[u8],
+        cols: u16,
+        rows: u16,
+        (cell_width, cell_height): (u32, u32),
+    ) -> Result<Self> {
         let mut terminal = new_terminal(cols, rows)?;
+        if cell_width > 0 && cell_height > 0 {
+            terminal.resize(cols, rows, cell_width, cell_height)?;
+        }
         terminal.vt_write(bytes);
         GridBuilder::new()?
             .build(&terminal, 1, Presentation::default())?
@@ -493,7 +509,14 @@ pub(crate) struct GridBuilder {
     state: RenderState<'static>,
     rows: RowIterator<'static>,
     cells: CellIterator<'static>,
-    last_shown: Option<(CursorVisualStyle, bool, Presentation, Option<Scrollbar>)>,
+    last_shown: Option<(
+        CursorVisualStyle,
+        bool,
+        Presentation,
+        Option<Scrollbar>,
+        u64,
+    )>,
+    images: ImageReader,
     /// The cells and clusters of the last build, for frames where only the presentation changed.
     content: Option<Content>,
     /// From the theme; without a background, selected cells swap their colours.
@@ -512,6 +535,7 @@ impl GridBuilder {
             rows: RowIterator::new()?,
             cells: CellIterator::new()?,
             last_shown: None,
+            images: ImageReader::new()?,
             content: None,
             selection_background: None,
             selection_foreground: None,
@@ -554,7 +578,14 @@ impl GridBuilder {
             wide: presentation.scrollbar_wide,
             ..scrollbar
         });
-        let shown = (cursor_style, cursor_blinking, presentation, scrollbar);
+        let image_generation = snapshot.image_placements_generation()?;
+        let shown = (
+            cursor_style,
+            cursor_blinking,
+            presentation,
+            scrollbar,
+            image_generation,
+        );
         // libghostty leaves the render state clean when only the cursor's style or the scrollback length changes.
         let unchanged = self.last_shown.replace(shown) == Some(shown);
         if matches!(snapshot.dirty()?, Dirty::Clean) && unchanged {
@@ -678,6 +709,7 @@ impl GridBuilder {
         } else {
             None
         };
+        let images = self.images.read(&snapshot, terminal, image_generation)?;
         snapshot.clean()?;
         Ok(Some(Grid {
             generation,
@@ -692,6 +724,7 @@ impl GridBuilder {
             metrics: presentation.metrics,
             bg: rgb(colors.background),
             scrollbar,
+            images,
             found: self.found,
         }))
     }
@@ -711,7 +744,27 @@ pub(crate) fn terminfo_name(bundled: Option<&Path>) -> &'static str {
     }
 }
 
+/// Per screen, as decoded pixels. Ghostty allows 320 MB, which several tabs of large images would multiply.
+const IMAGE_STORAGE_LIMIT: u64 = 128 * 1024 * 1024;
+
+/// libghostty's PNG hook is process-global and unsynchronised, so it is set once, before the
+/// first terminal exists.
+fn enable_png_images() {
+    static INSTALLED: std::sync::Once = std::sync::Once::new();
+    INSTALLED.call_once(|| {
+        // SAFETY: every terminal is made by `new_terminal`, and `Once` makes other callers wait
+        // here, so no thread is inside libghostty yet.
+        unsafe {
+            libghostty_vt::kitty::graphics::set_png_decoder(Some(Box::new(
+                libghostty_vt::kitty::graphics::RustPngDecoder::new(),
+            )))
+        }
+        .log_err("install PNG decoder");
+    });
+}
+
 pub(crate) fn new_terminal<'cb>(cols: u16, rows: u16) -> Result<Terminal<'static, 'cb>> {
+    enable_png_images();
     let mut terminal = Terminal::new(cols, rows)?;
     terminal
         .set_scrollback_max_lines(Some(10_000))?
@@ -724,6 +777,12 @@ pub(crate) fn new_terminal<'cb>(cols: u16, rows: u16) -> Result<Terminal<'static
         .set_default_fg_color(Some(DEFAULT_FG))?
         .set_default_bg_color(Some(DEFAULT_BG))?;
     terminal.set_mode(Mode::GRAPHEME_CLUSTER, true)?;
+    // Images arrive inline or as a temp file, which `kitten icat` uses on a local terminal. The file
+    // and shared memory media stay off, as they let a program, such as one over ssh, name any local
+    // path or segment to be read and displayed.
+    terminal
+        .set_kitty_image_storage_limit(IMAGE_STORAGE_LIMIT)?
+        .set_kitty_image_temp_file_dir(Some(&std::env::temp_dir()))?;
     Ok(terminal)
 }
 
@@ -790,6 +849,7 @@ mod tests {
     use crate::config::Theme;
 
     use crate::test_support::{THEME_BLUE, THEME_RED, fractional_metrics, scrolled_terminal};
+    use libghostty_vt::render::ImageLayer;
     use libghostty_vt::terminal::ScrollViewport;
 
     fn reply_to(theme: &Theme, query: &[u8]) -> Vec<u8> {
@@ -1305,5 +1365,178 @@ mod tests {
             .unwrap();
         let scrollbar = grid.scrollbar.unwrap();
         assert_eq!((scrollbar.opacity, scrollbar.wide), (0.5, true));
+    }
+
+    const TWO_PIXELS: &str = "\x1b_Ga=T,f=32,s=2,v=1,i=7,q=2;/wAA/wD/AP8=\x1b\\";
+
+    fn image_terminal<'cb>() -> Terminal<'static, 'cb> {
+        let mut terminal = new_terminal(10, 5).unwrap();
+        terminal.resize(10, 5, 10, 20).unwrap();
+        terminal
+    }
+
+    fn build(builder: &mut GridBuilder, terminal: &Terminal<'static, '_>, generation: u64) -> Grid {
+        builder
+            .build(terminal, generation, Presentation::default())
+            .unwrap()
+            .unwrap()
+    }
+
+    #[test]
+    fn a_placed_image_is_carried_in_the_grid_at_its_cell() {
+        let mut terminal = image_terminal();
+        terminal.vt_write(b"\x1b[3;4H");
+        terminal.vt_write(TWO_PIXELS.as_bytes());
+        let grid = build(&mut GridBuilder::new().unwrap(), &terminal, 1);
+        let [placement] = &grid.images[..] else {
+            panic!("expected one placement, got {}", grid.images.len());
+        };
+        assert_eq!((placement.col, placement.row), (3, 2));
+        assert_eq!(placement.size, [2, 1]);
+        assert_eq!(placement.layer, ImageLayer::AboveText);
+        assert_eq!(placement.image.rgba, [255, 0, 0, 255, 0, 255, 0, 255]);
+        assert_eq!((placement.image.width, placement.image.height), (2, 1));
+    }
+
+    #[test]
+    fn an_image_scrolls_with_the_text_and_shares_its_pixels() {
+        let mut terminal = image_terminal();
+        let mut builder = GridBuilder::new().unwrap();
+        terminal.vt_write(b"\x1b[4;1H");
+        terminal.vt_write(TWO_PIXELS.as_bytes());
+        let before = build(&mut builder, &terminal, 1);
+        terminal.vt_write(b"\x1b[5;1H\r\n\r\n");
+        let after = build(&mut builder, &terminal, 2);
+        assert_eq!((before.images[0].row, after.images[0].row), (3, 1));
+        assert!(Arc::ptr_eq(&before.images[0].image, &after.images[0].image));
+    }
+
+    #[test]
+    fn clearing_the_screen_or_deleting_removes_the_image() {
+        let mut builder = GridBuilder::new().unwrap();
+        let mut terminal = image_terminal();
+        terminal.vt_write(TWO_PIXELS.as_bytes());
+        assert_eq!(build(&mut builder, &terminal, 1).images.len(), 1);
+        terminal.vt_write(b"\x1b[H\x1b[2J");
+        assert!(build(&mut builder, &terminal, 2).images.is_empty());
+        terminal.vt_write(TWO_PIXELS.as_bytes());
+        assert_eq!(build(&mut builder, &terminal, 3).images.len(), 1);
+        terminal.vt_write(b"\x1b_Ga=d,d=A,q=2\x1b\\");
+        assert!(build(&mut builder, &terminal, 4).images.is_empty());
+    }
+
+    #[test]
+    fn a_text_only_frame_keeps_the_list_without_reading_it_again() {
+        let mut builder = GridBuilder::new().unwrap();
+        let mut terminal = image_terminal();
+        terminal.vt_write(TWO_PIXELS.as_bytes());
+        let before = build(&mut builder, &terminal, 1);
+        terminal.vt_write(b"\x1b[5;5Hx");
+        let after = build(&mut builder, &terminal, 2);
+        assert!(Arc::ptr_eq(&before.images, &after.images));
+    }
+
+    #[test]
+    fn placements_come_in_layers_then_z_order() {
+        let mut terminal = image_terminal();
+        for (id, z) in [(1, 5), (2, -1_073_741_825), (3, -1), (4, 0)] {
+            terminal
+                .vt_write(format!("\x1b_Ga=T,f=24,s=1,v=1,i={id},z={z},q=2;////\x1b\\").as_bytes());
+        }
+        let grid = build(&mut GridBuilder::new().unwrap(), &terminal, 1);
+        let order: Vec<(u32, ImageLayer)> = grid
+            .images
+            .iter()
+            .map(|placement| (placement.image.id, placement.layer))
+            .collect();
+        assert_eq!(
+            order,
+            [
+                (2, ImageLayer::BelowBackground),
+                (3, ImageLayer::BelowText),
+                (4, ImageLayer::AboveText),
+                (1, ImageLayer::AboveText),
+            ]
+        );
+        assert_eq!(
+            grid.images[0].image.rgba, [255; 4],
+            "RGB gains an opaque alpha"
+        );
+    }
+
+    #[test]
+    fn a_png_is_decoded_for_the_grid() {
+        let mut terminal = image_terminal();
+        terminal.vt_write(
+            b"\x1b_Ga=T,f=100,q=2;iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==\x1b\\",
+        );
+        let grid = build(&mut GridBuilder::new().unwrap(), &terminal, 1);
+        assert_eq!(grid.images[0].image.rgba, [255, 0, 0, 255]);
+    }
+
+    fn base64(bytes: &[u8]) -> String {
+        const ALPHABET: &[u8; 64] =
+            b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        bytes
+            .chunks(3)
+            .flat_map(|chunk| {
+                let word = chunk.iter().enumerate().fold(0u32, |word, (index, byte)| {
+                    word | u32::from(*byte) << (16 - 8 * index)
+                });
+                (0..4).map(move |index| {
+                    if index <= chunk.len() {
+                        char::from(ALPHABET[(word >> (18 - 6 * index) & 63) as usize])
+                    } else {
+                        '='
+                    }
+                })
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_temp_file_loads_but_a_plain_file_does_not() {
+        let mut terminal = image_terminal();
+        let file = tempfile::Builder::new()
+            .prefix("tty-graphics-protocol-")
+            .tempfile()
+            .unwrap();
+        std::fs::write(file.path(), [1, 2, 3, 255]).unwrap();
+        let path = file.path().to_str().unwrap().as_bytes();
+        let payload = base64(path);
+        terminal.vt_write(format!("\x1b_Ga=T,t=f,f=32,s=1,v=1,i=1,q=2;{payload}\x1b\\").as_bytes());
+        terminal.vt_write(format!("\x1b_Ga=T,t=t,f=32,s=1,v=1,i=2,q=2;{payload}\x1b\\").as_bytes());
+        let grid = build(&mut GridBuilder::new().unwrap(), &terminal, 1);
+        let ids: Vec<u32> = grid
+            .images
+            .iter()
+            .map(|placement| placement.image.id)
+            .collect();
+        assert_eq!(ids, [2]);
+    }
+
+    #[test]
+    fn an_animation_tick_publishes_the_next_frame_as_a_new_generation() {
+        let mut terminal = image_terminal();
+        let mut builder = GridBuilder::new().unwrap();
+        terminal.vt_write(
+            b"\x1b_Ga=T,f=32,i=2,s=1,v=1,q=2;/wAA/w==\x1b\\\
+              \x1b_Ga=f,f=32,i=2,s=1,v=1,z=40,q=2;AAD//w==\x1b\\\
+              \x1b_Ga=a,i=2,r=1,z=30,q=2\x1b\\\
+              \x1b_Ga=a,i=2,s=3,q=2\x1b\\",
+        );
+        assert_eq!(terminal.kitty_graphics_animation_tick(0).unwrap(), Some(30));
+        let first = build(&mut builder, &terminal, 1);
+        assert_eq!(first.images[0].image.rgba, [255, 0, 0, 255]);
+        assert_eq!(
+            terminal.kitty_graphics_animation_tick(30).unwrap(),
+            Some(70)
+        );
+        let second = build(&mut builder, &terminal, 2);
+        assert_eq!(second.images[0].image.rgba, [0, 0, 255, 255]);
+        assert_ne!(
+            first.images[0].image.generation,
+            second.images[0].image.generation
+        );
     }
 }

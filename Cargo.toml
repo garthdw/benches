@@ -8,7 +8,7 @@ publish = false
 rune = { git = "https://github.com/anomalyco/rune", rev = "7dfaa8fb1fa8281e6e2ccc92568d95262e9c6f3c", features = [
   "native-file-dialog",
 ] }
-libghostty-vt = { git = "https://github.com/Uzaaft/libghostty-rs", rev = "cd4d497e8c698b27054a677ce19d1bd1a1a4d8bf" }
+libghostty-vt = { git = "https://github.com/Uzaaft/libghostty-rs", rev = "cd4d497e8c698b27054a677ce19d1bd1a1a4d8bf", features = ["png"] }
 wgpu = { version = "~30.0.1", default-features = false }
 bytemuck = { version = "1", features = ["derive"] }
 base64 = "0.22"

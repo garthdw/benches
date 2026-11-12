@@ -37,3 +37,18 @@ fn srgb_decode(c: vec3f) -> vec3f {
     }
     return vec4f(v.color, 1.0);
 }
+
+@group(1) @binding(0) var image: texture_2d<f32>;
+@group(1) @binding(1) var image_sampler: sampler;
+
+const MODE_IMAGE_LINEAR: u32 = 5u;
+
+// Straight-alpha sRGB texels, premultiplied here; a linear target needs them decoded first.
+@fragment fn fs_image(v: Out) -> @location(0) vec4f {
+    let texel = textureSample(image, image_sampler, v.uv);
+    var rgb = texel.rgb;
+    if v.mode == MODE_IMAGE_LINEAR {
+        rgb = srgb_decode(rgb);
+    }
+    return vec4f(rgb * texel.a, texel.a);
+}

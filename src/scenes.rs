@@ -28,6 +28,25 @@ const SCENE_UNICODE: &str = concat!(
     "\x1b[44;37m \u{E7A8} \x1b[34;42m\u{E0C6}\x1b[30m \u{F418} main \x1b[32;43m\u{E0C6}\x1b[30m \u{F0E7} \x1b[33;49m\u{E0C6}\x1b[0m \u{F07B} \u{F418}x \u{F07B}\u{F418} \u{F07B}\r\n"
 );
 
+/// The default font's cell at the scale the snapshots render at, so images span whole cells.
+const IMAGE_SCENE_CELL: (u32, u32) = (23, 45);
+const SCENE_IMAGE_PIXELS: &str =
+    "/wAA//8AAP8A/wD/AP8A//8AAP//AAD/AP8A/wD/AP8AAP//AAD//////4D///+AAAD//wAA//////+A////gA==";
+
+/// One 4x4 image in each layer: over the text, under the text, and under backgrounds that
+/// cover only some of its cells.
+fn image_scene_bytes() -> String {
+    let image = |id: u32, z: i32| {
+        format!("\x1b_Ga=T,f=32,s=4,v=4,c=5,r=3,i={id},z={z},C=1,q=2;{SCENE_IMAGE_PIXELS}\x1b\\")
+    };
+    format!(
+        "\x1b[2;3H{}\x1b[3;3Habove\x1b[2;13H{}\x1b[3;13Hbelow\x1b[2;26H{}\x1b[3;26H\x1b[44m  \x1b[0m \x1b[44m  \x1b[0m\x1b[9;1H$ ",
+        image(1, 0),
+        image(2, -1),
+        image(3, -1_073_741_825),
+    )
+}
+
 pub(crate) fn fixture_grid(bytes: &[u8]) -> Grid {
     Grid::from_vt(bytes, 60, 12)
         .unwrap_or_else(|error| Grid::message(&format!("failed to build fixture: {error:#}")))
@@ -152,6 +171,25 @@ pub(crate) const SCENES: &[Scene] = &[
     ("fixture", |state| show_scene(state, SCENE_FIXTURE)),
     ("unicode", |state| {
         show_scene(state, SCENE_UNICODE.as_bytes())
+    }),
+    ("images", |state| {
+        show_tab(
+            state,
+            Tab::new(
+                "shell",
+                Session::fixture(
+                    Grid::from_vt_with_cells(
+                        image_scene_bytes().as_bytes(),
+                        60,
+                        12,
+                        IMAGE_SCENE_CELL,
+                    )
+                    .unwrap_or_else(|error| {
+                        Grid::message(&format!("failed to build fixture: {error:#}"))
+                    }),
+                ),
+            ),
+        )
     }),
     ("scrollback", |state| show_tab(state, scrollback_tab(false))),
     ("scrollback-hover", |state| {
