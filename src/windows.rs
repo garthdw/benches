@@ -6,6 +6,7 @@ use rune::{Tx, Waker, WindowSpec};
 
 use crate::LogErr;
 use crate::app::{State, save_layout, window_app};
+use crate::config::Config;
 use crate::workspace::{Project, SavedWorkspace};
 
 pub(crate) type WindowId = u32;
@@ -30,6 +31,8 @@ struct Entry {
     waker: Option<Waker>,
     reveal: Option<Rc<dyn Fn(u64)>>,
     inbox: Vec<Project>,
+    /// A config reloaded in another window, for this one to take on its next poll.
+    config: Option<Config>,
 }
 
 impl Fleet {
@@ -91,6 +94,28 @@ impl Fleet {
             .projects
             .extend(others.flat_map(|(_, layout)| layout.projects.clone()));
         Some(merged)
+    }
+
+    /// Hands `config` to every window but `from`, which applied it itself.
+    pub fn share_config(&self, from: WindowId, config: &Config) {
+        let wakers: Vec<_> = self
+            .0
+            .borrow_mut()
+            .entries
+            .iter_mut()
+            .filter(|(window, _)| **window != from)
+            .filter_map(|(_, entry)| {
+                entry.config = Some(config.clone());
+                entry.waker.clone()
+            })
+            .collect();
+        for waker in wakers {
+            waker();
+        }
+    }
+
+    fn take_config(&self, window: WindowId) -> Option<Config> {
+        self.0.borrow_mut().entries.get_mut(&window)?.config.take()
     }
 
     pub fn take(&self, window: WindowId) -> Vec<Project> {
@@ -160,6 +185,53 @@ pub(crate) fn torn_off([x, y]: [f32; 2], sidebar_width: f32) -> bool {
     x < 0.0 || y < 0.0 || x > sidebar_width + TEAR_OFF_DISTANCE
 }
 
+/// The config at launch. A config.toml that fails falls back to the defaults, and the window says why.
+pub(crate) fn load_config(state: &mut State) {
+    let Some(paths) = &state.paths else { return };
+    let (config, error) = Config::load(paths);
+    state.config = config;
+    report_config_error(state, error);
+}
+
+/// Rereads the config for every window. A config.toml that fails to parse changes nothing, and
+/// this window says why.
+pub(crate) fn reload_config(state: &mut State) {
+    let Some(paths) = &state.paths else { return };
+    match Config::reload(paths) {
+        Ok(config) => {
+            report_config_error(state, None);
+            state.fleet.share_config(state.window, &config);
+            apply_config(state, config);
+        }
+        Err(error) => report_config_error(state, Some(error)),
+    }
+}
+
+/// Logs why config.toml was skipped and shows it in the banner, or clears the banner.
+fn report_config_error(state: &mut State, error: Option<anyhow::Error>) {
+    if let Some(error) = &error {
+        eprintln!("agentd: config: {error:#}");
+    }
+    state.config_error = error.map(|error| format!("{error:#}"));
+}
+
+pub(crate) fn adopt_config(state: &mut State) -> bool {
+    let config = state.fleet.take_config(state.window);
+    let adopted = config.is_some();
+    if let Some(config) = config {
+        apply_config(state, config);
+    }
+    adopted
+}
+
+/// Running sessions take the theme and the like; the shell, tabs and folder apply to new tabs.
+fn apply_config(state: &mut State, config: Config) {
+    for tab in state.workspace.tabs_mut() {
+        tab.session.configure(&config);
+    }
+    state.config = config;
+}
+
 /// Takes the projects other windows handed over, pointing their sessions at this window.
 pub(crate) fn adopt_projects(state: &mut State) -> bool {
     let projects = state.fleet.take(state.window);
@@ -178,6 +250,7 @@ pub(crate) fn adopt_projects(state: &mut State) -> bool {
 mod tests {
     use super::*;
     use crate::app::open_tab;
+    use crate::config::Paths;
     use crate::protocol::Visibility;
     use crate::session::Session;
     use crate::test_support::*;
@@ -211,6 +284,78 @@ mod tests {
         };
         assert_eq!(shown(&runtime), Some(Visibility::Shown));
         assert_eq!(shown(&second), Some(Visibility::Shown));
+    }
+
+    #[test]
+    fn a_reloaded_config_reaches_every_window() {
+        let mut runtime = workspace_runtime();
+        move_to_new_window(&mut runtime.state, 1, None);
+        let mut second = second_window(&runtime.state.fleet, 1);
+        let root = tempfile::tempdir().unwrap();
+        let paths = Paths {
+            dir: root.path().join("agentd"),
+            ghostty_dir: root.path().join("ghostty"),
+        };
+        std::fs::create_dir_all(&paths.dir).unwrap();
+        std::fs::write(paths.dir.join("config.toml"), "jump-command = \"j\"\n").unwrap();
+        runtime.state.paths = Some(paths);
+        press(&mut runtime, rune::Key::Command(','), command_shift());
+        second.frame(2.0 / 60.0);
+        let jump = |state: &State| state.config.jump_command.clone();
+        assert_eq!(jump(&runtime.state).as_deref(), Some("j"));
+        assert_eq!(jump(&second.state).as_deref(), Some("j"));
+    }
+
+    #[test]
+    fn a_broken_config_at_launch_falls_back_and_shows_the_banner() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = Paths {
+            dir: root.path().join("agentd"),
+            ghostty_dir: root.path().join("ghostty"),
+        };
+        std::fs::create_dir_all(&paths.dir).unwrap();
+        std::fs::write(paths.dir.join("config.toml"), "shel = 1\n").unwrap();
+        let mut state = State {
+            paths: Some(paths),
+            ..State::default()
+        };
+        load_config(&mut state);
+        assert_eq!(state.config, Config::default());
+        assert!(
+            state
+                .config_error
+                .as_deref()
+                .is_some_and(|error| error.contains("shel"))
+        );
+    }
+
+    #[test]
+    fn a_broken_config_shows_a_banner_until_a_reload_succeeds_or_it_is_dismissed() {
+        let mut runtime = workspace_runtime();
+        let root = tempfile::tempdir().unwrap();
+        let paths = Paths {
+            dir: root.path().join("agentd"),
+            ghostty_dir: root.path().join("ghostty"),
+        };
+        std::fs::create_dir_all(&paths.dir).unwrap();
+        let write = |text: &str| std::fs::write(paths.dir.join("config.toml"), text).unwrap();
+        runtime.state.paths = Some(paths.clone());
+        let reload = |runtime: &mut Runtime<State>| {
+            press(runtime, rune::Key::Command(','), command_shift());
+        };
+
+        write("shel = 1\n");
+        reload(&mut runtime);
+        assert!(runtime.find("config-error").is_some());
+        assert_eq!(runtime.state.config, Config::default());
+        write("shell = \"/bin/zsh\"\n");
+        reload(&mut runtime);
+        assert!(runtime.find("config-error").is_none());
+
+        write("shel = 1\n");
+        reload(&mut runtime);
+        click(&mut runtime, "config-error-dismiss");
+        assert!(runtime.find("config-error").is_none());
     }
 
     #[test]

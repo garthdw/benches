@@ -275,6 +275,12 @@ pub(crate) const SCENES: &[Scene] = &[
             location: ClipboardLocation::Standard,
         });
     }),
+    ("config-error", |state| {
+        show_workspace_scene(state);
+        state.config_error = toml::from_str::<toml::Table>("shel = \"/bin/zsh\"\nfont = [")
+            .err()
+            .map(|error| format!("parse config.toml: {error}"));
+    }),
     ("empty", isolate_scene),
     ("collapsed", |state| {
         show_workspace_scene(state);

@@ -94,11 +94,7 @@ fn main() {
     let fleet = Fleet::default();
     let app = window_app(&fleet, MAIN_WINDOW, |state| {
         state.paths = config::Paths::from_home();
-        state.config = state
-            .paths
-            .as_ref()
-            .map(config::Config::load)
-            .unwrap_or_default();
+        windows::load_config(state);
     });
     let handle = app.handle();
     notify::start(move |session| match session {

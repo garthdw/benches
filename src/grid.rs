@@ -554,6 +554,13 @@ impl GridBuilder {
         self.content = None;
     }
 
+    /// libghostty knows nothing of the selection colours, so nothing else would redraw for them.
+    pub(crate) fn set_selection_colors(&mut self, theme: &Theme) {
+        self.selection_background = theme.selection_background;
+        self.selection_foreground = theme.selection_foreground;
+        self.selection_changed();
+    }
+
     /// Matches are painted over the cells at build time, so the cached cells stay plain.
     pub(crate) fn set_search(&mut self, highlights: Vec<Highlight>, found: Option<Found>) {
         if (&self.highlights, self.found) != (&highlights, found) {

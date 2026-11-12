@@ -245,10 +245,7 @@ impl Session {
             reported_cwd: reported_cwd.clone(),
             events: events_tx,
             waker,
-            theme: config.theme.clone(),
-            command_finish_after: config.command_finish_after,
-            clipboard_read: config.clipboard_read,
-            clipboard_write: config.clipboard_write,
+            settings: config.terminal(),
         };
         thread::spawn(move || {
             if let Err(error) = actor.run() {
@@ -403,6 +400,11 @@ impl Session {
         self.send(Msg::SelectLastOutput);
     }
 
+    /// Applies the theme, clipboard access and command-finish threshold of a reloaded config.
+    pub fn configure(&self, config: &Config) {
+        self.send(Msg::Configure(config.terminal()));
+    }
+
     pub fn copy(&self) {
         self.send(Msg::Copy);
     }
@@ -491,10 +493,12 @@ fn set_cloexec(fd: &OwnedFd) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::Theme;
     use crate::grid::{FRAME, GridBuilder, Presentation, Scrollbar, new_terminal};
     use crate::protocol::{Progress, ProgressKind};
     use crate::terminal_input::TerminalInput;
     use crate::test_support::{TEST_SURFACE, pointer_at, wait_until, wheel_by};
+    use libghostty_vt::color::Rgb;
     use libghostty_vt::render::CursorVisualStyle;
     use nix::errno::Errno;
     use nix::unistd::Pid;
@@ -1070,6 +1074,38 @@ mod tests {
         wait_for_alert(&session);
         assert_eq!(finished_events(&session, 1), [true]);
         assert_eq!(notify_events(&session), []);
+    }
+
+    #[test]
+    fn configure_changes_when_a_running_session_counts_a_command_as_long() {
+        let session = spawn_with_threshold(Duration::from_secs(3600));
+        session.configure(&Config {
+            command_finish_after: Some(Duration::from_millis(200)),
+            ..Config::default()
+        });
+        session.set_visibility(Visibility::Hidden);
+        type_line(&session, SLOW_FAILURE);
+        wait_for_alert(&session);
+    }
+
+    #[test]
+    fn configure_recolours_an_idle_session() {
+        let session = spawn_shell();
+        type_line(&session, "echo ready");
+        wait_for_line(&session, "ready");
+        let background = Rgb { r: 1, g: 2, b: 3 };
+        session.configure(&Config {
+            theme: Theme {
+                background,
+                ..Theme::default()
+            },
+            ..Config::default()
+        });
+        wait_until(
+            Duration::from_secs(15),
+            || format!("background is still {:?}", session.grid().bg),
+            || (session.grid().bg == [1, 2, 3]).then_some(()),
+        );
     }
 
     #[test]

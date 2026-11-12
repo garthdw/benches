@@ -26,7 +26,7 @@ use nix::unistd::Pid;
 use rune::Waker;
 
 use crate::LogErr;
-use crate::config::{ClipboardAccess, Theme};
+use crate::config::{ClipboardAccess, TerminalSettings};
 use crate::grid::{
     FRAME, Grid, GridBuilder, Presentation, ScrollbarFade, Surface, answer_queries, apply_theme,
     new_terminal,
@@ -101,7 +101,7 @@ impl CommandTimer {
 
 fn watch_commands(
     terminal: &mut Terminal<'static, '_>,
-    threshold: Option<Duration>,
+    threshold: Rc<Cell<Option<Duration>>>,
 ) -> Result<Rc<RefCell<Vec<Finished>>>> {
     let finished = Rc::new(RefCell::new(Vec::new()));
     let mut timer = CommandTimer::default();
@@ -110,7 +110,9 @@ fn watch_commands(
         move |_, prompt| match prompt.kind() {
             Ok(SemanticPromptKind::OutputStart) => timer.start(Instant::now()),
             Ok(SemanticPromptKind::CommandEnd) => {
-                if let Some(command) = timer.finish(Instant::now(), prompt.exit_code(), threshold) {
+                if let Some(command) =
+                    timer.finish(Instant::now(), prompt.exit_code(), threshold.get())
+                {
                     finished.borrow_mut().push(command);
                 }
             }
@@ -167,10 +169,7 @@ pub(crate) struct Actor {
     pub(crate) reported_cwd: Arc<Mutex<Option<PathBuf>>>,
     pub(crate) events: Sender<Event>,
     pub(crate) waker: Waker,
-    pub(crate) theme: Theme,
-    pub(crate) command_finish_after: Option<Duration>,
-    pub(crate) clipboard_read: ClipboardAccess,
-    pub(crate) clipboard_write: ClipboardAccess,
+    pub(crate) settings: TerminalSettings,
 }
 
 impl Actor {
@@ -213,13 +212,35 @@ impl Actor {
         }
     }
 
+    /// Registering a callback again replaces it, so this also applies a reloaded config.
+    fn apply_settings(
+        &self,
+        terminal: &mut Terminal<'static, '_>,
+        reply_muted: &Rc<Cell<bool>>,
+    ) -> Result<()> {
+        let settings = &self.settings;
+        apply_theme(terminal, &settings.theme)?;
+        answer_queries(terminal, &settings.theme, settings.clipboard_write)?;
+        let events = self.events.clone();
+        let waker = self.waker.clone();
+        install_clipboard(
+            terminal,
+            settings.clipboard_read,
+            settings.clipboard_write,
+            reply_muted.clone(),
+            Rc::new(move |event| {
+                events.send(event).log_err("queue event");
+                waker();
+            }),
+        )
+    }
+
     pub(crate) fn run(&mut self) -> Result<()> {
         let mut terminal = new_terminal(self.cols, self.rows)?;
-        apply_theme(&mut terminal, &self.theme)?;
-        answer_queries(&mut terminal, &self.theme, self.clipboard_write)?;
+        let reply_muted = Rc::new(Cell::new(false));
+        self.apply_settings(&mut terminal, &reply_muted)?;
         let mut builder = GridBuilder::new()?;
-        builder.selection_background = self.theme.selection_background;
-        builder.selection_foreground = self.theme.selection_foreground;
+        builder.set_selection_colors(&self.settings.theme);
         let publisher = Rc::new(RefCell::new(Publisher {
             builder,
             slot: self.slot.clone(),
@@ -233,23 +254,10 @@ impl Actor {
         }));
 
         let pty_input = self.input.clone();
-        let reply_muted = Rc::new(Cell::new(false));
         terminal.on_pty_write({
             let reply_muted = reply_muted.clone();
             move |_, data| queue_reply(&pty_input, &reply_muted, data)
         })?;
-        let events = self.events.clone();
-        let waker = self.waker.clone();
-        install_clipboard(
-            &mut terminal,
-            self.clipboard_read,
-            self.clipboard_write,
-            reply_muted,
-            Rc::new(move |event| {
-                events.send(event).log_err("queue event");
-                waker();
-            }),
-        )?;
         let hold_publisher = publisher.clone();
         terminal.on_render_hold(move |terminal, held| {
             let mut publisher = hold_publisher.borrow_mut();
@@ -335,7 +343,8 @@ impl Actor {
         })?;
         let mut progress_due: Option<Instant> = None;
         let mut notified = false;
-        let finished_commands = watch_commands(&mut terminal, self.command_finish_after)?;
+        let finish_threshold = Rc::new(Cell::new(self.settings.command_finish_after));
+        let finished_commands = watch_commands(&mut terminal, finish_threshold.clone())?;
 
         let mut input = TerminalInput::new()?;
         let mut searcher = Searcher::default();
@@ -512,6 +521,13 @@ impl Actor {
                         resize.request(surface, Instant::now());
                     }
                     Ok(Msg::Stop) => terminate(&mut self.child, &self.pid),
+                    Ok(Msg::Configure(settings)) => {
+                        self.settings = settings;
+                        finish_threshold.set(self.settings.command_finish_after);
+                        self.apply_settings(&mut terminal, &reply_muted).log_err("apply config");
+                        publisher.borrow_mut().builder.set_selection_colors(&self.settings.theme);
+                        dirty = true;
+                    }
                     Ok(Msg::Visibility(visibility)) => {
                         if visibility == Visibility::Shown {
                             self.alerted.store(false, Ordering::Release);
@@ -837,7 +853,7 @@ mod tests {
 
     fn finished_by(bytes: &[u8], threshold: Option<Duration>) -> Vec<(bool, bool)> {
         let mut terminal = new_terminal(20, 5).unwrap();
-        let finished = watch_commands(&mut terminal, threshold).unwrap();
+        let finished = watch_commands(&mut terminal, Rc::new(Cell::new(threshold))).unwrap();
         terminal.vt_write(bytes);
         let finished = finished.borrow();
         finished

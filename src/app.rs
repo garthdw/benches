@@ -4,7 +4,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use libghostty_vt::effect::ClipboardLocation;
 use rune::{
-    App, AppSpec, ClipboardContent, FileDialogOptions, Ime, Key, KeyEvent, Live, Mods, Tx, Waker,
+    App, AppSpec, ClipboardContent, FileDialogOptions, Ime, Key, KeyEvent, Live, MenuItem, Mods,
+    Tx, Waker,
 };
 
 use crate::LogErr;
@@ -22,7 +23,8 @@ use crate::secure_input::SecureInput;
 use crate::session::{Attention, Retarget, Session};
 use crate::view::{DRAWER_MARK, OVERLAY_MARK, view, window_title};
 use crate::windows::{
-    Fleet, MAIN_WINDOW, WindowId, adopt_projects, move_to_new_window, on_close, on_quit,
+    Fleet, MAIN_WINDOW, WindowId, adopt_config, adopt_projects, move_to_new_window, on_close,
+    on_quit, reload_config,
 };
 use crate::workspace::{Project, SavedWorkspace, Slot, Status, Tab, Workspace};
 use anyhow::Context;
@@ -79,6 +81,9 @@ pub(crate) struct State {
     pub(crate) find: Find,
     pub(crate) sidebar_hidden: bool,
     pub(crate) config: config::Config,
+    /// Why config.toml wasn't applied, at launch or on the last reload; shown until a reload
+    /// succeeds or it is dismissed.
+    pub(crate) config_error: Option<String>,
     /// Points added to the configured font size by ⌘= and ⌘-; never written to disk.
     pub(crate) font_zoom: f64,
     /// Unset in tests and scenes, which then read and write no files.
@@ -554,6 +559,7 @@ pub(crate) fn run_command(state: &mut State, command: Command, tx: &mut Tx) {
                 session.select_last_output();
             }
         }
+        Command::ReloadConfig => reload_config(state),
     }
 }
 
@@ -567,7 +573,7 @@ pub(crate) fn poll(state: &mut State, now: f64, tx: &mut Tx) -> bool {
             state.workspace.add_project(Project::new(root, vec![tab]));
         }
     }
-    let mut changed = adopt_projects(state);
+    let mut changed = adopt_projects(state) | adopt_config(state);
     let project_name = state.workspace.project().map(|project| &project.name);
     if state.titled.as_ref().map(Option::as_ref) != Some(project_name) {
         tx.set_title(window_title(&state.workspace));
@@ -794,6 +800,22 @@ pub(crate) fn on_ime(state: &mut State, ime: &Ime, _: &mut Tx) -> bool {
     }
 }
 
+/// In the app menu, after About. The palette's chord reaches `on_key` first, so it reloads once.
+fn reload_menu_item() -> MenuItem<State> {
+    let item = MenuItem::new("Reload Config", |state: &mut State, _: &mut Tx| {
+        reload_config(state);
+    })
+    .id("reload-config")
+    .keys_first();
+    let shortcut = Command::ReloadConfig
+        .chord()
+        .and_then(|chord| chord.parse().log_err("reload config shortcut"));
+    match shortcut {
+        Some(shortcut) => item.key_equivalent(shortcut),
+        None => item,
+    }
+}
+
 /// One window's app, with its state made by `init`.
 pub(crate) fn window_app(
     fleet: &Fleet,
@@ -829,6 +851,7 @@ pub(crate) fn window_app(
                 tab.session.command_held(mods.logo);
             }
         })
+        .menu_item(reload_menu_item())
         .on_quit(on_quit)
         .on_close(on_close)
         .on_focus(|state, focused, _| {

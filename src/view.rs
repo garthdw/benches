@@ -669,6 +669,46 @@ pub(crate) fn view(state: &State, cx: &mut Cx<State>) -> El {
                 .child(text("Open a folder with ⌘N, or drop one here").color(theme.text_secondary)),
         );
     }
+    if let Some(error) = &state.config_error {
+        overlays.push(
+            row()
+                .key("config-error")
+                .pin(Some(12.0), None, Some(12.0), Some(12.0))
+                .gap(8.0)
+                .items_start()
+                .px(10.0)
+                .py(6.0)
+                .radius(6.0)
+                .fill(theme.card)
+                // Rune's orange accent, whatever accent the system uses.
+                .border(1.0, tok::accent(3, true))
+                .child(
+                    col()
+                        .gap(4.0)
+                        .grow(1.0)
+                        .min_w(0.0)
+                        .child(text("config.toml not applied").color(theme.text))
+                        // TOML errors point at the column with a caret, which needs even widths.
+                        .child(
+                            text(error.trim_end().to_owned())
+                                .font(tok::type_::BODY.family(tok::Family::SystemMono))
+                                .color(theme.text_secondary)
+                                .wrap(),
+                        ),
+                )
+                .child(
+                    el().key("config-error-dismiss")
+                        .role("button")
+                        .label("Dismiss")
+                        .px(10.0)
+                        .py(4.0)
+                        .radius(6.0)
+                        .fill(theme.bg)
+                        .child(text("Dismiss").color(theme.text))
+                        .on_press(|state: &mut State| state.config_error = None),
+                ),
+        );
+    }
     let focus_overlays = focus_overlays(state, &theme);
     let project = state.workspace.project();
     let drawer_focused = project.is_some_and(|project| project.drawer_focused);
