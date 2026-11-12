@@ -243,6 +243,38 @@ pub fn is_private_use(character: char) -> bool {
     )
 }
 
+/// Ghostty's metric modifier: a percentage change such as `20%` or a pixel delta such as `-2`.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum Modifier {
+    /// A factor of the value, where `20%` is 1.2 and `-100%` or less is 0.
+    Percent(f64),
+    Absolute(i32),
+}
+
+impl std::str::FromStr for Modifier {
+    type Err = String;
+
+    fn from_str(input: &str) -> Result<Self, String> {
+        let invalid = || format!("invalid modifier {input:?}: expected a number or a percentage");
+        match input.strip_suffix('%') {
+            Some(percent) => {
+                let change = percent.parse::<f64>().map_err(|_| invalid())? / 100.0;
+                Ok(Self::Percent((1.0 + change).max(0.0)))
+            }
+            None => input.parse().map(Self::Absolute).map_err(|_| invalid()),
+        }
+    }
+}
+
+impl Modifier {
+    pub fn apply(self, value: f64) -> f64 {
+        match self {
+            Self::Percent(factor) => value * factor,
+            Self::Absolute(delta) => value + f64::from(delta),
+        }
+    }
+}
+
 /// Ghostty's `isSymbol`: private use plus the Unicode blocks of arrows, dingbats, emoticons,
 /// miscellaneous symbols (and pictographs), enclosed alphanumerics (and supplement), and
 /// transport and map symbols.
@@ -431,5 +463,24 @@ mod tests {
         for character in ['a', '\u{2192}', '\u{E0D8}', '\u{F418}'] {
             assert!(!is_graphics_element(character), "{character:?}");
         }
+    }
+
+    #[test]
+    fn a_modifier_parses_as_ghostty_does() {
+        assert_eq!("20%".parse(), Ok(Modifier::Percent(1.2)));
+        assert_eq!("-20%".parse(), Ok(Modifier::Percent(0.8)));
+        assert_eq!("-100%".parse(), Ok(Modifier::Percent(0.0)));
+        assert_eq!("-150%".parse(), Ok(Modifier::Percent(0.0)));
+        assert_eq!("5".parse(), Ok(Modifier::Absolute(5)));
+        assert_eq!("-5".parse(), Ok(Modifier::Absolute(-5)));
+        for invalid in ["", "%", "x", "1.5", "5px"] {
+            assert!(invalid.parse::<Modifier>().is_err(), "{invalid:?}");
+        }
+    }
+
+    #[test]
+    fn a_modifier_changes_a_value_by_a_delta() {
+        assert_eq!(Modifier::Percent(0.75).apply(100.0), 75.0);
+        assert_eq!(Modifier::Absolute(-5).apply(100.0), 95.0);
     }
 }

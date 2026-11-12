@@ -721,6 +721,9 @@ impl TerminalCompositor {
             ) {
                 Ok(mut font) => {
                     font.break_runs_at_cursor = config.shaping_breaks_at_cursor;
+                    if let Some(modifier) = config.adjust_icon_height {
+                        font.adjust_icon_height(modifier);
+                    }
                     gpu.atlas.reset();
                     self.font = Some((site.scale, size, config.clone(), font));
                 }

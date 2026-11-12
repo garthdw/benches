@@ -21,7 +21,7 @@ use objc2_core_text::{
 };
 
 use crate::config::DEFAULT_FONT_FAMILY;
-use crate::constraint::{Bounds, Constraint, Metrics, Size, is_private_use};
+use crate::constraint::{Bounds, Constraint, Metrics, Modifier, Size, is_private_use};
 use crate::sprite;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
@@ -475,6 +475,12 @@ impl Font {
         Some(context)
     }
 
+    /// Ghostty's `adjust-icon-height`, applied to the icon heights the constraints size against.
+    pub fn adjust_icon_height(&mut self, modifier: Modifier) {
+        self.metrics.icon_height = modifier.apply(self.metrics.icon_height);
+        self.metrics.icon_height_single = modifier.apply(self.metrics.icon_height_single);
+    }
+
     /// Premultiplied RGBA for `text`, `cells * cell_width` by `cell_height` with the top row first.
     pub fn rasterize(
         &self,
@@ -887,6 +893,29 @@ mod tests {
             (height - expected).abs() <= 1.5,
             "{height} high, expected {expected}"
         );
+    }
+
+    #[test]
+    fn adjusting_the_icon_height_scales_both_icon_metrics() {
+        let mut font = Font::new(DEFAULT_FONT_FAMILY, 13.0, 2.0).unwrap();
+        let (tall, single) = (font.metrics.icon_height, font.metrics.icon_height_single);
+        font.adjust_icon_height(Modifier::Percent(0.5));
+        assert_eq!(font.metrics.icon_height, tall / 2.0);
+        assert_eq!(font.metrics.icon_height_single, single / 2.0);
+        font.adjust_icon_height(Modifier::Absolute(3));
+        assert_eq!(font.metrics.icon_height_single, single / 2.0 + 3.0);
+    }
+
+    #[test]
+    fn a_height_limited_icon_shrinks_with_a_smaller_icon_height() {
+        let mut font = Font::new(DEFAULT_FONT_FAMILY, 13.0, 2.0).unwrap();
+        let mut pixels = Vec::new();
+        font.rasterize("\u{F0E7}", REGULAR, 1, &mut pixels);
+        let full = ink_height(&font, &pixels, 1);
+        font.adjust_icon_height(Modifier::Percent(0.5));
+        font.rasterize("\u{F0E7}", REGULAR, 1, &mut pixels);
+        let half = ink_height(&font, &pixels, 1);
+        assert!(half + 5 <= full, "{half} high, was {full}");
     }
 
     #[test]
