@@ -1,5 +1,9 @@
 use libghostty_vt::key::{Key as Vt, Mods as VtMods};
-use rune::{Key, KeyEvent, Mods, PhysicalKeyCode as Code};
+use libghostty_vt::mouse;
+use rune::{Key, KeyEvent, Mods, Phase, PhysicalKeyCode as Code, Tx};
+
+use crate::app::State;
+use crate::session::{Grid, PointerInput, PointerPhase, Session};
 
 #[derive(Debug, PartialEq)]
 pub struct KeyInput {
@@ -134,6 +138,65 @@ pub fn map_key(event: &KeyEvent, physical: Option<Code>, base: Option<char>) -> 
         text: None,
         unshifted: '\0',
     })
+}
+
+pub(crate) fn send_pointer(
+    session: Option<&Session>,
+    phase: PointerPhase,
+    button: Option<mouse::Button>,
+    x: f32,
+    y: f32,
+    mods: Mods,
+) {
+    if let Some(session) = session {
+        session.pointer(PointerInput {
+            phase,
+            button,
+            x,
+            y,
+            mods: vt_mods(mods),
+        });
+    }
+}
+
+/// The cursor cell in points within the terminal surface, or `None` before the first layout.
+pub(crate) fn caret_rect(grid: &Grid) -> Option<[f32; 4]> {
+    let (x, y) = grid.cursor?;
+    let metrics = grid.metrics;
+    if metrics.cell_width == 0 {
+        return None;
+    }
+    let origin = metrics.origin([0.0; 4]);
+    Some(metrics.to_points(metrics.cell_rect(origin, x, y)))
+}
+
+pub(crate) fn pointer_phase(phase: Phase) -> PointerPhase {
+    match phase {
+        Phase::Down => PointerPhase::Press,
+        Phase::Move => PointerPhase::Drag,
+        Phase::Up => PointerPhase::Release,
+    }
+}
+
+/// Pressing the drawer's terminal gives it the keys, and pressing the tab's takes them back.
+/// The overlay (`None`) always has them while shown.
+pub(crate) fn focus_on_press(
+    state: &mut State,
+    drawer: Option<bool>,
+    phase: PointerPhase,
+    tx: &mut Tx,
+) {
+    if phase == PointerPhase::Press
+        && let Some(drawer) = drawer
+        && state
+            .workspace
+            .project()
+            .is_some_and(|project| project.drawer_focused != drawer)
+    {
+        state.workspace.focus_drawer(drawer);
+    } else {
+        tx.live_only();
+    }
 }
 
 #[cfg(test)]

@@ -5,10 +5,11 @@ use std::time::{Duration, Instant};
 
 use rune::{Env, Key, KeyEvent, Mods, Runtime, Waker};
 
+use crate::app::{State, on_key, poll};
 use crate::scenes::show_workspace_scene;
-use crate::windows::WindowId;
+use crate::view::view;
+use crate::windows::{Fleet, WindowId};
 use crate::workspace::{Project, Workspace};
-use crate::{Fleet, State, on_key, poll, view};
 
 pub(crate) fn runtime_with(state: State) -> Runtime<State> {
     let env = Env {

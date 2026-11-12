@@ -2,10 +2,11 @@ use std::path::PathBuf;
 
 use rune::TextEdit;
 
+use crate::app::State;
+use crate::jump;
 use crate::palette::WorktreeChoice;
 use crate::session::{Grid, Session};
 use crate::workspace::{Project, Status, Tab};
-use crate::{State, jump};
 
 pub(crate) const SCENE_FIXTURE: &[u8] = b"\x1b[1;32magentd\x1b[0m fixture\r\n\x1b[31mred\x1b[0m \x1b[42;30m on green \x1b[0m \x1b[7minverse\x1b[0m\r\na != b // c == d ... \x1b[1m!=\x1b[0m \x1b[3m!=\x1b[0m\r\n$ ";
 const SCENE_UNICODE: &str = concat!(
