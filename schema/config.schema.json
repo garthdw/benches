@@ -135,13 +135,6 @@
         "null"
       ]
     },
-    "shell-integration": {
-      "description": "`none` starts shells as they are; anything else injects shell integration, which makes\nfish report its prompts and directory. Falls back to Ghostty's setting.",
-      "type": [
-        "string",
-        "null"
-      ]
-    },
     "tabs": {
       "description": "The tabs a new project opens with.",
       "items": {

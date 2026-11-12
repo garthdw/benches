@@ -22,7 +22,6 @@ use crate::actor::{Actor, store, terminate};
 use crate::config::Config;
 use crate::grid::{Grid, Surface, bundled_terminfo, terminfo_name};
 use crate::protocol::{Event, Msg, Visibility};
-use crate::shell_integration;
 use crate::terminal_input::{KeyInput, PointerInput, PointerPhase, WheelInput};
 
 const BATCH_GAP: Duration = Duration::from_micros(50);
@@ -188,17 +187,6 @@ impl Session {
             .stdin(Stdio::from(pty.slave));
         if let Some(locale) = missing_locale(|name| std::env::var_os(name), system_locale) {
             process.env("LANG", locale);
-        }
-        // A command replaces the shell before it draws a prompt, so the integration would only leak.
-        if config.shell_integration
-            && command.is_none()
-            && let Some(directory) = shell_integration::directory()
-        {
-            process.envs(shell_integration::environment(
-                &config.shell,
-                directory,
-                std::env::var_os("XDG_DATA_DIRS"),
-            ));
         }
         // SAFETY: only async-signal-safe calls run between fork and exec.
         unsafe {
