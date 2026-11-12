@@ -1,30 +1,24 @@
-use std::fmt::Display;
 use std::fs::File;
 use std::io::{Read, Write};
 use std::os::fd::OwnedFd;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, ExitStatus, Stdio};
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::thread;
-use std::time::Duration;
 
 use anyhow::Result;
 use crossbeam_channel::{Receiver, Sender, bounded, unbounded};
-use libghostty_vt::Terminal;
-use libghostty_vt::terminal::Mode;
-use nix::errno::Errno;
 use nix::pty::{Winsize, openpty};
-use nix::sys::signal::{Signal, killpg};
-use nix::unistd::Pid;
 use rune::Waker;
 
-use crate::actor::{Actor, store};
-use crate::config::{Config, Theme};
-use crate::grid::{DEFAULT_BG, DEFAULT_FG, Grid, Surface};
-use crate::input::KeyInput;
-use crate::terminal_input::{PointerInput, PointerPhase, WheelInput};
+use crate::LogErr;
+use crate::actor::{Actor, store, terminate};
+use crate::config::Config;
+use crate::grid::{Grid, Surface};
+use crate::protocol::{Event, Msg, Visibility};
+use crate::terminal_input::{KeyInput, PointerInput, PointerPhase, WheelInput};
 
 /// A waker whose target can change, so a session keeps waking the window that shows it after a move.
 #[derive(Clone)]
@@ -52,97 +46,12 @@ impl Retarget {
     }
 }
 
-pub(crate) const FRAME: Duration = Duration::from_millis(8);
-
-pub trait LogErr<T> {
-    fn log_err(self, context: &str) -> Option<T>;
-}
-
-impl<T, E: Display> LogErr<T> for std::result::Result<T, E> {
-    fn log_err(self, context: &str) -> Option<T> {
-        match self {
-            Ok(value) => Some(value),
-            Err(error) => {
-                eprintln!("agentd: {context}: {error:#}");
-                None
-            }
-        }
-    }
-}
-
-/// Sent from the actor for the UI to pick up in `poll`.
-pub enum Event {
-    Copied(String),
-    PasteRejected(String),
-    /// The program's title (OSC 0 or 2); empty when it clears it.
-    Title(String),
-    Exited(ExitStatus),
-    /// A bell or desktop notification while not shown with keys, once until it next is.
-    /// A bell has an empty title and body; OSC 9 has no title.
-    Notify {
-        title: String,
-        body: String,
-    },
-    /// ⌘ moved onto or off a link; read `Session::link_hovered`.
-    LinkHover,
-}
-
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Attention {
     #[default]
     None,
     /// A bell or desktop notification (OSC 9 or 777).
     Alert,
-}
-
-pub(crate) fn new_terminal<'cb>(cols: u16, rows: u16) -> Result<Terminal<'static, 'cb>> {
-    let mut terminal = Terminal::new(cols, rows)?;
-    terminal
-        .set_scrollback_max_lines(Some(10_000))?
-        .set_terminfo_name("xterm-256color")?
-        .set_default_fg_color(Some(DEFAULT_FG))?
-        .set_default_bg_color(Some(DEFAULT_BG))?;
-    terminal.set_mode(Mode::GRAPHEME_CLUSTER, true)?;
-    Ok(terminal)
-}
-
-pub(crate) fn apply_theme(terminal: &mut Terminal<'static, '_>, theme: &Theme) -> Result<()> {
-    let mut palette = terminal.default_color_palette()?;
-    for &(index, color) in &theme.palette {
-        palette.0[usize::from(index)] = color;
-    }
-    terminal
-        .set_default_fg_color(Some(theme.foreground))?
-        .set_default_bg_color(Some(theme.background))?
-        .set_default_cursor_color(theme.cursor)?
-        .set_default_color_palette(Some(palette))?;
-    Ok(())
-}
-
-pub(crate) enum Msg {
-    Key(KeyInput),
-    Focus(bool),
-    Pointer(PointerInput),
-    Wheel(WheelInput),
-    Scrollbar { phase: PointerPhase, y: f32 },
-    ScrollbarHover(bool),
-    CommandHeld(bool),
-    Copy,
-    Paste { text: String, allow_unsafe: bool },
-    Resize(Surface),
-    Visibility(Visibility),
-    Stop,
-}
-
-/// How much of a session the UI shows, which decides what it publishes.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub enum Visibility {
-    /// The terminal itself, published every frame.
-    Shown,
-    /// Only its tab label, so titles still come back.
-    Listed,
-    /// Nothing; the latest title waits until it is listed or shown.
-    Hidden,
 }
 
 /// Apps launched from Finder get no locale, which leaves children in the C locale and mangles
@@ -493,44 +402,17 @@ fn set_cloexec(fd: &OwnedFd) -> Result<()> {
     Ok(())
 }
 
-fn signal_group(group: Pid, signal: Signal) {
-    if let Err(error) = killpg(group, signal)
-        && error != Errno::ESRCH
-    {
-        eprintln!("agentd: signal process group: {error}");
-    }
-}
-
-/// Call before reaping `Child`, which frees its pid for reuse.
-pub(crate) fn forget(pid: &Mutex<Option<i32>>) {
-    *pid.lock().unwrap_or_else(PoisonError::into_inner) = None;
-}
-
-pub(crate) fn terminate(child: &mut Child, pid: &Mutex<Option<i32>>) {
-    forget(pid);
-    // Also true once the actor has reaped the process, whose pid may have been reused.
-    if matches!(child.try_wait(), Ok(Some(_))) {
-        return;
-    }
-    let group = Pid::from_raw(child.id() as i32);
-    signal_group(group, Signal::SIGHUP);
-    for _ in 0..50 {
-        if matches!(child.try_wait(), Ok(Some(_))) {
-            return;
-        }
-        thread::sleep(Duration::from_millis(10));
-    }
-    signal_group(group, Signal::SIGKILL);
-    child.wait().log_err("wait for process");
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::grid::{GridBuilder, Presentation, Scrollbar};
+    use crate::grid::{FRAME, GridBuilder, Presentation, Scrollbar, new_terminal};
     use crate::terminal_input::TerminalInput;
     use crate::test_support::{TEST_SURFACE, pointer_at, wait_until, wheel_by};
     use libghostty_vt::render::CursorVisualStyle;
+    use nix::errno::Errno;
+    use nix::unistd::Pid;
+    use std::process::ExitStatus;
+    use std::time::Duration;
 
     fn spawn_shell() -> Session {
         Session::spawn(None, Path::new("/tmp"), &Config::default(), Arc::new(|| {})).unwrap()

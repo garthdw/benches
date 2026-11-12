@@ -39,7 +39,7 @@ shell <-> PTY --reader thread--> bounded channel --> actor thread (owns Terminal
          UI thread: poll() compares generation --> TerminalCompositor draws quads
 ```
 
-- **`session.rs`**: PTY, process and the `Session` handle; the actor thread itself is in `actor.rs` (`Actor`, `ResizeDebounce`, `Titles`, `Publisher`). libghostty types are `!Send`, so a `Terminal` must stay on its actor thread; everything else talks to it through `Msg` over a channel. The UI only sees immutable `Arc<Grid>` snapshots swapped into a mutex slot, with a `generation` counter for change detection.
+- **`session.rs`**: PTY, process and the `Session` handle; the actor thread itself is in `actor.rs` (`Actor`, `ResizeDebounce`, `Titles`, `Publisher`). libghostty types are `!Send`, so a `Terminal` must stay on its actor thread; everything else talks to it through `Msg` over a channel (`protocol.rs` holds `Msg`, `Event` and `Visibility`). The UI only sees immutable `Arc<Grid>` snapshots swapped into a mutex slot, with a `generation` counter for change detection.
 - **`grid.rs`**: the snapshot side. `Grid` and `Cell`, `GridBuilder` (reads the render state into a `Grid`), `Presentation`, `Metrics`, `Surface` and `Scrollbar` with its fade.
 - **Back-pressure**: PTY output goes through a bounded channel and publishing is capped by `FRAME`, so output floods can't stall the UI. Publishing also respects libghostty's render hold (`on_render_hold`).
 - **Spawning**: `openpty` plus `login_tty` in `pre_exec`. Only async-signal-safe calls may run between fork and exec, because the app is multi-threaded.

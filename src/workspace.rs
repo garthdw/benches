@@ -5,7 +5,8 @@ use std::process::ExitStatus;
 use serde::{Deserialize, Serialize};
 
 use crate::grid::Grid;
-use crate::session::{Attention, Retarget, Session, Visibility};
+use crate::protocol::Visibility;
+use crate::session::{Attention, Retarget, Session};
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Status {

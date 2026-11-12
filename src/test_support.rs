@@ -8,9 +8,9 @@ use libghostty_vt::{Terminal, key, mouse};
 use rune::{Env, Key, KeyEvent, Mods, Runtime, Waker};
 
 use crate::app::{State, on_key, poll};
+use crate::grid::new_terminal;
 use crate::grid::{Metrics, Surface};
 use crate::scenes::show_workspace_scene;
-use crate::session::new_terminal;
 use crate::terminal_input::{PointerInput, PointerPhase, WheelInput};
 use crate::view::view;
 use crate::windows::{Fleet, WindowId};

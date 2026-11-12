@@ -6,10 +6,10 @@ use std::time::Duration;
 use rune::tok;
 use rune::{El, Key, KeyEvent, TextEdit, Tx, col, text, text_input};
 
+use crate::LogErr;
 use crate::app::{State, open_project, open_tab, open_tray, run_command, tray_action};
 use crate::jump;
 use crate::keymap::{COMMANDS, Command, CommandSpec, chord_hint};
-use crate::session::LogErr;
 use crate::workspace::{Status, Workspace};
 
 const PALETTE_WIDTH: f32 = 520.0;

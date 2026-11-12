@@ -5,8 +5,8 @@ use libghostty_vt::style::RgbColor;
 use schemars::JsonSchema;
 use serde::Deserialize;
 
+use crate::LogErr;
 use crate::grid::{DEFAULT_BG, DEFAULT_FG};
-use crate::session::LogErr;
 
 const DEFAULT_SHELL: &str = "/opt/homebrew/bin/fish";
 pub const DEFAULT_FONT_FAMILY: &str = "Monaspace Neon";
