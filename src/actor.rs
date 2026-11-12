@@ -12,8 +12,10 @@ use anyhow::Result;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use crossbeam_channel::{Receiver, Sender, never, select};
+use libghostty_vt::effect::SemanticPromptKind;
 use libghostty_vt::effect::{ClipboardLocation, ClipboardReadError, ClipboardWriteError};
 use libghostty_vt::mode::Mode;
+use libghostty_vt::terminal::ScrollViewport;
 use libghostty_vt::{Terminal, focus, key};
 use nix::errno::Errno;
 use nix::pty::Winsize;
@@ -30,6 +32,7 @@ use crate::grid::{
 };
 use crate::link::reported_directory;
 use crate::protocol::{Event, Msg, Visibility};
+use crate::search::Searcher;
 use crate::terminal_input::{TerminalInput, open_link, paste_text, selection_text};
 
 /// How long the size must hold before the program sees it, as each SIGWINCH makes inline TUIs reprint.
@@ -59,6 +62,59 @@ fn focus_report(terminal: &Terminal<'static, '_>, focused: bool) -> Result<Optio
     let mut buffer = [0; 8];
     let length = event.encode(&mut buffer)?;
     Ok(Some(buffer[..length].to_vec()))
+}
+
+struct Finished {
+    failed: bool,
+    /// Ran past the configured threshold.
+    long: bool,
+}
+
+/// Times commands from OSC 133 C to D. A shell and its integration may both emit the marks, so
+/// only the first C and the first D after it count.
+#[derive(Default)]
+struct CommandTimer {
+    started: Option<Instant>,
+}
+
+impl CommandTimer {
+    fn start(&mut self, now: Instant) {
+        self.started.get_or_insert(now);
+    }
+
+    fn finish(
+        &mut self,
+        now: Instant,
+        exit_code: Option<i32>,
+        threshold: Option<Duration>,
+    ) -> Option<Finished> {
+        let ran = now.saturating_duration_since(self.started.take()?);
+        Some(Finished {
+            failed: exit_code.is_some_and(|code| code != 0),
+            long: threshold.is_some_and(|threshold| ran >= threshold),
+        })
+    }
+}
+
+fn watch_commands(
+    terminal: &mut Terminal<'static, '_>,
+    threshold: Option<Duration>,
+) -> Result<Rc<RefCell<Vec<Finished>>>> {
+    let finished = Rc::new(RefCell::new(Vec::new()));
+    let mut timer = CommandTimer::default();
+    terminal.on_semantic_prompt({
+        let finished = finished.clone();
+        move |_, prompt| match prompt.kind() {
+            Ok(SemanticPromptKind::OutputStart) => timer.start(Instant::now()),
+            Ok(SemanticPromptKind::CommandEnd) => {
+                if let Some(command) = timer.finish(Instant::now(), prompt.exit_code(), threshold) {
+                    finished.borrow_mut().push(command);
+                }
+            }
+            _ => {}
+        }
+    })?;
+    Ok(finished)
 }
 
 pub(crate) fn store(slot: &Mutex<Arc<Grid>>, grid: Grid) {
@@ -109,6 +165,7 @@ pub(crate) struct Actor {
     pub(crate) events: Sender<Event>,
     pub(crate) waker: Waker,
     pub(crate) theme: Theme,
+    pub(crate) command_finish_after: Option<Duration>,
     pub(crate) clipboard_read: ClipboardAccess,
     pub(crate) clipboard_write: ClipboardAccess,
 }
@@ -156,7 +213,7 @@ impl Actor {
     pub(crate) fn run(&mut self) -> Result<()> {
         let mut terminal = new_terminal(self.cols, self.rows)?;
         apply_theme(&mut terminal, &self.theme)?;
-        answer_queries(&mut terminal, &self.theme)?;
+        answer_queries(&mut terminal, &self.theme, self.clipboard_write)?;
         let mut builder = GridBuilder::new()?;
         builder.selection_background = self.theme.selection_background;
         builder.selection_foreground = self.theme.selection_foreground;
@@ -237,8 +294,10 @@ impl Actor {
             }
         })?;
         let mut notified = false;
+        let finished_commands = watch_commands(&mut terminal, self.command_finish_after)?;
 
         let mut input = TerminalInput::new()?;
+        let mut searcher = Searcher::default();
         let mut fade = ScrollbarFade::default();
         fade.follow(&terminal);
         let mut scrollbar_hovered = false;
@@ -272,7 +331,8 @@ impl Actor {
                         dirty = true;
                         let alerted = alerted.replace(false);
                         let notice = notice.borrow_mut().take();
-                        if alerted
+                        let finished = finished_commands.take();
+                        if (alerted || finished.iter().any(|command| command.long))
                             && !publisher.borrow().visible()
                             && !self.alerted.swap(true, Ordering::AcqRel)
                         {
@@ -286,6 +346,11 @@ impl Actor {
                             notified = true;
                             let (title, body) = notice.unwrap_or_default();
                             self.emit(Event::Notify { title, body });
+                        }
+                        for command in finished {
+                            self.emit(Event::CommandFinished {
+                                failed: command.failed,
+                            });
                         }
                     }
                     Err(_) => {
@@ -343,6 +408,15 @@ impl Actor {
                             self.emit(Event::Copied(text));
                         }
                     }
+                    Ok(Msg::PromptJump(delta)) => {
+                        terminal.scroll_viewport(ScrollViewport::DeltaPrompt(delta));
+                        fade.show(Instant::now());
+                        dirty = true;
+                    }
+                    Ok(Msg::SelectLastOutput) => {
+                        input.select_last_output(&terminal).log_err("select output");
+                        dirty = true;
+                    }
                     Ok(Msg::ClipboardReply { location, text }) => {
                         let reply = osc52_reply(location, text.as_deref().unwrap_or_default());
                         self.input.send(reply).log_err("queue clipboard reply");
@@ -370,6 +444,14 @@ impl Actor {
                             }
                             None => {}
                         }
+                    }
+                    Ok(Msg::Search(query)) => {
+                        searcher.set(&mut terminal, &query).log_err("search");
+                        dirty = true;
+                    }
+                    Ok(Msg::SearchStep { older }) => {
+                        searcher.step(&mut terminal, older).log_err("step search");
+                        dirty = true;
                     }
                     Ok(Msg::Resize(surface)) => {
                         resize.request(surface, Instant::now());
@@ -451,6 +533,15 @@ impl Actor {
             // A selection must track the pointer even while a program is holding its frame.
             let held = publisher.hold_started.is_some() && !input.selecting;
             if dirty && !held && publisher.visible() && Instant::now() >= publisher.next_frame {
+                if let Some((highlights, found)) =
+                    terminal.cols().log_err("read columns").and_then(|cols| {
+                        searcher
+                            .highlights(&mut terminal, cols)
+                            .log_err("find matches")
+                    })
+                {
+                    publisher.builder.set_search(highlights, found);
+                }
                 publisher.publish(&terminal)?;
                 dirty = false;
             }
@@ -666,6 +757,81 @@ mod tests {
             next_blink: None,
             visibility: Visibility::Shown,
         }
+    }
+    const DUPLICATED_COMMAND: &[u8] =
+        b"\x1b]133;A\x07\x1b]133;A\x07$ \x1b]133;B\x07ls\r\n\x1b]133;C\x07\x1b]133;C\x07out\r\n\
+          \x1b]133;D;2\x07\x1b]133;D;2\x07";
+
+    fn finished_by(bytes: &[u8], threshold: Option<Duration>) -> Vec<(bool, bool)> {
+        let mut terminal = new_terminal(20, 5).unwrap();
+        let finished = watch_commands(&mut terminal, threshold).unwrap();
+        terminal.vt_write(bytes);
+        let finished = finished.borrow();
+        finished
+            .iter()
+            .map(|command| (command.failed, command.long))
+            .collect()
+    }
+    #[test]
+    fn duplicate_marks_finish_a_command_once() {
+        assert_eq!(
+            finished_by(DUPLICATED_COMMAND, Some(Duration::ZERO)),
+            [(true, true)]
+        );
+    }
+    #[test]
+    fn only_a_command_past_the_threshold_is_long() {
+        let hour = Some(Duration::from_secs(3600));
+        assert_eq!(finished_by(DUPLICATED_COMMAND, hour), [(true, false)]);
+        assert_eq!(finished_by(DUPLICATED_COMMAND, None), [(true, false)]);
+    }
+    #[test]
+    fn a_finish_without_a_start_or_an_exit_code_is_not_a_failure() {
+        assert!(finished_by(b"\x1b]133;D;0\x07", Some(Duration::ZERO)).is_empty());
+        assert_eq!(
+            finished_by(b"\x1b]133;C\x07\x1b]133;D\x07", Some(Duration::ZERO)),
+            [(false, true)]
+        );
+    }
+    #[test]
+    fn the_first_start_times_the_command() {
+        let now = Instant::now();
+        let mut timer = CommandTimer::default();
+        timer.start(now);
+        timer.start(now + Duration::from_secs(9));
+        let threshold = Some(Duration::from_secs(5));
+        let finished = timer
+            .finish(now + Duration::from_secs(10), Some(0), threshold)
+            .unwrap();
+        assert!(finished.long);
+        assert!(
+            timer
+                .finish(now + Duration::from_secs(11), Some(0), threshold)
+                .is_none()
+        );
+    }
+    #[test]
+    fn duplicate_prompt_marks_give_one_stop_per_prompt() {
+        let mut terminal = new_terminal(20, 3).unwrap();
+        for command in 0..3 {
+            terminal.vt_write(
+                format!(
+                    "\x1b]133;A\x07\x1b]133;A\x07$ \x1b]133;B\x07c{command}\r\n\
+                     \x1b]133;C\x07out\r\n\x1b]133;D;0\x07\x1b]133;D;0\x07"
+                )
+                .as_bytes(),
+            );
+        }
+        terminal.vt_write(b"\x1b]133;A\x07$ ");
+        let offset = |terminal: &mut Terminal<'static, '_>, delta| {
+            terminal.scroll_viewport(ScrollViewport::DeltaPrompt(delta));
+            terminal.scrollbar().unwrap().offset
+        };
+        // Each command takes two rows, so prompts sit on rows 0, 2, 4 and 6 and the view starts at 4.
+        assert_eq!(offset(&mut terminal, -1), 2);
+        assert_eq!(offset(&mut terminal, -1), 0);
+        assert_eq!(offset(&mut terminal, -1), 0);
+        assert_eq!(offset(&mut terminal, 1), 2);
     }
     #[test]
     fn a_hidden_dirty_publisher_sleeps() {

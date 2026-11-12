@@ -9,6 +9,7 @@ use rune::{
 
 use crate::LogErr;
 use crate::config;
+use crate::find::{Find, open_find, poll_find};
 use crate::grid::{Grid, Surface};
 use crate::input::caret_rect;
 use crate::keymap::{Command, pressed, shortcut};
@@ -75,6 +76,7 @@ pub(crate) struct State {
     pub(crate) option_held: bool,
     pub(crate) caret: Option<[f32; 4]>,
     pub(crate) palette: Palette,
+    pub(crate) find: Find,
     pub(crate) sidebar_hidden: bool,
     pub(crate) config: config::Config,
     /// Points added to the configured font size by ⌘= and ⌘-; never written to disk.
@@ -487,7 +489,7 @@ pub(crate) fn open_project(state: &mut State, root: PathBuf) {
     state.workspace.add_project(Project::new(root, tabs));
 }
 
-fn pick_folder(tx: &mut Tx, replace_active: bool) {
+fn pick_folder(tx: &mut Tx, directory: Option<PathBuf>, replace_active: bool) {
     let options = FileDialogOptions {
         title: if replace_active {
             "Change project folder"
@@ -495,6 +497,7 @@ fn pick_folder(tx: &mut Tx, replace_active: bool) {
             "Open project"
         }
         .into(),
+        directory,
         ..FileDialogOptions::default()
     };
     tx.open_folder(options, move |state: &mut State, result, _| match result {
@@ -518,10 +521,13 @@ pub(crate) fn run_command(state: &mut State, command: Command, tx: &mut Tx) {
     match command {
         Command::NewShell => open_tab(state, "shell", None),
         Command::ToggleLazygit => toggle_lazygit(state),
-        Command::OpenProject => pick_folder(tx, false),
-        Command::ChangeFolder => pick_folder(tx, true),
+        Command::OpenProject => {
+            pick_folder(tx, Some(state.config.working_directory.clone()), false)
+        }
+        Command::ChangeFolder => pick_folder(tx, None, true),
         Command::MoveToNewWindow => move_to_new_window(state, state.workspace.active, None),
         Command::Palette => open_palette(state, tx),
+        Command::Find => open_find(state, tx),
         Command::ToggleSidebar => state.sidebar_hidden = !state.sidebar_hidden,
         Command::ToggleDrawer => toggle_last_drawer(state),
         Command::CloseTab => request_close(state),
@@ -534,6 +540,20 @@ pub(crate) fn run_command(state: &mut State, command: Command, tx: &mut Tx) {
         Command::ZoomReset => state.font_zoom = 0.0,
         Command::PrevTab => state.workspace.cycle_tab(-1),
         Command::NextTab => state.workspace.cycle_tab(1),
+        Command::PrevPrompt | Command::NextPrompt => {
+            if let Some(session) = state.session() {
+                session.jump_prompt(if command == Command::PrevPrompt {
+                    -1
+                } else {
+                    1
+                });
+            }
+        }
+        Command::SelectLastOutput => {
+            if let Some(session) = state.session() {
+                session.select_last_output();
+            }
+        }
     }
 }
 
@@ -542,9 +562,9 @@ pub(crate) fn poll(state: &mut State, now: f64, tx: &mut Tx) -> bool {
         state.started = true;
         load_layout(state);
         if state.workspace.projects.is_empty() {
-            let home = std::env::var_os("HOME").map_or_else(|| PathBuf::from("/"), PathBuf::from);
-            let tab = state.spawn_tab("shell", None, &home);
-            state.workspace.add_project(Project::new(home, vec![tab]));
+            let root = state.config.working_directory.clone();
+            let tab = state.spawn_tab("shell", None, &root);
+            state.workspace.add_project(Project::new(root, vec![tab]));
         }
     }
     let mut changed = adopt_projects(state);
@@ -559,6 +579,7 @@ pub(crate) fn poll(state: &mut State, now: f64, tx: &mut Tx) -> bool {
     launch_active(state);
     let active = state.session().map(Session::id);
     changed |= poll_jump(state, now, tx);
+    changed |= poll_find(state, active);
     changed |= poll_worktrees(state);
     changed |= poll_creation(state);
     let (kept, dismissed): (Vec<_>, Vec<_>) = std::mem::take(&mut state.confirms)
@@ -628,6 +649,9 @@ pub(crate) fn poll(state: &mut State, now: f64, tx: &mut Tx) -> bool {
                         restarts.push(tab.session.id());
                     }
                     changed = true;
+                }
+                Event::CommandFinished { failed } => {
+                    changed |= std::mem::replace(&mut tab.command_failed, failed) != failed;
                 }
                 Event::LinkHover => changed = true,
                 Event::Notify { title, body } => notices.push((tab.session.id(), title, body)),
@@ -1428,6 +1452,31 @@ mod tests {
         assert_eq!(workspace.projects[workspace.active].name, "moved");
     }
 
+    #[test]
+    fn command_up_and_down_are_workspace_shortcuts_and_plain_arrows_are_not() {
+        let mut state = workspace_state();
+        let mut tx = Tx::default();
+        for key in [Key::Up, Key::Down] {
+            let event = KeyEvent {
+                key: key.clone(),
+                mods: command(),
+            };
+            assert!(on_key(&mut state, &event, &mut tx));
+            let plain = KeyEvent {
+                key,
+                mods: Mods::default(),
+            };
+            assert!(!shortcut(&mut state, &plain, &mut tx));
+        }
+        assert_eq!(
+            crate::keymap::COMMANDS
+                .iter()
+                .find(|spec| spec.command == Command::SelectLastOutput)
+                .map(|spec| spec.chord),
+            Some(None)
+        );
+    }
+
     fn tray_runtime() -> Runtime<State> {
         let mut state = workspace_state();
         add_scene_tray(&mut state);
@@ -1877,6 +1926,19 @@ mod tests {
             }],
             tray: vec![],
         }
+    }
+
+    #[test]
+    fn the_first_project_starts_in_the_working_directory() {
+        let tmp = std::env::temp_dir().canonicalize().unwrap();
+        let mut state = State::default();
+        state.config.working_directory = tmp.clone();
+        let mut runtime = runtime_with(state);
+        runtime.poll = Some(poll);
+        runtime.frame(1.0 / 60.0);
+        let project = &runtime.state.workspace.projects[0];
+        assert_eq!(project.root, tmp);
+        assert_eq!(project.tabs[0].cwd, Some(tmp));
     }
 
     #[test]

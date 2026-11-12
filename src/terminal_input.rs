@@ -180,6 +180,19 @@ impl TerminalInput {
         Ok(())
     }
 
+    /// The output of the command above the cursor's prompt, as marked by OSC 133.
+    pub(crate) fn select_last_output(&mut self, terminal: &Terminal<'static, '_>) -> Result<()> {
+        let cursor_row = terminal.scrollback_rows()? as u32 + u32::from(terminal.cursor_y()?);
+        // The prompt rows themselves select nothing, so look upwards for the output.
+        for y in (0..=cursor_row).rev() {
+            let grid_ref = terminal.grid_ref(Point::Screen(Coordinate { x: 0, y }))?;
+            if let Some(output) = terminal.select_output(grid_ref)? {
+                return self.select(terminal, Some(&output));
+            }
+        }
+        Ok(())
+    }
+
     fn encode_key(&mut self, terminal: &Terminal<'static, '_>, input: KeyInput) -> Result<Vec<u8>> {
         self.key_event
             .set_action(key::Action::Press)
@@ -792,6 +805,34 @@ mod tests {
         terminal.vt_write(b"hello world");
         select_hello(&terminal, &mut input_for_test());
         assert_eq!(selection_text(&terminal).unwrap().as_deref(), Some("hello"));
+    }
+
+    pub(crate) const TWO_COMMANDS: &[u8] =
+        b"\x1b]133;A\x07$ \x1b]133;B\x07one\r\n\x1b]133;C\x07out1\r\n\
+        \x1b]133;D;0\x07\x1b]133;A\x07$ \x1b]133;B\x07two\r\n\x1b]133;C\x07out2a\r\nout2b\r\n\
+        \x1b]133;D;0\x07\x1b]133;A\x07$ \x1b]133;B\x07";
+
+    #[test]
+    fn the_last_commands_output_can_be_selected() {
+        let mut terminal = new_terminal(20, 8).unwrap();
+        terminal.vt_write(TWO_COMMANDS);
+        let mut input = input_for_test();
+        input.select_last_output(&terminal).unwrap();
+        assert!(input.selection_changed);
+        assert_eq!(
+            selection_text(&terminal).unwrap().as_deref(),
+            Some("out2a\nout2b")
+        );
+    }
+
+    #[test]
+    fn without_prompt_marks_no_output_is_selected() {
+        let mut terminal = new_terminal(20, 5).unwrap();
+        terminal.vt_write(b"plain\r\n");
+        let mut input = input_for_test();
+        input.select_last_output(&terminal).unwrap();
+        assert!(!input.selection_changed);
+        assert_eq!(selection_text(&terminal).unwrap(), None);
     }
 
     #[test]
