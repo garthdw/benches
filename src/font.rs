@@ -129,16 +129,16 @@ pub struct Font {
     /// Per style, which cells of a run shape differently from standing alone.
     runs: RefCell<[RunCache; 4]>,
     /// The glyph a character shapes to alone, per style index.
-    alone: RefCell<HashMap<(usize, char), Option<u16>>>,
-    joins: RefCell<HashMap<char, bool>>,
+    alone: RefCell<FnvMap<(usize, char), Option<u16>>>,
+    joins: RefCell<FnvMap<char, bool>>,
     /// The horizontal extent of a glyph's ink from its origin, per style index and glyph.
-    ink: RefCell<HashMap<(usize, u16), InkExtent>>,
+    ink: RefCell<FnvMap<(usize, u16), InkExtent>>,
 }
 
 /// Where a glyph's ink starts and ends horizontally, if it has any.
 type InkExtent = Option<(f64, f64)>;
 
-type RunCache = HashMap<Rc<str>, Rc<ShapedRun>, BuildHasherDefault<Fnv>>;
+type RunCache = FnvMap<Rc<str>, Rc<ShapedRun>>;
 
 /// A run shaped as a whole, and which of its cells differ from standing alone.
 pub struct ShapedRun {
@@ -157,9 +157,12 @@ impl ShapedRun {
     }
 }
 
-/// FNV-1a, because the run cache hashes every word of every rebuild and its keys are short.
+/// FNV-1a, because the shaping caches and glyph atlas hash every word or cell of every rebuild and
+/// their keys are short.
 #[derive(Default)]
-struct Fnv(u64);
+pub(crate) struct Fnv(u64);
+
+pub(crate) type FnvMap<K, V> = HashMap<K, V, BuildHasherDefault<Fnv>>;
 
 impl Hasher for Fnv {
     fn finish(&self) -> u64 {
@@ -688,7 +691,6 @@ impl Font {
                 signatures: vec![0; length].into(),
             };
         };
-        let placed = self.placed(face, &shaped);
         // A monospaced font gives a ligature one glyph per character, though CoreText clusters
         // them under the first. Fewer glyphs than characters is a true ligature, so no cell
         // stands alone.
@@ -706,6 +708,13 @@ impl Font {
         } else {
             vec![true; length]
         };
+        if !differs.contains(&true) {
+            return ShapedRun {
+                text,
+                signatures: vec![0; length].into(),
+            };
+        }
+        let placed = self.placed(face, &shaped);
         let signatures = differs
             .iter()
             .enumerate()
