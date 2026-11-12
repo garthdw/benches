@@ -177,9 +177,10 @@ pub(crate) fn adopt_projects(state: &mut State) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::open_tab;
     use crate::session::{self, Session};
     use crate::test_support::*;
-    use crate::{SIDEBAR_WIDTH, open_tab};
+    use crate::view::SIDEBAR_WIDTH;
     use rune::Runtime;
     use std::sync::atomic::Ordering;
 
