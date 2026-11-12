@@ -156,6 +156,7 @@ pub struct Grid {
     pub cursor_style: CursorVisualStyle,
     pub cursor_blinking: bool,
     pub cursor_color: [u8; 3],
+    pub password_input: bool,
     pub metrics: Metrics,
     pub bg: [u8; 3],
     pub scrollbar: Option<Scrollbar>,
@@ -172,6 +173,7 @@ impl Default for Grid {
             cursor_style: CursorVisualStyle::Block,
             cursor_blinking: false,
             cursor_color: [0; 3],
+            password_input: false,
             metrics: Metrics::default(),
             bg: rgb(DEFAULT_BG),
             scrollbar: None,
@@ -362,6 +364,8 @@ fn faint(color: [u8; 3], background: [u8; 3]) -> [u8; 3] {
 #[derive(Clone, Copy, PartialEq)]
 pub(crate) struct Presentation {
     pub(crate) focused: bool,
+    /// The PTY is in the mode programs use to read a password, which libghostty can't see.
+    pub(crate) password_input: bool,
     pub(crate) cursor_on: bool,
     pub(crate) metrics: Metrics,
     pub(crate) scrollbar_opacity: f32,
@@ -372,6 +376,7 @@ impl Default for Presentation {
     fn default() -> Self {
         Self {
             focused: true,
+            password_input: false,
             cursor_on: true,
             metrics: Metrics::default(),
             scrollbar_opacity: 0.0,
@@ -620,6 +625,7 @@ impl GridBuilder {
             cursor_style,
             cursor_blinking,
             cursor_color: rgb(colors.cursor.unwrap_or(colors.foreground)),
+            password_input: presentation.password_input,
             metrics: presentation.metrics,
             bg: rgb(colors.background),
             scrollbar,

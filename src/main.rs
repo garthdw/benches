@@ -14,6 +14,7 @@ mod palette;
 mod protocol;
 mod render;
 mod scenes;
+mod secure_input;
 mod session;
 mod sprite;
 mod terminal_input;

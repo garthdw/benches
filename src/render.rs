@@ -448,6 +448,34 @@ fn spills_into_next(grid: &Grid, index: usize, cell: &Cell) -> bool {
         })
 }
 
+/// A padlock filling most of the cell: a body with a shackle whose posts run into it.
+fn lock_edges(left: f32, top: f32, width: f32, height: f32, thickness: f32) -> [[f32; 4]; 4] {
+    let stroke = (width * 0.14).max(thickness);
+    let body_width = width * 0.8;
+    let body_left = left + (width - body_width) / 2.0;
+    let body_top = top + height * 0.45;
+    let shackle_width = body_width * 0.66;
+    let shackle_left = left + (width - shackle_width) / 2.0;
+    let shackle_top = top + height * 0.05;
+    let post = body_top - shackle_top;
+    [
+        [
+            body_left,
+            body_top,
+            body_width,
+            top + height * 0.95 - body_top,
+        ],
+        [shackle_left, shackle_top, shackle_width, stroke],
+        [shackle_left, shackle_top, stroke, post],
+        [
+            shackle_left + shackle_width - stroke,
+            shackle_top,
+            stroke,
+            post,
+        ],
+    ]
+}
+
 /// Neighbouring cells shaped together: the same style, on one row, identical but for the background (selection included), and
 /// not the cursor, which splits a ligature as Ghostty does.
 struct Run {
@@ -560,6 +588,7 @@ fn build_quads(
         let wide = grid.cells.get(index).is_some_and(|cell| cell.wide);
         let cursor_width = if wide { 2.0 * width } else { width };
         let edges: &[[f32; 4]] = match grid.cursor_style {
+            _ if grid.password_input => &lock_edges(left, top, cursor_width, height, thickness),
             CursorVisualStyle::Bar => &[[left, top, thickness, height]],
             CursorVisualStyle::Underline => &[[
                 left,
@@ -580,7 +609,8 @@ fn build_quads(
         }
     }
     let run_cursor = cursor.filter(|_| font.break_runs_at_cursor);
-    let inverted = cursor.filter(|_| grid.cursor_style == CursorVisualStyle::Block);
+    let inverted =
+        cursor.filter(|_| grid.cursor_style == CursorVisualStyle::Block && !grid.password_input);
     let glyphs_start = quads.len();
     let underline_top = font.underline_top as f32;
     let textured = |found: AtlasGlyph, left: f32, top: f32, cells: f32, fg: [u8; 3]| {
@@ -1526,6 +1556,15 @@ mod tests {
         assert_eq!(underline[0].rect[3], font.line_thickness as f32);
         let (block, font) = shape(b"");
         assert_eq!(block[0].rect[3], font.cell_height as f32);
+    }
+
+    #[test]
+    fn a_password_prompt_draws_a_lock_in_place_of_the_cursor() {
+        let mut grid = Grid::from_vt(b"", 4, 1).unwrap();
+        grid.password_input = true;
+        let (lock, font) = cursor_quads(&grid);
+        assert_eq!(lock.len(), 4);
+        assert!(lock[0].rect[2] < font.cell_width as f32);
     }
 
     #[test]

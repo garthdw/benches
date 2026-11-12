@@ -79,6 +79,13 @@
   "additionalProperties": false,
   "description": "The `config.toml` format. Every key is optional.",
   "properties": {
+    "auto-secure-input": {
+      "description": "Whether to turn on secure keyboard entry while a program reads a password. Falls back to\nGhostty's `macos-auto-secure-input`, then on.",
+      "type": [
+        "boolean",
+        "null"
+      ]
+    },
     "font": {
       "$ref": "#/$defs/FontFile",
       "description": "The terminal font. Each key falls back to Ghostty's config."

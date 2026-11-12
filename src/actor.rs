@@ -14,6 +14,7 @@ use libghostty_vt::{Terminal, focus, key};
 use nix::errno::Errno;
 use nix::pty::Winsize;
 use nix::sys::signal::{Signal, killpg};
+use nix::sys::termios::{LocalFlags, tcgetattr};
 use nix::unistd::Pid;
 use rune::Waker;
 
@@ -29,6 +30,16 @@ use crate::terminal_input::{TerminalInput, open_link, paste_text, selection_text
 const RESIZE_SETTLE: Duration = Duration::from_millis(100);
 const HOLD_TIMEOUT: Duration = Duration::from_secs(1);
 const BLINK: Duration = Duration::from_millis(530);
+/// Ghostty's interval for watching the terminal modes that mark a password prompt.
+const PASSWORD_POLL: Duration = Duration::from_millis(200);
+
+/// Programs reading a password turn echo off while keeping line editing, as `sudo` and `ssh` do.
+fn password_prompt(master: &OwnedFd) -> bool {
+    tcgetattr(master).is_ok_and(|termios| {
+        termios.local_flags.contains(LocalFlags::ICANON)
+            && !termios.local_flags.contains(LocalFlags::ECHO)
+    })
+}
 
 fn focus_report(terminal: &Terminal<'static, '_>, focused: bool) -> Result<Option<Vec<u8>>> {
     if !terminal.mode(Mode::FOCUS_EVENT)? {
@@ -195,6 +206,7 @@ impl Actor {
         let mut scrollbar_hovered = false;
         let mut resize = ResizeDebounce::default();
         let mut dirty = true;
+        let mut next_password_check = Instant::now();
         let mut titles = Titles {
             sent: String::new(),
             next: Instant::now(),
@@ -208,6 +220,7 @@ impl Actor {
                 resize.due,
                 fade.next_change(now),
                 titles.due(visibility).filter(|_| title_changed.get()),
+                (visibility != Visibility::Hidden).then_some(next_password_check),
             ]
             .into_iter()
             .flatten()
@@ -363,6 +376,12 @@ impl Actor {
                 dirty = true;
             }
             let mut publisher = publisher.borrow_mut();
+            if publisher.visibility != Visibility::Hidden && Instant::now() >= next_password_check {
+                next_password_check = Instant::now() + PASSWORD_POLL;
+                let password_input = password_prompt(&self.master);
+                dirty |= publisher.presentation.password_input != password_input;
+                publisher.presentation.password_input = password_input;
+            }
             dirty |= publisher.tick_blink(Instant::now());
             let held = scrollbar_hovered || input.scrollbar_grab.is_some();
             let opacity = fade.opacity(&terminal, held, Instant::now());
@@ -669,6 +688,19 @@ mod tests {
                 .cursor
                 .is_none()
         );
+    }
+    #[test]
+    fn echo_off_with_line_editing_is_a_password_prompt() {
+        use nix::sys::termios::{SetArg, tcsetattr};
+        let pty = nix::pty::openpty(None, None).unwrap();
+        assert!(!password_prompt(&pty.master));
+        let mut termios = tcgetattr(&pty.slave).unwrap();
+        termios.local_flags.remove(LocalFlags::ECHO);
+        tcsetattr(&pty.slave, SetArg::TCSANOW, &termios).unwrap();
+        assert!(password_prompt(&pty.master));
+        termios.local_flags.remove(LocalFlags::ICANON);
+        tcsetattr(&pty.slave, SetArg::TCSANOW, &termios).unwrap();
+        assert!(!password_prompt(&pty.master));
     }
     #[test]
     fn focus_is_reported_only_when_the_program_asked() {

@@ -168,6 +168,12 @@ pub(crate) const SCENES: &[Scene] = &[
             project: None,
         });
     }),
+    ("secure-input", |state| {
+        let mut grid = fixture_grid(b"[sudo] password for me: ");
+        grid.password_input = true;
+        show_tab(state, Tab::new("shell", Session::fixture(grid)));
+        state.workspace.set_window_focused(true);
+    }),
     ("empty", isolate_scene),
     ("collapsed", |state| {
         show_workspace_scene(state);
