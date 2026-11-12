@@ -184,7 +184,7 @@ impl Atlas {
     }
 }
 
-fn glyph_key(grid: &Grid, cell: &Cell) -> Option<GlyphKey> {
+fn glyph_key(grid: &Grid, index: usize, cell: &Cell) -> Option<GlyphKey> {
     let text = match grid.cluster(cell) {
         Some(cluster) => GlyphText::Cluster(cluster.to_owned()),
         None if cell.spacer || cell.character == ' ' => return None,
@@ -196,8 +196,26 @@ fn glyph_key(grid: &Grid, cell: &Cell) -> Option<GlyphKey> {
             bold: cell.bold,
             italic: cell.italic,
         },
-        cells: if cell.wide { 2 } else { 1 },
+        cells: if cell.wide || spills_into_next(grid, index, cell) {
+            2
+        } else {
+            1
+        },
     })
+}
+
+/// Ghostty lets a constrained glyph use the next cell when that is blank, unless the row ends there
+/// or an icon precedes, so that a run of icons stays aligned.
+fn spills_into_next(grid: &Grid, index: usize, cell: &Cell) -> bool {
+    let cols = usize::from(grid.cols).max(1);
+    cell.cluster.is_none()
+        && Font::spills(cell.character)
+        && !(index + 1).is_multiple_of(cols)
+        && grid
+            .cells
+            .get(index + 1)
+            .is_some_and(|next| next.character == ' ' && !next.spacer)
+        && (index.is_multiple_of(cols) || !Font::is_icon(grid.cells[index - 1].character))
 }
 
 /// Neighbouring cells shaped together: the same style, on one row, identical but for the background (selection included), and
@@ -436,7 +454,7 @@ fn build_quads(
                         cells: 1,
                     })
                 });
-            let Some(key) = shaped.or_else(|| glyph_key(grid, cell)) else {
+            let Some(key) = shaped.or_else(|| glyph_key(grid, index, cell)) else {
                 continue;
             };
             let cells = key.cells as f32;
@@ -958,6 +976,23 @@ mod tests {
             .map(|start| find_run(&grid, start, text_end(&grid, start), None, &font, &mut text).end)
             .collect();
         assert_eq!(ends, [1, 3, 5]);
+    }
+
+    #[test]
+    fn a_constrained_glyph_spills_only_into_a_blank_cell_after_a_non_icon() {
+        let widths = |text: &str| -> Vec<u32> {
+            let grid = Grid::from_vt(text.as_bytes(), 4, 1).unwrap();
+            (0..4)
+                .filter_map(|index| {
+                    glyph_key(&grid, index, &grid.cells[index]).map(|key| key.cells)
+                })
+                .collect()
+        };
+        assert_eq!(widths("a\u{E0C6} "), [1, 2]);
+        assert_eq!(widths("a\u{E0C6}b"), [1, 1, 1]);
+        assert_eq!(widths("\u{F432}\u{E0C6} "), [1, 1]);
+        assert_eq!(widths("abc\u{E0C6}"), [1, 1, 1, 1]);
+        assert_eq!(widths("\u{E0B0} "), [1]);
     }
 
     fn run_end(bytes: &[u8], start: usize) -> usize {
