@@ -11,6 +11,7 @@ pub enum Command {
     ChangeFolder,
     MoveToNewWindow,
     Palette,
+    Find,
     ToggleSidebar,
     ToggleDrawer,
     CloseTab,
@@ -66,6 +67,7 @@ pub const COMMANDS: &[CommandSpec] = &[
         enabled: |_| false,
         ..spec(Command::Palette, "Command palette", Some("mod+p"))
     },
+    spec(Command::Find, "Find in scrollback", Some("mod+f")),
     spec(Command::ToggleSidebar, "Toggle sidebar", Some("mod+b")),
     spec(Command::ToggleDrawer, "Toggle drawer", Some("mod+j")),
     spec(Command::CloseTab, "Close tab", Some("mod+w")),

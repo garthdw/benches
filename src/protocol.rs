@@ -13,6 +13,8 @@ pub(crate) enum Msg {
     CommandHeld(bool),
     Copy,
     Paste { text: String, allow_unsafe: bool },
+    Search(String),
+    SearchStep { older: bool },
     Resize(Surface),
     Visibility(Visibility),
     Stop,

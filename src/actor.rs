@@ -23,6 +23,7 @@ use crate::grid::{
     FRAME, Grid, GridBuilder, Presentation, ScrollbarFade, Surface, apply_theme, new_terminal,
 };
 use crate::protocol::{Event, Msg, Visibility};
+use crate::search::Searcher;
 use crate::terminal_input::{TerminalInput, open_link, paste_text, selection_text};
 
 /// How long the size must hold before the program sees it, as each SIGWINCH makes inline TUIs reprint.
@@ -190,6 +191,7 @@ impl Actor {
         let mut notified = false;
 
         let mut input = TerminalInput::new()?;
+        let mut searcher = Searcher::default();
         let mut fade = ScrollbarFade::default();
         fade.follow(&terminal);
         let mut scrollbar_hovered = false;
@@ -316,6 +318,14 @@ impl Actor {
                             None => {}
                         }
                     }
+                    Ok(Msg::Search(query)) => {
+                        searcher.set(&mut terminal, &query).log_err("search");
+                        dirty = true;
+                    }
+                    Ok(Msg::SearchStep { older }) => {
+                        searcher.step(&mut terminal, older).log_err("step search");
+                        dirty = true;
+                    }
                     Ok(Msg::Resize(surface)) => {
                         resize.request(surface, Instant::now());
                     }
@@ -390,6 +400,15 @@ impl Actor {
             // A selection must track the pointer even while a program is holding its frame.
             let held = publisher.hold_started.is_some() && !input.selecting;
             if dirty && !held && publisher.visible() && Instant::now() >= publisher.next_frame {
+                if let Some((highlights, found)) =
+                    terminal.cols().log_err("read columns").and_then(|cols| {
+                        searcher
+                            .highlights(&mut terminal, cols)
+                            .log_err("find matches")
+                    })
+                {
+                    publisher.builder.set_search(highlights, found);
+                }
                 publisher.publish(&terminal)?;
                 dirty = false;
             }

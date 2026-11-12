@@ -377,6 +377,14 @@ impl Session {
         self.send(Msg::Paste { text, allow_unsafe });
     }
 
+    pub fn search(&self, query: String) {
+        self.send(Msg::Search(query));
+    }
+
+    pub fn search_step(&self, older: bool) {
+        self.send(Msg::SearchStep { older });
+    }
+
     /// Ends the process but keeps its last screen.
     pub fn stop(&self) {
         self.send(Msg::Stop);
@@ -523,6 +531,31 @@ mod tests {
         session.paste("echo pasted-ok".to_owned(), false);
         type_line(&session, "");
         wait_for_line(&session, "pasted-ok");
+    }
+
+    #[test]
+    fn a_search_finds_output_in_a_real_shell_and_steps_between_matches() {
+        let session = spawn_shell();
+        type_line(&session, "printf 'nee%sle\\n' d d d");
+        session.search("needle".to_owned());
+        wait_until(
+            Duration::from_secs(15),
+            || "no matches".to_owned(),
+            || (session.grid().found.map(|found| found.total) == Some(3)).then_some(()),
+        );
+        let selected = session.grid().found.and_then(|found| found.selected);
+        session.search_step(true);
+        wait_until(
+            Duration::from_secs(15),
+            || "never stepped".to_owned(),
+            || (session.grid().found.and_then(|found| found.selected) != selected).then_some(()),
+        );
+        session.search(String::new());
+        wait_until(
+            Duration::from_secs(15),
+            || "search never ended".to_owned(),
+            || session.grid().found.is_none().then_some(()),
+        );
     }
 
     #[test]

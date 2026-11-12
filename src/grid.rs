@@ -159,6 +159,34 @@ pub struct Grid {
     pub metrics: Metrics,
     pub bg: [u8; 3],
     pub scrollbar: Option<Scrollbar>,
+    /// The match count while a search is open.
+    pub found: Option<Found>,
+}
+
+/// How many matches a search has and which one is current, counted newest first.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Found {
+    pub total: usize,
+    pub selected: Option<usize>,
+}
+
+/// Matched cells in one viewport row, as inclusive columns.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct Highlight {
+    pub(crate) row: u16,
+    pub(crate) first: u16,
+    pub(crate) last: u16,
+    pub(crate) current: bool,
+}
+
+/// Ghostty's default `search-*` colours: background and foreground.
+pub(crate) fn match_colors(current: bool) -> ([u8; 3], [u8; 3]) {
+    let background = if current {
+        [0xf2, 0xa5, 0x7e]
+    } else {
+        [0xff, 0xe0, 0x82]
+    };
+    (background, [0; 3])
 }
 
 impl Default for Grid {
@@ -175,6 +203,7 @@ impl Default for Grid {
             metrics: Metrics::default(),
             bg: rgb(DEFAULT_BG),
             scrollbar: None,
+            found: None,
         }
     }
 }
@@ -459,6 +488,8 @@ pub(crate) struct GridBuilder {
     /// From the theme; without a background, selected cells swap their colours.
     pub(crate) selection_background: Option<Rgb>,
     pub(crate) selection_foreground: Option<Rgb>,
+    highlights: Vec<Highlight>,
+    found: Option<Found>,
     /// Off only in tests, to compare against reading every cell the slow way.
     pub(crate) plain_fast_path: bool,
 }
@@ -473,6 +504,8 @@ impl GridBuilder {
             content: None,
             selection_background: None,
             selection_foreground: None,
+            highlights: Vec::new(),
+            found: None,
             plain_fast_path: true,
         })
     }
@@ -481,6 +514,15 @@ impl GridBuilder {
     pub(crate) fn selection_changed(&mut self) {
         self.last_shown = None;
         self.content = None;
+    }
+
+    /// Matches are painted over the cells at build time, so the cached cells stay plain.
+    pub(crate) fn set_search(&mut self, highlights: Vec<Highlight>, found: Option<Found>) {
+        if (&self.highlights, self.found) != (&highlights, found) {
+            self.highlights = highlights;
+            self.found = found;
+            self.last_shown = None;
+        }
     }
 
     pub(crate) fn build(
@@ -602,6 +644,21 @@ impl GridBuilder {
                 content
             }
         };
+        let cells = if self.highlights.is_empty() {
+            cells
+        } else {
+            let mut painted = cells.to_vec();
+            for highlight in &self.highlights {
+                let (background, foreground) = match_colors(highlight.current);
+                let start = usize::from(highlight.row) * usize::from(cols);
+                let range =
+                    start + usize::from(highlight.first)..=start + usize::from(highlight.last);
+                for cell in painted.get_mut(range).unwrap_or_default() {
+                    (cell.bg, cell.fg) = (Some(background), foreground);
+                }
+            }
+            painted.into()
+        };
         let cursor = if snapshot.cursor_visible()? && (presentation.cursor_on || !cursor_blinking) {
             snapshot.cursor_viewport()?.map(|viewport| {
                 let x = viewport.x.saturating_sub(u16::from(viewport.at_wide_tail));
@@ -623,6 +680,7 @@ impl GridBuilder {
             metrics: presentation.metrics,
             bg: rgb(colors.background),
             scrollbar,
+            found: self.found,
         }))
     }
 }
