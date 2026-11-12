@@ -10,6 +10,7 @@ use rune::{
 use crate::app::{
     Confirm, State, open_project, pick_new_tab, request_close_project, resolve_confirm, tray_action,
 };
+use crate::find;
 use crate::input::{self, focus_on_press, pointer_phase, send_pointer};
 use crate::palette::{self, open_palette};
 use crate::render;
@@ -465,6 +466,7 @@ fn focus_overlays(state: &State, theme: &tok::Theme) -> Vec<El> {
             move |state, tx, confirmed| resolve_confirm(state, index, confirmed, tx),
         ));
     }
+    overlays.extend(find::view(state, theme));
     if let Some((_, tab)) = state.workspace.focused_tab()
         && tab.status != Status::Running
     {

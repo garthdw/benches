@@ -24,6 +24,10 @@ pub(crate) enum Msg {
         text: String,
         allow_unsafe: bool,
     },
+    Search(String),
+    SearchStep {
+        older: bool,
+    },
     /// The answer to `Event::ClipboardRead`; `None` is a refusal, which the program sees as an
     /// empty clipboard.
     ClipboardReply {

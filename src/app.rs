@@ -9,6 +9,7 @@ use rune::{
 
 use crate::LogErr;
 use crate::config;
+use crate::find::{Find, open_find, poll_find};
 use crate::grid::{Grid, Surface};
 use crate::input::caret_rect;
 use crate::keymap::{Command, pressed, shortcut};
@@ -75,6 +76,7 @@ pub(crate) struct State {
     pub(crate) option_held: bool,
     pub(crate) caret: Option<[f32; 4]>,
     pub(crate) palette: Palette,
+    pub(crate) find: Find,
     pub(crate) sidebar_hidden: bool,
     pub(crate) config: config::Config,
     /// Points added to the configured font size by ⌘= and ⌘-; never written to disk.
@@ -522,6 +524,7 @@ pub(crate) fn run_command(state: &mut State, command: Command, tx: &mut Tx) {
         Command::ChangeFolder => pick_folder(tx, true),
         Command::MoveToNewWindow => move_to_new_window(state, state.workspace.active, None),
         Command::Palette => open_palette(state, tx),
+        Command::Find => open_find(state, tx),
         Command::ToggleSidebar => state.sidebar_hidden = !state.sidebar_hidden,
         Command::ToggleDrawer => toggle_last_drawer(state),
         Command::CloseTab => request_close(state),
@@ -573,6 +576,7 @@ pub(crate) fn poll(state: &mut State, now: f64, tx: &mut Tx) -> bool {
     launch_active(state);
     let active = state.session().map(Session::id);
     changed |= poll_jump(state, now, tx);
+    changed |= poll_find(state, active);
     changed |= poll_worktrees(state);
     changed |= poll_creation(state);
     let (kept, dismissed): (Vec<_>, Vec<_>) = std::mem::take(&mut state.confirms)
