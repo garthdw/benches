@@ -7,15 +7,16 @@ use rune::{
     Tx, WheelEvent, col, effect, el, icon, row, text,
 };
 
+use crate::app::{
+    State, open_project, pick_new_tab, request_close_project, resolve_close, resolve_paste,
+    tray_action,
+};
 use crate::input::{self, focus_on_press, pointer_phase, send_pointer};
 use crate::palette::{self, open_palette};
+use crate::render;
 use crate::session::{Attention, PointerPhase, Session, WheelInput};
 use crate::windows::{move_to_new_window, torn_off};
 use crate::workspace::{Project, Status, Workspace};
-use crate::{
-    State, open_project, pick_new_tab, render, request_close_project, resolve_close, resolve_paste,
-    tray_action,
-};
 
 pub(crate) const TERMINAL_MARK: u32 = 1;
 pub(crate) const DRAWER_MARK: u32 = 2;

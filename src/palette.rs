@@ -6,10 +6,11 @@ use std::time::Duration;
 use rune::tok;
 use rune::{El, Key, KeyEvent, TextEdit, Tx, col, text, text_input};
 
+use crate::app::{State, open_project, open_tab, open_tray, run_command, tray_action};
+use crate::jump;
 use crate::keymap::{COMMANDS, Command, CommandSpec, chord_hint};
 use crate::session::LogErr;
 use crate::workspace::{Status, Workspace};
-use crate::{State, jump, open_project, open_tab, open_tray, run_command, tray_action};
 
 const PALETTE_WIDTH: f32 = 520.0;
 const PALETTE_TOP: f32 = 96.0;
@@ -633,9 +634,9 @@ pub(crate) fn view(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::app::{on_key, poll};
     use crate::scenes::*;
     use crate::test_support::*;
-    use crate::{on_key, poll};
     use rune::{Mods, Runtime};
 
     #[test]

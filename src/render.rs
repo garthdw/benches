@@ -9,7 +9,7 @@ use rune::color::srgb_decode;
 use rune::compose::{Compositor, DeviceKey, Frame};
 use rune::render::EffectSite;
 
-use crate::State;
+use crate::app::State;
 use crate::font::{Font, FontStyle, GlyphKind, ShapedRun};
 use crate::session::{Cell, Grid, Metrics, Scrollbar, Session, Surface};
 

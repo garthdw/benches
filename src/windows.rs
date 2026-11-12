@@ -4,9 +4,9 @@ use std::rc::Rc;
 
 use rune::{Tx, Waker, WindowSpec};
 
+use crate::app::{State, save_layout, window_app};
 use crate::session::LogErr;
 use crate::workspace::{Project, SavedWorkspace};
-use crate::{State, save_layout, window_app};
 
 pub(crate) type WindowId = u32;
 
@@ -177,7 +177,7 @@ pub(crate) fn adopt_projects(state: &mut State) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::open_tab;
+    use crate::app::open_tab;
     use crate::session::{self, Session};
     use crate::test_support::*;
     use crate::view::SIDEBAR_WIDTH;
