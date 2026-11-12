@@ -270,6 +270,116 @@ fn is_private_use(character: char) -> bool {
     )
 }
 
+#[derive(Clone, Copy, PartialEq)]
+enum Fit {
+    Stretch,
+    /// Fit down, or cover up to one cell (Nerd Fonts' `pa`).
+    FitCover,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum Align {
+    Start,
+    End,
+    /// Centred in the first cell even when the glyph may span two.
+    CenterFirst,
+}
+
+/// Ghostty's Nerd Font constraint as generated from font-patcher's Powerline attributes. Those are
+/// all centred vertically on the whole cell and, once stretched, need no padding.
+#[derive(Clone, Copy)]
+struct Constraint {
+    fit: Fit,
+    align: Align,
+    max_cells: u32,
+    max_ratio: Option<f64>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Bounds {
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
+}
+
+impl Constraint {
+    /// Powerline and Powerline Extra, apart from the arrows `sprite` draws.
+    fn of(character: char) -> Option<Self> {
+        use {Align::*, Fit::*};
+        let (fit, align, max_cells, max_ratio) = match u32::from(character) {
+            0xE0A0..=0xE0A3 | 0xE0CF => (FitCover, CenterFirst, 2, None),
+            0xE0CE | 0xE0D0 | 0xE0D1 => (FitCover, Start, 2, None),
+            0xE0B4 => (Stretch, Start, 1, Some(0.59)),
+            0xE0B5 => (Stretch, Start, 1, Some(0.5)),
+            0xE0B6 => (Stretch, End, 1, Some(0.59)),
+            0xE0B7 => (Stretch, End, 1, Some(0.5)),
+            0xE0B8 | 0xE0B9 | 0xE0BC | 0xE0BD => (Stretch, Start, 1, None),
+            0xE0BA | 0xE0BB | 0xE0BE | 0xE0BF => (Stretch, End, 1, None),
+            0xE0C0 | 0xE0C1 | 0xE0C8 => (Stretch, Start, 2, None),
+            0xE0C2 | 0xE0C3 | 0xE0CA => (Stretch, End, 2, None),
+            0xE0C4 => (Stretch, Start, 2, Some(0.86)),
+            0xE0C5 => (Stretch, End, 2, Some(0.86)),
+            0xE0C6 => (Stretch, Start, 2, Some(0.78)),
+            0xE0C7 => (Stretch, End, 2, Some(0.78)),
+            0xE0CC => (Stretch, Start, 2, Some(0.85)),
+            0xE0CD => (Stretch, Start, 2, Some(0.865)),
+            0xE0D2 | 0xE0D6 => (Stretch, Start, 1, Some(0.7)),
+            0xE0D4 | 0xE0D7 => (Stretch, End, 1, Some(0.7)),
+            _ => return None,
+        };
+        Some(Self {
+            fit,
+            align,
+            max_cells,
+            max_ratio,
+        })
+    }
+
+    /// Ghostty's `Constraint.constrain`, with the face taken as the whole cell and `y` measured up
+    /// from the cell's bottom. `cells` is how many cells the glyph may use.
+    fn constrain(&self, glyph: Bounds, cell_width: f64, cell_height: f64, cells: u32) -> Bounds {
+        let span = self.max_cells.min(cells).max(1);
+        let factors = |span: u32| {
+            let width = f64::from(span) * cell_width / glyph.width;
+            let height = cell_height / glyph.height;
+            match self.fit {
+                Fit::Stretch => (width, height),
+                Fit::FitCover => {
+                    let factor = width.min(height);
+                    (factor, factor)
+                }
+            }
+        };
+        let (mut width_factor, mut height_factor) = factors(span);
+        if self.fit == Fit::FitCover {
+            // An icon must not shrink when a space opens up after it.
+            if span > 1 && height_factor > 1.0 {
+                height_factor = factors(1).1.max(1.0);
+            }
+            width_factor = height_factor;
+        }
+        if let Some(ratio) = self.max_ratio
+            && glyph.width * width_factor > glyph.height * height_factor * ratio
+        {
+            width_factor = glyph.height * height_factor * ratio / glyph.width;
+        }
+        let width = glyph.width * width_factor;
+        let height = glyph.height * height_factor;
+        let x = match self.align {
+            Align::Start => 0.0,
+            Align::End => (f64::from(span) * cell_width - width).max(0.0),
+            Align::CenterFirst => ((cell_width - width) / 2.0).max(0.0),
+        };
+        Bounds {
+            x,
+            y: (cell_height - height) / 2.0,
+            width,
+            height,
+        }
+    }
+}
+
 fn shaped_line(font: &CTFont, text: &str) -> Option<CFRetained<CTLine>> {
     // SAFETY: the extern statics are immutable CoreFoundation constants.
     let (font_key, color_key, enabled) = unsafe {
@@ -446,6 +556,16 @@ impl Font {
         Some(context)
     }
 
+    /// Whether `character` is an icon rather than Powerline graphics, which sit flush against their neighbours.
+    pub fn is_icon(character: char) -> bool {
+        is_private_use(character) && !matches!(u32::from(character), 0xE0B0..=0xE0D7)
+    }
+
+    /// Whether `character` is a constrained Nerd Font glyph, which may spill into a blank cell after it.
+    pub fn spills(character: char) -> bool {
+        Constraint::of(character).is_some()
+    }
+
     /// Premultiplied RGBA for `text`, `cells * cell_width` by `cell_height` with the top row first.
     pub fn rasterize(
         &self,
@@ -464,13 +584,41 @@ impl Font {
         out.clear();
         out.resize((width * self.cell_height * 4) as usize, 0);
         let mut characters = text.chars();
-        if let (Some(character), None, 1) = (characters.next(), characters.next(), cells)
+        let single = characters.next().filter(|_| characters.next().is_none());
+        if let Some(character) = single
+            && cells == 1
             && sprite::draw(character, width, self.cell_height, self.line_thickness, out)
         {
             return Some(GlyphKind::Coverage);
         }
         let line = shaped_line(font, text)?;
         let context = self.bitmap_context(out, width)?;
+        if let Some(constraint) = single.and_then(Constraint::of) {
+            // SAFETY: `line` and `context` are live.
+            let ink = unsafe { line.image_bounds(Some(&context)) };
+            if ink.size.width > 0.0 && ink.size.height > 0.0 {
+                let glyph = Bounds {
+                    x: ink.origin.x,
+                    y: ink.origin.y + self.baseline,
+                    width: ink.size.width,
+                    height: ink.size.height,
+                };
+                let target = constraint.constrain(
+                    glyph,
+                    f64::from(self.cell_width),
+                    f64::from(self.cell_height),
+                    cells,
+                );
+                let (scale_x, scale_y) = (target.width / glyph.width, target.height / glyph.height);
+                CGContext::translate_ctm(Some(&context), target.x, target.y);
+                CGContext::scale_ctm(Some(&context), scale_x, scale_y);
+                CGContext::translate_ctm(Some(&context), -glyph.x, -ink.origin.y);
+                CGContext::set_text_position(Some(&context), 0.0, 0.0);
+                // SAFETY: `line` and `context` are live, and `out` outlives the context.
+                unsafe { line.draw(&context) };
+                return Some(GlyphKind::Coverage);
+            }
+        }
         // SAFETY: null out-parameters are allowed when only the width is needed.
         let line_width = unsafe {
             line.typographic_bounds(
@@ -786,6 +934,52 @@ mod tests {
         );
         // Three separate emoji would be shrunk to a third of the height to fit.
         assert!(ink_height(&font, &family, 2) * 10 >= ink_height(&font, &single, 2) * 7);
+    }
+
+    /// Columns of the bitmap holding any ink, first and last.
+    fn ink_columns(font: &Font, pixels: &[u8], cells: u32) -> (usize, usize) {
+        let width = (font.cell_width * cells) as usize;
+        let columns: Vec<usize> = (0..width)
+            .filter(|column| {
+                pixels
+                    .chunks_exact(width * 4)
+                    .any(|row| row[column * 4 + 3] != 0)
+            })
+            .collect();
+        (columns[0], columns[columns.len() - 1])
+    }
+
+    #[test]
+    fn powerline_extra_squares_fill_the_cell_height_from_the_left_edge() {
+        let font = Font::new(DEFAULT_FONT_FAMILY, 13.0, 2.0).unwrap();
+        let mut pixels = Vec::new();
+        font.rasterize("\u{E0C6}", REGULAR, 2, &mut pixels);
+        assert!(ink_height(&font, &pixels, 2) + 2 >= font.cell_height as usize);
+        let (first, last) = ink_columns(&font, &pixels, 2);
+        assert!(first <= 1, "starts at {first}");
+        assert!(last >= font.cell_width as usize, "ends at {last}");
+        font.rasterize("\u{E0C6}", REGULAR, 1, &mut pixels);
+        assert!(ink_height(&font, &pixels, 1) + 2 >= font.cell_height as usize);
+        assert!(ink_columns(&font, &pixels, 1).1 + 2 >= font.cell_width as usize);
+    }
+
+    #[test]
+    fn a_regular_icon_stays_within_its_cell() {
+        let font = Font::new(DEFAULT_FONT_FAMILY, 13.0, 2.0).unwrap();
+        let mut pixels = Vec::new();
+        font.rasterize("\u{F432}", REGULAR, 1, &mut pixels);
+        assert!(ink_height(&font, &pixels, 1) > 0);
+        assert_eq!(
+            pixels.len(),
+            (font.cell_width * font.cell_height * 4) as usize
+        );
+    }
+
+    #[test]
+    fn constraints_exist_only_for_glyphs_the_font_draws() {
+        assert!(Constraint::of('\u{E0C6}').is_some());
+        assert!(Constraint::of('\u{E0B0}').is_none());
+        assert!(Constraint::of('\u{F432}').is_none());
     }
 
     #[test]
