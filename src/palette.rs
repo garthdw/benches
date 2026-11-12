@@ -120,7 +120,7 @@ fn letters_in_order(label: &str, query: &str) -> bool {
 /// How well a command label matches a query. Only the query's letters in order are required.
 struct Match {
     score: u32,
-    /// A contiguous substring, or every letter on a word start, so safe to rank above `Run`.
+    /// A contiguous substring starting a word, so safe to rank above `Run`.
     strong: bool,
 }
 
@@ -128,15 +128,19 @@ fn fuzzy_match(label: &str, query: &str) -> Option<Match> {
     let label: Vec<char> = label.to_lowercase().chars().collect();
     let query: Vec<char> = query.to_lowercase().chars().collect();
     let starts_word = |index: usize| index == 0 || !label[index - 1].is_alphanumeric();
-    if let Some(start) = label
-        .windows(query.len())
-        .position(|window| window == query.as_slice())
+    let found: Vec<usize> = (0..label.len())
+        .filter(|&start| label[start..].starts_with(&query))
+        .collect();
+    if let Some(&start) = found
+        .iter()
+        .find(|&&start| starts_word(start))
+        .or(found.first())
     {
         let prefix = if start == 0 { 200 } else { 0 };
         let word = if starts_word(start) { 100 } else { 0 };
         return Some(Match {
             score: 1000 + prefix + word - start as u32,
-            strong: true,
+            strong: starts_word(start),
         });
     }
     let word_starts: Vec<usize> = (0..label.len())
@@ -149,7 +153,7 @@ fn fuzzy_match(label: &str, query: &str) -> Option<Match> {
     {
         return Some(Match {
             score: 500,
-            strong: true,
+            strong: false,
         });
     }
     let mut score = 0;
@@ -720,7 +724,17 @@ mod tests {
 
     #[test]
     fn typed_shell_commands_stay_first_despite_loose_matches() {
-        for query in ["ls", "htop", "cat", "git status", "make"] {
+        for query in [
+            "ls",
+            "htop",
+            "cat",
+            "git status",
+            "make",
+            "ct",
+            "nt",
+            "cp",
+            "zi",
+        ] {
             assert_eq!(
                 first_action(query),
                 Action::Run(query.to_owned()),
@@ -733,7 +747,6 @@ mod tests {
     fn strong_matches_lead_the_commands() {
         let zoom_in = Action::Command(Command::ZoomIn);
         assert_eq!(first_action("zoom"), zoom_in);
-        assert_eq!(first_action("zi"), zoom_in);
         assert_eq!(
             first_action("sidebar"),
             Action::Command(Command::ToggleSidebar)
@@ -744,6 +757,8 @@ mod tests {
     fn loose_matches_follow_the_run_and_tray_rows() {
         let actions = palette_actions("ls", None, &one_project());
         assert_eq!(actions[2], Action::Command(Command::ToggleSidebar));
+        let actions = palette_actions("zi", None, &one_project());
+        assert_eq!(actions[2], Action::Command(Command::ZoomIn));
     }
 
     #[test]
