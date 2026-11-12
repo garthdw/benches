@@ -8,8 +8,7 @@ use rune::{
 };
 
 use crate::app::{
-    State, open_project, pick_new_tab, request_close_project, resolve_close, resolve_paste,
-    tray_action,
+    Confirm, State, open_project, pick_new_tab, request_close_project, resolve_confirm, tray_action,
 };
 use crate::input::{self, focus_on_press, pointer_phase, send_pointer};
 use crate::palette::{self, open_palette};
@@ -343,12 +342,15 @@ fn tab_strip(state: &State, theme: &tok::Theme, accent: Color, titlebar_inset: f
         .children(new_tab)
 }
 
+const CONFIRM_BAR_PITCH: f32 = 40.0;
+
 fn confirm_bar(
     theme: &tok::Theme,
     key: &'static str,
     message: String,
     action: &'static str,
-    resolve: fn(&mut State, bool),
+    y: f32,
+    resolve: impl Fn(&mut State, bool) + Clone + 'static,
 ) -> El {
     let button = |key: String, label: &'static str| {
         el().key(key)
@@ -362,7 +364,7 @@ fn confirm_bar(
     };
     row()
         .key(key)
-        .absolute(12.0, 12.0)
+        .absolute(12.0, y)
         .gap(8.0)
         .items_center()
         .px(10.0)
@@ -370,10 +372,10 @@ fn confirm_bar(
         .radius(6.0)
         .fill(theme.control_off)
         .child(text(message).color(theme.text))
-        .child(
-            button(format!("{key}-yes"), action)
-                .on_press(move |state: &mut State| resolve(state, true)),
-        )
+        .child(button(format!("{key}-yes"), action).on_press({
+            let resolve = resolve.clone();
+            move |state: &mut State| resolve(state, true)
+        }))
         .child(
             button(format!("{key}-no"), "Cancel")
                 .on_press(move |state: &mut State| resolve(state, false)),
@@ -402,28 +404,40 @@ fn focus_overlays(state: &State, theme: &tok::Theme) -> Vec<El> {
             );
         }
     }
-    if state.pending_paste.is_some() {
+    // Enter and Escape answer the newest, drawn last, so it carries the key hint.
+    for (index, confirm) in state.confirms.iter().enumerate() {
+        let (key, message, action) = match confirm {
+            Confirm::Paste { .. } => (
+                "paste-confirm",
+                "This paste could run commands".to_owned(),
+                "Paste",
+            ),
+            Confirm::Close { project, .. } => {
+                let place = project
+                    .as_ref()
+                    .and_then(|root| state.workspace.project_index(root))
+                    .and_then(|index| state.workspace.projects.get(index))
+                    .map_or("here".to_owned(), |project| format!("in {}", project.name));
+                (
+                    "close-confirm",
+                    format!("A program is still running {place}"),
+                    "Close",
+                )
+            }
+        };
+        let message = if index + 1 == state.confirms.len() {
+            format!("{message} · Enter / Esc")
+        } else {
+            message
+        };
+        let y = 12.0 + index as f32 * CONFIRM_BAR_PITCH;
         overlays.push(confirm_bar(
             theme,
-            "paste-confirm",
-            "This paste could run commands".to_owned(),
-            "Paste",
-            resolve_paste,
-        ));
-    }
-    if state.pending_close.is_some() {
-        let place = state
-            .closing_project
-            .as_ref()
-            .and_then(|root| state.workspace.project_index(root))
-            .and_then(|index| state.workspace.projects.get(index))
-            .map_or("here".to_owned(), |project| format!("in {}", project.name));
-        overlays.push(confirm_bar(
-            theme,
-            "close-confirm",
-            format!("A program is still running {place}"),
-            "Close",
-            resolve_close,
+            key,
+            message,
+            action,
+            y,
+            move |state, confirmed| resolve_confirm(state, index, confirmed),
         ));
     }
     if let Some((_, tab)) = state.workspace.focused_tab()
