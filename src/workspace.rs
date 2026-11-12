@@ -5,7 +5,7 @@ use std::process::ExitStatus;
 use serde::{Deserialize, Serialize};
 
 use crate::grid::Grid;
-use crate::protocol::Visibility;
+use crate::protocol::{Progress, Visibility};
 use crate::session::{Attention, Retarget, Session};
 
 #[derive(Clone, Debug, PartialEq)]
@@ -23,6 +23,7 @@ pub struct Tab {
     /// What the tab runs, shown until the program sets a title of its own.
     pub title: String,
     pub program_title: Option<String>,
+    pub progress: Option<Progress>,
     /// What a restart runs; `None` is the launch shell.
     pub command: Option<String>,
     /// Where the process started, so a restart runs there again.
@@ -43,6 +44,7 @@ impl Tab {
         Self {
             title: title.to_owned(),
             program_title: None,
+            progress: None,
             command: None,
             cwd: None,
             session,

@@ -14,6 +14,7 @@ use base64::engine::general_purpose::STANDARD;
 use crossbeam_channel::{Receiver, Sender, never, select};
 use libghostty_vt::effect::SemanticPromptKind;
 use libghostty_vt::effect::{ClipboardLocation, ClipboardReadError, ClipboardWriteError};
+use libghostty_vt::effect::{ProgramStatusKind, ProgramStatusState, ProgressState};
 use libghostty_vt::mode::Mode;
 use libghostty_vt::terminal::ScrollViewport;
 use libghostty_vt::{Terminal, focus, key};
@@ -31,12 +32,14 @@ use crate::grid::{
     new_terminal,
 };
 use crate::link::reported_directory;
-use crate::protocol::{Event, Msg, Visibility};
+use crate::protocol::{Event, Msg, Progress, ProgressKind, Visibility};
 use crate::search::Searcher;
 use crate::terminal_input::{TerminalInput, open_link, paste_text, selection_text};
 
 /// How long the size must hold before the program sees it, as each SIGWINCH makes inline TUIs reprint.
 const RESIZE_SETTLE: Duration = Duration::from_millis(100);
+/// Ghostty's: a program that dies mid-task never removes its progress. Short in tests.
+const PROGRESS_TIMEOUT: Duration = Duration::from_millis(if cfg!(test) { 1000 } else { 15_000 });
 const HOLD_TIMEOUT: Duration = Duration::from_secs(1);
 const BLINK: Duration = Duration::from_millis(530);
 /// Ghostty's interval for watching the terminal modes that mark a password prompt.
@@ -293,6 +296,44 @@ impl Actor {
                 ));
             }
         })?;
+        terminal.on_program_status({
+            let alerted = alerted.clone();
+            let notice = notice.clone();
+            move |_, report| {
+                if !matches!(report.state(), Ok(ProgramStatusState::Blocked)) {
+                    return;
+                }
+                alerted.set(true);
+                let body = match report.kind() {
+                    Ok(ProgramStatusKind::Permission) => "Needs permission",
+                    Ok(ProgramStatusKind::Question) => "Has a question",
+                    Ok(ProgramStatusKind::Auth) => "Needs authentication",
+                    _ => "Needs input",
+                };
+                // A program's own OSC 9 or 777 text for the same prompt is more specific.
+                notice
+                    .borrow_mut()
+                    .get_or_insert_with(|| (String::new(), body.to_owned()));
+            }
+        })?;
+        let reported = Rc::new(std::cell::Cell::new(None));
+        terminal.on_progress_report({
+            let reported = reported.clone();
+            move |_, report| {
+                let Ok(state) = report.state() else { return };
+                let percent = report.progress().unwrap_or(0).min(100);
+                let kind = match state {
+                    ProgressState::Remove => None,
+                    ProgressState::Set => Some(ProgressKind::Normal),
+                    ProgressState::Error => Some(ProgressKind::Error),
+                    ProgressState::Indeterminate => Some(ProgressKind::Indeterminate),
+                    ProgressState::Pause => Some(ProgressKind::Paused),
+                    _ => return,
+                };
+                reported.set(Some(kind.map(|kind| Progress { kind, percent })));
+            }
+        })?;
+        let mut progress_due: Option<Instant> = None;
         let mut notified = false;
         let finished_commands = watch_commands(&mut terminal, self.command_finish_after)?;
 
@@ -322,6 +363,7 @@ impl Actor {
                 fade.next_change(now),
                 animation_due.filter(|_| visibility == Visibility::Shown),
                 titles.due(visibility).filter(|_| title_changed.get()),
+                progress_due,
                 (visibility != Visibility::Hidden).then_some(next_password_check),
             ]
             .into_iter()
@@ -353,6 +395,10 @@ impl Actor {
                             let (title, body) = notice.unwrap_or_default();
                             self.emit(Event::Notify { title, body });
                         }
+                        if let Some(progress) = reported.take() {
+                            progress_due = progress.map(|_| Instant::now() + PROGRESS_TIMEOUT);
+                            self.emit(Event::Progress(progress));
+                        }
                         for command in finished {
                             self.emit(Event::CommandFinished {
                                 failed: command.failed,
@@ -361,6 +407,9 @@ impl Actor {
                     }
                     Err(_) => {
                         self.output = never();
+                        if progress_due.take().is_some() {
+                            self.emit(Event::Progress(None));
+                        }
                         forget(&self.pid);
                         if let Some(status) = self.child.wait().log_err("wait for process") {
                             self.emit(Event::Exited(status));
@@ -483,6 +532,10 @@ impl Actor {
                     Err(_) => return Ok(()),
                 },
                 default(wait) => {}
+            }
+            if progress_due.is_some_and(|due| Instant::now() >= due) {
+                progress_due = None;
+                self.emit(Event::Progress(None));
             }
             // libghostty only exposes a new title once the write that set it returns.
             let visibility = publisher.borrow().visibility;

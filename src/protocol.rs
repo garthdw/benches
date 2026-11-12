@@ -39,6 +39,21 @@ pub(crate) enum Msg {
     Stop,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProgressKind {
+    Normal,
+    Error,
+    Paused,
+    Indeterminate,
+}
+
+/// A program's OSC 9;4 progress report.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Progress {
+    pub kind: ProgressKind,
+    pub percent: u8,
+}
+
 /// Sent from the actor for the UI to pick up in `poll`.
 pub enum Event {
     Copied(String),
@@ -63,6 +78,8 @@ pub enum Event {
         title: String,
         body: String,
     },
+    /// The program's progress, or `None` once it removes it, lets it go stale or exits.
+    Progress(Option<Progress>),
     /// A command ended, by the shell's OSC 133 D; `failed` is a non-zero exit code.
     CommandFinished {
         failed: bool,

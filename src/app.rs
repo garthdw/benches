@@ -654,6 +654,10 @@ pub(crate) fn poll(state: &mut State, now: f64, tx: &mut Tx) -> bool {
                     changed |= std::mem::replace(&mut tab.command_failed, failed) != failed;
                 }
                 Event::LinkHover => changed = true,
+                Event::Progress(progress) => {
+                    tab.progress = progress;
+                    changed = true;
+                }
                 Event::Notify { title, body } => notices.push((tab.session.id(), title, body)),
             }
         }
@@ -848,6 +852,7 @@ pub(crate) fn window_app(
 mod tests {
     use super::*;
     use crate::grid::Metrics;
+    use crate::protocol::{Progress, ProgressKind};
     use crate::scenes::*;
     use crate::test_support::*;
     use crate::view::{DRAWER_HEIGHT, RAIL_WIDTH, SIDEBAR_WIDTH};
@@ -1729,6 +1734,47 @@ mod tests {
             runtime.state.workspace.projects[0].attention(),
             Attention::Alert
         );
+    }
+
+    #[test]
+    fn a_background_tab_reports_progress_and_blocking_to_its_tab_and_project() {
+        let mut state = State::default();
+        state
+            .workspace
+            .add_project(Project::new("/tmp".into(), vec![]));
+        let command = "sh -c \"sleep 0.5; printf '\\033]9;4;1;50\\a\\033]7501;state=blocked:kind=auth\\a'; sleep 100\"";
+        for command in [Some("sleep 100"), Some(command)] {
+            let tab = state.spawn_tab("tab", command, Path::new("/tmp"));
+            state.workspace.add_tab(tab);
+        }
+        state.workspace.select_tab(0);
+        let mut runtime = runtime_with(state);
+        runtime.poll = Some(poll);
+        let mut frame = 1.0;
+        wait_until(
+            Duration::from_secs(15),
+            || "timed out".to_owned(),
+            || {
+                if runtime.state.workspace.projects[0].tabs[1]
+                    .progress
+                    .is_some()
+                {
+                    return Some(());
+                }
+                frame += 1.0;
+                runtime.frame(frame / 60.0);
+                None
+            },
+        );
+        let project = &runtime.state.workspace.projects[0];
+        assert_eq!(
+            project.tabs[1].progress,
+            Some(Progress {
+                kind: ProgressKind::Normal,
+                percent: 50
+            })
+        );
+        assert_eq!(project.attention(), Attention::Alert);
     }
 
     #[test]
