@@ -2,9 +2,10 @@ use std::path::PathBuf;
 
 use rune::TextEdit;
 
+use crate::palette::WorktreeChoice;
 use crate::session::{Grid, Session};
 use crate::workspace::{Project, Status, Tab};
-use crate::{State, WorktreeChoice, jump};
+use crate::{State, jump};
 
 pub(crate) const SCENE_FIXTURE: &[u8] = b"\x1b[1;32magentd\x1b[0m fixture\r\n\x1b[31mred\x1b[0m \x1b[42;30m on green \x1b[0m \x1b[7minverse\x1b[0m\r\na != b // c == d ... \x1b[1m!=\x1b[0m \x1b[3m!=\x1b[0m\r\n$ ";
 const SCENE_UNICODE: &str = concat!(
@@ -116,21 +117,21 @@ pub(crate) const SCENES: &[Scene] = &[
     ("workspace", show_workspace_scene),
     ("palette", |state| {
         show_workspace_scene(state);
-        state.palette = TextEdit::new("lz");
-        state.palette_open = true;
+        state.palette.edit = TextEdit::new("lz");
+        state.palette.open = true;
     }),
     ("palette-error", |state| {
         show_workspace_scene(state);
         add_scene_tray(state);
-        state.palette = TextEdit::new("site");
-        state.palette_open = true;
-        state.palette_error = Some("✗ Branch site already exists".to_owned());
+        state.palette.edit = TextEdit::new("site");
+        state.palette.open = true;
+        state.palette.error = Some("✗ Branch site already exists".to_owned());
     }),
     ("worktrees", |state| {
         show_workspace_scene(state);
-        state.palette = TextEdit::new("site");
-        state.palette_open = true;
-        state.worktrees = Some(WorktreeChoice {
+        state.palette.edit = TextEdit::new("site");
+        state.palette.open = true;
+        state.palette.worktrees = Some(WorktreeChoice {
             root: PathBuf::from("/Users/me/dev/site"),
             pending: None,
             found: vec![
