@@ -6,6 +6,7 @@ use crate::app::{Confirm, State};
 use crate::grid::Grid;
 use crate::jump;
 use crate::palette::WorktreeChoice;
+use crate::protocol::{Progress, ProgressKind};
 use crate::session::Session;
 use crate::workspace::{Project, Status, Tab};
 
@@ -97,6 +98,18 @@ fn show_tray_scene(state: &mut State) {
     state.workspace.toggle_drawer(0);
 }
 
+fn show_progress_scene(state: &mut State) {
+    show_workspace_scene(state);
+    add_scene_tray(state);
+    let progress = |kind, percent| Some(Progress { kind, percent });
+    let project = &mut state.workspace.projects[0];
+    project.tabs[0].progress = progress(ProgressKind::Normal, 62);
+    project.tabs[1].progress = progress(ProgressKind::Error, 30);
+    project.tabs[2].progress = progress(ProgressKind::Indeterminate, 0);
+    project.tray[0].progress = progress(ProgressKind::Paused, 80);
+    project.tabs[1].session.alert();
+}
+
 const SCENE_LAZYGIT: &[u8] = b"\x1b[1mStatus\x1b[0m\r\n\x1b[32m\xe2\x9c\x93\x1b[0m agentd -> lazygit-overlay\r\n\r\n\x1b[1mFiles\x1b[0m\r\n\x1b[32m M\x1b[0m src/main.rs\r\n\x1b[32m M\x1b[0m src/workspace.rs\r\n\x1b[31m??\x1b[0m notes.txt\r\n";
 
 fn show_lazygit_scene(state: &mut State) {
@@ -155,6 +168,7 @@ pub(crate) const SCENES: &[Scene] = &[
         });
     }),
     ("tray", show_tray_scene),
+    ("progress", show_progress_scene),
     ("lazygit", show_lazygit_scene),
     ("confirm-stack", |state| {
         show_workspace_scene(state);

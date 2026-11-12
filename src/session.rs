@@ -446,6 +446,7 @@ fn set_cloexec(fd: &OwnedFd) -> Result<()> {
 mod tests {
     use super::*;
     use crate::grid::{FRAME, GridBuilder, Presentation, Scrollbar, new_terminal};
+    use crate::protocol::{Progress, ProgressKind};
     use crate::terminal_input::TerminalInput;
     use crate::test_support::{TEST_SURFACE, pointer_at, wait_until, wheel_by};
     use libghostty_vt::render::CursorVisualStyle;
@@ -954,6 +955,148 @@ mod tests {
         type_line(&session, "printf '\\a'; echo four");
         wait_for_line(&session, "four");
         assert_eq!(notify_events(&session), [(String::new(), String::new())]);
+    }
+
+    fn progress_events(session: &Session) -> Vec<Option<Progress>> {
+        std::iter::from_fn(|| session.next_event())
+            .filter_map(|event| match event {
+                Event::Progress(progress) => Some(progress),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn osc_9_4_progress_comes_back_and_is_removed() {
+        let session = spawn_shell();
+        let reports = [
+            ("1;50", Some((ProgressKind::Normal, 50))),
+            ("2;70", Some((ProgressKind::Error, 70))),
+            ("3", Some((ProgressKind::Indeterminate, 0))),
+            ("4;20", Some((ProgressKind::Paused, 20))),
+            ("0", None),
+        ];
+        for (index, (report, want)) in reports.into_iter().enumerate() {
+            type_line(
+                &session,
+                &format!("printf '\\033]9;4;{report}\\a'; echo step{index}"),
+            );
+            wait_for_line(&session, &format!("step{index}"));
+            let want = want.map(|(kind, percent)| Progress { kind, percent });
+            assert_eq!(progress_events(&session), [want]);
+        }
+    }
+
+    #[test]
+    fn stale_progress_is_dropped() {
+        let session = spawn_shell();
+        type_line(&session, "printf '\\033]9;4;1;50\\a'");
+        wait_until(
+            Duration::from_secs(15),
+            || "the progress never went stale".to_owned(),
+            || {
+                std::iter::from_fn(|| session.next_event())
+                    .any(|event| matches!(event, Event::Progress(None)))
+                    .then_some(())
+            },
+        );
+    }
+
+    #[test]
+    fn progress_ends_when_the_process_exits() {
+        let session = spawn_shell();
+        type_line(&session, "printf '\\033]9;4;1;50\\a'; exit");
+        let mut events = Vec::new();
+        wait_until(
+            Duration::from_secs(15),
+            || "the process never exited".to_owned(),
+            || {
+                while let Some(event) = session.next_event() {
+                    match event {
+                        Event::Progress(progress) => events.push(progress),
+                        Event::Exited(_) => return Some(()),
+                        _ => {}
+                    }
+                }
+                None
+            },
+        );
+        assert_eq!(events.last(), Some(&None));
+    }
+
+    #[test]
+    fn a_status_query_is_answered() {
+        let session = spawn_shell();
+        type_line(&session, "printf '\\033]7501;?\\033\\\\'; cat -v");
+        type_line(&session, "end");
+        wait_until(
+            Duration::from_secs(15),
+            || format!("no reply: {:#?}", session.grid().lines()),
+            || {
+                session
+                    .grid()
+                    .lines()
+                    .iter()
+                    .any(|line| {
+                        line.contains(
+                            "7501;?:states=idle,working,done,blocked,error:kinds=permission,question,auth",
+                        )
+                    })
+                    .then_some(())
+            },
+        );
+    }
+
+    #[test]
+    fn a_blocked_program_alerts_and_notifies_once_until_seen() {
+        let session = spawn_shell();
+        session.focus(false);
+        session.set_visibility(Visibility::Listed);
+        type_line(
+            &session,
+            "printf '\\033]7501;state=blocked:kind=permission\\033\\\\'",
+        );
+        wait_for_alert(&session);
+        assert_eq!(
+            notify_events(&session),
+            [(String::new(), "Needs permission".into())]
+        );
+        type_line(
+            &session,
+            "printf '\\a\\033]7501;state=blocked:kind=question\\033\\\\'; echo two",
+        );
+        session.set_visibility(Visibility::Shown);
+        wait_for_line(&session, "two");
+        assert_eq!(notify_events(&session), []);
+    }
+
+    #[test]
+    fn a_blocked_prompt_with_an_osc_notification_notifies_once() {
+        let session = spawn_shell();
+        session.focus(false);
+        type_line(
+            &session,
+            "printf '\\033]777;notify;Claude;Allow edit?\\a\\033]7501;state=blocked:kind=permission\\033\\\\'; echo one",
+        );
+        wait_for_line(&session, "one");
+        assert_eq!(
+            notify_events(&session),
+            [("Claude".into(), "Allow edit?".into())]
+        );
+    }
+
+    #[test]
+    fn other_program_states_do_not_alert() {
+        let session = spawn_shell();
+        session.focus(false);
+        session.set_visibility(Visibility::Listed);
+        type_line(
+            &session,
+            "printf '\\033]7501;state=working\\a'; printf '\\033]7501;state=done\\a'; echo one",
+        );
+        session.set_visibility(Visibility::Shown);
+        wait_for_line(&session, "one");
+        assert_eq!(notify_events(&session), []);
     }
 
     #[test]

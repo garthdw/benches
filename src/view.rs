@@ -12,6 +12,7 @@ use crate::app::{
 };
 use crate::input::{self, focus_on_press, pointer_phase, send_pointer};
 use crate::palette::{self, open_palette};
+use crate::protocol::{Progress, ProgressKind};
 use crate::render;
 use crate::session::{Attention, Session};
 use crate::terminal_input::{PointerPhase, WheelInput};
@@ -183,6 +184,33 @@ fn attention_dot(accent: Color, attention: Attention) -> Option<El> {
     }
 }
 
+const PROGRESS_WIDTH: f32 = 28.0;
+
+fn progress_bar(theme: &tok::Theme, accent: Color, progress: Option<Progress>) -> Option<El> {
+    let progress = progress?;
+    let (color, width) = match progress.kind {
+        ProgressKind::Normal => (accent, f32::from(progress.percent)),
+        ProgressKind::Error => (
+            rune::color::oklch(0.66, 0.2, 25.0),
+            f32::from(progress.percent),
+        ),
+        ProgressKind::Paused => (
+            rune::color::oklch(0.8, 0.15, 85.0),
+            f32::from(progress.percent),
+        ),
+        ProgressKind::Indeterminate => (theme.text_secondary, 100.0),
+    };
+    Some(
+        row()
+            .w(PROGRESS_WIDTH)
+            .h(4.0)
+            .radius(2.0)
+            .clip_rounded(2.0)
+            .fill(rune::color::oklcha(0.5, 0.0, 0.0, 0.3))
+            .child(el().w(PROGRESS_WIDTH * width / 100.0).h_full().fill(color)),
+    )
+}
+
 fn status_dot(theme: &tok::Theme, status: &Status) -> El {
     dot(match status {
         Status::Running => rune::color::oklch(0.74, 0.17, 150.0),
@@ -304,6 +332,7 @@ fn tab_strip(state: &State, theme: &tok::Theme, accent: Color, titlebar_inset: f
                     index == project.active_tab,
                     attention_dot(accent, tab.session.attention()),
                 )
+                .children(progress_bar(theme, accent, tab.progress))
                 .max_w(TAB_MAX_WIDTH)
                 .on_press(move |state: &mut State| state.workspace.select_tab(index))
             })
@@ -461,7 +490,7 @@ fn focus_overlays(state: &State, theme: &tok::Theme) -> Vec<El> {
     overlays
 }
 
-fn tray_bar(project: &Project, theme: &tok::Theme) -> Option<El> {
+fn tray_bar(project: &Project, theme: &tok::Theme, accent: Color) -> Option<El> {
     (!project.tray.is_empty()).then(|| {
         let chips = project.tray.iter().enumerate().map(|(index, tab)| {
             let key = format!("chip-{index}");
@@ -473,6 +502,7 @@ fn tray_bar(project: &Project, theme: &tok::Theme) -> Option<El> {
                 open,
                 Some(status_dot(theme, &tab.status)),
             )
+            .children(progress_bar(theme, accent, tab.progress))
             .max_w(TAB_MAX_WIDTH)
             .on_press(move |state: &mut State| state.workspace.toggle_drawer(index))
             .on_secondary_press(move |_: &mut State, _, tx: &mut Tx| {
@@ -625,7 +655,7 @@ pub(crate) fn view(state: &State, cx: &mut Cx<State>) -> El {
     } else {
         overlays.extend(focus_overlays);
     }
-    let tray_bar = project.and_then(|project| tray_bar(project, &theme));
+    let tray_bar = project.and_then(|project| tray_bar(project, &theme, accent));
     let drawer =
         project.map(|project| drawer(state, &theme, project, tray_bar.is_some(), drawer_overlays));
     let overlay = project
