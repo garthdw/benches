@@ -120,6 +120,11 @@ pub(crate) const SCENES: &[Scene] = &[
         state.palette.edit = TextEdit::new("lz");
         state.palette.open = true;
     }),
+    ("palette-commands", |state| {
+        show_workspace_scene(state);
+        state.palette.edit = TextEdit::new("zoom");
+        state.palette.open = true;
+    }),
     ("palette-error", |state| {
         show_workspace_scene(state);
         add_scene_tray(state);
