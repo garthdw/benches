@@ -11,6 +11,7 @@ mod session;
 mod sprite;
 #[cfg(test)]
 mod test_support;
+mod windows;
 mod workspace;
 
 use std::path::{Path, PathBuf};
@@ -23,16 +24,17 @@ use rune::tok;
 use rune::{
     App, AppSpec, ClipboardContent, Color, Cursor, Cx, Drag, El, FileDialogOptions, Icon, Ime, Key,
     KeyEvent, Live, Mods, Phase, PointerButton, PointerEvent, PopupItem, PopupMenu, TextEdit, Tx,
-    Waker, WheelEvent, WindowSpec, col, effect, el, icon, row, text, text_input,
+    Waker, WheelEvent, col, effect, el, icon, row, text, text_input,
 };
 
 use anyhow::Context;
 use keymap::{COMMANDS, Command, pressed, shortcut};
 use session::LogErr;
 use session::{Attention, Event, Grid, PointerInput, PointerPhase, Retarget, Session, WheelInput};
-use workspace::{
-    Fleet, MAIN_WINDOW, Project, SavedWorkspace, Slot, Status, Tab, WindowId, Workspace,
+use windows::{
+    Fleet, MAIN_WINDOW, WindowId, adopt_projects, move_to_new_window, on_close, on_quit, torn_off,
 };
+use workspace::{Project, SavedWorkspace, Slot, Status, Tab, Workspace};
 
 const TERMINAL_MARK: u32 = 1;
 const DRAWER_MARK: u32 = 2;
@@ -45,7 +47,6 @@ const OVERLAY_PADDING: f32 = 6.0;
 const DOT: f32 = 7.0;
 /// Wider than the traffic lights, which sit over the sidebar.
 const SIDEBAR_WIDTH: f32 = 200.0;
-const TEAR_OFF_DISTANCE: f32 = 48.0;
 /// The sidebar's top padding too, so the traffic lights clear the first project.
 const TAB_STRIP_HEIGHT: f32 = 36.0;
 const TAB_MAX_WIDTH: f32 = 220.0;
@@ -59,8 +60,6 @@ static SIDEBAR_ICON: Icon = Icon {
     body: r#"<rect x="3" y="4.5" width="18" height="15" rx="3" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="M9.5 4.5v15" stroke="currentColor" stroke-width="1.6"/>"#,
 };
 const PALETTE_TOP: f32 = 96.0;
-/// Longer than `terminate`'s grace before it kills, so stubborn processes are killed too.
-const QUIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 /// Waits for typing to pause, as the lookup starts a login shell.
 const JUMP_DEBOUNCE: Duration = Duration::from_millis(250);
 const JUMP_TIMEOUT: Duration = Duration::from_secs(5);
@@ -323,31 +322,6 @@ fn save_layout(state: &State) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Closing the main window quits, as it did when it was the only one. Closing another gives its
-/// projects, still running, back to the main window.
-fn on_close(state: &mut State, tx: &mut Tx) {
-    if rune::quitting() {
-        return;
-    }
-    if state.window == MAIN_WINDOW {
-        tx.quit();
-    } else {
-        merge_into_main(state);
-    }
-}
-
-fn merge_into_main(state: &mut State) {
-    while let Some(project) = state.workspace.take_project(0) {
-        state.fleet.send(MAIN_WINDOW, project);
-    }
-}
-
-/// Saves the layout, then ends every process so none outlives the app.
-fn on_quit(state: &mut State, _: &mut Tx) {
-    save_layout(state).log_err("save layout");
-    state.workspace.shutdown(QUIT_TIMEOUT);
-}
-
 fn tray_action(state: &mut State, index: usize, picked: Option<&str>) {
     match picked {
         Some("restart") => restart_tray(state, index),
@@ -457,48 +431,6 @@ fn open_project(state: &mut State, root: PathBuf) {
         .map(|spec| state.spawn_tab(&spec.title, spec.command.as_deref(), &root))
         .collect();
     state.workspace.add_project(Project::new(root, tabs));
-}
-
-/// Hands project `index` to a new window, with its processes still running. A window's last
-/// project stays, as it would leave that window empty.
-fn move_to_new_window(state: &mut State, index: usize, position: Option<(i32, i32)>) {
-    if state.workspace.projects.len() < 2 {
-        return;
-    }
-    let Some(project) = state.workspace.take_project(index) else {
-        return;
-    };
-    let window = state.fleet.reserve_window();
-    state.fleet.send(window, project);
-    let (config, paths) = (state.config.clone(), state.paths.clone());
-    let app = window_app(&state.fleet, window, move |state| {
-        state.config = config;
-        state.paths = paths;
-        state.started = true;
-    });
-    let mut spec = WindowSpec::from_app(format!("agentd-{window}"), app);
-    spec.options.position = position;
-    rune::open_window(spec);
-}
-
-/// Whether a project dragged from the sidebar was let go far enough outside it, or off the
-/// window's top or left edge, to leave for a window of its own.
-fn torn_off([x, y]: [f32; 2], sidebar_width: f32) -> bool {
-    x < 0.0 || y < 0.0 || x > sidebar_width + TEAR_OFF_DISTANCE
-}
-
-/// Takes the projects other windows handed over, pointing their sessions at this window.
-fn adopt_projects(state: &mut State) -> bool {
-    let projects = state.fleet.take(state.window);
-    let adopted = !projects.is_empty();
-    for mut project in projects {
-        let waker = state.window_waker();
-        for retarget in project.tabs_mut().filter_map(|tab| tab.retarget.as_ref()) {
-            retarget.set(waker.clone());
-        }
-        state.workspace.add_project(project);
-    }
-    adopted
 }
 
 fn pick_folder(tx: &mut Tx, replace_active: bool) {
@@ -3466,79 +3398,6 @@ mod tests {
     }
 
     #[test]
-    fn a_window_keeps_its_last_project() {
-        let mut state = State::default();
-        state
-            .workspace
-            .add_project(Project::new("/tmp".into(), vec![]));
-        move_to_new_window(&mut state, 0, None);
-        assert_eq!(state.workspace.projects.len(), 1);
-        assert!(state.fleet.take(1).is_empty());
-    }
-
-    #[test]
-    fn each_window_shows_only_its_own_active_session() {
-        let mut runtime = workspace_runtime();
-        move_to_new_window(&mut runtime.state, 1, None);
-        let mut second = second_window(&runtime.state.fleet, 1);
-        second.frame(3.0 / 60.0);
-        let shown = |runtime: &Runtime<State>| {
-            runtime
-                .state
-                .workspace
-                .active_session()
-                .map(|session| session.visibility())
-        };
-        assert_eq!(shown(&runtime), Some(session::Visibility::Shown));
-        assert_eq!(shown(&second), Some(session::Visibility::Shown));
-    }
-
-    #[test]
-    fn a_moved_session_keeps_running_and_wakes_its_new_window() {
-        let (first_waker, first_wakes) = counting_waker();
-        let mut state = State {
-            waker: Some(first_waker),
-            ..State::default()
-        };
-        state
-            .workspace
-            .add_project(Project::new("/tmp".into(), vec![]));
-        open_tab(&mut state, "slow", Some("sh -c 'sleep 0.5; echo moved'"));
-        state
-            .workspace
-            .add_project(Project::new("/dev/site".into(), vec![]));
-        state.workspace.select_project(0);
-        move_to_new_window(&mut state, 0, None);
-
-        let (second_waker, second_wakes) = counting_waker();
-        let mut second = second_window(&state.fleet, 1);
-        second.state.waker = Some(second_waker);
-        second.frame(1.0 / 60.0);
-        assert_eq!(second.state.workspace.projects.len(), 1);
-        let before = first_wakes.load(Ordering::Relaxed);
-
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
-        let mut frame = 1.0;
-        while !second
-            .state
-            .workspace
-            .active_session()
-            .is_some_and(|session| {
-                let grid = session.grid();
-                let text: String = grid.cells.iter().map(|cell| cell.character).collect();
-                text.contains("moved")
-            })
-        {
-            assert!(std::time::Instant::now() < deadline, "timed out");
-            std::thread::sleep(std::time::Duration::from_millis(20));
-            frame += 1.0;
-            second.frame(frame / 60.0);
-        }
-        assert!(second_wakes.load(Ordering::Relaxed) > 0);
-        assert_eq!(first_wakes.load(Ordering::Relaxed), before);
-    }
-
-    #[test]
     fn a_project_menu_moves_it_to_a_new_window() {
         let mut runtime = workspace_runtime();
         let (x, y) = runtime.find("project-1").unwrap();
@@ -3549,39 +3408,6 @@ mod tests {
         runtime.frame(2.0 / 60.0);
         assert_eq!(runtime.state.workspace.projects.len(), 1);
         assert_eq!(runtime.state.fleet.take(1).len(), 1);
-    }
-
-    #[test]
-    fn closing_a_window_gives_its_running_projects_back_to_the_main_window() {
-        let (main_waker, _) = counting_waker();
-        let mut main = State {
-            waker: Some(main_waker),
-            ..State::default()
-        };
-        main.workspace
-            .add_project(Project::new("/dev/site".into(), vec![]));
-        let mut second = State {
-            fleet: main.fleet.clone(),
-            window: 1,
-            started: true,
-            ..State::default()
-        };
-        second
-            .workspace
-            .add_project(Project::new("/tmp".into(), vec![]));
-        open_tab(&mut second, "slow", Some("sh -c 'sleep 0.5; echo back'"));
-        let session = second.workspace.active_session().map(Session::id);
-        merge_into_main(&mut second);
-        assert!(second.workspace.projects.is_empty());
-
-        assert!(adopt_projects(&mut main));
-        assert_eq!(main.workspace.projects.len(), 2);
-        assert_eq!(main.workspace.active_session().map(Session::id), session);
-        assert_eq!(
-            main.workspace.active_session().map(Session::visibility),
-            Some(session::Visibility::Shown)
-        );
-        assert!(!adopt_projects(&mut main));
     }
 
     #[test]
@@ -3680,12 +3506,5 @@ mod tests {
         drag_project(&mut runtime, "project-1", (SIDEBAR_WIDTH - 20.0, 300.0));
         assert_eq!(runtime.state.workspace.projects.len(), 2);
         assert!(runtime.state.fleet.take(1).is_empty());
-    }
-
-    #[test]
-    fn a_project_released_off_the_windows_edge_is_torn_off() {
-        assert!(torn_off([-4.0, 100.0], SIDEBAR_WIDTH));
-        assert!(torn_off([40.0, -4.0], SIDEBAR_WIDTH));
-        assert!(!torn_off([SIDEBAR_WIDTH + 10.0, 100.0], SIDEBAR_WIDTH));
     }
 }
