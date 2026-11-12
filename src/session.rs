@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use crossbeam_channel::{Receiver, Sender, bounded, unbounded};
+use libghostty_vt::effect::ClipboardLocation;
 use nix::pty::{Winsize, openpty};
 use nix::sys::select::{FdSet, select};
 use nix::sys::time::{TimeVal, TimeValLike};
@@ -235,6 +236,8 @@ impl Session {
             events: events_tx,
             waker,
             theme: config.theme.clone(),
+            clipboard_read: config.clipboard_read,
+            clipboard_write: config.clipboard_write,
         };
         thread::spawn(move || {
             if let Err(error) = actor.run() {
@@ -375,6 +378,10 @@ impl Session {
 
     pub fn paste(&self, text: String, allow_unsafe: bool) {
         self.send(Msg::Paste { text, allow_unsafe });
+    }
+
+    pub fn clipboard_reply(&self, location: ClipboardLocation, text: Option<String>) {
+        self.send(Msg::ClipboardReply { location, text });
     }
 
     /// Ends the process but keeps its last screen.
@@ -540,6 +547,44 @@ mod tests {
             },
         );
         assert_eq!(refused, text);
+    }
+
+    #[test]
+    fn a_clipboard_read_is_answered_once_the_ui_replies() {
+        // The tty echoes what `cat` is sent, so the reply shows on the grid.
+        let session = Session::spawn(
+            Some(r#"sh -c 'printf "\\033]52;c;?\\007"; cat'"#),
+            Path::new("/tmp"),
+            &Config::default(),
+            Arc::new(|| {}),
+        )
+        .unwrap();
+        let location = wait_until(
+            Duration::from_secs(5),
+            || "the read never reached the UI".to_owned(),
+            || match session.next_event() {
+                Some(Event::ClipboardRead {
+                    location,
+                    ask: true,
+                }) => Some(location),
+                _ => None,
+            },
+        );
+        session.clipboard_reply(location, Some("hi".to_owned()));
+        wait_until(
+            Duration::from_secs(5),
+            || {
+                format!(
+                    "the reply never reached the program: {:#?}",
+                    session.grid().lines()
+                )
+            },
+            || {
+                (session.grid().lines().iter())
+                    .any(|line| line.contains("]52;c;aGk="))
+                    .then_some(())
+            },
+        );
     }
 
     #[test]

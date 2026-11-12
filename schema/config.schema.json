@@ -1,5 +1,14 @@
 {
   "$defs": {
+    "ClipboardAccess": {
+      "description": "Ghostty's `clipboard-read` and `clipboard-write` values.",
+      "enum": [
+        "allow",
+        "deny",
+        "ask"
+      ],
+      "type": "string"
+    },
     "FontFile": {
       "additionalProperties": false,
       "properties": {
@@ -85,6 +94,28 @@
         "boolean",
         "null"
       ]
+    },
+    "clipboard-read": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/ClipboardAccess"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "Whether programs may read the clipboard through OSC 52: `allow`, `deny` or `ask`\n(the default). Falls back to Ghostty's setting."
+    },
+    "clipboard-write": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/ClipboardAccess"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "Whether programs may set the clipboard through OSC 52: `allow` (the default), `deny` or\n`ask`. Falls back to Ghostty's setting."
     },
     "font": {
       "$ref": "#/$defs/FontFile",
