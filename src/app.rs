@@ -80,6 +80,9 @@ pub(crate) struct State {
     pub(crate) find: Find,
     pub(crate) sidebar_hidden: bool,
     pub(crate) config: config::Config,
+    /// Why config.toml wasn't applied, at launch or on the last reload; shown until a reload
+    /// succeeds or it is dismissed.
+    pub(crate) config_error: Option<String>,
     /// Points added to the configured font size by ⌘= and ⌘-; never written to disk.
     pub(crate) font_zoom: f64,
     /// Unset in tests and scenes, which then read and write no files.
