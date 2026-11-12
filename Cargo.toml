@@ -11,6 +11,7 @@ rune = { git = "https://github.com/anomalyco/rune", rev = "7dfaa8fb1fa8281e6e2cc
 libghostty-vt = { git = "https://github.com/Uzaaft/libghostty-rs", rev = "cd4d497e8c698b27054a677ce19d1bd1a1a4d8bf" }
 wgpu = { version = "~30.0.1", default-features = false }
 bytemuck = { version = "1", features = ["derive"] }
+base64 = "0.22"
 crossbeam-channel = "0.5"
 libc = "0.2"
 nix = { version = "0.31", features = ["term", "fs", "signal", "poll", "hostname"] }

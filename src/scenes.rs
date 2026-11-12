@@ -2,6 +2,8 @@ use std::path::PathBuf;
 
 use rune::TextEdit;
 
+use libghostty_vt::effect::ClipboardLocation;
+
 use crate::app::{Confirm, State};
 use crate::grid::Grid;
 use crate::jump;
@@ -173,6 +175,14 @@ pub(crate) const SCENES: &[Scene] = &[
         grid.password_input = true;
         show_tab(state, Tab::new("shell", Session::fixture(grid)));
         state.workspace.set_window_focused(true);
+    }),
+    ("clipboard-read", |state| {
+        show_workspace_scene(state);
+        let session = state.session().map_or(0, Session::id);
+        state.confirms.push(Confirm::ClipboardRead {
+            session,
+            location: ClipboardLocation::Standard,
+        });
     }),
     ("empty", isolate_scene),
     ("collapsed", |state| {
