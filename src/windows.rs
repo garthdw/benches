@@ -70,6 +70,10 @@ impl Fleet {
         }
     }
 
+    pub fn unregister(&self, window: WindowId) {
+        self.0.borrow_mut().entries.remove(&window);
+    }
+
     pub fn send(&self, window: WindowId, project: Project) {
         let waker = {
             let mut windows = self.0.borrow_mut();
@@ -149,6 +153,7 @@ fn merge_into_main(state: &mut State) {
     while let Some(project) = state.workspace.take_project(0) {
         state.fleet.send(MAIN_WINDOW, project);
     }
+    state.fleet.unregister(state.window);
 }
 
 /// Saves the layout, then ends every process so none outlives the app.
@@ -256,6 +261,7 @@ mod tests {
     use crate::test_support::*;
     use crate::view::SIDEBAR_WIDTH;
     use rune::Runtime;
+    use std::cell::Cell;
     use std::sync::atomic::Ordering;
 
     #[test]
@@ -434,6 +440,23 @@ mod tests {
             Some(Visibility::Shown)
         );
         assert!(!adopt_projects(&mut main));
+    }
+
+    #[test]
+    fn a_closed_window_is_no_longer_revealed() {
+        let mut closed = State {
+            window: 1,
+            ..State::default()
+        };
+        let revealed = Rc::new(Cell::new(false));
+        closed.fleet.on_reveal(1, {
+            let revealed = revealed.clone();
+            move |_| revealed.set(true)
+        });
+        merge_into_main(&mut closed);
+
+        closed.fleet.reveal(0);
+        assert!(!revealed.get());
     }
 
     #[test]
