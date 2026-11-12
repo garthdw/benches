@@ -5,6 +5,8 @@ use anyhow::{Context, Result, bail};
 use libghostty_vt::color::Rgb;
 use schemars::JsonSchema;
 use serde::Deserialize;
+use serde::de::IntoDeserializer;
+use serde::de::value::Error as ValueError;
 
 use crate::LogErr;
 use crate::constraint::Modifier;
@@ -32,6 +34,17 @@ pub struct Config {
     /// `notify-on-command-finish` and `-after`: how long a command must run before finishing out
     /// of sight marks its tab for attention; `None` never does.
     pub command_finish_after: Option<Duration>,
+    pub clipboard_read: ClipboardAccess,
+    pub clipboard_write: ClipboardAccess,
+}
+
+/// Ghostty's `clipboard-read` and `clipboard-write` values.
+#[derive(Clone, Copy, Debug, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ClipboardAccess {
+    Allow,
+    Deny,
+    Ask,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -109,6 +122,8 @@ impl Default for Config {
             jump_command: None,
             auto_secure_input: true,
             command_finish_after: Some(DEFAULT_COMMAND_FINISH_AFTER),
+            clipboard_read: ClipboardAccess::Ask,
+            clipboard_write: ClipboardAccess::Allow,
         }
     }
 }
@@ -144,6 +159,14 @@ struct File {
     /// Ghostty's `notify-on-command-finish-after`, then `5s`.
     #[serde(rename = "notify-on-command-finish-after")]
     notify_on_command_finish_after: Option<String>,
+    /// Whether programs may read the clipboard through OSC 52: `allow`, `deny` or `ask`
+    /// (the default). Falls back to Ghostty's setting.
+    #[serde(rename = "clipboard-read")]
+    clipboard_read: Option<ClipboardAccess>,
+    /// Whether programs may set the clipboard through OSC 52: `allow` (the default), `deny` or
+    /// `ask`. Falls back to Ghostty's setting.
+    #[serde(rename = "clipboard-write")]
+    clipboard_write: Option<ClipboardAccess>,
 }
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
@@ -284,6 +307,10 @@ fn default_config_text() -> String {
          # it must have run, as in Ghostty; unset uses Ghostty's, then `unfocused` and 5s.\n\
          # notify-on-command-finish = \"never\"\n\
          # notify-on-command-finish-after = \"30s\"\n\
+         # Whether programs may read or set the clipboard through OSC 52: \"allow\", \"deny\" or\n\
+         # \"ask\". Unset uses Ghostty's, then \"ask\" for reads and \"allow\" for writes.\n\
+         # clipboard-read = \"ask\"\n\
+         # clipboard-write = \"allow\"\n\
          \n\
          [font]\n\
          # family = {family}\n\
@@ -328,6 +355,18 @@ impl Config {
         let defaults = Config::default();
         let ghostty_size = ghostty_value("font-size")
             .and_then(|size| size.parse::<f64>().log_err("ghostty font-size"));
+        let clipboard = |setting: Option<ClipboardAccess>, key: &str, default| {
+            setting
+                .or_else(|| {
+                    ghostty_value(key).and_then(|value| {
+                        ClipboardAccess::deserialize(
+                            IntoDeserializer::<ValueError>::into_deserializer(value.as_str()),
+                        )
+                        .log_err(key)
+                    })
+                })
+                .unwrap_or(default)
+        };
         let theme = file
             .theme
             .or_else(|| ghostty_value("theme"))
@@ -388,6 +427,16 @@ impl Config {
                     .or_else(|| ghostty_value("notify-on-command-finish")),
                 file.notify_on_command_finish_after
                     .or_else(|| ghostty_value("notify-on-command-finish-after")),
+            ),
+            clipboard_read: clipboard(
+                file.clipboard_read,
+                "clipboard-read",
+                defaults.clipboard_read,
+            ),
+            clipboard_write: clipboard(
+                file.clipboard_write,
+                "clipboard-write",
+                defaults.clipboard_write,
             ),
         }
     }
@@ -625,6 +674,31 @@ mod tests {
             adjust(Some("[font]\nadjust-icon-height = \"big\"\n"), None),
             None
         );
+    }
+
+    #[test]
+    fn clipboard_access_defaults_to_asking_for_reads_and_allowing_writes() {
+        let (_root, paths) = paths(None, None);
+        let config = Config::load(&paths);
+        assert_eq!(config.clipboard_read, ClipboardAccess::Ask);
+        assert_eq!(config.clipboard_write, ClipboardAccess::Allow);
+    }
+
+    #[test]
+    fn clipboard_access_comes_from_config_toml_then_ghostty() {
+        let (_root, paths) = paths(
+            Some("clipboard-read = \"allow\"\n"),
+            Some("clipboard-read = deny\nclipboard-write = ask\n"),
+        );
+        let config = Config::load(&paths);
+        assert_eq!(config.clipboard_read, ClipboardAccess::Allow);
+        assert_eq!(config.clipboard_write, ClipboardAccess::Ask);
+    }
+
+    #[test]
+    fn an_unknown_ghostty_clipboard_value_falls_back_to_the_default() {
+        let (_root, paths) = paths(None, Some("clipboard-read = sometimes\n"));
+        assert_eq!(Config::load(&paths).clipboard_read, ClipboardAccess::Ask);
     }
 
     #[test]

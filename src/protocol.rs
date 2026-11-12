@@ -1,5 +1,7 @@
 use std::process::ExitStatus;
 
+use libghostty_vt::effect::ClipboardLocation;
+
 use crate::grid::Surface;
 use crate::terminal_input::{KeyInput, PointerInput, PointerPhase, WheelInput};
 
@@ -22,6 +24,12 @@ pub(crate) enum Msg {
         text: String,
         allow_unsafe: bool,
     },
+    /// The answer to `Event::ClipboardRead`; `None` is a refusal, which the program sees as an
+    /// empty clipboard.
+    ClipboardReply {
+        location: ClipboardLocation,
+        text: Option<String>,
+    },
     Resize(Surface),
     Visibility(Visibility),
     Stop,
@@ -30,6 +38,17 @@ pub(crate) enum Msg {
 /// Sent from the actor for the UI to pick up in `poll`.
 pub enum Event {
     Copied(String),
+    /// A program set the clipboard (OSC 52); `ask` is whether the user must agree first.
+    ClipboardWrite {
+        text: String,
+        ask: bool,
+    },
+    /// A program wants the clipboard (OSC 52 `?`); the actor holds its reply until
+    /// `Msg::ClipboardReply`.
+    ClipboardRead {
+        location: ClipboardLocation,
+        ask: bool,
+    },
     PasteRejected(String),
     /// The program's title (OSC 0 or 2); empty when it clears it.
     Title(String),
