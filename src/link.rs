@@ -14,16 +14,25 @@ pub fn openable(uri: &str) -> bool {
 /// Arguments for `/usr/bin/open`. A file is revealed in Finder rather than opened, because
 /// opening would launch an `.app` or `.command` that program output merely named.
 pub fn open_args(uri: &str) -> Vec<String> {
-    let Some(rest) = uri
+    file_path(uri).map_or_else(|| vec![uri.to_owned()], |path| vec!["-R".to_owned(), path])
+}
+
+/// The path of a `file://` URI, without its host such as `localhost`.
+pub fn file_path(uri: &str) -> Option<String> {
+    let rest = uri
         .get(..7)
         .filter(|scheme| scheme.eq_ignore_ascii_case("file://"))
-        .and_then(|_| uri.get(7..))
-    else {
-        return vec![uri.to_owned()];
-    };
-    // Skips a host such as `localhost`.
-    let path = &rest[rest.find('/').unwrap_or(rest.len())..];
-    vec!["-R".to_owned(), percent_decode(path)]
+        .and_then(|_| uri.get(7..))?;
+    Some(percent_decode(
+        &rest[rest.find('/').unwrap_or(rest.len())..],
+    ))
+}
+
+/// The directory a program reported with OSC 7 (a `file://` URI) or OSC 9;9 and 1337 (a bare path).
+pub fn reported_directory(reported: &[u8]) -> Option<std::path::PathBuf> {
+    let reported = std::str::from_utf8(reported).ok()?;
+    let path = file_path(reported).unwrap_or_else(|| reported.to_owned());
+    path.starts_with('/').then(|| path.into())
 }
 
 fn percent_decode(text: &str) -> String {
@@ -87,6 +96,23 @@ pub fn url_at(row: &[char], column: usize) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_reported_directory_is_decoded_and_hostless() {
+        let directory = |reported: &str| reported_directory(reported.as_bytes());
+        let path = |path: &str| Some(std::path::PathBuf::from(path));
+        assert_eq!(
+            directory("file://host/Users/me/My%20Dir"),
+            path("/Users/me/My Dir")
+        );
+        assert_eq!(directory("file:///tmp/caf%C3%A9"), path("/tmp/café"));
+        assert_eq!(directory("file://localhost/"), path("/"));
+        assert_eq!(directory("/bare/path"), path("/bare/path"));
+        assert_eq!(directory("file://host"), None);
+        assert_eq!(directory("https://example.com/x"), None);
+        assert_eq!(directory(""), None);
+        assert_eq!(reported_directory(b"file:///\xff"), None);
+    }
 
     fn at(text: &str, needle: &str) -> Option<String> {
         let row: Vec<char> = text.chars().collect();

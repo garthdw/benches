@@ -26,6 +26,8 @@ pub struct Config {
     pub jump_command: Option<String>,
     /// `auto-secure-input`: turn secure keyboard entry on while a program reads a password.
     pub auto_secure_input: bool,
+    /// Whether new fish shells are started with prompt marks and directory reports.
+    pub shell_integration: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -102,6 +104,7 @@ impl Default for Config {
             ],
             jump_command: None,
             auto_secure_input: true,
+            shell_integration: true,
         }
     }
 }
@@ -128,6 +131,10 @@ struct File {
     /// Ghostty's `macos-auto-secure-input`, then on.
     #[serde(rename = "auto-secure-input")]
     auto_secure_input: Option<bool>,
+    /// `none` starts shells as they are; anything else injects shell integration, which makes
+    /// fish report its prompts and directory. Falls back to Ghostty's setting.
+    #[serde(rename = "shell-integration")]
+    shell_integration: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
@@ -264,6 +271,9 @@ fn default_config_text() -> String {
          # Turn on secure keyboard entry while a program reads a password; unset uses Ghostty's\n\
          # `macos-auto-secure-input`, then true.\n\
          # auto-secure-input = false\n\
+         # `none` starts shells as they are, without prompt marks or directory reports; unset uses\n\
+         # Ghostty's `shell-integration`.\n\
+         # shell-integration = \"none\"\n\
          \n\
          [font]\n\
          # family = {family}\n\
@@ -363,6 +373,10 @@ impl Config {
                         .and_then(|value| value.parse().log_err("macos-auto-secure-input"))
                 })
                 .unwrap_or(defaults.auto_secure_input),
+            shell_integration: file
+                .shell_integration
+                .or_else(|| ghostty_value("shell-integration"))
+                .is_none_or(|value| value != "none"),
         }
     }
 }
@@ -532,6 +546,19 @@ mod tests {
                 }
             )]
         );
+    }
+
+    #[test]
+    fn shell_integration_is_on_unless_config_toml_or_ghostty_says_none() {
+        let enabled = |config, ghostty| Config::load(&paths(config, ghostty).1).shell_integration;
+        assert!(enabled(None, None));
+        assert!(!enabled(None, Some("shell-integration = none")));
+        assert!(enabled(None, Some("shell-integration = detect")));
+        assert!(!enabled(Some("shell-integration = \"none\""), None));
+        assert!(enabled(
+            Some("shell-integration = \"detect\""),
+            Some("shell-integration = none")
+        ));
     }
 
     #[test]

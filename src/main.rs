@@ -16,6 +16,7 @@ mod render;
 mod scenes;
 mod secure_input;
 mod session;
+mod shell_integration;
 mod sprite;
 mod terminal_input;
 #[cfg(test)]
