@@ -97,32 +97,32 @@ impl TerminalSource for State {
         (&self.config.font, self.font_size())
     }
 
-    fn show(&self, mark: u32, surface: Surface) -> Option<&Session> {
+    fn resize(&self, mark: u32, surface: Surface) {
         // Hidden tabs share the visible area, as closed tray processes share the drawer's, so they are sized too.
         let workspace = &self.workspace;
         match mark {
-            OVERLAY_MARK => {
-                workspace
-                    .overlay_sessions()
-                    .for_each(|session| session.resize(surface));
-                workspace.overlay_session()
-            }
-            DRAWER_MARK => {
-                workspace
-                    .tray_sessions()
-                    .for_each(|session| session.resize(surface));
+            OVERLAY_MARK => workspace
+                .overlay_sessions()
+                .for_each(|session| session.resize(surface)),
+            DRAWER_MARK => workspace
+                .tray_sessions()
+                .for_each(|session| session.resize(surface)),
+            _ => workspace
+                .tab_sessions()
+                .for_each(|session| session.resize(surface)),
+        }
+    }
+
+    fn drawn_session(&self, mark: u32) -> Option<&Session> {
+        let workspace = &self.workspace;
+        match mark {
+            OVERLAY_MARK => workspace.overlay_session(),
+            DRAWER_MARK => workspace
+                .project()
                 // Not `drawer_session`, which is gone once closing starts, so the drawer slides out showing its process.
-                workspace
-                    .project()
-                    .and_then(|project| project.tray.get(project.drawer))
-                    .map(|tab| &tab.session)
-            }
-            _ => {
-                workspace
-                    .tab_sessions()
-                    .for_each(|session| session.resize(surface));
-                workspace.active_session()
-            }
+                .and_then(|project| project.tray.get(project.drawer))
+                .map(|tab| &tab.session),
+            _ => workspace.active_session(),
         }
     }
 }

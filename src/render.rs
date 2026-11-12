@@ -673,8 +673,10 @@ fn quad_buffer(device: &wgpu::Device, size: u64) -> wgpu::Buffer {
 pub trait TerminalSource: 'static {
     /// The configured font and the size to draw it at, which zoom changes.
     fn font(&self) -> (&crate::config::FontConfig, f64);
-    /// Resizes every session sharing the area of effect `mark` to `surface`, then returns the one to draw.
-    fn show(&self, mark: u32, surface: Surface) -> Option<&Session>;
+    /// Resizes every session sharing the area of effect `mark` to `surface`.
+    fn resize(&self, mark: u32, surface: Surface);
+    /// The session to draw in the area of effect `mark`.
+    fn drawn_session(&self, mark: u32) -> Option<&Session>;
 }
 
 #[derive(Default)]
@@ -739,7 +741,8 @@ impl TerminalCompositor {
             scale: site.scale,
         };
         let surface = Surface::fit((rect[2], rect[3]), metrics);
-        let session = source.show(site.mark, surface);
+        source.resize(site.mark, surface);
+        let session = source.drawn_session(site.mark);
 
         let grid = session.map_or_else(Default::default, Session::grid);
         let built = (
