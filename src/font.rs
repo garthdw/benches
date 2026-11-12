@@ -332,6 +332,20 @@ fn shape(font: &CTFont, text: &str) -> Option<Shaped> {
     Some(shaped)
 }
 
+/// A glyph with any `rgb != alpha` pixel is colour, such as an emoji drawn through a constraint.
+fn glyph_kind(pixels: &[u8]) -> GlyphKind {
+    let is_color = pixels
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .any(|pixel| pixel[0] != pixel[3] || pixel[1] != pixel[3] || pixel[2] != pixel[3]);
+    if is_color {
+        GlyphKind::Color
+    } else {
+        GlyphKind::Coverage
+    }
+}
+
 impl Font {
     #[cfg(test)]
     pub fn new(family: &str, points: f64, scale: f32) -> Result<Self> {
@@ -461,16 +475,6 @@ impl Font {
         Some(context)
     }
 
-    /// Whether `character` is an icon rather than Powerline graphics, which sit flush against their neighbours.
-    pub fn is_icon(character: char) -> bool {
-        is_private_use(character) && !matches!(u32::from(character), 0xE0B0..=0xE0D7)
-    }
-
-    /// Whether `character` may use two cells when a blank follows: its constraint allows it.
-    pub fn spills(character: char) -> bool {
-        Constraint::of(character).is_some_and(|constraint| constraint.max_constraint_width > 1)
-    }
-
     /// Premultiplied RGBA for `text`, `cells * cell_width` by `cell_height` with the top row first.
     pub fn rasterize(
         &self,
@@ -520,7 +524,7 @@ impl Font {
                 CGContext::set_text_position(Some(&context), 0.0, 0.0);
                 // SAFETY: `line` and `context` are live, and `out` outlives the context.
                 unsafe { line.draw(&context) };
-                return Some(GlyphKind::Coverage);
+                return Some(glyph_kind(out));
             }
         }
         // SAFETY: null out-parameters are allowed when only the width is needed.
@@ -542,16 +546,7 @@ impl Font {
         CGContext::set_text_position(Some(&context), 0.0, 0.0);
         // SAFETY: `line` and `context` are live, and `out` outlives the context.
         unsafe { line.draw(&context) };
-        let is_color = out
-            .as_chunks::<4>()
-            .0
-            .iter()
-            .any(|pixel| pixel[0] != pixel[3] || pixel[1] != pixel[3] || pixel[2] != pixel[3]);
-        Some(if is_color {
-            GlyphKind::Color
-        } else {
-            GlyphKind::Coverage
-        })
+        Some(glyph_kind(out))
     }
 
     /// Whether `character` may be shaped with its neighbours. Only characters the main face draws
