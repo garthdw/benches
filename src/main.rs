@@ -1,3 +1,4 @@
+mod actor;
 mod app;
 mod config;
 mod constraint;
