@@ -4,8 +4,8 @@ use std::rc::Rc;
 
 use rune::{Tx, Waker, WindowSpec};
 
+use crate::LogErr;
 use crate::app::{State, save_layout, window_app};
-use crate::session::LogErr;
 use crate::workspace::{Project, SavedWorkspace};
 
 pub(crate) type WindowId = u32;
@@ -178,7 +178,8 @@ pub(crate) fn adopt_projects(state: &mut State) -> bool {
 mod tests {
     use super::*;
     use crate::app::open_tab;
-    use crate::session::{self, Session};
+    use crate::protocol::Visibility;
+    use crate::session::Session;
     use crate::test_support::*;
     use crate::view::SIDEBAR_WIDTH;
     use rune::Runtime;
@@ -208,8 +209,8 @@ mod tests {
                 .active_session()
                 .map(|session| session.visibility())
         };
-        assert_eq!(shown(&runtime), Some(session::Visibility::Shown));
-        assert_eq!(shown(&second), Some(session::Visibility::Shown));
+        assert_eq!(shown(&runtime), Some(Visibility::Shown));
+        assert_eq!(shown(&second), Some(Visibility::Shown));
     }
 
     #[test]
@@ -285,7 +286,7 @@ mod tests {
         assert_eq!(main.workspace.active_session().map(Session::id), session);
         assert_eq!(
             main.workspace.active_session().map(Session::visibility),
-            Some(session::Visibility::Shown)
+            Some(Visibility::Shown)
         );
         assert!(!adopt_projects(&mut main));
     }

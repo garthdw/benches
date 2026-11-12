@@ -4,6 +4,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
+use libghostty_vt::key::{Key as Vt, Mods as VtMods};
 use libghostty_vt::screen::Screen;
 use libghostty_vt::selection::gesture::{
     Autoscroll, AutoscrollTickEvent, DragEvent, Geometry, Gesture, PressEvent, ReleaseEvent,
@@ -11,13 +12,21 @@ use libghostty_vt::selection::gesture::{
 use libghostty_vt::terminal::{ClipboardMime, Mode, Point, PointCoordinate, ScrollViewport};
 use libghostty_vt::{Terminal, fmt, key, mouse, paste};
 
+use crate::LogErr;
 use crate::grid::{Scrollbar, Surface};
-use crate::input::KeyInput;
 use crate::link;
-use crate::session::LogErr;
 
 const AUTOSCROLL: Duration = Duration::from_millis(50);
 const MULTI_CLICK: Duration = Duration::from_millis(500);
+
+#[derive(Debug, PartialEq)]
+pub struct KeyInput {
+    pub key: Vt,
+    pub mods: VtMods,
+    pub consumed: VtMods,
+    pub text: Option<String>,
+    pub unshifted: char,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PointerPhase {
@@ -566,8 +575,8 @@ impl TerminalInput {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::grid::new_terminal;
     use crate::grid::{DEFAULT_BG, DEFAULT_FG, GridBuilder, Presentation, rgb};
-    use crate::session::new_terminal;
     use crate::test_support::{
         TEST_SURFACE, THEME_BLUE, THEME_RED, fractional_metrics, pointer_at, scrolled_terminal,
         wheel_by,
@@ -942,7 +951,7 @@ mod tests {
         );
     }
 
-    fn command_k() -> crate::input::KeyInput {
+    fn command_k() -> KeyInput {
         let command = rune::Mods {
             cmd: true,
             logo: true,

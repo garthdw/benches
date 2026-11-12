@@ -5,16 +5,7 @@ use rune::{Key, KeyEvent, Mods, Phase, PhysicalKeyCode as Code, Tx};
 use crate::app::State;
 use crate::grid::Grid;
 use crate::session::Session;
-use crate::terminal_input::{PointerInput, PointerPhase};
-
-#[derive(Debug, PartialEq)]
-pub struct KeyInput {
-    pub key: Vt,
-    pub mods: VtMods,
-    pub consumed: VtMods,
-    pub text: Option<String>,
-    pub unshifted: char,
-}
+use crate::terminal_input::{KeyInput, PointerInput, PointerPhase};
 
 pub fn vt_mods(mods: Mods) -> VtMods {
     let mut out = VtMods::empty();

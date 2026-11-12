@@ -7,9 +7,13 @@ use libghostty_vt::render::{
 };
 use libghostty_vt::screen::{CellContentTag, CellWide, Screen, cell};
 use libghostty_vt::style::{RgbColor, StyleColor, Underline};
+use libghostty_vt::terminal::Mode;
 use libghostty_vt::{RenderState, Terminal};
 
-use crate::session::{FRAME, LogErr, new_terminal};
+use crate::LogErr;
+use crate::config::Theme;
+
+pub(crate) const FRAME: Duration = Duration::from_millis(8);
 
 const SCROLLBAR_HOLD: Duration = Duration::from_secs(1);
 const SCROLLBAR_FADE: Duration = Duration::from_millis(200);
@@ -622,11 +626,35 @@ impl GridBuilder {
     }
 }
 
+pub(crate) fn new_terminal<'cb>(cols: u16, rows: u16) -> Result<Terminal<'static, 'cb>> {
+    let mut terminal = Terminal::new(cols, rows)?;
+    terminal
+        .set_scrollback_max_lines(Some(10_000))?
+        .set_terminfo_name("xterm-256color")?
+        .set_default_fg_color(Some(DEFAULT_FG))?
+        .set_default_bg_color(Some(DEFAULT_BG))?;
+    terminal.set_mode(Mode::GRAPHEME_CLUSTER, true)?;
+    Ok(terminal)
+}
+
+pub(crate) fn apply_theme(terminal: &mut Terminal<'static, '_>, theme: &Theme) -> Result<()> {
+    let mut palette = terminal.default_color_palette()?;
+    for &(index, color) in &theme.palette {
+        palette.0[usize::from(index)] = color;
+    }
+    terminal
+        .set_default_fg_color(Some(theme.foreground))?
+        .set_default_bg_color(Some(theme.background))?
+        .set_default_cursor_color(theme.cursor)?
+        .set_default_color_palette(Some(palette))?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::config::Theme;
-    use crate::session::apply_theme;
+
     use crate::test_support::{THEME_BLUE, THEME_RED, fractional_metrics, scrolled_terminal};
     use libghostty_vt::terminal::ScrollViewport;
 

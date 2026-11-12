@@ -6,6 +6,7 @@ use rune::{
     App, AppSpec, ClipboardContent, FileDialogOptions, Ime, Key, KeyEvent, Live, Mods, Tx, Waker,
 };
 
+use crate::LogErr;
 use crate::config;
 use crate::grid::{Grid, Surface};
 use crate::input::caret_rect;
@@ -13,9 +14,9 @@ use crate::keymap::{Command, pressed, shortcut};
 use crate::palette::{
     Action, Palette, open_palette, poll_creation, poll_jump, poll_worktrees, run_action,
 };
+use crate::protocol::Event;
 use crate::render::TerminalSource;
-use crate::session::LogErr;
-use crate::session::{Attention, Event, Retarget, Session};
+use crate::session::{Attention, Retarget, Session};
 use crate::view::{DRAWER_MARK, OVERLAY_MARK, view, window_title};
 use crate::windows::{
     Fleet, MAIN_WINDOW, WindowId, adopt_projects, move_to_new_window, on_close, on_quit,

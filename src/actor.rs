@@ -4,20 +4,25 @@ use std::process::Child;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
+use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use crossbeam_channel::{Receiver, Sender, never, select};
 use libghostty_vt::terminal::Mode;
 use libghostty_vt::{Terminal, focus, key};
+use nix::errno::Errno;
 use nix::pty::Winsize;
+use nix::sys::signal::{Signal, killpg};
+use nix::unistd::Pid;
 use rune::Waker;
 
+use crate::LogErr;
 use crate::config::Theme;
-use crate::grid::{Grid, GridBuilder, Presentation, ScrollbarFade, Surface};
-use crate::session::{
-    Event, FRAME, LogErr, Msg, Visibility, apply_theme, forget, new_terminal, terminate,
+use crate::grid::{
+    FRAME, Grid, GridBuilder, Presentation, ScrollbarFade, Surface, apply_theme, new_terminal,
 };
+use crate::protocol::{Event, Msg, Visibility};
 use crate::terminal_input::{TerminalInput, open_link, paste_text, selection_text};
 
 /// How long the size must hold before the program sees it, as each SIGWINCH makes inline TUIs reprint.
@@ -479,6 +484,37 @@ impl Publisher {
         }
         Ok(())
     }
+}
+
+fn signal_group(group: Pid, signal: Signal) {
+    if let Err(error) = killpg(group, signal)
+        && error != Errno::ESRCH
+    {
+        eprintln!("agentd: signal process group: {error}");
+    }
+}
+
+/// Call before reaping `Child`, which frees its pid for reuse.
+pub(crate) fn forget(pid: &Mutex<Option<i32>>) {
+    *pid.lock().unwrap_or_else(PoisonError::into_inner) = None;
+}
+
+pub(crate) fn terminate(child: &mut Child, pid: &Mutex<Option<i32>>) {
+    forget(pid);
+    // Also true once the actor has reaped the process, whose pid may have been reused.
+    if matches!(child.try_wait(), Ok(Some(_))) {
+        return;
+    }
+    let group = Pid::from_raw(child.id() as i32);
+    signal_group(group, Signal::SIGHUP);
+    for _ in 0..50 {
+        if matches!(child.try_wait(), Ok(Some(_))) {
+            return;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    signal_group(group, Signal::SIGKILL);
+    child.wait().log_err("wait for process");
 }
 
 #[cfg(test)]
