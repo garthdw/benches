@@ -1,14 +1,21 @@
 use std::collections::HashMap;
 use std::mem::size_of;
 use std::rc::Rc;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use bytemuck::{Pod, Zeroable, cast_slice};
+use crossbeam_channel::{Receiver, Sender, unbounded};
 use libghostty_vt::render::CursorVisualStyle;
 use libghostty_vt::style::Underline;
+use rune::Waker;
 use rune::color::srgb_decode;
 use rune::compose::{Compositor, DeviceKey, Frame};
 use rune::render::EffectSite;
 
+use crate::LogErr;
 use crate::constraint::{Constraint, is_graphics_element, is_symbol};
 use crate::font::{Font, FontStyle, GlyphKind, ShapedRun};
 use crate::grid::{Cell, Grid, Metrics, Scrollbar, Surface};
@@ -89,39 +96,256 @@ struct AtlasGlyph {
     kind: GlyphKind,
 }
 
+/// Two, as more slowed a CJK flood on a 6+2 core machine without shortening frames.
+const WORKERS: usize = 2;
+/// How long a frame waits for glyphs it asked for before drawing without them, so ordinary
+/// screens never show missing text while a screen of new glyphs can't stall every surface.
+const GLYPH_WAIT: Duration = Duration::from_millis(4);
+
+/// What a worker rasterises; `GlyphText` without its `Rc`, which can't leave the UI thread.
+enum JobText {
+    Character(char),
+    Cluster(String),
+    Shaped { run: String, index: u16 },
+    Underline(Underline),
+}
+
+impl From<&GlyphText> for JobText {
+    fn from(text: &GlyphText) -> Self {
+        match text {
+            GlyphText::Character(character) => Self::Character(*character),
+            GlyphText::Cluster(cluster) => Self::Cluster(cluster.clone()),
+            GlyphText::Shaped(cell) => Self::Shaped {
+                run: cell.run.to_string(),
+                index: cell.index,
+            },
+            GlyphText::Underline(underline) => Self::Underline(*underline),
+        }
+    }
+}
+
+struct Job {
+    id: u64,
+    text: JobText,
+    style: FontStyle,
+    cells: u32,
+}
+
+struct Rasterized {
+    id: u64,
+    kind: Option<GlyphKind>,
+    bitmap: Vec<u8>,
+}
+
+fn rasterize(
+    font: &Font,
+    text: &JobText,
+    style: FontStyle,
+    cells: u32,
+    out: &mut Vec<u8>,
+) -> Option<GlyphKind> {
+    let mut utf8 = [0; 4];
+    match text {
+        JobText::Character(character) => {
+            font.rasterize(character.encode_utf8(&mut utf8), style, cells, out)
+        }
+        JobText::Cluster(cluster) => font.rasterize(cluster, style, cells, out),
+        JobText::Shaped { run, index } => {
+            font.rasterize_shaped(run, style, usize::from(*index), out)
+        }
+        JobText::Underline(underline) => {
+            font.rasterize_underline(*underline, out);
+            Some(GlyphKind::Coverage)
+        }
+    }
+}
+
+fn load_font(config: &crate::config::FontConfig, size: f64, scale: f32) -> anyhow::Result<Font> {
+    let mut font = Font::with_symbols(
+        &config.family,
+        size,
+        scale,
+        config.symbols_family.as_deref(),
+        &config.fallback_families,
+        &config.features,
+    )?;
+    font.break_runs_at_cursor = config.shaping_breaks_at_cursor;
+    if let Some(modifier) = config.adjust_icon_height {
+        font.adjust_icon_height(modifier);
+    }
+    Ok(font)
+}
+
+/// Rasterises glyphs off the UI thread, each worker with its own `Font`, as CoreText objects and
+/// the font's caches stay on one thread. Dropping it stops the workers.
+struct Rasterizer {
+    jobs: Sender<Job>,
+    done: Receiver<Rasterized>,
+    /// Set once a result is waiting, so a burst of glyphs wakes the window once.
+    woken: Arc<AtomicBool>,
+}
+
+impl Rasterizer {
+    fn new(config: &crate::config::FontConfig, size: f64, scale: f32, wake: Waker) -> Self {
+        let (jobs, queued) = unbounded::<Job>();
+        let (finished, done) = unbounded();
+        let woken = Arc::new(AtomicBool::new(false));
+        for _ in 0..WORKERS {
+            let (queued, finished, config, wake, woken) = (
+                queued.clone(),
+                finished.clone(),
+                config.clone(),
+                wake.clone(),
+                woken.clone(),
+            );
+            thread::spawn(move || {
+                // Utility QoS leaves the performance cores to the PTY readers and actors, which a
+                // flood keeps busy; a glyph that lands a frame later costs less than slower output.
+                // SAFETY: changes only the calling thread's QoS class.
+                if unsafe {
+                    libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_UTILITY, 0)
+                } != 0
+                {
+                    eprintln!("agentd: lower the glyph rasteriser's priority failed");
+                }
+                let Some(font) = load_font(&config, size, scale).log_err("load font to rasterise")
+                else {
+                    return;
+                };
+                for job in queued {
+                    let mut bitmap = Vec::new();
+                    let kind = rasterize(&font, &job.text, job.style, job.cells, &mut bitmap);
+                    if finished
+                        .send(Rasterized {
+                            id: job.id,
+                            kind,
+                            bitmap,
+                        })
+                        .is_err()
+                    {
+                        break;
+                    }
+                    if !woken.swap(true, Ordering::AcqRel) {
+                        wake();
+                    }
+                }
+            });
+        }
+        Self { jobs, done, woken }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum Wait {
+    /// Only for glyphs already finished.
+    Ready,
+    Until(Instant),
+    /// For every requested glyph, as a headless render has a single frame to draw.
+    All,
+}
+
+impl Wait {
+    fn expired(self) -> bool {
+        matches!(self, Self::Until(deadline) if Instant::now() >= deadline)
+    }
+}
+
+enum AtlasSlot {
+    Pending,
+    Ready(Option<AtlasGlyph>),
+}
+
 struct Atlas {
-    slots: HashMap<GlyphKey, Option<AtlasGlyph>>,
+    slots: HashMap<GlyphKey, AtlasSlot>,
+    /// Glyphs out with the rasterizer, by job id.
+    requested: HashMap<u64, GlyphKey>,
+    next_job: u64,
     next: [u32; 2],
     epoch: u64,
-    scratch: Vec<u8>,
+    /// Whether a lookup since this was last cleared found a glyph not rasterised yet.
+    missing: bool,
 }
 
 impl Atlas {
-    fn new() -> Self {
+    fn new(epoch: u64) -> Self {
         Self {
             slots: HashMap::new(),
+            requested: HashMap::new(),
+            next_job: 0,
             next: [1, 1],
-            epoch: 0,
-            scratch: Vec::new(),
+            epoch,
+            missing: false,
         }
     }
 
+    /// Empties the texture; glyphs still out with the rasterizer land in the new one.
     fn reset(&mut self) {
-        self.slots.clear();
+        self.slots
+            .retain(|_, slot| matches!(slot, AtlasSlot::Pending));
         self.next = [1, 1];
         self.epoch += 1;
     }
 
-    fn glyph(
+    /// The glyph if it's ready; otherwise asks `jobs` for it, once, and notes it missing.
+    fn glyph(&mut self, jobs: &Sender<Job>, key: GlyphKey) -> Option<AtlasGlyph> {
+        match self.slots.get(&key) {
+            Some(AtlasSlot::Ready(slot)) => return *slot,
+            Some(AtlasSlot::Pending) => {}
+            None => {
+                let id = self.next_job;
+                self.next_job += 1;
+                let job = Job {
+                    id,
+                    text: JobText::from(&key.text),
+                    style: key.style,
+                    cells: key.cells,
+                };
+                if jobs.send(job).log_err("queue glyph").is_some() {
+                    self.slots.insert(key.clone(), AtlasSlot::Pending);
+                    self.requested.insert(id, key);
+                }
+            }
+        }
+        self.missing = true;
+        None
+    }
+
+    /// Uploads every finished glyph, waiting as `wait` says for the rest. Returns whether any landed.
+    fn receive(
         &mut self,
         queue: &wgpu::Queue,
         texture: &wgpu::Texture,
         font: &Font,
-        key: GlyphKey,
-    ) -> Option<AtlasGlyph> {
-        if let Some(slot) = self.slots.get(&key) {
-            return *slot;
+        rasterizer: &Rasterizer,
+        wait: Wait,
+    ) -> bool {
+        rasterizer.woken.store(false, Ordering::Release);
+        let mut landed = false;
+        loop {
+            let result = match wait {
+                _ if self.requested.is_empty() => break,
+                Wait::Ready => rasterizer.done.try_recv().ok(),
+                Wait::Until(deadline) => rasterizer.done.recv_deadline(deadline).ok(),
+                Wait::All => rasterizer.done.recv().ok(),
+            };
+            let Some(result) = result else {
+                break;
+            };
+            landed |= self.place(queue, texture, font, result);
         }
+        landed
+    }
+
+    fn place(
+        &mut self,
+        queue: &wgpu::Queue,
+        texture: &wgpu::Texture,
+        font: &Font,
+        result: Rasterized,
+    ) -> bool {
+        let Some(key) = self.requested.remove(&result.id) else {
+            return false;
+        };
         let (width, height) = (font.cell_width * key.cells, font.cell_height);
         if self.next[0] + width + 1 > ATLAS_SIZE {
             self.next = [1, self.next[1] + height + 1];
@@ -129,29 +353,7 @@ impl Atlas {
         if self.next[1] + height + 1 > ATLAS_SIZE {
             self.reset();
         }
-        let mut utf8 = [0; 4];
-        let kind = match &key.text {
-            GlyphText::Character(character) => font.rasterize(
-                character.encode_utf8(&mut utf8),
-                key.style,
-                key.cells,
-                &mut self.scratch,
-            ),
-            GlyphText::Cluster(cluster) => {
-                font.rasterize(cluster, key.style, key.cells, &mut self.scratch)
-            }
-            GlyphText::Shaped(cell) => font.rasterize_shaped(
-                &cell.run,
-                key.style,
-                usize::from(cell.index),
-                &mut self.scratch,
-            ),
-            GlyphText::Underline(underline) => {
-                font.rasterize_underline(*underline, &mut self.scratch);
-                Some(GlyphKind::Coverage)
-            }
-        };
-        let slot = kind.map(|kind| AtlasGlyph {
+        let slot = result.kind.map(|kind| AtlasGlyph {
             position: self.next,
             kind,
         });
@@ -166,7 +368,7 @@ impl Atlas {
                     origin: wgpu::Origin3d { x, y, z: 0 },
                     aspect: wgpu::TextureAspect::All,
                 },
-                &self.scratch,
+                &result.bitmap,
                 wgpu::TexelCopyBufferLayout {
                     offset: 0,
                     bytes_per_row: Some(width * 4),
@@ -180,8 +382,8 @@ impl Atlas {
             );
             self.next[0] += width + 1;
         }
-        self.slots.insert(key, slot);
-        slot
+        self.slots.insert(key, AtlasSlot::Ready(slot));
+        true
     }
 }
 
@@ -581,7 +783,7 @@ impl Gpu {
             view: texture.create_view(&Default::default()),
             texture,
             sampler: device.create_sampler(&Default::default()),
-            atlas: Atlas::new(),
+            atlas: Atlas::new(0),
             pipelines: Vec::new(),
             slots: HashMap::new(),
         }
@@ -685,12 +887,22 @@ pub trait TerminalSource: 'static {
     fn resize(&self, mark: u32, surface: Surface);
     /// The session to draw in the area of effect `mark`.
     fn drawn_session(&self, mark: u32) -> Option<&Session>;
+    /// Wakes the window this compositor draws, for glyphs that finish after their frame.
+    fn waker(&self) -> Waker;
+}
+
+struct LoadedFont {
+    scale: f32,
+    size: f64,
+    config: crate::config::FontConfig,
+    font: Font,
+    rasterizer: Rasterizer,
 }
 
 #[derive(Default)]
 pub struct TerminalCompositor {
     gpu: Option<Gpu>,
-    font: Option<(f32, f64, crate::config::FontConfig, Font)>,
+    font: Option<LoadedFont>,
 }
 
 impl TerminalCompositor {
@@ -706,28 +918,20 @@ impl TerminalCompositor {
             return;
         };
         let (config, size) = source.font();
-        if self
-            .font
-            .as_ref()
-            .is_none_or(|(scale, current_size, current, _)| {
-                (*scale, *current_size, current) != (site.scale, size, config)
-            })
-        {
-            match Font::with_symbols(
-                &config.family,
-                size,
-                site.scale,
-                config.symbols_family.as_deref(),
-                &config.fallback_families,
-                &config.features,
-            ) {
-                Ok(mut font) => {
-                    font.break_runs_at_cursor = config.shaping_breaks_at_cursor;
-                    if let Some(modifier) = config.adjust_icon_height {
-                        font.adjust_icon_height(modifier);
-                    }
-                    gpu.atlas.reset();
-                    self.font = Some((site.scale, size, config.clone(), font));
+        if self.font.as_ref().is_none_or(|loaded| {
+            (loaded.scale, loaded.size, &loaded.config) != (site.scale, size, config)
+        }) {
+            match load_font(config, size, site.scale) {
+                Ok(font) => {
+                    // Glyphs still out with the old rasterizer never come back, so none stay pending.
+                    gpu.atlas = Atlas::new(gpu.atlas.epoch + 1);
+                    self.font = Some(LoadedFont {
+                        scale: site.scale,
+                        size,
+                        config: config.clone(),
+                        font,
+                        rasterizer: Rasterizer::new(config, size, site.scale, source.waker()),
+                    });
                 }
                 Err(error) => {
                     eprintln!("agentd: load font: {error:#}");
@@ -735,9 +939,14 @@ impl TerminalCompositor {
                 }
             }
         }
-        let Some((_, _, _, font)) = &self.font else {
+        let Some(LoadedFont {
+            font, rasterizer, ..
+        }) = &self.font
+        else {
             return;
         };
+        gpu.atlas
+            .receive(queue, &gpu.texture, font, rasterizer, Wait::Ready);
         gpu.ensure_pipeline(device, site.format);
         let slot = gpu
             .slots
@@ -756,7 +965,7 @@ impl TerminalCompositor {
         let session = source.drawn_session(site.mark);
 
         let grid = session.map_or_else(Default::default, Session::grid);
-        let built = (
+        let mut built = (
             session.map_or(0, Session::id),
             grid.generation,
             rect,
@@ -764,19 +973,31 @@ impl TerminalCompositor {
             site.srgb_blend,
         );
         if slot.built != Some(built) {
+            let wait = if rune::is_headless() {
+                Wait::All
+            } else {
+                Wait::Until(Instant::now() + GLYPH_WAIT)
+            };
             let (atlas, texture) = (&mut gpu.atlas, &gpu.texture);
-            build_quads(
-                &grid,
-                rect,
-                metrics,
-                font,
-                site.srgb_blend,
-                &mut slot.scratch,
-                |key| {
-                    let slot = atlas.glyph(queue, texture, font, key);
-                    (slot, atlas.epoch)
-                },
-            );
+            loop {
+                atlas.missing = false;
+                build_quads(
+                    &grid,
+                    rect,
+                    metrics,
+                    font,
+                    site.srgb_blend,
+                    &mut slot.scratch,
+                    |key| (atlas.glyph(&rasterizer.jobs, key), atlas.epoch),
+                );
+                // Glyphs keep landing while the workers run, so past the deadline the frame draws what it has.
+                if !atlas.missing
+                    || wait.expired()
+                    || !atlas.receive(queue, texture, font, rasterizer, wait)
+                {
+                    break;
+                }
+            }
             if let Some(scrollbar) = grid.scrollbar
                 && let Some(thumb) = scrollbar_thumb(&grid, rect, metrics)
             {
@@ -791,7 +1012,9 @@ impl TerminalCompositor {
                 slot.quads = quad_buffer(device, (bytes.len() as u64).next_power_of_two());
             }
             queue.write_buffer(&slot.quads, 0, bytes);
-            slot.built = Some(built);
+            // Left unbuilt while glyphs are missing, so the frame their arrival wakes redraws it.
+            built.3 = atlas.epoch;
+            slot.built = (!atlas.missing).then_some(built);
         }
 
         let frame = [
@@ -847,6 +1070,47 @@ impl<S: TerminalSource> Compositor<S> for TerminalCompositor {
 mod tests {
     use super::*;
     use std::collections::HashSet;
+
+    #[test]
+    fn an_unseen_glyph_is_queued_once_and_reported_missing() {
+        let (jobs, queued) = crossbeam_channel::unbounded();
+        let mut atlas = Atlas::new(0);
+        let key = GlyphKey {
+            text: GlyphText::Character('世'),
+            style: FontStyle::default(),
+            cells: 2,
+        };
+        assert!(atlas.glyph(&jobs, key.clone()).is_none());
+        assert!(atlas.glyph(&jobs, key).is_none());
+        assert!(atlas.missing);
+        assert_eq!(queued.len(), 1);
+    }
+
+    #[test]
+    fn a_worker_rasterises_as_the_ui_thread_would() {
+        let config = crate::config::Config::default().font;
+        let rasterizer = Rasterizer::new(&config, 18.0, 2.0, Arc::new(|| {}));
+        let font = load_font(&config, 18.0, 2.0).unwrap();
+        for (id, text, cells) in [
+            (1, JobText::Character('a'), 1),
+            (2, JobText::Character('世'), 2),
+        ] {
+            let mut expected = Vec::new();
+            let expected_kind = rasterize(&font, &text, FontStyle::default(), cells, &mut expected);
+            rasterizer
+                .jobs
+                .send(Job {
+                    id,
+                    text,
+                    style: FontStyle::default(),
+                    cells,
+                })
+                .unwrap();
+            let done = rasterizer.done.recv().unwrap();
+            assert_eq!((done.id, done.kind), (id, expected_kind));
+            assert!(done.bitmap == expected);
+        }
+    }
 
     fn fake_glyph(position: [u32; 2]) -> AtlasGlyph {
         AtlasGlyph {
