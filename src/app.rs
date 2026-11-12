@@ -12,9 +12,10 @@ use crate::keymap::{Command, pressed, shortcut};
 use crate::palette::{
     Action, Palette, open_palette, poll_creation, poll_jump, poll_worktrees, run_action,
 };
+use crate::render::TerminalSource;
 use crate::session::LogErr;
-use crate::session::{Attention, Event, Grid, Retarget, Session};
-use crate::view::{view, window_title};
+use crate::session::{Attention, Event, Grid, Retarget, Session, Surface};
+use crate::view::{DRAWER_MARK, OVERLAY_MARK, view, window_title};
 use crate::windows::{
     Fleet, MAIN_WINDOW, WindowId, adopt_projects, move_to_new_window, on_close, on_quit,
 };
@@ -88,6 +89,41 @@ impl State {
     pub(crate) fn zoom(&mut self, points: f64) {
         let size = (self.font().size + points).clamp(MIN_FONT_SIZE, MAX_FONT_SIZE);
         self.font_zoom = size - self.config.font.size;
+    }
+}
+
+impl TerminalSource for State {
+    fn font(&self) -> config::FontConfig {
+        State::font(self)
+    }
+
+    fn show(&self, mark: u32, surface: Surface) -> Option<&Session> {
+        // Hidden tabs share the visible area, as closed tray processes share the drawer's, so they are sized too.
+        let workspace = &self.workspace;
+        match mark {
+            OVERLAY_MARK => {
+                workspace
+                    .overlay_sessions()
+                    .for_each(|session| session.resize(surface));
+                workspace.overlay_session()
+            }
+            DRAWER_MARK => {
+                workspace
+                    .tray_sessions()
+                    .for_each(|session| session.resize(surface));
+                // Not `drawer_session`, which is gone once closing starts, so the drawer slides out showing its process.
+                workspace
+                    .project()
+                    .and_then(|project| project.tray.get(project.drawer))
+                    .map(|tab| &tab.session)
+            }
+            _ => {
+                workspace
+                    .tab_sessions()
+                    .for_each(|session| session.resize(surface));
+                workspace.active_session()
+            }
+        }
     }
 }
 
