@@ -19,7 +19,7 @@ use rune::Waker;
 use crate::LogErr;
 use crate::actor::{Actor, store, terminate};
 use crate::config::Config;
-use crate::grid::{Grid, Surface};
+use crate::grid::{Grid, Surface, bundled_terminfo, terminfo_name};
 use crate::protocol::{Event, Msg, Visibility};
 use crate::terminal_input::{KeyInput, PointerInput, PointerPhase, WheelInput};
 
@@ -169,9 +169,15 @@ impl Session {
         if let Some(command) = command {
             process.arg("-c").arg(format!("exec {command}"));
         }
+        let terminfo = std::env::current_exe()
+            .ok()
+            .and_then(|exe| bundled_terminfo(&exe));
+        if let Some(dir) = &terminfo {
+            process.env("TERMINFO", dir);
+        }
         process
             .current_dir(cwd)
-            .env("TERM", "xterm-256color")
+            .env("TERM", terminfo_name(terminfo.as_deref()))
             .env("COLORTERM", "truecolor")
             .env("TERM_PROGRAM", "agentd")
             .env("SHELL", &config.shell)
