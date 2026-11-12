@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use crossbeam_channel::{Receiver, Sender, never, select};
-use libghostty_vt::terminal::Mode;
+use libghostty_vt::mode::Mode;
 use libghostty_vt::{Terminal, focus, key};
 use nix::errno::Errno;
 use nix::pty::Winsize;

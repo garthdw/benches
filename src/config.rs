@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
-use libghostty_vt::style::RgbColor;
+use libghostty_vt::color::Rgb;
 use schemars::JsonSchema;
 use serde::Deserialize;
 
@@ -52,13 +52,13 @@ pub struct TabSpec {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Theme {
-    pub foreground: RgbColor,
-    pub background: RgbColor,
-    pub cursor: Option<RgbColor>,
-    pub selection_background: Option<RgbColor>,
-    pub selection_foreground: Option<RgbColor>,
+    pub foreground: Rgb,
+    pub background: Rgb,
+    pub cursor: Option<Rgb>,
+    pub selection_background: Option<Rgb>,
+    pub selection_foreground: Option<Rgb>,
     /// Overrides of the built-in 256-colour palette.
-    pub palette: Vec<(u8, RgbColor)>,
+    pub palette: Vec<(u8, Rgb)>,
 }
 
 impl Default for Theme {
@@ -430,14 +430,14 @@ fn parse_theme(text: &str) -> Result<Theme> {
     Ok(theme)
 }
 
-fn parse_color(value: &str) -> Result<RgbColor> {
+fn parse_color(value: &str) -> Result<Rgb> {
     let hex = value.trim().trim_start_matches('#');
     if hex.len() != 6 {
         bail!("colour {value} isn't #rrggbb");
     }
     let channel =
         |range| u8::from_str_radix(&hex[range], 16).with_context(|| format!("colour {value}"));
-    Ok(RgbColor {
+    Ok(Rgb {
         r: channel(0..2)?,
         g: channel(2..4)?,
         b: channel(4..6)?,
@@ -498,7 +498,7 @@ mod tests {
         );
         assert_eq!(
             config.theme.background,
-            RgbColor {
+            Rgb {
                 r: 0x10,
                 g: 0x10,
                 b: 0x10
@@ -508,7 +508,7 @@ mod tests {
             config.theme.palette,
             [(
                 1,
-                RgbColor {
+                Rgb {
                     r: 0xff,
                     g: 0,
                     b: 0
@@ -617,7 +617,7 @@ mod tests {
         let (_root, paths) = paths(Some("theme = \"light:nope,dark:dusk\"\n"), None);
         assert_eq!(
             Config::load(&paths).theme.foreground,
-            RgbColor {
+            Rgb {
                 r: 0xee,
                 g: 0xee,
                 b: 0xee

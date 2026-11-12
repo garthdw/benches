@@ -17,7 +17,7 @@ Every type is `!Send` and `!Sync`. agentd keeps `Terminal` and everything tied t
 - `Terminal::new(cols, rows)`, `vt_write(&[u8])`, `resize(cols, rows, cell_w_px, cell_h_px)` (reflows), `reset()`.
 - Setup chain: `set_scrollback_max_lines(Some(n))`, `set_terminfo_name`, `set_default_fg_color`, `set_default_bg_color`, `set_default_cursor_color`, `set_default_cursor_style`, `set_default_cursor_blink`, `set_default_color_palette`.
 - State: `mode(Mode::X)`, `active_screen() -> Screen::{Primary, Alternate}`, `is_mouse_tracking()`, `viewport_active()`, `mouse_shape()`, `title()`, `pwd()`, `total_rows()`, `scrollback_rows()`.
-- Modes: `Mode::{BRACKETED_PASTE, ALT_SCROLL, FOCUS_EVENT, NORMAL_MOUSE, BUTTON_MOUSE, ANY_MOUSE, SGR_MOUSE, ALT_SCREEN_SAVE, ...}`.
+- Modes: `mode::Mode::{BRACKETED_PASTE, ALT_SCROLL, FOCUS_EVENT, NORMAL_MOUSE, BUTTON_MOUSE, ANY_MOUSE, SGR_MOUSE, ALT_SCREEN_SAVE, ...}`.
 - Callbacks (`on_*`): `pty_write, bell, render_hold, enquiry, xtversion, title_changed, pwd_changed, size, color_scheme, device_attributes, clipboard_write, clipboard_read, desktop_notification, progress_report, program_status, semantic_prompt, reset, resize_window, unknown_sequence`.
 - `on_render_hold(|term, held|)`: synchronized output. Capture the finished frame when a hold begins, or a constantly redrawing program looks frozen. Holds can be ignored when live content matters, such as during scrolling or selection.
 
@@ -82,12 +82,12 @@ encoder.encode_to_vec(&event, &mut out)?;
 
 ## Selection
 
-A `selection::gesture::Gesture` per terminal interprets pointer streams. Reusable events: `PressEvent`, `DragEvent`, `ReleaseEvent`, `AutoscrollTickEvent`, `DeepPressEvent`. All use surface-pixel positions and a `GridRef` from `terminal.grid_ref(Point::Viewport(PointCoordinate { x, y }))`.
+A `selection::gesture::Gesture` per terminal interprets pointer streams. Reusable events: `PressEvent`, `DragEvent`, `ReleaseEvent`, `AutoscrollTickEvent`, `DeepPressEvent`. All use surface-pixel positions and a `GridRef` from `terminal.grid_ref(point::Point::Viewport(point::Coordinate { x, y }))`.
 
 - Press: `set_position(x, y)?`, `set_time(dur)?`, `set_repeat_interval(dur)?`, `set_repeat_distance(px)?`, then `apply(&mut gesture, &terminal, grid_ref)? -> Option<Selection>`. **Without `set_time` only single-click works.** Default behaviours: cell, word, line.
 - Drag: `set_position`, `set_rectangle`, then `apply(gesture, terminal, grid_ref, Geometry { columns, cell_width, padding_left, screen_height })`.
 - Release: `apply(gesture, terminal, Option<GridRef>)`, returns nothing.
-- Autoscroll: poll `gesture.autoscroll(&terminal)? -> Autoscroll::{None, Up, Down}` and drive `AutoscrollTickEvent::apply(gesture, terminal, viewport: PointCoordinate, geometry)` on a timer.
+- Autoscroll: poll `gesture.autoscroll(&terminal)? -> Autoscroll::{None, Up, Down}` and drive `AutoscrollTickEvent::apply(gesture, terminal, viewport: point::Coordinate, geometry)` on a timer.
 - Install results with `terminal.set_selection(selection.as_ref())?`, which takes `&self`.
 - Selections and `GridRef`s are only valid until the next mutating terminal call. Use `track_grid_ref` to outlive that.
 - Dropping a `Gesture` leaks tracked refs until the terminal drops; `gesture.reset(&terminal)` reclaims them.
@@ -104,7 +104,7 @@ let bytes = f.format_alloc(None)?;                    // Bytes derefs to [u8]
 ## Paste
 
 ```rust
-let mimes = [ClipboardMime::new(b"text/plain")];
+let mimes = [effect::ClipboardMime::new(b"text/plain")];
 terminal.paste(paste::Options::new().with_allow_unsafe(allow), &mimes,
     |_mime, out: &mut dyn Write| out.write_all(text))?;
 ```

@@ -2,12 +2,13 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
+use libghostty_vt::color::Rgb;
+use libghostty_vt::mode::Mode;
 use libghostty_vt::render::{
     CellIteration, CellIterator, Colors, CursorVisualStyle, Dirty, RowIterator,
 };
 use libghostty_vt::screen::{CellContentTag, CellWide, Screen, cell};
-use libghostty_vt::style::{RgbColor, StyleColor, Underline};
-use libghostty_vt::terminal::Mode;
+use libghostty_vt::style::{StyleColor, Underline};
 use libghostty_vt::{RenderState, Terminal};
 
 use crate::LogErr;
@@ -18,12 +19,12 @@ pub(crate) const FRAME: Duration = Duration::from_millis(8);
 const SCROLLBAR_HOLD: Duration = Duration::from_secs(1);
 const SCROLLBAR_FADE: Duration = Duration::from_millis(200);
 const MESSAGE_COLS: u16 = 80;
-pub const DEFAULT_FG: RgbColor = RgbColor {
+pub const DEFAULT_FG: Rgb = Rgb {
     r: 0xd8,
     g: 0xd9,
     b: 0xda,
 };
-pub const DEFAULT_BG: RgbColor = RgbColor {
+pub const DEFAULT_BG: Rgb = Rgb {
     r: 0x14,
     g: 0x15,
     b: 0x17,
@@ -347,7 +348,7 @@ impl ScrollbarFade {
     }
 }
 
-pub(crate) fn rgb(color: RgbColor) -> [u8; 3] {
+pub(crate) fn rgb(color: Rgb) -> [u8; 3] {
     [color.r, color.g, color.b]
 }
 
@@ -385,7 +386,7 @@ type Content = (Arc<[Cell]>, Arc<[Arc<str>]>);
 fn read_cell(
     cell: &CellIteration<'_, '_>,
     colors: &Colors,
-    (selection_background, selection_foreground): (Option<RgbColor>, Option<RgbColor>),
+    (selection_background, selection_foreground): (Option<Rgb>, Option<Rgb>),
     clusters: &mut Vec<Arc<str>>,
 ) -> Result<Cell> {
     let mut fg = cell.fg_color()?.unwrap_or(colors.foreground);
@@ -456,8 +457,8 @@ pub(crate) struct GridBuilder {
     /// The cells and clusters of the last build, for frames where only the presentation changed.
     content: Option<Content>,
     /// From the theme; without a background, selected cells swap their colours.
-    pub(crate) selection_background: Option<RgbColor>,
-    pub(crate) selection_foreground: Option<RgbColor>,
+    pub(crate) selection_background: Option<Rgb>,
+    pub(crate) selection_foreground: Option<Rgb>,
     /// Off only in tests, to compare against reading every cell the slow way.
     pub(crate) plain_fast_path: bool,
 }

@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
-use libghostty_vt::style::RgbColor;
+use libghostty_vt::color::Rgb;
 use libghostty_vt::{Terminal, key, mouse};
 use rune::{Env, Key, KeyEvent, Mods, Runtime, Waker};
 
@@ -168,12 +168,12 @@ pub(crate) fn fractional_metrics(scale: f32) -> Metrics {
     }
 }
 
-pub(crate) const THEME_RED: RgbColor = RgbColor {
+pub(crate) const THEME_RED: Rgb = Rgb {
     r: 0xff,
     g: 0,
     b: 0,
 };
-pub(crate) const THEME_BLUE: RgbColor = RgbColor {
+pub(crate) const THEME_BLUE: Rgb = Rgb {
     r: 0,
     g: 0,
     b: 0xff,

@@ -4,12 +4,15 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
+use libghostty_vt::effect::ClipboardMime;
 use libghostty_vt::key::{Key as Vt, Mods as VtMods};
+use libghostty_vt::mode::Mode;
+use libghostty_vt::point::{Coordinate, Point};
 use libghostty_vt::screen::Screen;
 use libghostty_vt::selection::gesture::{
     Autoscroll, AutoscrollTickEvent, DragEvent, Geometry, Gesture, PressEvent, ReleaseEvent,
 };
-use libghostty_vt::terminal::{ClipboardMime, Mode, Point, PointCoordinate, ScrollViewport};
+use libghostty_vt::terminal::ScrollViewport;
 use libghostty_vt::{Terminal, fmt, key, mouse, paste};
 
 use crate::LogErr;
@@ -205,13 +208,13 @@ impl TerminalInput {
         Ok(encoded)
     }
 
-    fn viewport_point(surface: Surface, (x, y): (f32, f32)) -> PointCoordinate {
+    fn viewport_point(surface: Surface, (x, y): (f32, f32)) -> Coordinate {
         let metrics = surface.metrics;
         let origin = metrics.origin([0.0; 4]);
         let cell = |position: f32, origin: f32, size: u16, count: u16| {
             ((position - origin) / f32::from(size)).clamp(0.0, f32::from(count.saturating_sub(1)))
         };
-        PointCoordinate {
+        Coordinate {
             x: cell(x, origin.0, metrics.cell_width, surface.cols) as u16,
             y: cell(y, origin.1, metrics.cell_height, surface.rows) as u32,
         }
@@ -371,7 +374,7 @@ impl TerminalInput {
     fn link_at(
         terminal: &Terminal<'static, '_>,
         surface: Surface,
-        position: PointCoordinate,
+        position: Coordinate,
     ) -> Result<Option<String>> {
         let mut uri = [0; 4096];
         let length = terminal
@@ -382,7 +385,7 @@ impl TerminalInput {
         {
             return Ok(Some(uri.to_owned()));
         }
-        let grid_ref = |x, y| terminal.grid_ref(Point::Viewport(PointCoordinate { x, y }));
+        let grid_ref = |x, y| terminal.grid_ref(Point::Viewport(Coordinate { x, y }));
         let mut first = position.y;
         while first > 0 && grid_ref(0, first)?.row()?.is_wrap_continuation()? {
             first -= 1;
