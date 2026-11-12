@@ -26,7 +26,8 @@ use rune::Waker;
 use crate::LogErr;
 use crate::config::{ClipboardAccess, Theme};
 use crate::grid::{
-    FRAME, Grid, GridBuilder, Presentation, ScrollbarFade, Surface, apply_theme, new_terminal,
+    FRAME, Grid, GridBuilder, Presentation, ScrollbarFade, Surface, answer_queries, apply_theme,
+    new_terminal,
 };
 use crate::protocol::{Event, Msg, Visibility};
 use crate::terminal_input::{TerminalInput, open_link, paste_text, selection_text};
@@ -208,6 +209,7 @@ impl Actor {
     pub(crate) fn run(&mut self) -> Result<()> {
         let mut terminal = new_terminal(self.cols, self.rows)?;
         apply_theme(&mut terminal, &self.theme)?;
+        answer_queries(&mut terminal, &self.theme)?;
         let mut builder = GridBuilder::new()?;
         builder.selection_background = self.theme.selection_background;
         builder.selection_foreground = self.theme.selection_foreground;
