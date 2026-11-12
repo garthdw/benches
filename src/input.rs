@@ -2,7 +2,7 @@ use libghostty_vt::key::{Key as Vt, Mods as VtMods};
 use libghostty_vt::mouse;
 use rune::{Key, KeyEvent, Mods, Phase, PhysicalKeyCode as Code, Tx};
 
-use crate::State;
+use crate::app::State;
 use crate::session::{Grid, PointerInput, PointerPhase, Session};
 
 #[derive(Debug, PartialEq)]

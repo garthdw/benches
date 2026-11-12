@@ -21,7 +21,7 @@ scripts/install                             # scripts/bundle, then into ~/Applic
 scripts/icon                                # regenerate assets/agentd.icns from scripts/icon.swift
 ```
 
-`--snap`, `--scene` and the other headless flags come from Rune. Scenes are registered in `AppSpec::scenes` in `src/main.rs`.
+`--snap`, `--scene` and the other headless flags come from Rune. Scenes are registered in `AppSpec::scenes` in `window_app` in `src/app.rs`.
 
 `scripts/install` uses the pinned Rune checkout's installer and launches the app with a Finder-like environment, so nothing from the calling terminal leaks into tabs. It signs with the identity in `MAC_APP_SIGN` (create an Apple Development certificate in Xcode → Settings → Accounts → Manage Certificates; `security find-identity -v -p codesigning` lists it), or ad hoc without one, in which case macOS may ask again for folder access after each install. A bundled app logs to `~/Library/Logs/agentd.log`.
 
@@ -46,6 +46,7 @@ shell <-> PTY --reader thread--> bounded channel --> actor thread (owns Terminal
 - **`sprite.rs`**: procedural box drawing, blocks, Powerline glyphs and tiling underlines, so they meet their neighbours with no seams.
 - **`workspace.rs`**: projects (folders) holding tabs and a tray, each with its own `Session`. Selection hides the outgoing session and shows the incoming one: a hidden session keeps reading its PTY but doesn't publish grids or wake the UI, so a flood in a background tab costs nothing on the UI thread. The compositor resizes every session to the terminal area, so hidden tabs are already the right size when shown, and keys its quad cache by session id because generations restart per session.
 - **Windows**: each window has its own `State` and `Workspace`, so selection, hidden sessions and sizing stay per window. `Fleet` (in `windows.rs`) hands a `Project` to another window's inbox, which takes it in `poll` and retargets each tab's `Retarget` waker. Closing a torn-off window merges its projects back into the main window; closing the main window quits. Torn-off windows aren't restored: the layout saved at quit lists their projects after the main window's.
+- **`app.rs`**: `State`, `window_app` (the `AppSpec` and hooks), `poll`, `on_key` and the tab, layout and close-confirm logic. `main.rs` is only the entry point and `config` CLI dispatch.
 - **`input.rs`**: maps Rune key events to `KeyInput`; the actor encodes them with libghostty's encoder using the terminal's current modes. Returning `None` from `map_key` keeps a key (such as a ⌘ chord) away from the terminal.
 - **Pointer input**: the UI sends raw `Msg::Pointer` and `Msg::Wheel`, and `TerminalInput` on the actor decides between mouse reports, selection, alt-screen arrows and scrollback, because only the actor knows the terminal's modes.
 
