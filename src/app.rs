@@ -4,7 +4,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use libghostty_vt::effect::ClipboardLocation;
 use rune::{
-    App, AppSpec, ClipboardContent, FileDialogOptions, Ime, Key, KeyEvent, Live, Mods, Tx, Waker,
+    App, AppSpec, ClipboardContent, FileDialogOptions, Ime, Key, KeyEvent, Live, MenuItem, Mods,
+    Tx, Waker,
 };
 
 use crate::LogErr;
@@ -799,6 +800,22 @@ pub(crate) fn on_ime(state: &mut State, ime: &Ime, _: &mut Tx) -> bool {
     }
 }
 
+/// In the app menu, after About. The palette's chord reaches `on_key` first, so it reloads once.
+fn reload_menu_item() -> MenuItem<State> {
+    let item = MenuItem::new("Reload Config", |state: &mut State, _: &mut Tx| {
+        reload_config(state);
+    })
+    .id("reload-config")
+    .keys_first();
+    let shortcut = Command::ReloadConfig
+        .chord()
+        .and_then(|chord| chord.parse().log_err("reload config shortcut"));
+    match shortcut {
+        Some(shortcut) => item.key_equivalent(shortcut),
+        None => item,
+    }
+}
+
 /// One window's app, with its state made by `init`.
 pub(crate) fn window_app(
     fleet: &Fleet,
@@ -834,6 +851,7 @@ pub(crate) fn window_app(
                 tab.session.command_held(mods.logo);
             }
         })
+        .menu_item(reload_menu_item())
         .on_quit(on_quit)
         .on_close(on_close)
         .on_focus(|state, focused, _| {

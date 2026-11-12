@@ -127,11 +127,16 @@ pub fn chord_hint(chord: &str) -> String {
 }
 
 impl Command {
+    fn find_spec(self) -> Option<&'static CommandSpec> {
+        COMMANDS.iter().find(|spec| spec.command == self)
+    }
+
     pub fn label(self) -> &'static str {
-        COMMANDS
-            .iter()
-            .find(|spec| spec.command == self)
-            .map_or("", |spec| spec.label)
+        self.find_spec().map_or("", |spec| spec.label)
+    }
+
+    pub fn chord(self) -> Option<&'static str> {
+        self.find_spec().and_then(|spec| spec.chord)
     }
 }
 
