@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::mem::size_of;
+use std::ops::Range;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -8,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use bytemuck::{Pod, Zeroable, cast_slice};
 use crossbeam_channel::{Receiver, Sender, unbounded};
-use libghostty_vt::render::CursorVisualStyle;
+use libghostty_vt::render::{CursorVisualStyle, ImageLayer};
 use libghostty_vt::style::Underline;
 use rune::Waker;
 use rune::color::srgb_decode;
@@ -19,6 +20,7 @@ use crate::LogErr;
 use crate::constraint::{Constraint, is_graphics_element, is_symbol};
 use crate::font::{FnvMap, Font, FontStyle, GlyphKind, ShapedRun};
 use crate::grid::{Cell, Grid, Metrics, Scrollbar, Surface};
+use crate::images::{Image, Placement};
 use crate::session::Session;
 
 /// Also the width of the scrollbar's strip, which takes the right padding.
@@ -31,6 +33,9 @@ const MODE_COVERAGE: u32 = 1;
 const MODE_COLOR: u32 = 2;
 /// A colour glyph whose sRGB texels must be decoded for a linear target.
 const MODE_COLOR_LINEAR: u32 = 3;
+/// An image texel, which `fs_image` premultiplies; the linear variant decodes it first.
+const MODE_IMAGE: u32 = 4;
+const MODE_IMAGE_LINEAR: u32 = 5;
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -544,6 +549,50 @@ fn find_run(
     }
 }
 
+/// The quad for `placement`, clipped to `area`, the cells' rectangle, so an image that starts
+/// beyond the viewport doesn't spill into the padding.
+fn image_quad(
+    placement: &Placement,
+    origin: (f32, f32),
+    metrics: Metrics,
+    area: [f32; 4],
+    srgb_blend: bool,
+) -> Option<Quad> {
+    let [width, height] = placement.size.map(|pixels| pixels as f32);
+    let left = origin.0
+        + placement.col as f32 * f32::from(metrics.cell_width)
+        + placement.offset[0] as f32;
+    let top = origin.1
+        + placement.row as f32 * f32::from(metrics.cell_height)
+        + placement.offset[1] as f32;
+    let (x0, y0) = (left.max(area[0]), top.max(area[1]));
+    let (x1, y1) = (
+        (left + width).min(area[0] + area[2]),
+        (top + height).min(area[1] + area[3]),
+    );
+    if width <= 0.0 || height <= 0.0 || x1 <= x0 || y1 <= y0 {
+        return None;
+    }
+    let [source_x, source_y, source_width, source_height] =
+        placement.source.map(|pixels| pixels as f32);
+    let (image_width, image_height) = (placement.image.width as f32, placement.image.height as f32);
+    Some(Quad {
+        rect: [x0, y0, x1 - x0, y1 - y0],
+        uv: [
+            (source_x + (x0 - left) / width * source_width) / image_width,
+            (source_y + (y0 - top) / height * source_height) / image_height,
+            (x1 - x0) / width * source_width / image_width,
+            (y1 - y0) / height * source_height / image_height,
+        ],
+        color: [0.0; 3],
+        mode: if srgb_blend {
+            MODE_IMAGE
+        } else {
+            MODE_IMAGE_LINEAR
+        },
+    })
+}
+
 fn solid(rect: [f32; 4], fill: [u8; 3], srgb_blend: bool) -> Quad {
     Quad {
         rect,
@@ -561,7 +610,7 @@ fn build_quads(
     srgb_blend: bool,
     quads: &mut Vec<Quad>,
     mut glyph: impl FnMut(GlyphKey) -> (Option<AtlasGlyph>, u64),
-) {
+) -> usize {
     let solid = |rect, fill| solid(rect, fill, srgb_blend);
     let (width, height) = (
         f32::from(metrics.cell_width),
@@ -726,6 +775,140 @@ fn build_quads(
             break;
         }
     }
+    glyphs_start
+}
+
+/// Image textures by `(id, generation)`, uploaded once and shared by every slot, so a keystroke's
+/// rebuild doesn't upload again. A texture no frame used is dropped.
+struct ImageTextures {
+    layout: wgpu::BindGroupLayout,
+    sampler: wgpu::Sampler,
+    cache: HashMap<(u32, u64), (wgpu::BindGroup, u64)>,
+    frame: u64,
+}
+
+impl ImageTextures {
+    fn new(device: &wgpu::Device) -> Self {
+        let entry = |binding, visibility, ty| wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility,
+            ty,
+            count: None,
+        };
+        Self {
+            layout: device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("terminal images"),
+                entries: &[
+                    entry(
+                        0,
+                        wgpu::ShaderStages::FRAGMENT,
+                        wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                    ),
+                    entry(
+                        1,
+                        wgpu::ShaderStages::FRAGMENT,
+                        wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    ),
+                ],
+            }),
+            sampler: device.create_sampler(&wgpu::SamplerDescriptor {
+                mag_filter: wgpu::FilterMode::Linear,
+                min_filter: wgpu::FilterMode::Linear,
+                ..Default::default()
+            }),
+            cache: HashMap::new(),
+            frame: 0,
+        }
+    }
+
+    /// `None` for an image too large for the device, which is then not drawn.
+    fn bind_group(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        image: &Image,
+    ) -> Option<wgpu::BindGroup> {
+        let key = (image.id, image.generation);
+        if let Some((bind_group, used)) = self.cache.get_mut(&key) {
+            *used = self.frame;
+            return Some(bind_group.clone());
+        }
+        if image.width.max(image.height) > device.limits().max_texture_dimension_2d {
+            eprintln!(
+                "agentd: image {}x{} is too large to draw",
+                image.width, image.height
+            );
+            return None;
+        }
+        let size = wgpu::Extent3d {
+            width: image.width,
+            height: image.height,
+            depth_or_array_layers: 1,
+        };
+        // Not an sRGB format: filtering and blending stay in the encoded space, as the glyph atlas does.
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("terminal image"),
+            size,
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        queue.write_texture(
+            texture.as_image_copy(),
+            &image.rgba,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(image.width * 4),
+                rows_per_image: Some(image.height),
+            },
+            size,
+        );
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &self.layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(
+                        &texture.create_view(&Default::default()),
+                    ),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&self.sampler),
+                },
+            ],
+        });
+        self.cache.insert(key, (bind_group.clone(), self.frame));
+        Some(bind_group)
+    }
+
+    /// Keeps a texture a slot still draws from an earlier build.
+    fn touch(&mut self, key: (u32, u64)) {
+        if let Some((_, used)) = self.cache.get_mut(&key) {
+            *used = self.frame;
+        }
+    }
+
+    /// Ends a frame, dropping the textures it didn't use.
+    fn sweep(&mut self) {
+        let frame = self.frame;
+        self.cache.retain(|_, (_, used)| *used == frame);
+        self.frame += 1;
+    }
+}
+
+struct ImageDraw {
+    layer: ImageLayer,
+    key: (u32, u64),
+    bind_group: wgpu::BindGroup,
 }
 
 /// The thumb, centred in the right padding beside the rows the grid fills, as the pointer finds it there.
@@ -762,6 +945,11 @@ struct Slot {
     bind_group: wgpu::BindGroup,
     /// Session id, generation, rect, atlas epoch and blend mode; generations restart per session.
     built: Option<(u64, u64, [f32; 4], u64, bool)>,
+    /// Where each part of `scratch` ends: the cell backgrounds and cursor, the text and its
+    /// decorations, and the scrollbar. The background fill is the first quad, and the images the rest.
+    bounds: [u32; 3],
+    /// In drawing order; draw `i` is the quad at `bounds[2] + i`.
+    images: Vec<ImageDraw>,
 }
 
 struct Gpu {
@@ -772,7 +960,13 @@ struct Gpu {
     view: wgpu::TextureView,
     sampler: wgpu::Sampler,
     atlas: Atlas,
-    pipelines: Vec<(wgpu::TextureFormat, wgpu::RenderPipeline)>,
+    /// By target format: the cells' pipeline, then the images'.
+    pipelines: Vec<(
+        wgpu::TextureFormat,
+        wgpu::RenderPipeline,
+        wgpu::RenderPipeline,
+    )>,
+    images: ImageTextures,
     slots: HashMap<u32, Slot>,
 }
 
@@ -835,49 +1029,54 @@ impl Gpu {
             sampler: device.create_sampler(&Default::default()),
             atlas: Atlas::new(0),
             pipelines: Vec::new(),
+            images: ImageTextures::new(device),
             slots: HashMap::new(),
         }
     }
 
     fn ensure_pipeline(&mut self, device: &wgpu::Device, format: wgpu::TextureFormat) {
-        if self.pipelines.iter().any(|(built, _)| *built == format) {
+        if self.pipelines.iter().any(|(built, ..)| *built == format) {
             return;
         }
-        let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: None,
-            bind_group_layouts: &[Some(&self.layout)],
-            immediate_size: 0,
-        });
-        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("terminal cells"),
-            layout: Some(&layout),
-            vertex: wgpu::VertexState {
-                module: &self.module,
-                entry_point: Some("vs"),
-                compilation_options: Default::default(),
-                buffers: &[Some(wgpu::VertexBufferLayout {
-                    array_stride: size_of::<Quad>() as u64,
-                    step_mode: wgpu::VertexStepMode::Instance,
-                    attributes: &wgpu::vertex_attr_array![0 => Float32x4, 1 => Float32x4, 2 => Float32x3, 3 => Uint32],
-                })],
-            },
-            primitive: wgpu::PrimitiveState { topology: wgpu::PrimitiveTopology::TriangleStrip, ..Default::default() },
-            depth_stencil: None,
-            multisample: Default::default(),
-            fragment: Some(wgpu::FragmentState {
-                module: &self.module,
-                entry_point: Some("fs"),
-                compilation_options: Default::default(),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format,
-                    blend: Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING),
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-            }),
-            multiview_mask: None,
-            cache: None,
-        });
-        self.pipelines.push((format, pipeline));
+        let build = |groups: &[Option<&wgpu::BindGroupLayout>], fragment: &str| {
+            let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: None,
+                bind_group_layouts: groups,
+                immediate_size: 0,
+            });
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("terminal cells"),
+                layout: Some(&layout),
+                vertex: wgpu::VertexState {
+                    module: &self.module,
+                    entry_point: Some("vs"),
+                    compilation_options: Default::default(),
+                    buffers: &[Some(wgpu::VertexBufferLayout {
+                        array_stride: size_of::<Quad>() as u64,
+                        step_mode: wgpu::VertexStepMode::Instance,
+                        attributes: &wgpu::vertex_attr_array![0 => Float32x4, 1 => Float32x4, 2 => Float32x3, 3 => Uint32],
+                    })],
+                },
+                primitive: wgpu::PrimitiveState { topology: wgpu::PrimitiveTopology::TriangleStrip, ..Default::default() },
+                depth_stencil: None,
+                multisample: Default::default(),
+                fragment: Some(wgpu::FragmentState {
+                    module: &self.module,
+                    entry_point: Some(fragment),
+                    compilation_options: Default::default(),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format,
+                        blend: Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                }),
+                multiview_mask: None,
+                cache: None,
+            })
+        };
+        let cells = build(&[Some(&self.layout)], "fs");
+        let images = build(&[Some(&self.layout), Some(&self.images.layout)], "fs_image");
+        self.pipelines.push((format, cells, images));
     }
 }
 
@@ -917,6 +1116,8 @@ fn new_slot(
         uniforms,
         bind_group,
         built: None,
+        bounds: [0; 3],
+        images: Vec::new(),
     }
 }
 
@@ -1029,9 +1230,9 @@ impl TerminalCompositor {
                 Wait::Until(Instant::now() + GLYPH_WAIT)
             };
             let (atlas, texture) = (&mut gpu.atlas, &gpu.texture);
-            loop {
+            let glyphs_start = loop {
                 atlas.missing = false;
-                build_quads(
+                let glyphs_start = build_quads(
                     &grid,
                     rect,
                     metrics,
@@ -1045,9 +1246,10 @@ impl TerminalCompositor {
                     || wait.expired()
                     || !atlas.receive(queue, texture, font, rasterizer, wait)
                 {
-                    break;
+                    break glyphs_start;
                 }
-            }
+            };
+            let text_end = slot.scratch.len() as u32;
             if let Some(scrollbar) = grid.scrollbar
                 && let Some(thumb) = scrollbar_thumb(&grid, rect, metrics)
             {
@@ -1056,6 +1258,28 @@ impl TerminalCompositor {
                     thumb_color(grid.bg, scrollbar.opacity),
                     site.srgb_blend,
                 ));
+            }
+            slot.bounds = [glyphs_start as u32, text_end, slot.scratch.len() as u32];
+            let origin = metrics.origin(rect);
+            let rows = grid.cells.len() / usize::from(grid.cols).max(1);
+            let area = [
+                origin.0,
+                origin.1,
+                f32::from(grid.cols) * f32::from(metrics.cell_width),
+                rows as f32 * f32::from(metrics.cell_height),
+            ];
+            slot.images.clear();
+            for placement in grid.images.iter() {
+                if let Some(quad) = image_quad(placement, origin, metrics, area, site.srgb_blend)
+                    && let Some(bind_group) = gpu.images.bind_group(device, queue, &placement.image)
+                {
+                    slot.scratch.push(quad);
+                    slot.images.push(ImageDraw {
+                        layer: placement.layer,
+                        key: (placement.image.id, placement.image.generation),
+                        bind_group,
+                    });
+                }
             }
             let bytes: &[u8] = cast_slice(&slot.scratch);
             if bytes.len() as u64 > slot.quads.size() {
@@ -1074,17 +1298,44 @@ impl TerminalCompositor {
             site.size[1] as f32,
         ];
         queue.write_buffer(&slot.uniforms, 0, cast_slice(&frame));
-        let Some((_, pipeline)) = gpu
+        for draw in &slot.images {
+            gpu.images.touch(draw.key);
+        }
+        let Some((_, cells, images)) = gpu
             .pipelines
             .iter()
-            .find(|(built, _)| *built == site.format)
+            .find(|(built, ..)| *built == site.format)
         else {
             return;
         };
-        pass.set_pipeline(pipeline);
-        pass.set_bind_group(0, &slot.bind_group, &[]);
         pass.set_vertex_buffer(0, slot.quads.slice(..));
-        pass.draw(0..4, 0..slot.scratch.len() as u32);
+        let draw_cells = |pass: &mut wgpu::RenderPass<'_>, range: Range<u32>| {
+            if !range.is_empty() {
+                pass.set_pipeline(cells);
+                pass.set_bind_group(0, &slot.bind_group, &[]);
+                pass.draw(0..4, range);
+            }
+        };
+        let draw_images = |pass: &mut wgpu::RenderPass<'_>, layer: ImageLayer| {
+            pass.set_pipeline(images);
+            pass.set_bind_group(0, &slot.bind_group, &[]);
+            for (offset, draw) in slot.images.iter().enumerate() {
+                if draw.layer == layer {
+                    pass.set_bind_group(1, &draw.bind_group, &[]);
+                    let instance = slot.bounds[2] + offset as u32;
+                    pass.draw(0..4, instance..instance + 1);
+                }
+            }
+        };
+        // Images below the backgrounds still lie over the fill, which is the first quad.
+        let [glyphs_start, text_end, chrome_end] = slot.bounds;
+        draw_cells(pass, 0..1.min(glyphs_start));
+        draw_images(pass, ImageLayer::BelowBackground);
+        draw_cells(pass, 1.min(glyphs_start)..glyphs_start);
+        draw_images(pass, ImageLayer::BelowText);
+        draw_cells(pass, glyphs_start..text_end);
+        draw_images(pass, ImageLayer::AboveText);
+        draw_cells(pass, text_end..chrome_end);
     }
 }
 
@@ -1113,6 +1364,9 @@ impl<S: TerminalSource> Compositor<S> for TerminalCompositor {
             .draw_with(frame.encoder, frame.target, clear, &mut |pass, site| {
                 self.draw(device, queue, source, pass, site)
             });
+        if let Some(gpu) = self.gpu.as_mut() {
+            gpu.images.sweep();
+        }
     }
 }
 
@@ -1729,6 +1983,65 @@ mod tests {
             "build_quads {cols}x{rows} flood: {} us/frame",
             start.elapsed().as_micros() / grids.len() as u128
         );
+    }
+
+    fn placement(col: i32, row: i32, size: [u32; 2]) -> Placement {
+        Placement {
+            image: Arc::new(Image {
+                id: 1,
+                generation: 1,
+                width: 4,
+                height: 4,
+                rgba: vec![0; 64],
+            }),
+            layer: ImageLayer::AboveText,
+            col,
+            row,
+            offset: [0, 0],
+            size,
+            source: [0, 0, 4, 4],
+        }
+    }
+
+    #[test]
+    fn an_image_past_the_top_of_the_viewport_is_clipped_with_its_texture_coordinates() {
+        let metrics = Metrics {
+            cell_width: 10,
+            cell_height: 20,
+            padding: 0.0,
+            scale: 1.0,
+        };
+        let area = [5.0, 7.0, 100.0, 100.0];
+        // Two cells tall, starting one row above the viewport, so half of it shows.
+        let quad =
+            image_quad(&placement(1, -1, [20, 40]), (5.0, 7.0), metrics, area, true).unwrap();
+        assert_eq!(quad.rect, [15.0, 7.0, 20.0, 20.0]);
+        assert_eq!(quad.uv, [0.0, 0.5, 1.0, 0.5]);
+        assert_eq!(quad.mode, MODE_IMAGE);
+        let linear = image_quad(&placement(0, 0, [20, 40]), (5.0, 7.0), metrics, area, false);
+        assert_eq!(linear.unwrap().mode, MODE_IMAGE_LINEAR);
+        assert!(image_quad(&placement(0, -2, [20, 40]), (5.0, 7.0), metrics, area, true).is_none());
+    }
+
+    #[test]
+    fn a_cropped_image_samples_only_its_source_rectangle() {
+        let metrics = Metrics {
+            cell_width: 10,
+            cell_height: 20,
+            padding: 0.0,
+            scale: 1.0,
+        };
+        let mut cropped = placement(0, 0, [10, 20]);
+        cropped.source = [2, 0, 2, 4];
+        let quad = image_quad(
+            &cropped,
+            (0.0, 0.0),
+            metrics,
+            [0.0, 0.0, 100.0, 100.0],
+            true,
+        )
+        .unwrap();
+        assert_eq!(quad.uv, [0.5, 0.0, 0.5, 1.0]);
     }
 
     #[test]

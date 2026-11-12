@@ -4,6 +4,7 @@ mod config;
 mod constraint;
 mod font;
 mod grid;
+mod images;
 mod input;
 mod jump;
 mod keymap;

@@ -227,6 +227,10 @@ impl Actor {
         let mut scrollbar_hovered = false;
         let mut resize = ResizeDebounce::default();
         let mut dirty = true;
+        // libghostty keeps no timer for animated images; this clock and the due time drive it.
+        let animation_epoch = Instant::now();
+        let mut animation_due: Option<Instant> = None;
+        let mut tick_animation = true;
         let mut next_password_check = Instant::now();
         let mut titles = Titles {
             sent: String::new(),
@@ -240,6 +244,7 @@ impl Actor {
                 input.next_autoscroll,
                 resize.due,
                 fade.next_change(now),
+                animation_due.filter(|_| visibility == Visibility::Shown),
                 titles.due(visibility).filter(|_| title_changed.get()),
                 (visibility != Visibility::Hidden).then_some(next_password_check),
             ]
@@ -253,6 +258,7 @@ impl Actor {
                         terminal.vt_write(&bytes);
                         fade.follow(&terminal);
                         dirty = true;
+                        tick_animation = true;
                         let alerted = alerted.replace(false);
                         let notice = notice.borrow_mut().take();
                         if alerted
@@ -373,6 +379,7 @@ impl Actor {
                         }
                         publisher.borrow_mut().visibility = visibility;
                         dirty = true;
+                        tick_animation = true;
                     }
                     Err(_) => return Ok(()),
                 },
@@ -408,6 +415,19 @@ impl Actor {
                 publisher.presentation.password_input = password_input;
             }
             dirty |= publisher.tick_blink(Instant::now());
+            // Output may have started an animation, which only a tick reveals.
+            if publisher.visible()
+                && (tick_animation || animation_due.is_some_and(|due| Instant::now() >= due))
+            {
+                tick_animation = false;
+                let elapsed = u64::try_from(animation_epoch.elapsed().as_millis())?;
+                animation_due = terminal
+                    .kitty_graphics_animation_tick(elapsed)
+                    .log_err("tick animations")
+                    .flatten()
+                    .map(|next| animation_epoch + Duration::from_millis(next));
+                dirty |= animation_due.is_some();
+            }
             let held = scrollbar_hovered || input.scrollbar_grab.is_some();
             let opacity = fade.opacity(&terminal, held, Instant::now());
             let presentation = &mut publisher.presentation;
