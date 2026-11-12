@@ -1,4 +1,5 @@
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use libghostty_vt::color::Rgb;
@@ -14,6 +15,8 @@ use crate::grid::{DEFAULT_BG, DEFAULT_FG};
 const DEFAULT_SHELL: &str = "/opt/homebrew/bin/fish";
 pub const DEFAULT_FONT_FAMILY: &str = "Monaspace Neon";
 const DEFAULT_FONT_SIZE: f64 = 18.0;
+/// Ghostty's default for `notify-on-command-finish-after`.
+const DEFAULT_COMMAND_FINISH_AFTER: Duration = Duration::from_secs(5);
 const GHOSTTY_THEMES: &str = "/Applications/Ghostty.app/Contents/Resources/ghostty/themes";
 
 #[derive(Clone, Debug, PartialEq)]
@@ -28,6 +31,9 @@ pub struct Config {
     pub jump_command: Option<String>,
     /// `auto-secure-input`: turn secure keyboard entry on while a program reads a password.
     pub auto_secure_input: bool,
+    /// `notify-on-command-finish` and `-after`: how long a command must run before finishing out
+    /// of sight marks its tab for attention; `None` never does.
+    pub command_finish_after: Option<Duration>,
     pub clipboard_read: ClipboardAccess,
     pub clipboard_write: ClipboardAccess,
 }
@@ -115,6 +121,7 @@ impl Default for Config {
             ],
             jump_command: None,
             auto_secure_input: true,
+            command_finish_after: Some(DEFAULT_COMMAND_FINISH_AFTER),
             clipboard_read: ClipboardAccess::Ask,
             clipboard_write: ClipboardAccess::Allow,
         }
@@ -143,6 +150,15 @@ struct File {
     /// Ghostty's `macos-auto-secure-input`, then on.
     #[serde(rename = "auto-secure-input")]
     auto_secure_input: Option<bool>,
+    /// Whether a command finishing out of sight marks its tab: `never`, or `unfocused` or
+    /// `always`, which mean the same here as a tab in view needs no mark. Falls back to Ghostty's
+    /// `notify-on-command-finish`, then `unfocused`.
+    #[serde(rename = "notify-on-command-finish")]
+    notify_on_command_finish: Option<String>,
+    /// How long a command must run to mark its tab, such as `5s` or `1m30s`. Falls back to
+    /// Ghostty's `notify-on-command-finish-after`, then `5s`.
+    #[serde(rename = "notify-on-command-finish-after")]
+    notify_on_command_finish_after: Option<String>,
     /// Whether programs may read the clipboard through OSC 52: `allow`, `deny` or `ask`
     /// (the default). Falls back to Ghostty's setting.
     #[serde(rename = "clipboard-read")]
@@ -287,6 +303,10 @@ fn default_config_text() -> String {
          # Turn on secure keyboard entry while a program reads a password; unset uses Ghostty's\n\
          # `macos-auto-secure-input`, then true.\n\
          # auto-secure-input = false\n\
+         # Mark a tab when a command finishes out of sight (`never`, or `unfocused`) and how long\n\
+         # it must have run, as in Ghostty; unset uses Ghostty's, then `unfocused` and 5s.\n\
+         # notify-on-command-finish = \"never\"\n\
+         # notify-on-command-finish-after = \"30s\"\n\
          # Whether programs may read or set the clipboard through OSC 52: \"allow\", \"deny\" or\n\
          # \"ask\". Unset uses Ghostty's, then \"ask\" for reads and \"allow\" for writes.\n\
          # clipboard-read = \"ask\"\n\
@@ -402,6 +422,12 @@ impl Config {
                         .and_then(|value| value.parse().log_err("macos-auto-secure-input"))
                 })
                 .unwrap_or(defaults.auto_secure_input),
+            command_finish_after: command_finish_after(
+                file.notify_on_command_finish
+                    .or_else(|| ghostty_value("notify-on-command-finish")),
+                file.notify_on_command_finish_after
+                    .or_else(|| ghostty_value("notify-on-command-finish-after")),
+            ),
             clipboard_read: clipboard(
                 file.clipboard_read,
                 "clipboard-read",
@@ -431,6 +457,49 @@ fn ghostty_values<'a>(text: &'a str, key: &str) -> Vec<&'a str> {
         .filter(|(name, _)| name.trim() == key)
         .map(|(_, value)| value.trim().trim_matches('"'))
         .collect()
+}
+
+fn command_finish_after(mode: Option<String>, after: Option<String>) -> Option<Duration> {
+    match mode.as_deref() {
+        Some("never") => None,
+        Some("unfocused" | "always") | None => Some(
+            after
+                .and_then(|after| parse_duration(&after).log_err("notify-on-command-finish-after"))
+                .unwrap_or(DEFAULT_COMMAND_FINISH_AFTER),
+        ),
+        Some(other) => {
+            eprintln!("agentd: notify-on-command-finish: unknown value {other}");
+            Some(DEFAULT_COMMAND_FINISH_AFTER)
+        }
+    }
+}
+
+/// Ghostty's duration syntax: units such as `500ms`, `5s` and `1m30s`, added up.
+fn parse_duration(text: &str) -> Result<Duration> {
+    let mut total = Duration::ZERO;
+    let mut rest = text.trim();
+    anyhow::ensure!(!rest.is_empty(), "empty duration");
+    while !rest.is_empty() {
+        let digits = rest
+            .find(|c: char| !c.is_ascii_digit())
+            .unwrap_or(rest.len());
+        let (number, tail) = rest.split_at(digits);
+        let number: u64 = number.parse().with_context(|| format!("duration {text}"))?;
+        let letters = tail
+            .find(|c: char| c.is_ascii_digit())
+            .unwrap_or(tail.len());
+        let (unit, next) = tail.split_at(letters);
+        total += match unit.trim() {
+            "ms" => Duration::from_millis(number),
+            "s" => Duration::from_secs(number),
+            "m" => Duration::from_secs(number * 60),
+            "h" => Duration::from_secs(number * 3600),
+            "d" => Duration::from_secs(number * 86400),
+            _ => bail!("unknown unit {unit:?} in duration {text}"),
+        };
+        rest = next.trim_start();
+    }
+    Ok(total)
 }
 
 /// Ghostty's `font-shaping-break`: comma-separated options, where `no-` turns one off, and the
@@ -691,6 +760,37 @@ mod tests {
             Some("macos-auto-secure-input = false\n")
         ));
         assert!(!auto(Some("auto-secure-input = false\n"), None));
+    }
+
+    #[test]
+    fn command_finish_reads_ghostty_and_config_toml_replaces_it() {
+        let after = |config: Option<&str>, ghostty: Option<&str>| {
+            let (_root, paths) = paths(config, ghostty);
+            Config::load(&paths).command_finish_after
+        };
+        let seconds = |seconds| Some(Duration::from_secs(seconds));
+        assert_eq!(after(None, None), seconds(5));
+        assert_eq!(
+            after(None, Some("notify-on-command-finish-after = 1m30s\n")),
+            seconds(90)
+        );
+        assert_eq!(
+            after(None, Some("notify-on-command-finish = never\n")),
+            None
+        );
+        assert_eq!(
+            after(
+                Some(
+                    "notify-on-command-finish = \"always\"\nnotify-on-command-finish-after = \"500ms\"\n"
+                ),
+                Some("notify-on-command-finish = never\n")
+            ),
+            Some(Duration::from_millis(500))
+        );
+        assert_eq!(
+            after(Some("notify-on-command-finish-after = \"soon\"\n"), None),
+            seconds(5)
+        );
     }
 
     #[test]

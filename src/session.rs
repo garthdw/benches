@@ -242,6 +242,7 @@ impl Session {
             events: events_tx,
             waker,
             theme: config.theme.clone(),
+            command_finish_after: config.command_finish_after,
             clipboard_read: config.clipboard_read,
             clipboard_write: config.clipboard_write,
         };
@@ -376,6 +377,14 @@ impl Session {
 
     pub fn hover_scrollbar(&self, hovered: bool) {
         self.send(Msg::ScrollbarHover(hovered));
+    }
+
+    pub fn jump_prompt(&self, delta: isize) {
+        self.send(Msg::PromptJump(delta));
+    }
+
+    pub fn select_last_output(&self) {
+        self.send(Msg::SelectLastOutput);
     }
 
     pub fn copy(&self) {
@@ -961,6 +970,61 @@ mod tests {
         session.set_visibility(Visibility::Hidden);
         type_line(&session, "printf '\\a'");
         wait_for_alert(&session);
+    }
+
+    fn finished_events(session: &Session, count: usize) -> Vec<bool> {
+        let mut failures = Vec::new();
+        wait_until(
+            Duration::from_secs(15),
+            || format!("fewer than {count} commands finished"),
+            || {
+                while let Some(event) = session.next_event() {
+                    if let Event::CommandFinished { failed } = event {
+                        failures.push(failed);
+                    }
+                }
+                (failures.len() >= count).then(|| failures.clone())
+            },
+        )
+    }
+
+    fn spawn_with_threshold(threshold: Duration) -> Session {
+        let config = Config {
+            command_finish_after: Some(threshold),
+            ..Config::default()
+        };
+        Session::spawn(None, Path::new("/tmp"), &config, Arc::new(|| {})).unwrap()
+    }
+
+    // Marks are doubled, as when a shell and its integration both emit them.
+    const SLOW_FAILURE: &str = "printf '\\033]133;C\\007\\033]133;C\\007'; sleep 0.4; \
+                                printf '\\033]133;D;1\\007\\033]133;D;1\\007'";
+
+    #[test]
+    fn a_long_command_finishing_out_of_sight_raises_attention_once() {
+        let session = spawn_with_threshold(Duration::from_millis(200));
+        session.set_visibility(Visibility::Hidden);
+        type_line(&session, SLOW_FAILURE);
+        wait_for_alert(&session);
+        assert_eq!(finished_events(&session, 1), [true]);
+        assert_eq!(notify_events(&session), []);
+    }
+
+    #[test]
+    fn a_quick_command_finishing_out_of_sight_leaves_no_mark() {
+        let session = spawn_with_threshold(Duration::from_secs(3600));
+        session.set_visibility(Visibility::Listed);
+        type_line(&session, SLOW_FAILURE);
+        assert_eq!(finished_events(&session, 1), [true]);
+        assert_eq!(session.attention(), Attention::None);
+    }
+
+    #[test]
+    fn a_long_command_in_a_shown_tab_leaves_no_mark() {
+        let session = spawn_with_threshold(Duration::from_millis(200));
+        type_line(&session, SLOW_FAILURE);
+        assert_eq!(finished_events(&session, 1), [true]);
+        assert_eq!(session.attention(), Attention::None);
     }
 
     #[test]
