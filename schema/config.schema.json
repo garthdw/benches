@@ -113,6 +113,13 @@
         "string",
         "null"
       ]
+    },
+    "working-directory": {
+      "description": "The folder new projects start in: an absolute path, `~/...`, `home`, or `inherit` (the\nfolder agentd was launched from, which is home unless that was a terminal). Falls back to\nGhostty's `working-directory`, then home.",
+      "type": [
+        "string",
+        "null"
+      ]
     }
   },
   "title": "File",
