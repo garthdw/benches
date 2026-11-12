@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 use rune::{Env, Key, KeyEvent, Mods, Runtime, Waker};
 
 use crate::scenes::show_workspace_scene;
-use crate::workspace::WindowId;
+use crate::windows::WindowId;
 use crate::{Fleet, State, on_key, poll, view};
 
 pub(crate) fn runtime_with(state: State) -> Runtime<State> {
