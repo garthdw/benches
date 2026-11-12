@@ -1,5 +1,14 @@
 {
   "$defs": {
+    "ClipboardAccess": {
+      "description": "Ghostty's `clipboard-read` and `clipboard-write` values.",
+      "enum": [
+        "allow",
+        "deny",
+        "ask"
+      ],
+      "type": "string"
+    },
     "FontFile": {
       "additionalProperties": false,
       "properties": {
@@ -79,6 +88,35 @@
   "additionalProperties": false,
   "description": "The `config.toml` format. Every key is optional.",
   "properties": {
+    "auto-secure-input": {
+      "description": "Whether to turn on secure keyboard entry while a program reads a password. Falls back to\nGhostty's `macos-auto-secure-input`, then on.",
+      "type": [
+        "boolean",
+        "null"
+      ]
+    },
+    "clipboard-read": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/ClipboardAccess"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "Whether programs may read the clipboard through OSC 52: `allow`, `deny` or `ask`\n(the default). Falls back to Ghostty's setting."
+    },
+    "clipboard-write": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/ClipboardAccess"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "Whether programs may set the clipboard through OSC 52: `allow` (the default), `deny` or\n`ask`. Falls back to Ghostty's setting."
+    },
     "font": {
       "$ref": "#/$defs/FontFile",
       "description": "The terminal font. Each key falls back to Ghostty's config."

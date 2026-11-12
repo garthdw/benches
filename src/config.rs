@@ -4,6 +4,8 @@ use anyhow::{Context, Result, bail};
 use libghostty_vt::color::Rgb;
 use schemars::JsonSchema;
 use serde::Deserialize;
+use serde::de::IntoDeserializer;
+use serde::de::value::Error as ValueError;
 
 use crate::LogErr;
 use crate::constraint::Modifier;
@@ -26,6 +28,19 @@ pub struct Config {
     pub jump_command: Option<String>,
     /// `working-directory`: the folder new projects start in, already checked to exist.
     pub working_directory: PathBuf,
+    /// `auto-secure-input`: turn secure keyboard entry on while a program reads a password.
+    pub auto_secure_input: bool,
+    pub clipboard_read: ClipboardAccess,
+    pub clipboard_write: ClipboardAccess,
+}
+
+/// Ghostty's `clipboard-read` and `clipboard-write` values.
+#[derive(Clone, Copy, Debug, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ClipboardAccess {
+    Allow,
+    Deny,
+    Ask,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -102,6 +117,9 @@ impl Default for Config {
             ],
             jump_command: None,
             working_directory: home_dir(),
+            auto_secure_input: true,
+            clipboard_read: ClipboardAccess::Ask,
+            clipboard_write: ClipboardAccess::Allow,
         }
     }
 }
@@ -129,6 +147,18 @@ struct File {
     /// Ghostty's `working-directory`, then home.
     #[serde(rename = "working-directory")]
     working_directory: Option<String>,
+    /// Whether to turn on secure keyboard entry while a program reads a password. Falls back to
+    /// Ghostty's `macos-auto-secure-input`, then on.
+    #[serde(rename = "auto-secure-input")]
+    auto_secure_input: Option<bool>,
+    /// Whether programs may read the clipboard through OSC 52: `allow`, `deny` or `ask`
+    /// (the default). Falls back to Ghostty's setting.
+    #[serde(rename = "clipboard-read")]
+    clipboard_read: Option<ClipboardAccess>,
+    /// Whether programs may set the clipboard through OSC 52: `allow` (the default), `deny` or
+    /// `ask`. Falls back to Ghostty's setting.
+    #[serde(rename = "clipboard-write")]
+    clipboard_write: Option<ClipboardAccess>,
 }
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
@@ -265,6 +295,13 @@ fn default_config_text() -> String {
          # The folder new projects start in: a path, `~/...`, `home` or `inherit`; unset uses\n\
          # Ghostty's `working-directory`, then home.\n\
          # working-directory = \"~/dev\"\n\
+         # Turn on secure keyboard entry while a program reads a password; unset uses Ghostty's\n\
+         # `macos-auto-secure-input`, then true.\n\
+         # auto-secure-input = false\n\
+         # Whether programs may read or set the clipboard through OSC 52: \"allow\", \"deny\" or\n\
+         # \"ask\". Unset uses Ghostty's, then \"ask\" for reads and \"allow\" for writes.\n\
+         # clipboard-read = \"ask\"\n\
+         # clipboard-write = \"allow\"\n\
          \n\
          [font]\n\
          # family = {family}\n\
@@ -309,6 +346,18 @@ impl Config {
         let defaults = Config::default();
         let ghostty_size = ghostty_value("font-size")
             .and_then(|size| size.parse::<f64>().log_err("ghostty font-size"));
+        let clipboard = |setting: Option<ClipboardAccess>, key: &str, default| {
+            setting
+                .or_else(|| {
+                    ghostty_value(key).and_then(|value| {
+                        ClipboardAccess::deserialize(
+                            IntoDeserializer::<ValueError>::into_deserializer(value.as_str()),
+                        )
+                        .log_err(key)
+                    })
+                })
+                .unwrap_or(default)
+        };
         let theme = file
             .theme
             .or_else(|| ghostty_value("theme"))
@@ -363,6 +412,23 @@ impl Config {
                     .as_deref(),
                 &home_dir(),
                 std::env::current_dir().ok(),
+            ),
+            auto_secure_input: file
+                .auto_secure_input
+                .or_else(|| {
+                    ghostty_value("macos-auto-secure-input")
+                        .and_then(|value| value.parse().log_err("macos-auto-secure-input"))
+                })
+                .unwrap_or(defaults.auto_secure_input),
+            clipboard_read: clipboard(
+                file.clipboard_read,
+                "clipboard-read",
+                defaults.clipboard_read,
+            ),
+            clipboard_write: clipboard(
+                file.clipboard_write,
+                "clipboard-write",
+                defaults.clipboard_write,
             ),
         }
     }
@@ -632,6 +698,31 @@ mod tests {
     }
 
     #[test]
+    fn clipboard_access_defaults_to_asking_for_reads_and_allowing_writes() {
+        let (_root, paths) = paths(None, None);
+        let config = Config::load(&paths);
+        assert_eq!(config.clipboard_read, ClipboardAccess::Ask);
+        assert_eq!(config.clipboard_write, ClipboardAccess::Allow);
+    }
+
+    #[test]
+    fn clipboard_access_comes_from_config_toml_then_ghostty() {
+        let (_root, paths) = paths(
+            Some("clipboard-read = \"allow\"\n"),
+            Some("clipboard-read = deny\nclipboard-write = ask\n"),
+        );
+        let config = Config::load(&paths);
+        assert_eq!(config.clipboard_read, ClipboardAccess::Allow);
+        assert_eq!(config.clipboard_write, ClipboardAccess::Ask);
+    }
+
+    #[test]
+    fn an_unknown_ghostty_clipboard_value_falls_back_to_the_default() {
+        let (_root, paths) = paths(None, Some("clipboard-read = sometimes\n"));
+        assert_eq!(Config::load(&paths).clipboard_read, ClipboardAccess::Ask);
+    }
+
+    #[test]
     fn config_toml_overrides_ghostty_key_by_key() {
         let config = "shell = \"/bin/zsh\"\njump-command = \"j\"\n[font]\nsize = 12\nsymbols-family = \"Icons NF\"\n[[tabs]]\ntitle = \"shell\"\n";
         let (_root, paths) = paths(
@@ -675,6 +766,21 @@ mod tests {
             ["+liga"]
         );
         assert!(features(Some("[font]\nfeatures = []\n")).is_empty());
+    }
+
+    #[test]
+    fn auto_secure_input_reads_ghostty_and_config_toml_replaces_it() {
+        let auto = |config: Option<&str>, ghostty: Option<&str>| {
+            let (_root, paths) = paths(config, ghostty);
+            Config::load(&paths).auto_secure_input
+        };
+        assert!(auto(None, None));
+        assert!(!auto(None, Some("macos-auto-secure-input = false\n")));
+        assert!(auto(
+            Some("auto-secure-input = true\n"),
+            Some("macos-auto-secure-input = false\n")
+        ));
+        assert!(!auto(Some("auto-secure-input = false\n"), None));
     }
 
     #[test]
