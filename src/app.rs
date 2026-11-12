@@ -642,6 +642,11 @@ pub(crate) fn on_ime(state: &mut State, ime: &Ime, _: &mut Tx) -> bool {
         }
         Ime::Commit(committed) => {
             state.preedit.clear();
+            // Rune commits an open composition when the window goes inactive; in a terminal
+            // that would type unfinished text into the program, so drop it.
+            if !state.workspace.window_focused {
+                return true;
+            }
             if let Some(session) = state.session() {
                 session.key(crate::input::map_text(
                     committed,
@@ -889,6 +894,44 @@ mod tests {
             ..State::default()
         });
         assert!(composing.find("caret").is_some());
+    }
+
+    #[test]
+    fn a_composition_finished_by_leaving_the_window_stays_out_of_the_terminal() {
+        let mut state = State::default();
+        state
+            .workspace
+            .add_project(Project::new("/tmp".into(), vec![]));
+        open_tab(&mut state, "shell", Some("cat"));
+        let mut tx = Tx::default();
+        state.workspace.set_window_focused(true);
+        on_ime(
+            &mut state,
+            &Ime::Preedit("leaked".to_owned(), None),
+            &mut tx,
+        );
+        state.workspace.set_window_focused(false);
+        on_ime(&mut state, &Ime::Commit("leaked".to_owned()), &mut tx);
+        assert_eq!(state.preedit, "");
+        state.workspace.set_window_focused(true);
+        on_ime(&mut state, &Ime::Commit("ok".to_owned()), &mut tx);
+        let session = state.session().unwrap();
+        let enter = KeyEvent {
+            key: Key::Enter,
+            mods: Mods::default(),
+        };
+        session.key(crate::input::map_key(&enter, None, None).unwrap());
+        wait_until(
+            Duration::from_secs(15),
+            || format!("{:#?}", session.grid().lines()),
+            || {
+                let lines = session.grid().lines();
+                lines
+                    .iter()
+                    .any(|line| line.trim_end() == "ok")
+                    .then_some(())
+            },
+        );
     }
 
     #[test]
