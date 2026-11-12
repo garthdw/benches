@@ -1,9 +1,11 @@
 mod config;
+mod constraint;
 mod font;
 mod input;
 mod jump;
 mod keymap;
 mod link;
+mod nerd_font_table;
 mod notify;
 mod palette;
 mod render;
