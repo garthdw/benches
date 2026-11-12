@@ -478,7 +478,10 @@ fn read_cell(
         bg = Some(background);
         fg = selection_foreground.unwrap_or(fg);
     }
-    let width = cell.raw_cell()?.wide()?;
+    let raw = cell.raw_cell()?;
+    // A kitty Unicode placeholder marks where an image is drawn and has no glyph of its own.
+    invisible |= raw.codepoint()? == 0x10EEEE;
+    let width = raw.wide()?;
     output.wide = width == CellWide::Wide;
     output.spacer = matches!(width, CellWide::SpacerTail | CellWide::SpacerHead);
     output.fg = if is_faint {
@@ -1396,6 +1399,18 @@ mod tests {
         assert_eq!(placement.layer, ImageLayer::AboveText);
         assert_eq!(placement.image.rgba, [255, 0, 0, 255, 0, 255, 0, 255]);
         assert_eq!((placement.image.width, placement.image.height), (2, 1));
+    }
+
+    #[test]
+    fn unicode_placeholders_draw_the_image_and_no_glyph() {
+        let mut terminal = image_terminal();
+        terminal.vt_write(b"\x1b_Ga=t,f=32,s=2,v=1,i=7,q=2;/wAA/wD/AP8=\x1b\\");
+        terminal.vt_write(b"\x1b_Ga=p,U=1,i=7,c=2,r=1,q=2\x1b\\");
+        terminal.vt_write("\x1b[38;5;7m\u{10EEEE}\u{305}\u{305}\u{10EEEE}".as_bytes());
+        let grid = build(&mut GridBuilder::new().unwrap(), &terminal, 1);
+        assert_eq!(grid.images.len(), 1);
+        assert_eq!(grid.lines()[0].trim_end(), "");
+        assert!(grid.cells[..2].iter().all(|cell| cell.cluster.is_none()));
     }
 
     #[test]
