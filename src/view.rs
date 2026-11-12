@@ -10,13 +10,14 @@ use rune::{
 use crate::app::{
     Confirm, State, open_project, pick_new_tab, request_close_project, resolve_confirm, tray_action,
 };
+use crate::find;
 use crate::input::{self, focus_on_press, pointer_phase, send_pointer};
 use crate::palette::{self, open_palette};
 use crate::render;
 use crate::session::{Attention, Session};
 use crate::terminal_input::{PointerPhase, WheelInput};
 use crate::windows::{move_to_new_window, torn_off};
-use crate::workspace::{Project, Status, Workspace};
+use crate::workspace::{Project, Status, Tab, Workspace};
 
 pub(crate) const TERMINAL_MARK: u32 = 1;
 pub(crate) const DRAWER_MARK: u32 = 2;
@@ -189,8 +190,9 @@ fn attention_dot(accent: Color, attention: Attention) -> Option<El> {
     }
 }
 
-fn status_dot(theme: &tok::Theme, status: &Status) -> El {
-    dot(match status {
+fn status_dot(theme: &tok::Theme, tab: &Tab) -> El {
+    dot(match &tab.status {
+        Status::Running if tab.command_failed => rune::color::oklch(0.66, 0.2, 25.0),
         Status::Running => rune::color::oklch(0.74, 0.17, 150.0),
         Status::Failed(_) => rune::color::oklch(0.66, 0.2, 25.0),
         Status::Stopped | Status::Exited => theme.text_secondary,
@@ -464,6 +466,7 @@ fn focus_overlays(state: &State, theme: &tok::Theme) -> Vec<El> {
             move |state, tx, confirmed| resolve_confirm(state, index, confirmed, tx),
         ));
     }
+    overlays.extend(find::view(state, theme));
     if let Some((_, tab)) = state.workspace.focused_tab()
         && tab.status != Status::Running
     {
@@ -494,7 +497,7 @@ fn tray_bar(project: &Project, theme: &tok::Theme) -> Option<El> {
                 key.clone(),
                 tab.label(),
                 open,
-                Some(status_dot(theme, &tab.status)),
+                Some(status_dot(theme, tab)),
             )
             .max_w(TAB_MAX_WIDTH)
             .on_press(move |state: &mut State| state.workspace.toggle_drawer(index))
@@ -542,7 +545,7 @@ fn drawer(
             .gap(8.0)
             .px(8.0)
             .items_center()
-            .child(status_dot(theme, &tab.status))
+            .child(status_dot(theme, tab))
             .child(text(tab.label().to_owned()).color(theme.text).truncate())
             .child(text(status_text(&tab.status).to_owned()).color(theme.text_secondary))
             .child(el().grow(1.0))
