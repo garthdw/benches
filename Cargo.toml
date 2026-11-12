@@ -5,7 +5,7 @@ edition = "2024"
 publish = false
 
 [dependencies]
-rune = { git = "https://github.com/anomalyco/rune", rev = "ba5e7c8069a24c36f95ca90a3058083cd468fcd1", features = [
+rune = { git = "https://github.com/anomalyco/rune", rev = "7dfaa8fb1fa8281e6e2ccc92568d95262e9c6f3c", features = [
   "native-file-dialog",
 ] }
 libghostty-vt = { git = "https://github.com/Uzaaft/libghostty-rs", rev = "635b1cc037e66ebb83c9fa39db782b77cd15014d" }

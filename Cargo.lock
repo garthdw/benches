@@ -2709,7 +2709,7 @@ dependencies = [
 [[package]]
 name = "rune"
 version = "0.0.1"
-source = "git+https://github.com/anomalyco/rune?rev=ba5e7c8069a24c36f95ca90a3058083cd468fcd1#ba5e7c8069a24c36f95ca90a3058083cd468fcd1"
+source = "git+https://github.com/anomalyco/rune?rev=7dfaa8fb1fa8281e6e2ccc92568d95262e9c6f3c#7dfaa8fb1fa8281e6e2ccc92568d95262e9c6f3c"
 dependencies = [
  "accesskit",
  "accesskit_macos",
@@ -2737,6 +2737,7 @@ dependencies = [
  "objc2-core-foundation",
  "objc2-core-graphics",
  "objc2-core-media",
+ "objc2-core-text",
  "objc2-core-video",
  "objc2-foundation 0.2.2",
  "objc2-foundation 0.3.2",
@@ -2779,6 +2780,7 @@ dependencies = [
  "wgpu-hal",
  "wgpu-naga-bridge",
  "windows",
+ "windows-core",
  "windows-sys 0.59.0",
  "winit",
  "x11rb",
@@ -2790,12 +2792,12 @@ dependencies = [
 [[package]]
 name = "rune-motion"
 version = "0.1.0"
-source = "git+https://github.com/anomalyco/rune?rev=ba5e7c8069a24c36f95ca90a3058083cd468fcd1#ba5e7c8069a24c36f95ca90a3058083cd468fcd1"
+source = "git+https://github.com/anomalyco/rune?rev=7dfaa8fb1fa8281e6e2ccc92568d95262e9c6f3c#7dfaa8fb1fa8281e6e2ccc92568d95262e9c6f3c"
 
 [[package]]
 name = "rune-staging"
 version = "0.0.1"
-source = "git+https://github.com/anomalyco/rune?rev=ba5e7c8069a24c36f95ca90a3058083cd468fcd1#ba5e7c8069a24c36f95ca90a3058083cd468fcd1"
+source = "git+https://github.com/anomalyco/rune?rev=7dfaa8fb1fa8281e6e2ccc92568d95262e9c6f3c#7dfaa8fb1fa8281e6e2ccc92568d95262e9c6f3c"
 dependencies = [
  "wgpu",
 ]
@@ -2803,7 +2805,7 @@ dependencies = [
 [[package]]
 name = "rune-taffy"
 version = "0.0.1"
-source = "git+https://github.com/anomalyco/rune?rev=ba5e7c8069a24c36f95ca90a3058083cd468fcd1#ba5e7c8069a24c36f95ca90a3058083cd468fcd1"
+source = "git+https://github.com/anomalyco/rune?rev=7dfaa8fb1fa8281e6e2ccc92568d95262e9c6f3c#7dfaa8fb1fa8281e6e2ccc92568d95262e9c6f3c"
 dependencies = [
  "taffy",
 ]
