@@ -113,6 +113,10 @@ impl TerminalSource for State {
         }
     }
 
+    fn waker(&self) -> Waker {
+        self.window_waker()
+    }
+
     fn drawn_session(&self, mark: u32) -> Option<&Session> {
         let workspace = &self.workspace;
         match mark {
