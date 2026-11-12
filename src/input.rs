@@ -4,7 +4,8 @@ use rune::{Key, KeyEvent, Mods, Phase, PhysicalKeyCode as Code, Tx};
 
 use crate::app::State;
 use crate::grid::Grid;
-use crate::session::{PointerInput, PointerPhase, Session};
+use crate::session::Session;
+use crate::terminal_input::{PointerInput, PointerPhase};
 
 #[derive(Debug, PartialEq)]
 pub struct KeyInput {

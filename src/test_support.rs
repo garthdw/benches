@@ -3,14 +3,15 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
-use libghostty_vt::Terminal;
 use libghostty_vt::style::RgbColor;
+use libghostty_vt::{Terminal, key, mouse};
 use rune::{Env, Key, KeyEvent, Mods, Runtime, Waker};
 
 use crate::app::{State, on_key, poll};
-use crate::grid::Metrics;
+use crate::grid::{Metrics, Surface};
 use crate::scenes::show_workspace_scene;
 use crate::session::new_terminal;
+use crate::terminal_input::{PointerInput, PointerPhase, WheelInput};
 use crate::view::view;
 use crate::windows::{Fleet, WindowId};
 use crate::workspace::{Project, Workspace};
@@ -177,3 +178,33 @@ pub(crate) const THEME_BLUE: RgbColor = RgbColor {
     g: 0,
     b: 0xff,
 };
+
+pub(crate) const TEST_SURFACE: Surface = Surface {
+    cols: 20,
+    rows: 5,
+    metrics: Metrics {
+        cell_width: 10,
+        cell_height: 20,
+        padding: 0.0,
+        scale: 1.0,
+    },
+};
+
+pub(crate) fn pointer_at(phase: PointerPhase, column: u16, row: u16) -> PointerInput {
+    PointerInput {
+        phase,
+        button: Some(mouse::Button::Left),
+        x: f32::from(column) * 10.0 + 5.0,
+        y: f32::from(row) * 20.0 + 10.0,
+        mods: key::Mods::empty(),
+    }
+}
+
+pub(crate) fn wheel_by(dy: f32) -> WheelInput {
+    WheelInput {
+        dy,
+        x: 5.0,
+        y: 10.0,
+        mods: key::Mods::empty(),
+    }
+}

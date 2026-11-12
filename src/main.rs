@@ -12,6 +12,7 @@ mod render;
 mod scenes;
 mod session;
 mod sprite;
+mod terminal_input;
 #[cfg(test)]
 mod test_support;
 mod view;

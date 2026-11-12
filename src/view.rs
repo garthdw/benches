@@ -13,7 +13,8 @@ use crate::app::{
 use crate::input::{self, focus_on_press, pointer_phase, send_pointer};
 use crate::palette::{self, open_palette};
 use crate::render;
-use crate::session::{Attention, PointerPhase, Session, WheelInput};
+use crate::session::{Attention, Session};
+use crate::terminal_input::{PointerPhase, WheelInput};
 use crate::windows::{move_to_new_window, torn_off};
 use crate::workspace::{Project, Status, Workspace};
 
