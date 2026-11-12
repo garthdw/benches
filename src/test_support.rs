@@ -7,6 +7,7 @@ use rune::{Env, Key, KeyEvent, Mods, Runtime, Waker};
 
 use crate::scenes::show_workspace_scene;
 use crate::windows::WindowId;
+use crate::workspace::{Project, Workspace};
 use crate::{Fleet, State, on_key, poll, view};
 
 pub(crate) fn runtime_with(state: State) -> Runtime<State> {
@@ -136,4 +137,10 @@ pub(crate) fn wait_until<T>(
         assert!(Instant::now() < deadline, "{}", describe());
         std::thread::sleep(Duration::from_millis(10));
     }
+}
+
+pub(crate) fn one_project() -> Workspace {
+    let mut workspace = Workspace::default();
+    workspace.add_project(Project::new("/dev/agentd".into(), Vec::new()));
+    workspace
 }
