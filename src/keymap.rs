@@ -25,7 +25,8 @@ pub struct CommandSpec {
     pub command: Command,
     pub label: &'static str,
     pub chord: Option<&'static str>,
-    pub in_palette: bool,
+    /// Listed in the palette before anything is typed.
+    pub default: bool,
     pub enabled: fn(&Workspace) -> bool,
 }
 
@@ -34,34 +35,37 @@ const fn spec(command: Command, label: &'static str, chord: Option<&'static str>
         command,
         label,
         chord,
-        in_palette: false,
+        default: false,
         enabled: |_| true,
     }
 }
 
-const fn palette(mut spec: CommandSpec) -> CommandSpec {
-    spec.in_palette = true;
+const fn default(mut spec: CommandSpec) -> CommandSpec {
+    spec.default = true;
     spec
 }
 
 /// Palette rows appear in this order, ahead of every dynamic action.
 pub const COMMANDS: &[CommandSpec] = &[
-    palette(spec(Command::NewShell, "New shell tab", Some("mod+t"))),
-    palette(spec(
+    default(spec(Command::NewShell, "New shell tab", Some("mod+t"))),
+    default(spec(
         Command::ToggleLazygit,
         "Toggle lazygit",
         Some("mod+g"),
     )),
-    palette(spec(Command::OpenProject, "Open project…", Some("mod+n"))),
-    palette(CommandSpec {
+    default(spec(Command::OpenProject, "Open project…", Some("mod+n"))),
+    default(CommandSpec {
         enabled: |workspace| workspace.project().is_some(),
         ..spec(Command::ChangeFolder, "Change project folder…", None)
     }),
-    palette(CommandSpec {
+    default(CommandSpec {
         enabled: |workspace| workspace.projects.len() > 1,
         ..spec(Command::MoveToNewWindow, "Move project to new window", None)
     }),
-    spec(Command::Palette, "Command palette", Some("mod+p")),
+    CommandSpec {
+        enabled: |_| false,
+        ..spec(Command::Palette, "Command palette", Some("mod+p"))
+    },
     spec(Command::ToggleSidebar, "Toggle sidebar", Some("mod+b")),
     spec(Command::ToggleDrawer, "Toggle drawer", Some("mod+j")),
     spec(Command::CloseTab, "Close tab", Some("mod+w")),
@@ -71,6 +75,32 @@ pub const COMMANDS: &[CommandSpec] = &[
     spec(Command::PrevTab, "Previous tab", Some("mod+shift+[")),
     spec(Command::NextTab, "Next tab", Some("mod+shift+]")),
 ];
+
+/// A chord such as `mod+shift+]` the way macOS menus show it: `⇧⌘]`.
+pub fn chord_hint(chord: &str) -> String {
+    let mut modifiers = ['⌃', '⌥', '⇧', '⌘'].map(|symbol| (symbol, false));
+    let mut key = String::new();
+    for part in chord.split('+') {
+        let symbol = match part {
+            "ctrl" => '⌃',
+            "alt" => '⌥',
+            "shift" => '⇧',
+            "mod" => '⌘',
+            _ => {
+                key = part.to_uppercase();
+                continue;
+            }
+        };
+        for (candidate, held) in &mut modifiers {
+            *held |= *candidate == symbol;
+        }
+    }
+    let held = modifiers
+        .iter()
+        .filter(|(_, held)| *held)
+        .map(|(symbol, _)| symbol);
+    held.copied().chain(key.chars()).collect()
+}
 
 impl Command {
     pub fn label(self) -> &'static str {
@@ -111,6 +141,15 @@ pub fn pressed(binding: &str, event: &KeyEvent, tx: &Tx) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn chords_read_like_macos_menus() {
+        assert_eq!(chord_hint("mod+t"), "⌘T");
+        assert_eq!(chord_hint("mod+shift+]"), "⇧⌘]");
+        assert_eq!(chord_hint("mod+="), "⌘=");
+        assert_eq!(chord_hint("ctrl+c"), "⌃C");
+        assert_eq!(chord_hint("alt+shift+mod+x"), "⌥⇧⌘X");
+    }
 
     #[test]
     fn every_chord_parses_and_is_unique() {

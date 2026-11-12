@@ -1,3 +1,4 @@
+use std::cmp::Reverse;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::time::Duration;
@@ -5,7 +6,7 @@ use std::time::Duration;
 use rune::tok;
 use rune::{El, Key, KeyEvent, TextEdit, Tx, col, text, text_input};
 
-use crate::keymap::{COMMANDS, Command};
+use crate::keymap::{COMMANDS, Command, CommandSpec, chord_hint};
 use crate::session::LogErr;
 use crate::workspace::{Status, Workspace};
 use crate::{State, jump, open_project, open_tab, open_tray, run_command, tray_action};
@@ -116,6 +117,62 @@ fn letters_in_order(label: &str, query: &str) -> bool {
         .all(|wanted| letters.any(|letter| letter == wanted))
 }
 
+/// How well a command label matches a query. Only the query's letters in order are required.
+struct Match {
+    score: u32,
+    /// A contiguous substring, or every letter on a word start, so safe to rank above `Run`.
+    strong: bool,
+}
+
+fn fuzzy_match(label: &str, query: &str) -> Option<Match> {
+    let label: Vec<char> = label.to_lowercase().chars().collect();
+    let query: Vec<char> = query.to_lowercase().chars().collect();
+    let starts_word = |index: usize| index == 0 || !label[index - 1].is_alphanumeric();
+    if let Some(start) = label
+        .windows(query.len())
+        .position(|window| window == query.as_slice())
+    {
+        let prefix = if start == 0 { 200 } else { 0 };
+        let word = if starts_word(start) { 100 } else { 0 };
+        return Some(Match {
+            score: 1000 + prefix + word - start as u32,
+            strong: true,
+        });
+    }
+    let word_starts: Vec<usize> = (0..label.len())
+        .filter(|&index| starts_word(index))
+        .collect();
+    let mut starts = word_starts.iter();
+    if query
+        .iter()
+        .all(|wanted| starts.any(|&index| label[index] == *wanted))
+    {
+        return Some(Match {
+            score: 500,
+            strong: true,
+        });
+    }
+    let mut score = 0;
+    let mut next = 0;
+    let mut previous = None;
+    for wanted in &query {
+        let index = (next..label.len()).find(|&index| label[index] == *wanted)?;
+        score += 1;
+        if previous.is_some_and(|previous| previous + 1 == index) {
+            score += 3;
+        }
+        if starts_word(index) {
+            score += 2;
+        }
+        previous = Some(index);
+        next = index + 1;
+    }
+    Some(Match {
+        score,
+        strong: false,
+    })
+}
+
 /// Open projects and tabs whose names contain the query's letters in order, as switch actions
 /// paired with their names. The jump folder's project is left out, as that action opens it.
 fn switch_actions(
@@ -143,9 +200,9 @@ fn switch_actions(
     found
 }
 
-/// The fixed actions whose labels contain the query's letters in order, then the jump command's
-/// folder, then running the query, so Enter on a typed command always runs it. Below those come
-/// the open projects and tabs matching the query, exact names first, then the active project's
+/// The commands strongly matching the query, best first, then the jump command's folder, then
+/// running the query, so Enter on a typed command always runs it. Below those come the commands
+/// matching only loosely, then the open projects and tabs matching the query, exact names first, then the active project's
 /// tray restarts and stops. A query of `wt` and one branch name puts creating that worktree
 /// first. Everything but the fixed actions appears only once something is typed.
 pub(crate) fn palette_actions(
@@ -158,19 +215,29 @@ pub(crate) fn palette_actions(
     let mut actions: Vec<Action> = create_worktree_action(query, workspace)
         .into_iter()
         .collect();
-    actions.extend(
-        COMMANDS
-            .iter()
-            .filter(|spec| spec.in_palette && (spec.enabled)(workspace))
-            .filter(|spec| letters_in_order(spec.label, &needle))
-            .map(|spec| Action::Command(spec.command)),
-    );
-    actions.extend(jump.map(|root| Action::Jump(root.to_owned())));
     if query.is_empty() {
+        actions.extend(
+            COMMANDS
+                .iter()
+                .filter(|spec| spec.default && (spec.enabled)(workspace))
+                .map(|spec| Action::Command(spec.command)),
+        );
+        actions.extend(jump.map(|root| Action::Jump(root.to_owned())));
         return actions;
     }
+    let mut matched: Vec<(&CommandSpec, Match)> = COMMANDS
+        .iter()
+        .filter(|spec| (spec.enabled)(workspace))
+        .filter_map(|spec| Some((spec, fuzzy_match(spec.label, query)?)))
+        .collect();
+    matched.sort_by_key(|(_, found)| Reverse(found.score));
+    let (strong, weak): (Vec<_>, Vec<_>) = matched.into_iter().partition(|(_, found)| found.strong);
+    let command = |(spec, _): (&CommandSpec, Match)| Action::Command(spec.command);
+    actions.extend(strong.into_iter().map(command));
+    actions.extend(jump.map(|root| Action::Jump(root.to_owned())));
     actions.push(Action::Run(query.to_owned()));
     actions.push(Action::Tray(query.to_owned()));
+    actions.extend(weak.into_iter().map(command));
     let (exact, partial): (Vec<_>, Vec<_>) = switch_actions(&needle, jump, workspace)
         .into_iter()
         .partition(|(name, _)| name.to_lowercase() == needle);
@@ -487,12 +554,17 @@ pub(crate) fn view(
                 .enumerate()
                 .map(|(index, action)| {
                     let shortcut = match action {
-                        Action::Tray(_) => Some("⌘↵"),
-                        Action::Jump(_) => Some("⌘↵ worktrees"),
+                        Action::Tray(_) => Some("⌘↵".to_owned()),
+                        Action::Jump(_) => Some("⌘↵ worktrees".to_owned()),
+                        Action::Command(command) => COMMANDS
+                            .iter()
+                            .find(|spec| spec.command == *command)
+                            .and_then(|spec| spec.chord)
+                            .map(chord_hint),
                         _ => None,
                     }
                     .map(|hint| {
-                        text(hint)
+                        text(&hint)
                             .key("palette-shortcut")
                             .color(theme.text_secondary)
                     });
@@ -622,9 +694,9 @@ mod tests {
         assert_eq!(
             palette_actions("lzg", None, &one_project()),
             [
-                Action::Command(Command::ToggleLazygit),
                 Action::Run("lzg".to_owned()),
                 Action::Tray("lzg".to_owned()),
+                Action::Command(Command::ToggleLazygit),
             ]
         );
         assert_eq!(
@@ -640,6 +712,57 @@ mod tests {
             !palette_actions("", None, &Workspace::default())
                 .contains(&Action::Command(Command::ChangeFolder))
         );
+    }
+
+    fn first_action(query: &str) -> Action {
+        palette_actions(query, None, &one_project()).remove(0)
+    }
+
+    #[test]
+    fn typed_shell_commands_stay_first_despite_loose_matches() {
+        for query in ["ls", "htop", "cat", "git status", "make"] {
+            assert_eq!(
+                first_action(query),
+                Action::Run(query.to_owned()),
+                "{query}"
+            );
+        }
+    }
+
+    #[test]
+    fn strong_matches_lead_the_commands() {
+        let zoom_in = Action::Command(Command::ZoomIn);
+        assert_eq!(first_action("zoom"), zoom_in);
+        assert_eq!(first_action("zi"), zoom_in);
+        assert_eq!(
+            first_action("sidebar"),
+            Action::Command(Command::ToggleSidebar)
+        );
+    }
+
+    #[test]
+    fn loose_matches_follow_the_run_and_tray_rows() {
+        let actions = palette_actions("ls", None, &one_project());
+        assert_eq!(actions[2], Action::Command(Command::ToggleSidebar));
+    }
+
+    #[test]
+    fn every_command_is_searchable_but_the_palette_itself() {
+        let actions = palette_actions("tab", None, &one_project());
+        assert!(actions.contains(&Action::Command(Command::CloseTab)));
+        assert!(actions.contains(&Action::Command(Command::NextTab)));
+        assert!(
+            !palette_actions("palette", None, &one_project())
+                .contains(&Action::Command(Command::Palette))
+        );
+    }
+
+    #[test]
+    fn command_rows_show_their_chord() {
+        let mut runtime = palette_runtime();
+        press(&mut runtime, Key::Text("zoom".into()), Mods::default());
+        runtime.frame(0.0);
+        assert!(runtime.find("palette-shortcut").is_some());
     }
 
     #[test]
