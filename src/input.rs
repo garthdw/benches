@@ -3,7 +3,8 @@ use libghostty_vt::mouse;
 use rune::{Key, KeyEvent, Mods, Phase, PhysicalKeyCode as Code, Tx};
 
 use crate::app::State;
-use crate::session::{Grid, PointerInput, PointerPhase, Session};
+use crate::grid::Grid;
+use crate::session::{PointerInput, PointerPhase, Session};
 
 #[derive(Debug, PartialEq)]
 pub struct KeyInput {

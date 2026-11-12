@@ -1,6 +1,7 @@
 mod app;
 mod config;
 mod font;
+mod grid;
 mod input;
 mod jump;
 mod keymap;

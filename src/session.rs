@@ -12,18 +12,14 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use crossbeam_channel::{Receiver, Sender, bounded, never, select, unbounded};
-use libghostty_vt::render::{
-    CellIteration, CellIterator, Colors, CursorVisualStyle, Dirty, RowIterator,
-};
-use libghostty_vt::screen::{CellContentTag, CellWide, Screen, cell};
+use libghostty_vt::screen::Screen;
 use libghostty_vt::selection::gesture::{
     Autoscroll, AutoscrollTickEvent, DragEvent, Geometry, Gesture, PressEvent, ReleaseEvent,
 };
-use libghostty_vt::style::{RgbColor, StyleColor, Underline};
 use libghostty_vt::terminal::{ClipboardMime, Mode, Point, PointCoordinate, ScrollViewport};
-use libghostty_vt::{RenderState, Terminal, fmt, focus, key, mouse, paste};
+use libghostty_vt::{Terminal, fmt, focus, key, mouse, paste};
 use nix::errno::Errno;
 use nix::pty::{Winsize, openpty};
 use nix::sys::signal::{Signal, killpg};
@@ -31,6 +27,9 @@ use nix::unistd::Pid;
 use rune::Waker;
 
 use crate::config::{Config, Theme};
+use crate::grid::{
+    DEFAULT_BG, DEFAULT_FG, Grid, GridBuilder, Presentation, Scrollbar, ScrollbarFade, Surface,
+};
 use crate::input::KeyInput;
 use crate::link;
 
@@ -60,26 +59,13 @@ impl Retarget {
     }
 }
 
-const FRAME: Duration = Duration::from_millis(8);
+pub(crate) const FRAME: Duration = Duration::from_millis(8);
 /// How long the size must hold before the program sees it, as each SIGWINCH makes inline TUIs reprint.
 const RESIZE_SETTLE: Duration = Duration::from_millis(100);
 const HOLD_TIMEOUT: Duration = Duration::from_secs(1);
 const BLINK: Duration = Duration::from_millis(530);
 const AUTOSCROLL: Duration = Duration::from_millis(50);
 const MULTI_CLICK: Duration = Duration::from_millis(500);
-const SCROLLBAR_HOLD: Duration = Duration::from_secs(1);
-const SCROLLBAR_FADE: Duration = Duration::from_millis(200);
-const MESSAGE_COLS: u16 = 80;
-pub const DEFAULT_FG: RgbColor = RgbColor {
-    r: 0xd8,
-    g: 0xd9,
-    b: 0xda,
-};
-pub const DEFAULT_BG: RgbColor = RgbColor {
-    r: 0x14,
-    g: 0x15,
-    b: 0x17,
-};
 
 pub trait LogErr<T> {
     fn log_err(self, context: &str) -> Option<T>;
@@ -122,59 +108,6 @@ pub enum Attention {
     Alert,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
-pub struct Metrics {
-    pub cell_width: u16,
-    pub cell_height: u16,
-    pub padding: f32,
-    pub scale: f32,
-}
-
-impl Metrics {
-    /// The first cell's top-left in pixels, whole so every cell edge lands on a pixel.
-    pub fn origin(self, rect: [f32; 4]) -> (f32, f32) {
-        (
-            (rect[0] + self.padding).round(),
-            (rect[1] + self.padding).round(),
-        )
-    }
-
-    pub fn cell_rect(self, origin: (f32, f32), col: u16, row: u16) -> [f32; 4] {
-        let (width, height) = (f32::from(self.cell_width), f32::from(self.cell_height));
-        [
-            origin.0 + f32::from(col) * width,
-            origin.1 + f32::from(row) * height,
-            width,
-            height,
-        ]
-    }
-
-    pub fn to_points(self, rect: [f32; 4]) -> [f32; 4] {
-        rect.map(|pixels| pixels / self.scale)
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct Surface {
-    pub cols: u16,
-    pub rows: u16,
-    pub metrics: Metrics,
-}
-
-impl Surface {
-    /// The whole cells that fit a pixel `size` inside the padding, at least one each way.
-    pub fn fit((width, height): (f32, f32), metrics: Metrics) -> Self {
-        let fit = |extent: f32, cell: u16| {
-            (((extent - 2.0 * metrics.padding) / f32::from(cell)) as u16).max(1)
-        };
-        Self {
-            cols: fit(width, metrics.cell_width),
-            rows: fit(height, metrics.cell_height),
-            metrics,
-        }
-    }
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PointerPhase {
     Press,
@@ -201,268 +134,7 @@ pub struct WheelInput {
     pub mods: key::Mods,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct Cell {
-    pub character: char,
-    pub fg: [u8; 3],
-    pub bg: Option<[u8; 3]>,
-    pub bold: bool,
-    pub italic: bool,
-    pub strikethrough: bool,
-    pub overline: bool,
-    pub underline: Underline,
-    pub underline_color: Option<[u8; 3]>,
-    pub wide: bool,
-    pub spacer: bool,
-    /// In the selection, which splits ligatures as the cursor does.
-    pub selected: bool,
-    /// Index into `Grid::clusters` when the cell holds more than one codepoint.
-    pub cluster: Option<u32>,
-}
-
-impl Cell {
-    /// Whether two neighbours may be shaped together, which every style difference
-    /// except the background forbids, as in Ghostty, so a ligature never changes colour midway.
-    pub fn shapes_with(&self, other: &Cell) -> bool {
-        (
-            self.fg,
-            self.bold,
-            self.italic,
-            self.selected,
-            self.strikethrough,
-            self.overline,
-            self.underline,
-            self.underline_color,
-        ) == (
-            other.fg,
-            other.bold,
-            other.italic,
-            other.selected,
-            other.strikethrough,
-            other.overline,
-            other.underline,
-            other.underline_color,
-        )
-    }
-}
-
-impl Default for Cell {
-    fn default() -> Self {
-        Self {
-            character: ' ',
-            fg: rgb(DEFAULT_FG),
-            bg: None,
-            bold: false,
-            italic: false,
-            strikethrough: false,
-            overline: false,
-            underline: Underline::None,
-            underline_color: None,
-            wide: false,
-            spacer: false,
-            selected: false,
-            cluster: None,
-        }
-    }
-}
-
-pub struct Grid {
-    pub generation: u64,
-    pub cols: u16,
-    pub cells: Arc<[Cell]>,
-    pub clusters: Arc<[String]>,
-    pub cursor: Option<(u16, u16)>,
-    pub cursor_style: CursorVisualStyle,
-    pub cursor_blinking: bool,
-    pub cursor_color: [u8; 3],
-    pub metrics: Metrics,
-    pub bg: [u8; 3],
-    pub scrollbar: Option<Scrollbar>,
-}
-
-impl Default for Grid {
-    fn default() -> Self {
-        Self {
-            generation: 0,
-            cols: 0,
-            cells: Arc::default(),
-            clusters: Arc::default(),
-            cursor: None,
-            cursor_style: CursorVisualStyle::Block,
-            cursor_blinking: false,
-            cursor_color: [0; 3],
-            metrics: Metrics::default(),
-            bg: rgb(DEFAULT_BG),
-            scrollbar: None,
-        }
-    }
-}
-
-impl Grid {
-    /// Parses `bytes` on the calling thread, for fixtures and tests.
-    pub fn from_vt(bytes: &[u8], cols: u16, rows: u16) -> Result<Self> {
-        let mut terminal = new_terminal(cols, rows)?;
-        terminal.vt_write(bytes);
-        GridBuilder::new()?
-            .build(&terminal, 1, Presentation::default())?
-            .context("a new terminal should be dirty")
-    }
-
-    /// Plain text built without libghostty, so it can report libghostty failures.
-    pub fn message(text: &str) -> Self {
-        let mut cells: Vec<Cell> = text
-            .chars()
-            .map(|character| Cell {
-                character,
-                ..Cell::default()
-            })
-            .collect();
-        cells.resize(
-            cells.len().next_multiple_of(usize::from(MESSAGE_COLS)),
-            Cell::default(),
-        );
-        Self {
-            // A live session never reaches this, so the UI always sees the message as a change.
-            generation: u64::MAX,
-            cols: MESSAGE_COLS,
-            cells: cells.into(),
-            ..Self::default()
-        }
-    }
-
-    pub fn cluster(&self, cell: &Cell) -> Option<&str> {
-        let index = usize::try_from(cell.cluster?).ok()?;
-        self.clusters.get(index).map(String::as_str)
-    }
-
-    #[cfg(test)]
-    pub fn lines(&self) -> Vec<String> {
-        self.cells
-            .chunks(usize::from(self.cols).max(1))
-            .map(|row| {
-                let mut line = String::new();
-                for cell in row.iter().filter(|cell| !cell.spacer) {
-                    match self.cluster(cell) {
-                        Some(cluster) => line.push_str(cluster),
-                        None => line.push(cell.character),
-                    }
-                }
-                line
-            })
-            .collect()
-    }
-}
-
-/// The thumb never shrinks below this, in points, so it stays easy to grab.
-const MIN_THUMB_POINTS: f32 = 24.0;
-
-/// Where the viewport sits in the scrollback, in rows, and how the thumb looks.
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
-pub struct Scrollbar {
-    total: u64,
-    offset: u64,
-    len: u64,
-    /// Zero while hidden; the thumb fades out after scrolling stops.
-    pub opacity: f32,
-    /// While hovered or dragged.
-    pub wide: bool,
-}
-
-impl Scrollbar {
-    /// `None` when there is nothing to scroll, including on the alternate screen, which has no scrollback.
-    fn of(terminal: &Terminal<'static, '_>) -> Result<Option<Self>> {
-        if terminal.active_screen()? == Screen::Alternate {
-            return Ok(None);
-        }
-        let bar = terminal.scrollbar()?;
-        Ok((bar.total > bar.len).then_some(Self {
-            total: bar.total,
-            offset: bar.offset,
-            len: bar.len,
-            ..Self::default()
-        }))
-    }
-
-    /// The track's length and the thumb's minimum, in pixels, beside `rows` rows; for `thumb` and `row_at`.
-    pub fn track(rows: usize, cell_height: f32, scale: f32) -> (f32, f32) {
-        (rows as f32 * cell_height, MIN_THUMB_POINTS * scale)
-    }
-
-    /// The thumb's top and height within a track `track` pixels tall.
-    pub fn thumb(self, track: f32, min: f32) -> (f32, f32) {
-        let height = (track * self.len as f32 / self.total as f32)
-            .max(min)
-            .min(track);
-        let travel = self.total.saturating_sub(self.len).max(1);
-        let top = (track - height) * self.offset.min(travel) as f32 / travel as f32;
-        (top, height)
-    }
-
-    /// The scrollback row that puts the thumb's top at `top`.
-    fn row_at(self, top: f32, track: f32, min: f32) -> usize {
-        let (_, height) = self.thumb(track, min);
-        let travel = track - height;
-        if travel <= 0.0 {
-            return 0;
-        }
-        let rows = self.total.saturating_sub(self.len) as f32;
-        ((top / travel).clamp(0.0, 1.0) * rows).round() as usize
-    }
-}
-
-/// Shows the scrollbar while the viewport scrolls or the pointer holds it, then fades it out.
-#[derive(Default)]
-struct ScrollbarFade {
-    until: Option<Instant>,
-    held: bool,
-    /// The viewport offset that output or a resize last left, so only other moves count as scrolls.
-    offset: Option<u64>,
-}
-
-impl ScrollbarFade {
-    fn show(&mut self, now: Instant) {
-        self.until = Some(now + SCROLLBAR_HOLD);
-    }
-
-    fn follow(&mut self, terminal: &Terminal<'static, '_>) {
-        self.offset = terminal
-            .scrollbar()
-            .log_err("read scrollbar")
-            .map(|bar| bar.offset);
-    }
-
-    /// The thumb's opacity at `now`, showing it if the viewport moved since the last call or
-    /// `follow`, or the pointer holds it or just let it go.
-    fn opacity(&mut self, terminal: &Terminal<'static, '_>, held: bool, now: Instant) -> f32 {
-        let offset = terminal
-            .scrollbar()
-            .log_err("read scrollbar")
-            .map(|bar| bar.offset);
-        let scrolled = offset != self.offset;
-        self.offset = offset;
-        if scrolled || held || self.held {
-            self.show(now);
-        }
-        self.held = held;
-        let Some(until) = self.until else {
-            return 0.0;
-        };
-        let fading = now.saturating_duration_since(until).as_secs_f32();
-        (1.0 - fading / SCROLLBAR_FADE.as_secs_f32()).max(0.0)
-    }
-
-    /// When the opacity next changes by itself.
-    fn next_change(&self, now: Instant) -> Option<Instant> {
-        let until = self.until.filter(|_| !self.held)?;
-        if now < until {
-            Some(until)
-        } else {
-            (now < until + SCROLLBAR_FADE).then_some(now + FRAME)
-        }
-    }
-}
-
-fn new_terminal<'cb>(cols: u16, rows: u16) -> Result<Terminal<'static, 'cb>> {
+pub(crate) fn new_terminal<'cb>(cols: u16, rows: u16) -> Result<Terminal<'static, 'cb>> {
     let mut terminal = Terminal::new(cols, rows)?;
     terminal
         .set_scrollback_max_lines(Some(10_000))?
@@ -473,7 +145,7 @@ fn new_terminal<'cb>(cols: u16, rows: u16) -> Result<Terminal<'static, 'cb>> {
     Ok(terminal)
 }
 
-fn apply_theme(terminal: &mut Terminal<'static, '_>, theme: &Theme) -> Result<()> {
+pub(crate) fn apply_theme(terminal: &mut Terminal<'static, '_>, theme: &Theme) -> Result<()> {
     let mut palette = terminal.default_color_palette()?;
     for &(index, color) in &theme.palette {
         palette.0[usize::from(index)] = color;
@@ -484,285 +156,6 @@ fn apply_theme(terminal: &mut Terminal<'static, '_>, theme: &Theme) -> Result<()
         .set_default_cursor_color(theme.cursor)?
         .set_default_color_palette(Some(palette))?;
     Ok(())
-}
-
-fn rgb(color: RgbColor) -> [u8; 3] {
-    [color.r, color.g, color.b]
-}
-
-fn faint(color: [u8; 3], background: [u8; 3]) -> [u8; 3] {
-    std::array::from_fn(|index| {
-        ((u16::from(color[index]) + u16::from(background[index])) / 2) as u8
-    })
-}
-
-/// What the actor knows that the terminal doesn't.
-#[derive(Clone, Copy, PartialEq)]
-struct Presentation {
-    focused: bool,
-    cursor_on: bool,
-    metrics: Metrics,
-    scrollbar_opacity: f32,
-    scrollbar_wide: bool,
-}
-
-impl Default for Presentation {
-    fn default() -> Self {
-        Self {
-            focused: true,
-            cursor_on: true,
-            metrics: Metrics::default(),
-            scrollbar_opacity: 0.0,
-            scrollbar_wide: false,
-        }
-    }
-}
-
-type Content = (Arc<[Cell]>, Arc<[String]>);
-
-/// Reads one cell through libghostty's cell iterator, which costs several calls.
-fn read_cell(
-    cell: &CellIteration<'_, '_>,
-    colors: &Colors,
-    (selection_background, selection_foreground): (Option<RgbColor>, Option<RgbColor>),
-    clusters: &mut Vec<String>,
-) -> Result<Cell> {
-    let mut fg = cell.fg_color()?.unwrap_or(colors.foreground);
-    let mut bg = cell.bg_color()?;
-    let mut output = Cell::default();
-    let mut invisible = false;
-    let mut is_faint = false;
-    let selected = cell.is_selected()?;
-    output.selected = selected;
-    let mut inverted = selected && selection_background.is_none();
-    if cell.has_styling()? {
-        let style = cell.style()?;
-        output.bold = style.bold;
-        output.italic = style.italic;
-        is_faint = style.faint;
-        output.strikethrough = style.strikethrough;
-        output.overline = style.overline;
-        output.underline = style.underline;
-        output.underline_color = match style.underline_color {
-            StyleColor::None => None,
-            StyleColor::Rgb(color) => Some(rgb(color)),
-            StyleColor::Palette(index) => Some(rgb(colors.palette[usize::from(index.0)])),
-        };
-        invisible = style.invisible;
-        inverted ^= style.inverse;
-    }
-    if inverted {
-        let old_fg = fg;
-        fg = bg.unwrap_or(colors.background);
-        bg = Some(old_fg);
-    }
-    if selected && let Some(background) = selection_background {
-        bg = Some(background);
-        fg = selection_foreground.unwrap_or(fg);
-    }
-    let width = cell.raw_cell()?.wide()?;
-    output.wide = width == CellWide::Wide;
-    output.spacer = matches!(width, CellWide::SpacerTail | CellWide::SpacerHead);
-    output.fg = if is_faint {
-        faint(rgb(fg), rgb(bg.unwrap_or(colors.background)))
-    } else {
-        rgb(fg)
-    };
-    output.bg = bg.map(rgb);
-    if !invisible {
-        let mut character = [' '];
-        match cell.graphemes_buf(&mut character) {
-            Ok(()) => {}
-            // The buffer holds the base codepoint even when the grapheme is longer.
-            Err(libghostty_vt::Error::OutOfSpace { .. }) => {
-                let mut cluster = String::new();
-                cell.graphemes_utf8(&mut cluster)?;
-                output.cluster = Some(u32::try_from(clusters.len())?);
-                clusters.push(cluster);
-            }
-            Err(error) => return Err(error.into()),
-        }
-        output.character = character[0];
-    }
-    Ok(output)
-}
-
-struct GridBuilder {
-    state: RenderState<'static>,
-    rows: RowIterator<'static>,
-    cells: CellIterator<'static>,
-    last_shown: Option<(CursorVisualStyle, bool, Presentation, Option<Scrollbar>)>,
-    /// The cells and clusters of the last build, for frames where only the presentation changed.
-    content: Option<Content>,
-    /// From the theme; without a background, selected cells swap their colours.
-    selection_background: Option<RgbColor>,
-    selection_foreground: Option<RgbColor>,
-    /// Off only in tests, to compare against reading every cell the slow way.
-    plain_fast_path: bool,
-}
-
-impl GridBuilder {
-    fn new() -> Result<Self> {
-        Ok(Self {
-            state: RenderState::new()?,
-            rows: RowIterator::new()?,
-            cells: CellIterator::new()?,
-            last_shown: None,
-            content: None,
-            selection_background: None,
-            selection_foreground: None,
-            plain_fast_path: true,
-        })
-    }
-
-    /// libghostty isn't known to mark the render state dirty when only the selection moves.
-    fn selection_changed(&mut self) {
-        self.last_shown = None;
-        self.content = None;
-    }
-
-    fn build(
-        &mut self,
-        terminal: &Terminal<'static, '_>,
-        generation: u64,
-        presentation: Presentation,
-    ) -> Result<Option<Grid>> {
-        let snapshot = self.state.update(terminal)?;
-        let cursor_style = if presentation.focused {
-            snapshot.cursor_visual_style()?
-        } else {
-            CursorVisualStyle::BlockHollow
-        };
-        let cursor_blinking = snapshot.cursor_blinking()? && snapshot.cursor_visible()?;
-        let scrollbar = Scrollbar::of(terminal)?.map(|scrollbar| Scrollbar {
-            opacity: presentation.scrollbar_opacity,
-            wide: presentation.scrollbar_wide,
-            ..scrollbar
-        });
-        let shown = (cursor_style, cursor_blinking, presentation, scrollbar);
-        // libghostty leaves the render state clean when only the cursor's style or the scrollback length changes.
-        let unchanged = self.last_shown.replace(shown) == Some(shown);
-        if matches!(snapshot.dirty()?, Dirty::Clean) && unchanged {
-            return Ok(None);
-        }
-        let colors = snapshot.colors()?;
-        let (cols, rows) = (snapshot.cols()?, snapshot.rows()?);
-        let dirty = snapshot.dirty()?;
-        let reusable = if matches!(dirty, Dirty::Clean) {
-            self.content.clone()
-        } else {
-            None
-        };
-        let (cells, clusters) = match reusable {
-            Some(content) => content,
-            None => {
-                let columns = usize::from(cols);
-                let previous = self.content.clone().filter(|(cells, _)| {
-                    matches!(dirty, Dirty::Partial) && cells.len() == columns * usize::from(rows)
-                });
-                let mut cells = Vec::with_capacity(columns * usize::from(rows));
-                let mut clusters = Vec::new();
-                // Runs of identical cells, mostly blanks, share one decode.
-                let mut decoded = None;
-                let mut row_iterator = self.rows.update(&snapshot)?;
-                while let Some(row) = row_iterator.next() {
-                    if let Some((old_cells, old_clusters)) = &previous
-                        && !row.dirty()?
-                        && let Some(old_row) = old_cells.get(cells.len()..cells.len() + columns)
-                    {
-                        for old in old_row {
-                            let mut cell = *old;
-                            if let Some(index) = cell.cluster {
-                                cell.cluster = Some(u32::try_from(clusters.len())?);
-                                clusters.push(
-                                    old_clusters
-                                        .get(usize::try_from(index)?)
-                                        .context("a copied cell's cluster should exist")?
-                                        .clone(),
-                                );
-                            }
-                            cells.push(cell);
-                        }
-                        continue;
-                    }
-                    let selection = row.selection()?;
-                    let mut cell_iterator = self.cells.update(row)?;
-                    for (column, raw) in row.cells_raw()?.enumerate() {
-                        let column = u16::try_from(column)?;
-                        let (tag, codepoint, width, styled) = match decoded {
-                            Some((previous, values)) if previous == raw => values,
-                            _ => {
-                                let values = raw.get_multi((
-                                    cell::ContentTag,
-                                    cell::Codepoint,
-                                    cell::Wide,
-                                    cell::HasStyling,
-                                ))?;
-                                decoded = Some((raw, values));
-                                values
-                            }
-                        };
-                        let selected = selection
-                            .is_some_and(|range| (range.start_x..=range.end_x).contains(&column));
-                        let character = match codepoint {
-                            0 => Some(' '),
-                            codepoint => char::from_u32(codepoint),
-                        };
-                        if let Some(character) = character
-                            && self.plain_fast_path
-                            && matches!(tag, CellContentTag::Codepoint)
-                            && !styled
-                            && !selected
-                        {
-                            cells.push(Cell {
-                                character,
-                                fg: rgb(colors.foreground),
-                                wide: width == CellWide::Wide,
-                                spacer: matches!(
-                                    width,
-                                    CellWide::SpacerTail | CellWide::SpacerHead
-                                ),
-                                ..Cell::default()
-                            });
-                            continue;
-                        }
-                        cell_iterator.select(column)?;
-                        cells.push(read_cell(
-                            &cell_iterator,
-                            &colors,
-                            (self.selection_background, self.selection_foreground),
-                            &mut clusters,
-                        )?);
-                    }
-                }
-                let content: Content = (cells.into(), clusters.into());
-                self.content = Some(content.clone());
-                content
-            }
-        };
-        let cursor = if snapshot.cursor_visible()? && (presentation.cursor_on || !cursor_blinking) {
-            snapshot.cursor_viewport()?.map(|viewport| {
-                let x = viewport.x.saturating_sub(u16::from(viewport.at_wide_tail));
-                (x, viewport.y)
-            })
-        } else {
-            None
-        };
-        snapshot.clean()?;
-        Ok(Some(Grid {
-            generation,
-            cols,
-            cells,
-            clusters,
-            cursor,
-            cursor_style,
-            cursor_blinking,
-            cursor_color: rgb(colors.cursor.unwrap_or(colors.foreground)),
-            metrics: presentation.metrics,
-            bg: rgb(colors.background),
-            scrollbar,
-        }))
-    }
 }
 
 enum Msg {
@@ -2139,108 +1532,11 @@ fn terminate(child: &mut Child, pid: &Mutex<Option<i32>>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::wait_until;
-
-    #[test]
-    fn parses_text_and_colour_into_the_grid() {
-        let grid = Grid::from_vt(b"hi \x1b[1;31mred\x1b[0m", 10, 2).unwrap();
-        assert_eq!(grid.lines()[0], "hi red    ");
-        let red = grid.cells[3];
-        assert_eq!((red.character, red.bold), ('r', true));
-        assert_ne!(red.fg, rgb(DEFAULT_FG));
-        assert_eq!(grid.cursor, Some((6, 0)));
-    }
-
-    #[test]
-    fn a_wide_character_takes_a_wide_cell_and_a_spacer() {
-        let grid = Grid::from_vt("a世b".as_bytes(), 8, 1).unwrap();
-        assert_eq!(grid.lines()[0], "a世b    ");
-        assert!(grid.cells[1].wide && !grid.cells[1].spacer);
-        assert!(grid.cells[2].spacer && !grid.cells[2].wide);
-        assert_eq!(grid.cells[3].character, 'b');
-    }
-
-    #[test]
-    fn combining_marks_and_zwj_sequences_stay_in_one_cluster() {
-        let family = "\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}";
-        let text = format!("e\u{301}{family}x");
-        let grid = Grid::from_vt(text.as_bytes(), 8, 1).unwrap();
-        assert_eq!(grid.cluster(&grid.cells[0]), Some("e\u{301}"));
-        assert_eq!(grid.cluster(&grid.cells[1]), Some(family));
-        assert!(grid.cells[1].wide && grid.cells[2].spacer);
-        assert_eq!(grid.cells[3].character, 'x');
-        assert_eq!(grid.cluster(&grid.cells[3]), None);
-    }
-
-    #[test]
-    fn an_emoji_variation_selector_widens_the_cell() {
-        let grid = Grid::from_vt("\u{2764}\u{FE0F}x".as_bytes(), 8, 1).unwrap();
-        assert!(grid.cells[0].wide);
-        assert_eq!(grid.cells[2].character, 'x');
-    }
-
-    #[test]
-    fn text_styles_reach_the_cell() {
-        let grid = Grid::from_vt(b"\x1b[3;2;9;53mx", 4, 1).unwrap();
-        let cell = grid.cells[0];
-        assert!(cell.italic && cell.strikethrough && cell.overline);
-        assert_eq!(cell.underline, Underline::None);
-        assert_eq!(cell.fg, faint(rgb(DEFAULT_FG), rgb(DEFAULT_BG)));
-    }
-
-    #[test]
-    fn faint_is_halfway_between_the_colour_and_the_background() {
-        assert_eq!(faint([200, 100, 0], [0, 100, 200]), [100, 100, 100]);
-    }
-
-    #[test]
-    fn underline_style_and_colour_reach_the_cell() {
-        let grid = Grid::from_vt(b"\x1b[4:3;58;2;1;2;3mx\x1b[0m\x1b[4my", 4, 1).unwrap();
-        assert_eq!(grid.cells[0].underline, Underline::Curly);
-        assert_eq!(grid.cells[0].underline_color, Some([1, 2, 3]));
-        assert_eq!(grid.cells[1].underline, Underline::Single);
-        assert_eq!(grid.cells[1].underline_color, None);
-    }
-
-    #[test]
-    fn invisible_text_has_no_glyph() {
-        let grid = Grid::from_vt(b"\x1b[8mx", 4, 1).unwrap();
-        assert_eq!(grid.lines()[0], "    ");
-    }
-
-    #[test]
-    fn a_cursor_on_a_wide_tail_moves_to_the_wide_cell() {
-        let grid = Grid::from_vt("世\x1b[1;2H".as_bytes(), 8, 1).unwrap();
-        assert_eq!(grid.cursor, Some((0, 0)));
-    }
-
-    #[test]
-    fn the_cursor_style_reaches_the_grid() {
-        let grid = Grid::from_vt(b"\x1b[6 q", 8, 1).unwrap();
-        assert_eq!(grid.cursor_style, CursorVisualStyle::Bar);
-    }
-
-    #[test]
-    fn a_message_fills_whole_rows_and_counts_as_a_change() {
-        let grid = Grid::message("no shell");
-        assert_eq!(grid.lines(), vec![format!("{:<80}", "no shell")]);
-        assert_ne!(grid.generation, Grid::default().generation);
-    }
-
-    #[test]
-    fn an_unchanged_terminal_builds_nothing_but_a_cursor_move_does() {
-        let mut terminal = new_terminal(10, 4).unwrap();
-        let mut builder = GridBuilder::new().unwrap();
-        terminal.vt_write(b"hi");
-        let shown = Presentation::default();
-        assert!(builder.build(&terminal, 1, shown).unwrap().is_some());
-        assert!(builder.build(&terminal, 2, shown).unwrap().is_none());
-        terminal.vt_write(b"\x1b[3;4H");
-        assert_eq!(
-            builder.build(&terminal, 3, shown).unwrap().unwrap().cursor,
-            Some((3, 2))
-        );
-    }
+    use crate::grid::{Metrics, rgb};
+    use crate::test_support::{
+        THEME_BLUE, THEME_RED, fractional_metrics, scrolled_terminal, wait_until,
+    };
+    use libghostty_vt::render::CursorVisualStyle;
 
     fn spawn_shell() -> Session {
         Session::spawn(None, Path::new("/tmp"), &Config::default(), Arc::new(|| {})).unwrap()
@@ -2306,58 +1602,6 @@ mod tests {
         assert!(!publisher.tick_blink(now));
     }
 
-    fn fractional_metrics(scale: f32) -> Metrics {
-        Metrics {
-            cell_width: 9,
-            cell_height: 19,
-            padding: 12.0 * scale,
-            scale,
-        }
-    }
-
-    #[test]
-    fn hit_testing_finds_the_cell_drawn_at_any_scale() {
-        for scale in [1.0, 1.25, 1.5, 2.0] {
-            let metrics = fractional_metrics(scale);
-            let surface = Surface::fit((700.0, 500.0), metrics);
-            let origin = metrics.origin([0.0; 4]);
-            for (col, row) in [(0, 0), (1, 3), (surface.cols - 1, surface.rows - 1)] {
-                let [left, top, width, height] = metrics.cell_rect(origin, col, row);
-                for (x, y) in [(left, top), (left + width / 2.0, top + height / 2.0)] {
-                    let point = TerminalInput::viewport_point(surface, (x, y));
-                    assert_eq!((point.x, u16::try_from(point.y)), (col, Ok(row)), "{scale}");
-                }
-                let just_before = TerminalInput::viewport_point(surface, (left - 0.01, top - 0.01));
-                assert_eq!(just_before.x, col.saturating_sub(1), "{scale}");
-            }
-        }
-    }
-
-    #[test]
-    fn the_cell_origin_is_whole_pixels_within_the_rect() {
-        let metrics = fractional_metrics(1.5);
-        assert_eq!(metrics.origin([0.0; 4]), (18.0, 18.0));
-        assert_eq!(metrics.origin([10.4, 20.6, 0.0, 0.0]), (28.0, 39.0));
-    }
-
-    #[test]
-    fn fit_keeps_whole_cells_inside_the_padding_and_at_least_one() {
-        let metrics = fractional_metrics(2.0);
-        let surface = Surface::fit((48.0 + 9.0 * 4.0 + 8.0, 48.0 + 19.0 * 2.0 + 5.0), metrics);
-        assert_eq!((surface.cols, surface.rows), (4, 2));
-        let tiny = Surface::fit((1.0, 1.0), metrics);
-        assert_eq!((tiny.cols, tiny.rows), (1, 1));
-    }
-
-    #[test]
-    fn rects_convert_to_points_by_the_scale() {
-        let metrics = fractional_metrics(2.0);
-        assert_eq!(
-            metrics.to_points([10.0, 20.0, 30.0, 40.0]),
-            [5.0, 10.0, 15.0, 20.0]
-        );
-    }
-
     const TEST_SURFACE: Surface = Surface {
         cols: 20,
         rows: 5,
@@ -2383,14 +1627,6 @@ mod tests {
             y: f32::from(row) * 20.0 + 10.0,
             mods: key::Mods::empty(),
         }
-    }
-
-    fn scrolled_terminal<'cb>() -> Terminal<'static, 'cb> {
-        let mut terminal = new_terminal(20, 5).unwrap();
-        for line in 0..30 {
-            terminal.vt_write(format!("line{line}\r\n").as_bytes());
-        }
-        terminal
     }
 
     fn top_line(terminal: &Terminal<'static, '_>) -> String {
@@ -2609,252 +1845,6 @@ mod tests {
         assert_eq!(selection_text(&terminal).unwrap(), None);
     }
 
-    fn busy_terminal() -> Terminal<'static, 'static> {
-        let mut terminal = new_terminal(200, 60).unwrap();
-        for row in 0..80 {
-            terminal.vt_write(
-                format!(
-                    "\x1b[3{}mline {row} the quick brown fox \x1b[1;4{}mjumps\x1b[0m over 世界 the lazy dog é\r\n",
-                    row % 8,
-                    row % 7
-                )
-                .repeat(1)
-                .as_bytes(),
-            );
-        }
-        terminal
-    }
-
-    /// Times only the build; `prepare` writes to the terminal and picks the presentation.
-    fn per_frame(
-        label: &str,
-        terminal: &mut Terminal<'static, 'static>,
-        builder: &mut GridBuilder,
-        mut prepare: impl FnMut(&mut Terminal<'static, 'static>, u32) -> Presentation,
-    ) {
-        let frames = 300;
-        let mut elapsed = std::time::Duration::ZERO;
-        for frame in 0..frames {
-            let presentation = prepare(terminal, frame);
-            let start = std::time::Instant::now();
-            builder
-                .build(terminal, u64::from(frame), presentation)
-                .unwrap();
-            elapsed += start.elapsed();
-        }
-        println!(
-            "{label}: {} ns/frame",
-            elapsed.as_nanos() / u128::from(frames)
-        );
-    }
-
-    #[test]
-    #[ignore = "benchmark: cargo test --release bench_ -- --ignored --nocapture"]
-    fn bench_grid_build() {
-        let mut terminal = busy_terminal();
-        let mut builder = GridBuilder::new().unwrap();
-        builder
-            .build(&terminal, 1, Presentation::default())
-            .unwrap();
-        per_frame(
-            "steady output (scrolling)",
-            &mut terminal,
-            &mut builder,
-            |terminal, _| {
-                terminal.vt_write(b"\x1b[32msteady output line with some text 12345\x1b[0m\r\n");
-                Presentation::default()
-            },
-        );
-        per_frame(
-            "steady styled output (scrolling)",
-            &mut terminal,
-            &mut builder,
-            |terminal, frame| {
-                let entry = format!(
-                    "\x1b[1;3{}mdrwxr-xr-x\x1b[0m 4 user \x1b[38;5;{}mstaff\x1b[0m \x1b[4;44mfile-{frame}.rs\x1b[0m \x1b[2mdim\x1b[7mrev\x1b[0m ",
-                    frame % 8,
-                    frame % 256
-                );
-                terminal.vt_write(format!("{}\r\n", entry.repeat(3)).as_bytes());
-                Presentation::default()
-            },
-        );
-        per_frame(
-            "one dirty row",
-            &mut terminal,
-            &mut builder,
-            |terminal, frame| {
-                terminal.vt_write(format!("\x1b[30;1H\x1b[2Kspinner {frame}").as_bytes());
-                Presentation::default()
-            },
-        );
-        per_frame("cursor blink", &mut terminal, &mut builder, |_, frame| {
-            Presentation {
-                cursor_on: frame % 2 == 0,
-                ..Presentation::default()
-            }
-        });
-        per_frame("scrollbar fade", &mut terminal, &mut builder, |_, frame| {
-            Presentation {
-                scrollbar_opacity: frame as f32 / 300.0,
-                ..Presentation::default()
-            }
-        });
-    }
-
-    #[test]
-    fn selected_cells_swap_their_colours() {
-        let mut terminal = new_terminal(20, 5).unwrap();
-        terminal.vt_write(b"hello world");
-        let mut builder = GridBuilder::new().unwrap();
-        builder
-            .build(&terminal, 1, Presentation::default())
-            .unwrap();
-        select_hello(&terminal, &mut input_for_test());
-        builder.selection_changed();
-        let grid = builder
-            .build(&terminal, 2, Presentation::default())
-            .unwrap()
-            .unwrap();
-        assert_eq!(grid.cells[0].bg, Some(rgb(DEFAULT_FG)));
-        assert_eq!(grid.cells[0].fg, rgb(DEFAULT_BG));
-        assert_eq!(grid.cells[6].bg, None);
-        assert!(grid.cells[0].selected && grid.cells[4].selected);
-        assert!(!grid.cells[5].selected && !grid.cells[6].selected);
-    }
-
-    #[test]
-    fn a_presentation_only_change_shares_cells_and_moves_the_cursor_state() {
-        let mut terminal = new_terminal(20, 5).unwrap();
-        terminal.vt_write(b"hello \x1b[?12h");
-        let mut builder = GridBuilder::new().unwrap();
-        let first = builder
-            .build(&terminal, 1, Presentation::default())
-            .unwrap()
-            .unwrap();
-        let blinked_off = Presentation {
-            cursor_on: false,
-            scrollbar_opacity: 0.5,
-            ..Presentation::default()
-        };
-        let second = builder.build(&terminal, 2, blinked_off).unwrap().unwrap();
-        assert!(Arc::ptr_eq(&first.cells, &second.cells));
-        assert_eq!(first.cursor, Some((6, 0)));
-        assert_eq!(second.cursor, None);
-        builder.selection_changed();
-        let third = builder.build(&terminal, 3, blinked_off).unwrap().unwrap();
-        assert!(!Arc::ptr_eq(&first.cells, &third.cells));
-    }
-
-    #[test]
-    fn a_partial_update_copies_clean_rows_and_rereads_dirty_ones() {
-        let mut terminal = new_terminal(20, 5).unwrap();
-        terminal.vt_write("e\u{301}x\r\nsecond\r\n\x1b[4;1H\u{1f468}\u{200d}\u{1f469}".as_bytes());
-        let mut builder = GridBuilder::new().unwrap();
-        let first = builder
-            .build(&terminal, 1, Presentation::default())
-            .unwrap()
-            .unwrap();
-        terminal.vt_write(b"\x1b[2;1Hchanged\x1b[5;1Hlast");
-        let second = builder
-            .build(&terminal, 2, Presentation::default())
-            .unwrap()
-            .unwrap();
-        let lines = second.lines();
-        assert_eq!(lines[0], first.lines()[0]);
-        assert_eq!(lines[1].trim_end(), "changed");
-        assert_eq!(lines[3], first.lines()[3]);
-        assert_eq!(lines[4].trim_end(), "last");
-        assert_eq!(second.cluster(&second.cells[0]), Some("e\u{301}"));
-    }
-
-    const THEME_RED: RgbColor = RgbColor {
-        r: 0xff,
-        g: 0,
-        b: 0,
-    };
-    const THEME_BLUE: RgbColor = RgbColor {
-        r: 0,
-        g: 0,
-        b: 0xff,
-    };
-
-    #[test]
-    fn a_theme_sets_the_default_colours_and_palette() {
-        let theme = Theme {
-            foreground: THEME_RED,
-            background: THEME_BLUE,
-            palette: vec![(1, THEME_BLUE)],
-            ..Theme::default()
-        };
-        let mut terminal = new_terminal(10, 2).unwrap();
-        apply_theme(&mut terminal, &theme).unwrap();
-        terminal.vt_write(b"a\x1b[31mb");
-        let grid = GridBuilder::new()
-            .unwrap()
-            .build(&terminal, 1, Presentation::default())
-            .unwrap()
-            .unwrap();
-        assert_eq!(grid.bg, rgb(THEME_BLUE));
-        assert_eq!(grid.cells[0].fg, rgb(THEME_RED));
-        assert_eq!(grid.cells[1].fg, rgb(THEME_BLUE));
-    }
-
-    #[test]
-    fn theme_selection_colours_replace_the_swap() {
-        let mut terminal = new_terminal(20, 5).unwrap();
-        terminal.vt_write(b"hello world");
-        let mut builder = GridBuilder::new().unwrap();
-        builder.selection_background = Some(THEME_RED);
-        builder.selection_foreground = Some(THEME_BLUE);
-        select_hello(&terminal, &mut input_for_test());
-        let grid = builder
-            .build(&terminal, 1, Presentation::default())
-            .unwrap()
-            .unwrap();
-        assert_eq!(grid.cells[0].bg, Some(rgb(THEME_RED)));
-        assert_eq!(grid.cells[0].fg, rgb(THEME_BLUE));
-        assert_eq!(grid.cells[6].bg, None);
-    }
-
-    #[test]
-    fn the_plain_fast_path_reads_the_same_cells_as_reading_each_one() {
-        let vt = concat!(
-            "he\x1b[1;31mll\x1b[0m\u{4e16}o plain\r\n",
-            "\x1b[1mbold\x1b[3mital\x1b[2mfaint\x1b[22;7minverse\x1b[27;8minvisible\x1b[0m\r\n",
-            "\x1b[4:3;58;2;1;2;3munder\x1b[0m \x1b[9mstrike\x1b[53mover\x1b[0m\r\n",
-            "\x1b[48;5;4m   \x1b[48;2;9;8;7m   \x1b[0m\x1b[44mblue bg\x1b[0m\x1b[2K\r\n",
-            "\u{4e16}\u{754c}\u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467} e\u{301}\u{2764}\u{fe0f}x\r\n",
-            "\x1b[38;2;10;20;30mrgb \x1b[38;5;200mpalette\x1b[0m\x1b[K",
-        );
-        for selection_colours in [None, Some((THEME_RED, THEME_BLUE))] {
-            for selected in [false, true] {
-                let mut terminal = new_terminal(40, 8).unwrap();
-                terminal.vt_write(vt.as_bytes());
-                if selected {
-                    select_hello(&terminal, &mut input_for_test());
-                }
-                let build = |plain_fast_path| {
-                    let mut builder = GridBuilder::new().unwrap();
-                    builder.plain_fast_path = plain_fast_path;
-                    builder.selection_background = selection_colours.map(|colours| colours.0);
-                    builder.selection_foreground = selection_colours.map(|colours| colours.1);
-                    builder
-                        .build(&terminal, 1, Presentation::default())
-                        .unwrap()
-                        .unwrap()
-                };
-                let (fast, slow) = (build(true), build(false));
-                assert_eq!(fast.cells, slow.cells);
-                assert_eq!(fast.clusters, slow.clusters);
-                assert!(fast.cells.iter().any(|cell| cell.wide));
-                assert!(fast.cells.iter().any(|cell| cell.spacer));
-                assert!(fast.cells.iter().any(|cell| cell.cluster.is_some()));
-                assert!(fast.cells.iter().any(|cell| cell.bg.is_some()));
-            }
-        }
-    }
-
     #[test]
     fn dragging_past_the_top_scrolls_one_line_per_tick() {
         let terminal = scrolled_terminal();
@@ -2879,77 +1869,6 @@ mod tests {
     }
 
     #[test]
-    fn the_thumb_shows_the_viewport_share_and_position() {
-        let scrollbar = Scrollbar {
-            total: 100,
-            offset: 75,
-            len: 25,
-            ..Scrollbar::default()
-        };
-        assert_eq!(scrollbar.thumb(200.0, 10.0), (150.0, 50.0));
-        let top = Scrollbar {
-            offset: 0,
-            ..scrollbar
-        };
-        assert_eq!(top.thumb(200.0, 10.0), (0.0, 50.0));
-        let long = Scrollbar {
-            total: 10_000,
-            ..top
-        };
-        assert_eq!(long.thumb(200.0, 10.0).1, 10.0);
-    }
-
-    #[test]
-    fn a_thumb_position_maps_back_to_its_row() {
-        let scrollbar = Scrollbar {
-            total: 100,
-            offset: 30,
-            len: 25,
-            ..Scrollbar::default()
-        };
-        let (top, _) = scrollbar.thumb(200.0, 10.0);
-        assert_eq!(scrollbar.row_at(top, 200.0, 10.0), 30);
-        assert_eq!(scrollbar.row_at(-50.0, 200.0, 10.0), 0);
-        assert_eq!(scrollbar.row_at(500.0, 200.0, 10.0), 75);
-    }
-
-    #[test]
-    fn only_a_primary_screen_with_history_has_a_scrollbar() {
-        assert_eq!(Grid::from_vt(b"hi", 20, 5).unwrap().scrollbar, None);
-        let mut history = String::new();
-        for line in 0..30 {
-            history.push_str(&format!("line{line}\r\n"));
-        }
-        let grid = Grid::from_vt(history.as_bytes(), 20, 5).unwrap();
-        assert_eq!(
-            grid.scrollbar,
-            Some(Scrollbar {
-                total: 31,
-                offset: 26,
-                len: 5,
-                ..Scrollbar::default()
-            })
-        );
-        history.push_str("\x1b[?1049h");
-        assert_eq!(
-            Grid::from_vt(history.as_bytes(), 20, 5).unwrap().scrollbar,
-            None
-        );
-    }
-
-    #[test]
-    fn output_below_a_scrolled_viewport_publishes_a_new_scrollbar() {
-        let mut terminal = scrolled_terminal();
-        terminal.scroll_viewport(ScrollViewport::Top);
-        let mut builder = GridBuilder::new().unwrap();
-        let shown = Presentation::default();
-        let before = builder.build(&terminal, 1, shown).unwrap().unwrap();
-        terminal.vt_write(b"more\r\n");
-        let after = builder.build(&terminal, 2, shown).unwrap().unwrap();
-        assert_ne!(after.scrollbar, before.scrollbar);
-    }
-
-    #[test]
     fn pressing_the_track_and_dragging_the_thumb_scrolls() {
         let mut terminal = scrolled_terminal();
         let mut input = input_for_test();
@@ -2971,48 +1890,6 @@ mod tests {
         assert_eq!(top_line(&terminal), "line26");
     }
 
-    fn faded(terminal: &Terminal<'static, '_>) -> (ScrollbarFade, Instant) {
-        let mut fade = ScrollbarFade::default();
-        fade.follow(terminal);
-        (fade, Instant::now())
-    }
-
-    #[test]
-    fn output_alone_leaves_the_scrollbar_hidden() {
-        let mut terminal = scrolled_terminal();
-        let (mut fade, now) = faded(&terminal);
-        terminal.vt_write(b"more\r\n");
-        fade.follow(&terminal);
-        assert_eq!(fade.opacity(&terminal, false, now), 0.0);
-        assert_eq!(fade.next_change(now), None);
-    }
-
-    #[test]
-    fn a_scroll_shows_the_scrollbar_until_it_fades() {
-        let mut terminal = scrolled_terminal();
-        let (mut fade, now) = faded(&terminal);
-        terminal.scroll_viewport(ScrollViewport::Delta(-3));
-        assert_eq!(fade.opacity(&terminal, false, now), 1.0);
-        assert_eq!(fade.next_change(now), Some(now + SCROLLBAR_HOLD));
-        let fading = now + SCROLLBAR_HOLD + SCROLLBAR_FADE / 2;
-        assert_eq!(fade.opacity(&terminal, false, fading), 0.5);
-        assert_eq!(fade.next_change(fading), Some(fading + FRAME));
-        let gone = now + SCROLLBAR_HOLD + SCROLLBAR_FADE;
-        assert_eq!(fade.opacity(&terminal, false, gone), 0.0);
-        assert_eq!(fade.next_change(gone), None);
-    }
-
-    #[test]
-    fn a_held_scrollbar_stays_until_a_while_after_release() {
-        let terminal = scrolled_terminal();
-        let (mut fade, now) = faded(&terminal);
-        assert_eq!(fade.opacity(&terminal, true, now), 1.0);
-        assert_eq!(fade.next_change(now), None);
-        let released = now + 5 * SCROLLBAR_HOLD;
-        assert_eq!(fade.opacity(&terminal, false, released), 1.0);
-        assert_eq!(fade.next_change(released), Some(released + SCROLLBAR_HOLD));
-    }
-
     #[test]
     fn a_scrollbar_drag_holds_until_release() {
         let mut terminal = scrolled_terminal();
@@ -3025,23 +1902,6 @@ mod tests {
             .drag_scrollbar(&mut terminal, PointerPhase::Release, 50.0)
             .unwrap();
         assert!(input.scrollbar_grab.is_none());
-    }
-
-    #[test]
-    fn the_scrollbar_carries_its_look_from_the_presentation() {
-        let terminal = scrolled_terminal();
-        let shown = Presentation {
-            scrollbar_opacity: 0.5,
-            scrollbar_wide: true,
-            ..Presentation::default()
-        };
-        let grid = GridBuilder::new()
-            .unwrap()
-            .build(&terminal, 1, shown)
-            .unwrap()
-            .unwrap();
-        let scrollbar = grid.scrollbar.unwrap();
-        assert_eq!((scrollbar.opacity, scrollbar.wide), (0.5, true));
     }
 
     #[test]
@@ -3873,5 +2733,99 @@ mod tests {
                 .iter()
                 .any(|line| line.trim_end() == "slept")
         );
+    }
+
+    #[test]
+    fn hit_testing_finds_the_cell_drawn_at_any_scale() {
+        for scale in [1.0, 1.25, 1.5, 2.0] {
+            let metrics = fractional_metrics(scale);
+            let surface = Surface::fit((700.0, 500.0), metrics);
+            let origin = metrics.origin([0.0; 4]);
+            for (col, row) in [(0, 0), (1, 3), (surface.cols - 1, surface.rows - 1)] {
+                let [left, top, width, height] = metrics.cell_rect(origin, col, row);
+                for (x, y) in [(left, top), (left + width / 2.0, top + height / 2.0)] {
+                    let point = TerminalInput::viewport_point(surface, (x, y));
+                    assert_eq!((point.x, u16::try_from(point.y)), (col, Ok(row)), "{scale}");
+                }
+                let just_before = TerminalInput::viewport_point(surface, (left - 0.01, top - 0.01));
+                assert_eq!(just_before.x, col.saturating_sub(1), "{scale}");
+            }
+        }
+    }
+
+    #[test]
+    fn selected_cells_swap_their_colours() {
+        let mut terminal = new_terminal(20, 5).unwrap();
+        terminal.vt_write(b"hello world");
+        let mut builder = GridBuilder::new().unwrap();
+        builder
+            .build(&terminal, 1, Presentation::default())
+            .unwrap();
+        select_hello(&terminal, &mut input_for_test());
+        builder.selection_changed();
+        let grid = builder
+            .build(&terminal, 2, Presentation::default())
+            .unwrap()
+            .unwrap();
+        assert_eq!(grid.cells[0].bg, Some(rgb(DEFAULT_FG)));
+        assert_eq!(grid.cells[0].fg, rgb(DEFAULT_BG));
+        assert_eq!(grid.cells[6].bg, None);
+        assert!(grid.cells[0].selected && grid.cells[4].selected);
+        assert!(!grid.cells[5].selected && !grid.cells[6].selected);
+    }
+
+    #[test]
+    fn theme_selection_colours_replace_the_swap() {
+        let mut terminal = new_terminal(20, 5).unwrap();
+        terminal.vt_write(b"hello world");
+        let mut builder = GridBuilder::new().unwrap();
+        builder.selection_background = Some(THEME_RED);
+        builder.selection_foreground = Some(THEME_BLUE);
+        select_hello(&terminal, &mut input_for_test());
+        let grid = builder
+            .build(&terminal, 1, Presentation::default())
+            .unwrap()
+            .unwrap();
+        assert_eq!(grid.cells[0].bg, Some(rgb(THEME_RED)));
+        assert_eq!(grid.cells[0].fg, rgb(THEME_BLUE));
+        assert_eq!(grid.cells[6].bg, None);
+    }
+
+    #[test]
+    fn the_plain_fast_path_reads_the_same_cells_as_reading_each_one() {
+        let vt = concat!(
+            "he\x1b[1;31mll\x1b[0m\u{4e16}o plain\r\n",
+            "\x1b[1mbold\x1b[3mital\x1b[2mfaint\x1b[22;7minverse\x1b[27;8minvisible\x1b[0m\r\n",
+            "\x1b[4:3;58;2;1;2;3munder\x1b[0m \x1b[9mstrike\x1b[53mover\x1b[0m\r\n",
+            "\x1b[48;5;4m   \x1b[48;2;9;8;7m   \x1b[0m\x1b[44mblue bg\x1b[0m\x1b[2K\r\n",
+            "\u{4e16}\u{754c}\u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467} e\u{301}\u{2764}\u{fe0f}x\r\n",
+            "\x1b[38;2;10;20;30mrgb \x1b[38;5;200mpalette\x1b[0m\x1b[K",
+        );
+        for selection_colours in [None, Some((THEME_RED, THEME_BLUE))] {
+            for selected in [false, true] {
+                let mut terminal = new_terminal(40, 8).unwrap();
+                terminal.vt_write(vt.as_bytes());
+                if selected {
+                    select_hello(&terminal, &mut input_for_test());
+                }
+                let build = |plain_fast_path| {
+                    let mut builder = GridBuilder::new().unwrap();
+                    builder.plain_fast_path = plain_fast_path;
+                    builder.selection_background = selection_colours.map(|colours| colours.0);
+                    builder.selection_foreground = selection_colours.map(|colours| colours.1);
+                    builder
+                        .build(&terminal, 1, Presentation::default())
+                        .unwrap()
+                        .unwrap()
+                };
+                let (fast, slow) = (build(true), build(false));
+                assert_eq!(fast.cells, slow.cells);
+                assert_eq!(fast.clusters, slow.clusters);
+                assert!(fast.cells.iter().any(|cell| cell.wide));
+                assert!(fast.cells.iter().any(|cell| cell.spacer));
+                assert!(fast.cells.iter().any(|cell| cell.cluster.is_some()));
+                assert!(fast.cells.iter().any(|cell| cell.bg.is_some()));
+            }
+        }
     }
 }

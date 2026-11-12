@@ -3,10 +3,14 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
+use libghostty_vt::Terminal;
+use libghostty_vt::style::RgbColor;
 use rune::{Env, Key, KeyEvent, Mods, Runtime, Waker};
 
 use crate::app::{State, on_key, poll};
+use crate::grid::Metrics;
 use crate::scenes::show_workspace_scene;
+use crate::session::new_terminal;
 use crate::view::view;
 use crate::windows::{Fleet, WindowId};
 use crate::workspace::{Project, Workspace};
@@ -145,3 +149,31 @@ pub(crate) fn one_project() -> Workspace {
     workspace.add_project(Project::new("/dev/agentd".into(), Vec::new()));
     workspace
 }
+
+pub(crate) fn scrolled_terminal<'cb>() -> Terminal<'static, 'cb> {
+    let mut terminal = new_terminal(20, 5).unwrap();
+    for line in 0..30 {
+        terminal.vt_write(format!("line{line}\r\n").as_bytes());
+    }
+    terminal
+}
+
+pub(crate) fn fractional_metrics(scale: f32) -> Metrics {
+    Metrics {
+        cell_width: 9,
+        cell_height: 19,
+        padding: 12.0 * scale,
+        scale,
+    }
+}
+
+pub(crate) const THEME_RED: RgbColor = RgbColor {
+    r: 0xff,
+    g: 0,
+    b: 0,
+};
+pub(crate) const THEME_BLUE: RgbColor = RgbColor {
+    r: 0,
+    g: 0,
+    b: 0xff,
+};
