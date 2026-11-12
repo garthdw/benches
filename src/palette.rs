@@ -1199,7 +1199,7 @@ mod tests {
         workspace.add_tray(stopped);
         state.workspace = workspace;
         let actions = palette_actions("stop", None, &state.workspace);
-        assert_eq!(actions[2], Action::StopTray(0, "pnpm dev".to_owned()));
+        assert!(actions.contains(&Action::StopTray(0, "pnpm dev".to_owned())));
         assert!(
             !actions
                 .iter()

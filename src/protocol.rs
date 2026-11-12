@@ -8,11 +8,20 @@ pub(crate) enum Msg {
     Focus(bool),
     Pointer(PointerInput),
     Wheel(WheelInput),
-    Scrollbar { phase: PointerPhase, y: f32 },
+    Scrollbar {
+        phase: PointerPhase,
+        y: f32,
+    },
     ScrollbarHover(bool),
     CommandHeld(bool),
     Copy,
-    Paste { text: String, allow_unsafe: bool },
+    /// Scroll to the previous (negative) or next prompt marked by the shell.
+    PromptJump(isize),
+    SelectLastOutput,
+    Paste {
+        text: String,
+        allow_unsafe: bool,
+    },
     Resize(Surface),
     Visibility(Visibility),
     Stop,
@@ -30,6 +39,10 @@ pub enum Event {
     Notify {
         title: String,
         body: String,
+    },
+    /// A command ended, by the shell's OSC 133 D; `failed` is a non-zero exit code.
+    CommandFinished {
+        failed: bool,
     },
     /// ⌘ moved onto or off a link; read `Session::link_hovered`.
     LinkHover,

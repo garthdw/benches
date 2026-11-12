@@ -33,6 +33,8 @@ pub struct Tab {
     pub status: Status,
     /// Respawn once the stopped process has exited, so the new one can take its port.
     pub restart: bool,
+    /// The last command the shell reported finishing exited non-zero.
+    pub command_failed: bool,
     stopping: bool,
 }
 
@@ -47,6 +49,7 @@ impl Tab {
             retarget: None,
             status: Status::Running,
             restart: false,
+            command_failed: false,
             stopping: false,
         }
     }

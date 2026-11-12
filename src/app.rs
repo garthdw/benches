@@ -481,6 +481,20 @@ pub(crate) fn run_command(state: &mut State, command: Command, tx: &mut Tx) {
         Command::ZoomReset => state.font_zoom = 0.0,
         Command::PrevTab => state.workspace.cycle_tab(-1),
         Command::NextTab => state.workspace.cycle_tab(1),
+        Command::PrevPrompt | Command::NextPrompt => {
+            if let Some(session) = state.session() {
+                session.jump_prompt(if command == Command::PrevPrompt {
+                    -1
+                } else {
+                    1
+                });
+            }
+        }
+        Command::SelectLastOutput => {
+            if let Some(session) = state.session() {
+                session.select_last_output();
+            }
+        }
     }
 }
 
@@ -539,6 +553,9 @@ pub(crate) fn poll(state: &mut State, now: f64, tx: &mut Tx) -> bool {
                         restarts.push(tab.session.id());
                     }
                     changed = true;
+                }
+                Event::CommandFinished { failed } => {
+                    changed |= std::mem::replace(&mut tab.command_failed, failed) != failed;
                 }
                 Event::LinkHover => changed = true,
                 Event::Notify { title, body } => notices.push((tab.session.id(), title, body)),
@@ -1337,6 +1354,31 @@ mod tests {
             Path::new("/dev/moved")
         );
         assert_eq!(workspace.projects[workspace.active].name, "moved");
+    }
+
+    #[test]
+    fn command_up_and_down_are_workspace_shortcuts_and_plain_arrows_are_not() {
+        let mut state = workspace_state();
+        let mut tx = Tx::default();
+        for key in [Key::Up, Key::Down] {
+            let event = KeyEvent {
+                key: key.clone(),
+                mods: command(),
+            };
+            assert!(on_key(&mut state, &event, &mut tx));
+            let plain = KeyEvent {
+                key,
+                mods: Mods::default(),
+            };
+            assert!(!shortcut(&mut state, &plain, &mut tx));
+        }
+        assert_eq!(
+            crate::keymap::COMMANDS
+                .iter()
+                .find(|spec| spec.command == Command::SelectLastOutput)
+                .map(|spec| spec.chord),
+            Some(None)
+        );
     }
 
     fn tray_runtime() -> Runtime<State> {

@@ -85,7 +85,9 @@ pub(crate) fn add_scene_tray(state: &mut State) {
     failed.status = Status::Failed("exit 1".to_owned());
     let mut stopped = fixture_tab("storybook", b"");
     stopped.status = Status::Stopped;
-    for tab in [fixture_tab("pnpm dev", SCENE_DEV_SERVER), failed, stopped] {
+    let mut dev = fixture_tab("pnpm dev", SCENE_DEV_SERVER);
+    dev.command_failed = true;
+    for tab in [dev, failed, stopped] {
         state.workspace.add_tray(tab);
     }
 }

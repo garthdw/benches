@@ -97,6 +97,20 @@
         "null"
       ]
     },
+    "notify-on-command-finish": {
+      "description": "Whether a command finishing out of sight marks its tab: `never`, or `unfocused` or\n`always`, which mean the same here as a tab in view needs no mark. Falls back to Ghostty's\n`notify-on-command-finish`, then `unfocused`.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "notify-on-command-finish-after": {
+      "description": "How long a command must run to mark its tab, such as `5s` or `1m30s`. Falls back to\nGhostty's `notify-on-command-finish-after`, then `5s`.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
     "shell": {
       "description": "The shell new tabs run, as an absolute path.",
       "type": [

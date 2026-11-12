@@ -20,6 +20,9 @@ pub enum Command {
     ZoomReset,
     PrevTab,
     NextTab,
+    PrevPrompt,
+    NextPrompt,
+    SelectLastOutput,
 }
 
 pub struct CommandSpec {
@@ -80,6 +83,17 @@ pub const COMMANDS: &[CommandSpec] = &[
     spec(Command::ZoomReset, "Reset zoom", Some("mod+0")),
     spec(Command::PrevTab, "Previous tab", Some("mod+shift+[")),
     spec(Command::NextTab, "Next tab", Some("mod+shift+]")),
+    spec(
+        Command::PrevPrompt,
+        "Jump to previous prompt",
+        Some("mod+up"),
+    ),
+    spec(Command::NextPrompt, "Jump to next prompt", Some("mod+down")),
+    spec(
+        Command::SelectLastOutput,
+        "Select last command output",
+        None,
+    ),
 ];
 
 /// A chord such as `mod+shift+]` the way macOS menus show it: `⇧⌘]`.
@@ -119,7 +133,7 @@ impl Command {
 
 /// Workspace shortcuts. These keys never reach the terminal.
 pub fn shortcut(state: &mut State, event: &KeyEvent, tx: &mut Tx) -> bool {
-    if !matches!(event.key, Key::Command(_)) && !event.mods.ctrl {
+    if !matches!(event.key, Key::Command(_)) && !event.mods.ctrl && !event.mods.cmd {
         return false;
     }
     let pressed = |binding: &str| pressed(binding, event, tx);
