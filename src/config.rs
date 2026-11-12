@@ -29,6 +29,8 @@ pub struct Config {
     /// `jump-command`: a command such as `j` or `zoxide query` that the command centre runs
     /// through `shell` with the query to find a folder to open as a project.
     pub jump_command: Option<String>,
+    /// `working-directory`: the folder new projects start in, already checked to exist.
+    pub working_directory: PathBuf,
     /// `auto-secure-input`: turn secure keyboard entry on while a program reads a password.
     pub auto_secure_input: bool,
     /// `notify-on-command-finish` and `-after`: how long a command must run before finishing out
@@ -120,6 +122,7 @@ impl Default for Config {
                 },
             ],
             jump_command: None,
+            working_directory: home_dir(),
             auto_secure_input: true,
             command_finish_after: Some(DEFAULT_COMMAND_FINISH_AFTER),
             clipboard_read: ClipboardAccess::Ask,
@@ -146,6 +149,11 @@ struct File {
     /// with the query to find a folder to open as a project.
     #[serde(rename = "jump-command")]
     jump_command: Option<String>,
+    /// The folder new projects start in: an absolute path, `~/...`, `home`, or `inherit` (the
+    /// folder agentd was launched from, which is home unless that was a terminal). Falls back to
+    /// Ghostty's `working-directory`, then home.
+    #[serde(rename = "working-directory")]
+    working_directory: Option<String>,
     /// Whether to turn on secure keyboard entry while a program reads a password. Falls back to
     /// Ghostty's `macos-auto-secure-input`, then on.
     #[serde(rename = "auto-secure-input")]
@@ -300,6 +308,9 @@ fn default_config_text() -> String {
          # theme = \"dusk\"\n\
          # A command the command centre runs through `shell` with the query to find a folder.\n\
          # jump-command = \"zoxide query\"\n\
+         # The folder new projects start in: a path, `~/...`, `home` or `inherit`; unset uses\n\
+         # Ghostty's `working-directory`, then home.\n\
+         # working-directory = \"~/dev\"\n\
          # Turn on secure keyboard entry while a program reads a password; unset uses Ghostty's\n\
          # `macos-auto-secure-input`, then true.\n\
          # auto-secure-input = false\n\
@@ -415,6 +426,13 @@ impl Config {
             theme,
             tabs: file.tabs.unwrap_or(defaults.tabs),
             jump_command: file.jump_command,
+            working_directory: resolve_working_directory(
+                file.working_directory
+                    .or_else(|| ghostty_value("working-directory"))
+                    .as_deref(),
+                &home_dir(),
+                std::env::current_dir().ok(),
+            ),
             auto_secure_input: file
                 .auto_secure_input
                 .or_else(|| {
@@ -440,6 +458,40 @@ impl Config {
             ),
         }
     }
+}
+
+fn home_dir() -> PathBuf {
+    std::env::var_os("HOME").map_or_else(|| PathBuf::from("/"), PathBuf::from)
+}
+
+/// Ghostty's `working-directory` values. A bundled app launches in `/`, so `inherit` only differs
+/// from home when agentd was started from a terminal. A bad folder is logged and becomes home.
+fn resolve_working_directory(
+    value: Option<&str>,
+    home: &Path,
+    launch_directory: Option<PathBuf>,
+) -> PathBuf {
+    let directory = match value {
+        None | Some("home") => return home.to_owned(),
+        Some("inherit") => {
+            return launch_directory
+                .filter(|directory| directory != Path::new("/"))
+                .unwrap_or_else(|| home.to_owned());
+        }
+        Some("~") => home.to_owned(),
+        Some(value) => match value.strip_prefix("~/") {
+            Some(rest) => home.join(rest),
+            None => PathBuf::from(value),
+        },
+    };
+    if directory.is_absolute() && directory.is_dir() {
+        return directory;
+    }
+    eprintln!(
+        "agentd: working-directory: {} is not an existing folder",
+        directory.display()
+    );
+    home.to_owned()
 }
 
 pub fn read_optional(path: &Path) -> Result<Option<String>> {
@@ -606,6 +658,44 @@ mod tests {
             }
         }
         (root, paths)
+    }
+
+    #[test]
+    fn working_directory_resolves_ghostty_values_and_falls_back_to_home() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        let project = home.join("dev");
+        std::fs::create_dir_all(&project).unwrap();
+        let launched = root.path().to_owned();
+        let resolve = |value, launch| resolve_working_directory(value, &home, launch);
+        assert_eq!(resolve(None, None), home);
+        assert_eq!(resolve(Some("home"), None), home);
+        assert_eq!(resolve(Some("~"), None), home);
+        assert_eq!(resolve(Some("~/dev"), None), project);
+        assert_eq!(resolve(Some(project.to_str().unwrap()), None), project);
+        assert_eq!(resolve(Some("inherit"), Some(launched.clone())), launched);
+        assert_eq!(resolve(Some("inherit"), Some("/".into())), home);
+        assert_eq!(resolve(Some("inherit"), None), home);
+        assert_eq!(resolve(Some("~/missing"), None), home);
+        assert_eq!(resolve(Some("relative"), None), home);
+    }
+
+    #[test]
+    fn working_directory_comes_from_config_toml_then_ghostty() {
+        let folder = tempfile::tempdir().unwrap();
+        let other = tempfile::tempdir().unwrap();
+        let toml = format!("working-directory = {:?}\n", folder.path());
+        let ghostty = format!(
+            "working-directory = /nope\nworking-directory = {}\n",
+            other.path().display()
+        );
+        let load = |config: Option<&str>, ghostty: Option<&str>| {
+            let (_root, paths) = paths(config, ghostty);
+            Config::load(&paths).working_directory
+        };
+        assert_eq!(load(Some(&toml), Some(&ghostty)), folder.path());
+        assert_eq!(load(None, Some(&ghostty)), other.path());
+        assert_eq!(load(None, None), home_dir());
     }
 
     #[test]

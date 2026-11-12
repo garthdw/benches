@@ -489,7 +489,7 @@ pub(crate) fn open_project(state: &mut State, root: PathBuf) {
     state.workspace.add_project(Project::new(root, tabs));
 }
 
-fn pick_folder(tx: &mut Tx, replace_active: bool) {
+fn pick_folder(tx: &mut Tx, directory: Option<PathBuf>, replace_active: bool) {
     let options = FileDialogOptions {
         title: if replace_active {
             "Change project folder"
@@ -497,6 +497,7 @@ fn pick_folder(tx: &mut Tx, replace_active: bool) {
             "Open project"
         }
         .into(),
+        directory,
         ..FileDialogOptions::default()
     };
     tx.open_folder(options, move |state: &mut State, result, _| match result {
@@ -520,8 +521,10 @@ pub(crate) fn run_command(state: &mut State, command: Command, tx: &mut Tx) {
     match command {
         Command::NewShell => open_tab(state, "shell", None),
         Command::ToggleLazygit => toggle_lazygit(state),
-        Command::OpenProject => pick_folder(tx, false),
-        Command::ChangeFolder => pick_folder(tx, true),
+        Command::OpenProject => {
+            pick_folder(tx, Some(state.config.working_directory.clone()), false)
+        }
+        Command::ChangeFolder => pick_folder(tx, None, true),
         Command::MoveToNewWindow => move_to_new_window(state, state.workspace.active, None),
         Command::Palette => open_palette(state, tx),
         Command::Find => open_find(state, tx),
@@ -559,9 +562,9 @@ pub(crate) fn poll(state: &mut State, now: f64, tx: &mut Tx) -> bool {
         state.started = true;
         load_layout(state);
         if state.workspace.projects.is_empty() {
-            let home = std::env::var_os("HOME").map_or_else(|| PathBuf::from("/"), PathBuf::from);
-            let tab = state.spawn_tab("shell", None, &home);
-            state.workspace.add_project(Project::new(home, vec![tab]));
+            let root = state.config.working_directory.clone();
+            let tab = state.spawn_tab("shell", None, &root);
+            state.workspace.add_project(Project::new(root, vec![tab]));
         }
     }
     let mut changed = adopt_projects(state);
@@ -1923,6 +1926,19 @@ mod tests {
             }],
             tray: vec![],
         }
+    }
+
+    #[test]
+    fn the_first_project_starts_in_the_working_directory() {
+        let tmp = std::env::temp_dir().canonicalize().unwrap();
+        let mut state = State::default();
+        state.config.working_directory = tmp.clone();
+        let mut runtime = runtime_with(state);
+        runtime.poll = Some(poll);
+        runtime.frame(1.0 / 60.0);
+        let project = &runtime.state.workspace.projects[0];
+        assert_eq!(project.root, tmp);
+        assert_eq!(project.tabs[0].cwd, Some(tmp));
     }
 
     #[test]
