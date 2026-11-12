@@ -1002,4 +1002,40 @@ mod tests {
                 .any(|line| line.trim_end() == "slept")
         );
     }
+
+    #[test]
+    fn command_backspace_clears_the_line() {
+        let session = spawn_shell();
+        session.key(crate::input::map_text(
+            "echo stale",
+            rune::Mods::default(),
+            None,
+            None,
+        ));
+        let cmd = rune::Mods {
+            cmd: true,
+            logo: true,
+            ..rune::Mods::default()
+        };
+        session.key(
+            crate::input::map_key(
+                &rune::KeyEvent {
+                    key: rune::Key::Backspace,
+                    mods: cmd,
+                },
+                Some(rune::PhysicalKeyCode::Backspace),
+                None,
+            )
+            .unwrap(),
+        );
+        type_line(&session, "echo fresh-7");
+        wait_for_line(&session, "fresh-7");
+        assert!(
+            !session
+                .grid()
+                .lines()
+                .iter()
+                .any(|line| line.contains("stale"))
+        );
+    }
 }

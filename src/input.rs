@@ -85,9 +85,38 @@ pub fn map_text(text: &str, mods: Mods, physical: Option<Code>, base: Option<cha
     }
 }
 
+/// Ghostty's default "natural text editing" keybinds, which send fixed bytes instead of
+/// an encoded key.
+fn line_editing_text(event: &KeyEvent) -> Option<&'static str> {
+    let Mods {
+        shift,
+        cmd,
+        alt,
+        ctrl,
+        ..
+    } = event.mods;
+    match (&event.key, cmd, alt, shift || ctrl) {
+        (Key::Backspace, true, false, false) => Some("\x15"),
+        (Key::Left, true, false, false) => Some("\x01"),
+        (Key::Right, true, false, false) => Some("\x05"),
+        (Key::Left, false, true, false) => Some("\x1bb"),
+        (Key::Right, false, true, false) => Some("\x1bf"),
+        _ => None,
+    }
+}
+
 /// `None` for keys with no terminal meaning. The app's own ⌘ shortcuts are taken before this,
 /// so any ⌘ chord that gets here goes to the terminal with super set and the encoder decides.
 pub fn map_key(event: &KeyEvent, physical: Option<Code>, base: Option<char>) -> Option<KeyInput> {
+    if let Some(text) = line_editing_text(event) {
+        return Some(KeyInput {
+            key: Vt::Unidentified,
+            mods: VtMods::empty(),
+            consumed: VtMods::empty(),
+            text: Some(text.to_owned()),
+            unshifted: '\0',
+        });
+    }
     let named = match &event.key {
         Key::Text(text) => return Some(map_text(text, event.mods, physical, base)),
         Key::Command(character) => {
@@ -300,5 +329,28 @@ mod tests {
     fn a_shifted_command_chord_keeps_shift_as_a_modifier() {
         let input = command_key(Key::Command('K'), true);
         assert!(input.mods.contains(VtMods::SUPER | VtMods::SHIFT));
+    }
+
+    fn chord_text(key: Key, mods: Mods) -> Option<String> {
+        map_key(&KeyEvent { key, mods }, Some(Code::Backspace), None)?.text
+    }
+
+    #[test]
+    fn command_chords_edit_the_line_like_ghostty() {
+        let cmd = Mods {
+            cmd: true,
+            logo: true,
+            ..Mods::default()
+        };
+        let alt = Mods {
+            alt: true,
+            ..Mods::default()
+        };
+        assert_eq!(chord_text(Key::Backspace, cmd).as_deref(), Some("\x15"));
+        assert_eq!(chord_text(Key::Left, cmd).as_deref(), Some("\x01"));
+        assert_eq!(chord_text(Key::Right, cmd).as_deref(), Some("\x05"));
+        assert_eq!(chord_text(Key::Left, alt).as_deref(), Some("\x1bb"));
+        assert_eq!(chord_text(Key::Right, alt).as_deref(), Some("\x1bf"));
+        assert_eq!(chord_text(Key::Left, Mods::default()), None);
     }
 }
