@@ -143,6 +143,8 @@ pub struct Session {
     /// Set by the actor when an alert arrives while not shown; cleared when it is shown.
     alerted: Arc<AtomicBool>,
     link_hovered: Arc<AtomicBool>,
+    /// The directory the shell last reported with OSC 7, which is right inside ssh or a subshell.
+    reported_cwd: Arc<Mutex<Option<PathBuf>>>,
     events: Receiver<Event>,
     sent_surface: std::cell::Cell<Option<Surface>>,
     visibility: std::cell::Cell<Visibility>,
@@ -225,6 +227,7 @@ impl Session {
         let grid = Arc::new(Mutex::new(Arc::new(Grid::default())));
         let alerted = Arc::new(AtomicBool::new(false));
         let link_hovered = Arc::new(AtomicBool::new(false));
+        let reported_cwd = Arc::new(Mutex::new(None));
         let (events_tx, events) = unbounded();
         let (finished_tx, finished) = bounded::<()>(0);
         let mut actor = Actor {
@@ -239,6 +242,7 @@ impl Session {
             slot: grid.clone(),
             alerted: alerted.clone(),
             link_hovered: link_hovered.clone(),
+            reported_cwd: reported_cwd.clone(),
             events: events_tx,
             waker,
             theme: config.theme.clone(),
@@ -264,6 +268,7 @@ impl Session {
             grid,
             alerted,
             link_hovered,
+            reported_cwd,
             events,
             sent_surface: std::cell::Cell::new(None),
             visibility: std::cell::Cell::new(Visibility::Shown),
@@ -281,6 +286,7 @@ impl Session {
             grid: Arc::new(Mutex::new(Arc::new(grid))),
             alerted: Arc::default(),
             link_hovered: Arc::default(),
+            reported_cwd: Arc::default(),
             events: unbounded().1,
             sent_surface: std::cell::Cell::new(None),
             visibility: std::cell::Cell::new(Visibility::Shown),
@@ -311,8 +317,18 @@ impl Session {
         (written == size).then(|| (pid, unsafe { info.assume_init() }))
     }
 
-    /// The process's current directory, which follows the shell's `cd`.
+    /// The shell's current directory, as it reports it, else the process's, which follows the
+    /// shell's `cd`.
     pub fn cwd(&self) -> Option<PathBuf> {
+        let reported = self
+            .reported_cwd
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        reported.or_else(|| self.process_cwd())
+    }
+
+    fn process_cwd(&self) -> Option<PathBuf> {
         use std::os::unix::ffi::OsStrExt;
         let (_, info) = self.pid_info::<libc::proc_vnodepathinfo>(libc::PROC_PIDVNODEPATHINFO)?;
         let path = info.pvi_cdir.vip_path;
@@ -964,6 +980,18 @@ mod tests {
             || (session.cwd() == Some(PathBuf::from("/usr/bin"))).then_some(()),
         );
         assert_eq!(Session::fixture(Grid::default()).cwd(), None);
+    }
+
+    #[test]
+    fn the_reported_directory_wins_over_the_process_directory() {
+        let session = spawn_shell();
+        // Fish reports the symlink `/tmp`, where the process's directory reads `/private/tmp`.
+        type_line(&session, "cd /tmp");
+        wait_until(
+            Duration::from_secs(15),
+            || format!("cwd is {:?}", session.cwd()),
+            || (session.cwd() == Some(PathBuf::from("/tmp"))).then_some(()),
+        );
     }
 
     #[test]

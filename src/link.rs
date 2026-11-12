@@ -14,16 +14,44 @@ pub fn openable(uri: &str) -> bool {
 /// Arguments for `/usr/bin/open`. A file is revealed in Finder rather than opened, because
 /// opening would launch an `.app` or `.command` that program output merely named.
 pub fn open_args(uri: &str) -> Vec<String> {
-    let Some(rest) = uri
+    file_path(uri).map_or_else(|| vec![uri.to_owned()], |path| vec!["-R".to_owned(), path])
+}
+
+/// The host and path of a `file://` URI.
+fn file_parts(uri: &str) -> Option<(&str, String)> {
+    let rest = uri
         .get(..7)
         .filter(|scheme| scheme.eq_ignore_ascii_case("file://"))
-        .and_then(|_| uri.get(7..))
-    else {
-        return vec![uri.to_owned()];
+        .and_then(|_| uri.get(7..))?;
+    let (host, path) = rest.split_at(rest.find('/').unwrap_or(rest.len()));
+    Some((host, percent_decode(path)))
+}
+
+/// The path of a `file://` URI, without its host such as `localhost`.
+pub fn file_path(uri: &str) -> Option<String> {
+    file_parts(uri).map(|(_, path)| path)
+}
+
+/// The local directory a program reported with OSC 7 (a `file://` URI) or OSC 9;9 and 1337 (a
+/// bare path). A URI naming another host, such as one sent from inside ssh, isn't local, and a bare
+/// path has no host to check, so it must exist here.
+pub fn reported_directory(reported: &[u8], hostname: &str) -> Option<std::path::PathBuf> {
+    let reported = std::str::from_utf8(reported).ok()?;
+    let path = match file_parts(reported) {
+        Some((host, path)) => is_local_host(host, hostname).then_some(path)?,
+        None => reported.to_owned(),
     };
-    // Skips a host such as `localhost`.
-    let path = &rest[rest.find('/').unwrap_or(rest.len())..];
-    vec!["-R".to_owned(), percent_decode(path)]
+    let path = std::path::PathBuf::from(path);
+    let local = path.is_absolute() && (file_parts(reported).is_some() || path.is_dir());
+    local.then_some(path)
+}
+
+fn is_local_host(host: &str, hostname: &str) -> bool {
+    let short = hostname.split('.').next().unwrap_or(hostname);
+    host.is_empty()
+        || host.eq_ignore_ascii_case("localhost")
+        || host.eq_ignore_ascii_case(hostname)
+        || host.eq_ignore_ascii_case(short)
 }
 
 fn percent_decode(text: &str) -> String {
@@ -87,6 +115,33 @@ pub fn url_at(row: &[char], column: usize) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_reported_directory_is_decoded_and_local() {
+        let directory = |reported: &str| reported_directory(reported.as_bytes(), "Mac.local");
+        let path = |path: &str| Some(std::path::PathBuf::from(path));
+        assert_eq!(
+            directory("file://mac.LOCAL/Users/me/My%20Dir"),
+            path("/Users/me/My Dir")
+        );
+        assert_eq!(directory("file://MAC/tmp"), path("/tmp"));
+        assert_eq!(directory("file:///tmp/caf%C3%A9"), path("/tmp/café"));
+        assert_eq!(directory("file://localhost/"), path("/"));
+        assert_eq!(directory("file://other.example/tmp"), None);
+        assert_eq!(directory("file://mac.example/tmp"), None);
+        assert_eq!(directory("file://host"), None);
+        assert_eq!(directory("https://example.com/x"), None);
+        assert_eq!(directory(""), None);
+        assert_eq!(reported_directory(b"file:///\xff", "mac"), None);
+    }
+
+    #[test]
+    fn a_bare_reported_path_must_be_a_local_directory() {
+        let directory = |reported: &str| reported_directory(reported.as_bytes(), "mac");
+        assert_eq!(directory("/tmp"), Some("/tmp".into()));
+        assert_eq!(directory("/no/such/folder"), None);
+        assert_eq!(directory("relative"), None);
+    }
 
     fn at(text: &str, needle: &str) -> Option<String> {
         let row: Vec<char> = text.chars().collect();
