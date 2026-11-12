@@ -18,7 +18,7 @@ use libghostty_vt::style::{StyleColor, Underline};
 use libghostty_vt::{RenderState, Terminal};
 
 use crate::LogErr;
-use crate::config::Theme;
+use crate::config::{ClipboardAccess, Theme};
 
 pub(crate) const FRAME: Duration = Duration::from_millis(8);
 
@@ -742,7 +742,11 @@ pub(crate) fn apply_theme(terminal: &mut Terminal<'static, '_>, theme: &Theme) -
 
 /// Answers the queries libghostty-vt leaves unanswered without a callback. The replies match
 /// Ghostty's, so programs that probe it for features behave the same here.
-pub(crate) fn answer_queries(terminal: &mut Terminal<'static, '_>, theme: &Theme) -> Result<()> {
+pub(crate) fn answer_queries(
+    terminal: &mut Terminal<'static, '_>,
+    theme: &Theme,
+    clipboard_write: ClipboardAccess,
+) -> Result<()> {
     let Rgb { r, g, b } = theme.background;
     let luma = 0.2126 * f32::from(r) + 0.7152 * f32::from(g) + 0.0722 * f32::from(b);
     let scheme = if luma < 128.0 {
@@ -750,15 +754,13 @@ pub(crate) fn answer_queries(terminal: &mut Terminal<'static, '_>, theme: &Theme
     } else {
         ColorScheme::Light
     };
-    terminal.on_device_attributes(|_| {
+    let mut features = vec![DeviceAttributeFeature::ANSI_COLOR];
+    if clipboard_write != ClipboardAccess::Deny {
+        features.push(DeviceAttributeFeature::CLIPBOARD);
+    }
+    terminal.on_device_attributes(move |_| {
         Some(DeviceAttributes {
-            primary: PrimaryDeviceAttributes::new(
-                ConformanceLevel::LEVEL_2,
-                &[
-                    DeviceAttributeFeature::ANSI_COLOR,
-                    DeviceAttributeFeature::CLIPBOARD,
-                ],
-            ),
+            primary: PrimaryDeviceAttributes::new(ConformanceLevel::LEVEL_2, &features),
             secondary: SecondaryDeviceAttributes {
                 device_type: DeviceType::VT220,
                 firmware_version: 10,
@@ -791,10 +793,14 @@ mod tests {
     use libghostty_vt::terminal::ScrollViewport;
 
     fn reply_to(theme: &Theme, query: &[u8]) -> Vec<u8> {
+        reply_with_clipboard(theme, ClipboardAccess::Allow, query)
+    }
+
+    fn reply_with_clipboard(theme: &Theme, write: ClipboardAccess, query: &[u8]) -> Vec<u8> {
         let replies = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
         let mut terminal = new_terminal(80, 24).unwrap();
         terminal.resize(80, 24, 9, 18).unwrap();
-        answer_queries(&mut terminal, theme).unwrap();
+        answer_queries(&mut terminal, theme, write).unwrap();
         terminal
             .on_pty_write({
                 let replies = replies.clone();
@@ -811,6 +817,13 @@ mod tests {
         assert_eq!(reply_to(&theme, b"\x1b[c"), b"\x1b[?62;22;52c");
         assert_eq!(reply_to(&theme, b"\x1b[>c"), b"\x1b[>1;10;0c");
         assert_eq!(reply_to(&theme, b"\x1b[=c"), b"\x1bP!|00000000\x1b\\");
+    }
+
+    #[test]
+    fn device_attributes_omit_clipboard_when_writes_are_denied() {
+        let reply = |write| reply_with_clipboard(&Theme::default(), write, b"\x1b[c");
+        assert_eq!(reply(ClipboardAccess::Deny), b"\x1b[?62;22c");
+        assert_eq!(reply(ClipboardAccess::Ask), b"\x1b[?62;22;52c");
     }
 
     #[test]
@@ -837,7 +850,7 @@ mod tests {
     fn a_resize_is_reported_in_band_once_mode_2048_is_set() {
         let replies = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
         let mut terminal = new_terminal(80, 24).unwrap();
-        answer_queries(&mut terminal, &Theme::default()).unwrap();
+        answer_queries(&mut terminal, &Theme::default(), ClipboardAccess::Allow).unwrap();
         terminal
             .on_pty_write({
                 let replies = replies.clone();

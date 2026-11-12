@@ -210,7 +210,7 @@ impl Actor {
     pub(crate) fn run(&mut self) -> Result<()> {
         let mut terminal = new_terminal(self.cols, self.rows)?;
         apply_theme(&mut terminal, &self.theme)?;
-        answer_queries(&mut terminal, &self.theme)?;
+        answer_queries(&mut terminal, &self.theme, self.clipboard_write)?;
         let mut builder = GridBuilder::new()?;
         builder.selection_background = self.theme.selection_background;
         builder.selection_foreground = self.theme.selection_foreground;
