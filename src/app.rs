@@ -78,23 +78,19 @@ pub(crate) struct State {
 }
 
 impl State {
-    pub(crate) fn font(&self) -> config::FontConfig {
-        let font = &self.config.font;
-        config::FontConfig {
-            size: (font.size + self.font_zoom).clamp(MIN_FONT_SIZE, MAX_FONT_SIZE),
-            ..font.clone()
-        }
+    pub(crate) fn font_size(&self) -> f64 {
+        (self.config.font.size + self.font_zoom).clamp(MIN_FONT_SIZE, MAX_FONT_SIZE)
     }
 
     pub(crate) fn zoom(&mut self, points: f64) {
-        let size = (self.font().size + points).clamp(MIN_FONT_SIZE, MAX_FONT_SIZE);
+        let size = (self.font_size() + points).clamp(MIN_FONT_SIZE, MAX_FONT_SIZE);
         self.font_zoom = size - self.config.font.size;
     }
 }
 
 impl TerminalSource for State {
-    fn font(&self) -> config::FontConfig {
-        State::font(self)
+    fn font(&self) -> (&config::FontConfig, f64) {
+        (&self.config.font, self.font_size())
     }
 
     fn show(&self, mark: u32, surface: Surface) -> Option<&Session> {
@@ -970,26 +966,26 @@ mod tests {
 
     #[test]
     fn command_equals_and_minus_zoom_the_font_by_one_point() {
-        let base = State::default().font().size;
-        assert_eq!(zoomed(&['=']).state.font().size, base + 1.0);
-        assert_eq!(zoomed(&['=', '=', '-']).state.font().size, base + 1.0);
-        assert_eq!(zoomed(&['-']).state.font().size, base - 1.0);
+        let base = State::default().font_size();
+        assert_eq!(zoomed(&['=']).state.font_size(), base + 1.0);
+        assert_eq!(zoomed(&['=', '=', '-']).state.font_size(), base + 1.0);
+        assert_eq!(zoomed(&['-']).state.font_size(), base - 1.0);
     }
 
     #[test]
     fn command_zero_restores_the_configured_size() {
-        let base = State::default().font().size;
-        assert_eq!(zoomed(&['=', '=', '0']).state.font().size, base);
-        assert_eq!(zoomed(&['-', '0']).state.font().size, base);
+        let base = State::default().font_size();
+        assert_eq!(zoomed(&['=', '=', '0']).state.font_size(), base);
+        assert_eq!(zoomed(&['-', '0']).state.font_size(), base);
     }
 
     #[test]
     fn zoom_stops_at_the_limits() {
-        assert_eq!(zoomed(&['='; 80]).state.font().size, MAX_FONT_SIZE);
-        assert_eq!(zoomed(&['-'; 80]).state.font().size, MIN_FONT_SIZE);
+        assert_eq!(zoomed(&['='; 80]).state.font_size(), MAX_FONT_SIZE);
+        assert_eq!(zoomed(&['-'; 80]).state.font_size(), MIN_FONT_SIZE);
         let mut runtime = zoomed(&['-'; 80]);
         press(&mut runtime, Key::Command('='), command());
-        assert_eq!(runtime.state.font().size, MIN_FONT_SIZE + 1.0);
+        assert_eq!(runtime.state.font_size(), MIN_FONT_SIZE + 1.0);
     }
 
     #[test]

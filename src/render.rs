@@ -670,7 +670,8 @@ fn quad_buffer(device: &wgpu::Device, size: u64) -> wgpu::Buffer {
 
 /// What the compositor reads from the app.
 pub trait TerminalSource: 'static {
-    fn font(&self) -> crate::config::FontConfig;
+    /// The configured font and the size to draw it at, which zoom changes.
+    fn font(&self) -> (&crate::config::FontConfig, f64);
     /// Resizes every session sharing the area of effect `mark` to `surface`, then returns the one to draw.
     fn show(&self, mark: u32, surface: Surface) -> Option<&Session>;
 }
@@ -678,7 +679,7 @@ pub trait TerminalSource: 'static {
 #[derive(Default)]
 pub struct TerminalCompositor {
     gpu: Option<Gpu>,
-    font: Option<(f32, crate::config::FontConfig, Font)>,
+    font: Option<(f32, f64, crate::config::FontConfig, Font)>,
 }
 
 impl TerminalCompositor {
@@ -693,16 +694,17 @@ impl TerminalCompositor {
         let Some(gpu) = self.gpu.as_mut() else {
             return;
         };
-        let config = source.font();
-        let wanted = (site.scale, &config);
+        let (config, size) = source.font();
         if self
             .font
             .as_ref()
-            .is_none_or(|(scale, current, _)| (*scale, current) != wanted)
+            .is_none_or(|(scale, current_size, current, _)| {
+                (*scale, *current_size, current) != (site.scale, size, config)
+            })
         {
             match Font::with_symbols(
                 &config.family,
-                config.size,
+                size,
                 site.scale,
                 config.symbols_family.as_deref(),
                 &config.fallback_families,
@@ -711,7 +713,7 @@ impl TerminalCompositor {
                 Ok(mut font) => {
                     font.break_runs_at_cursor = config.shaping_breaks_at_cursor;
                     gpu.atlas.reset();
-                    self.font = Some((site.scale, config, font));
+                    self.font = Some((site.scale, size, config.clone(), font));
                 }
                 Err(error) => {
                     eprintln!("agentd: load font: {error:#}");
@@ -719,7 +721,7 @@ impl TerminalCompositor {
                 }
             }
         }
-        let Some((_, _, font)) = &self.font else {
+        let Some((_, _, _, font)) = &self.font else {
             return;
         };
         gpu.ensure_pipeline(device, site.format);
