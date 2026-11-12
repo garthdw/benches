@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use std::hash::BuildHasherDefault;
 use std::mem::size_of;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -18,7 +17,7 @@ use rune::render::EffectSite;
 
 use crate::LogErr;
 use crate::constraint::{Constraint, is_graphics_element, is_symbol};
-use crate::font::{Fnv, Font, FontStyle, GlyphKind, ShapedRun};
+use crate::font::{FnvMap, Font, FontStyle, GlyphKind, ShapedRun};
 use crate::grid::{Cell, Grid, Metrics, Scrollbar, Surface};
 use crate::session::Session;
 
@@ -257,7 +256,7 @@ enum AtlasSlot {
 }
 
 struct Atlas {
-    slots: HashMap<GlyphKey, AtlasSlot, BuildHasherDefault<Fnv>>,
+    slots: FnvMap<GlyphKey, AtlasSlot>,
     /// Glyphs out with the rasterizer, by job id.
     requested: HashMap<u64, GlyphKey>,
     next_job: u64,
@@ -272,7 +271,7 @@ struct Atlas {
 impl Atlas {
     fn new(epoch: u64) -> Self {
         Self {
-            slots: HashMap::default(),
+            slots: FnvMap::default(),
             requested: HashMap::new(),
             next_job: 0,
             next: [1, 1],
@@ -1646,6 +1645,50 @@ mod tests {
             fastest.as_nanos(),
             quads.len(),
             grid.clusters.len()
+        );
+    }
+
+    /// A flood: every frame brings lines the run cache hasn't seen, so most runs are shaped anew.
+    #[test]
+    #[ignore = "benchmark: cargo test --release bench_ -- --ignored --nocapture"]
+    fn bench_shaping_flood() {
+        let (cols, rows) = (150u16, 60u16);
+        let grids: Vec<Grid> = (0..100)
+            .map(|frame| {
+                let mut bytes = Vec::new();
+                for row in 0..u32::from(rows) {
+                    let line = frame * u32::from(rows) + row;
+                    let text = if row % 2 == 0 {
+                        format!(
+                            "\x1b[1;3{}m{line}\x1b[0m \x1b[38;5;{}mstaff\x1b[0m \x1b[4;44mfile-{line}.rs\x1b[0m dim \x1b[7mrev\x1b[0m 世界 é -> !=",
+                            line % 8,
+                            line % 256
+                        )
+                    } else {
+                        format!("{line} the quick brown fox jumps over the lazy dog 0123456789 abcdefghij")
+                    };
+                    bytes.extend(format!("\x1b[{};1H{text}", row + 1).as_bytes());
+                }
+                Grid::from_vt(&bytes, cols, rows).unwrap()
+            })
+            .collect();
+        let font = Font::new(crate::config::DEFAULT_FONT_FAMILY, 8.0, 2.0).unwrap();
+        let mut quads = Vec::new();
+        let start = std::time::Instant::now();
+        for grid in &grids {
+            build_quads(
+                grid,
+                [0.0, 0.0, 2000.0, 1500.0],
+                metrics(&font, 0.0, 2.0),
+                &font,
+                true,
+                &mut quads,
+                |_| (Some(fake_glyph([0, 0])), 0),
+            );
+        }
+        println!(
+            "build_quads {cols}x{rows} flood: {} us/frame",
+            start.elapsed().as_micros() / grids.len() as u128
         );
     }
 
