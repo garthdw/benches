@@ -1372,18 +1372,32 @@ mod tests {
     #[test]
     fn ctrl_c_interrupts_the_foreground_process() {
         let session = spawn_shell();
-        type_line(&session, "sleep 30; echo slept; echo marker-2");
-        thread::sleep(Duration::from_millis(1500));
+        type_line(&session, "echo started; sleep 30; echo slept");
+        wait_for_line(&session, "started");
+        wait_until(
+            Duration::from_secs(15),
+            || "sleep never started".to_owned(),
+            || session.busy().then_some(()),
+        );
         let ctrl = rune::Mods {
             ctrl: true,
             ..rune::Mods::default()
         };
-        session.key(crate::input::map_text(
-            "c",
-            ctrl,
-            Some(rune::PhysicalKeyCode::KeyC),
-            Some('c'),
-        ));
+        // A ^C landing before the shell has put the job in the foreground group is lost, so repeat it.
+        wait_until(
+            Duration::from_secs(15),
+            || "sleep was never interrupted".to_owned(),
+            || {
+                session.key(crate::input::map_text(
+                    "c",
+                    ctrl,
+                    Some(rune::PhysicalKeyCode::KeyC),
+                    Some('c'),
+                ));
+                thread::sleep(Duration::from_millis(50));
+                (!session.busy()).then_some(())
+            },
+        );
         type_line(&session, "echo after-4");
         wait_for_line(&session, "after-4");
         assert!(
