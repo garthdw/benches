@@ -16,6 +16,7 @@ use crate::palette::{
 };
 use crate::protocol::Event;
 use crate::render::TerminalSource;
+use crate::secure_input::SecureInput;
 use crate::session::{Attention, Retarget, Session};
 use crate::view::{DRAWER_MARK, OVERLAY_MARK, view, window_title};
 use crate::windows::{
@@ -79,11 +80,22 @@ pub(crate) struct State {
     pub(crate) font_zoom: f64,
     /// Unset in tests and scenes, which then read and write no files.
     pub(crate) paths: Option<config::Paths>,
+    pub(crate) secure_input: SecureInput,
 }
 
 impl State {
     pub(crate) fn font_size(&self) -> f64 {
         (self.config.font.size + self.font_zoom).clamp(MIN_FONT_SIZE, MAX_FONT_SIZE)
+    }
+
+    /// Secure input is on for the user's choice or a password prompt, only while this window has focus.
+    pub(crate) fn sync_secure_input(&mut self) -> bool {
+        let password_prompt = self.config.auto_secure_input
+            && self
+                .session()
+                .is_some_and(|session| session.grid().password_input);
+        let wanted = self.workspace.window_focused && (self.secure_input.manual || password_prompt);
+        self.secure_input.set(wanted)
     }
 
     pub(crate) fn zoom(&mut self, points: f64) {
@@ -460,6 +472,10 @@ pub(crate) fn run_command(state: &mut State, command: Command, tx: &mut Tx) {
         Command::ToggleSidebar => state.sidebar_hidden = !state.sidebar_hidden,
         Command::ToggleDrawer => toggle_last_drawer(state),
         Command::CloseTab => request_close(state),
+        Command::ToggleSecureInput => {
+            state.secure_input.manual = !state.secure_input.manual;
+            state.sync_secure_input();
+        }
         Command::ZoomIn => state.zoom(1.0),
         Command::ZoomOut => state.zoom(-1.0),
         Command::ZoomReset => state.font_zoom = 0.0,
@@ -580,7 +596,7 @@ pub(crate) fn poll(state: &mut State, now: f64, tx: &mut Tx) -> bool {
         state.alerting = alerting().collect();
         changed = true;
     }
-    changed
+    changed | state.sync_secure_input()
 }
 
 pub(crate) fn on_key(state: &mut State, event: &KeyEvent, tx: &mut Tx) -> bool {
@@ -698,7 +714,10 @@ pub(crate) fn window_app(
         })
         .on_quit(on_quit)
         .on_close(on_close)
-        .on_focus(|state, focused, _| state.workspace.set_window_focused(focused));
+        .on_focus(|state, focused, _| {
+            state.workspace.set_window_focused(focused);
+            state.sync_secure_input();
+        });
     let handle = app.handle();
     fleet.on_reveal(window, move |session| {
         let opener = handle.clone();
@@ -894,6 +913,59 @@ mod tests {
             ..State::default()
         });
         assert!(composing.find("caret").is_some());
+    }
+
+    fn secure_input_state() -> State {
+        let mut state = State::default();
+        crate::scenes::show_scene(&mut state, b"");
+        state.workspace.set_window_focused(true);
+        state
+    }
+
+    #[test]
+    fn a_password_prompt_turns_secure_input_on_until_it_ends() {
+        let mut state = secure_input_state();
+        let password = Grid {
+            password_input: true,
+            ..Grid::default()
+        };
+        state.session().unwrap().publish_fixture(password);
+        assert!(state.sync_secure_input());
+        assert!(state.secure_input.enabled);
+        state.session().unwrap().publish_fixture(Grid::default());
+        assert!(state.sync_secure_input());
+        assert!(!state.secure_input.enabled);
+    }
+
+    #[test]
+    fn auto_secure_input_can_be_turned_off() {
+        let mut state = secure_input_state();
+        state.config.auto_secure_input = false;
+        let password = Grid {
+            password_input: true,
+            ..Grid::default()
+        };
+        state.session().unwrap().publish_fixture(password);
+        assert!(!state.sync_secure_input());
+        assert!(!state.secure_input.enabled);
+    }
+
+    #[test]
+    fn the_manual_toggle_survives_tabs_but_not_losing_focus() {
+        let mut state = secure_input_state();
+        let mut tx = Tx::default();
+        run_command(&mut state, Command::ToggleSecureInput, &mut tx);
+        assert!(state.secure_input.enabled);
+        open_tab(&mut state, "other", Some("cat"));
+        assert!(!state.sync_secure_input());
+        assert!(state.secure_input.enabled);
+        state.workspace.set_window_focused(false);
+        assert!(state.sync_secure_input());
+        assert!(!state.secure_input.enabled);
+        state.workspace.set_window_focused(true);
+        assert!(state.sync_secure_input());
+        run_command(&mut state, Command::ToggleSecureInput, &mut tx);
+        assert!(!state.secure_input.enabled);
     }
 
     #[test]

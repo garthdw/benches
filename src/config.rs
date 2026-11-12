@@ -24,6 +24,8 @@ pub struct Config {
     /// `jump-command`: a command such as `j` or `zoxide query` that the command centre runs
     /// through `shell` with the query to find a folder to open as a project.
     pub jump_command: Option<String>,
+    /// `auto-secure-input`: turn secure keyboard entry on while a program reads a password.
+    pub auto_secure_input: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -99,6 +101,7 @@ impl Default for Config {
                 },
             ],
             jump_command: None,
+            auto_secure_input: true,
         }
     }
 }
@@ -121,6 +124,10 @@ struct File {
     /// with the query to find a folder to open as a project.
     #[serde(rename = "jump-command")]
     jump_command: Option<String>,
+    /// Whether to turn on secure keyboard entry while a program reads a password. Falls back to
+    /// Ghostty's `macos-auto-secure-input`, then on.
+    #[serde(rename = "auto-secure-input")]
+    auto_secure_input: Option<bool>,
 }
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
@@ -254,6 +261,9 @@ fn default_config_text() -> String {
          # theme = \"dusk\"\n\
          # A command the command centre runs through `shell` with the query to find a folder.\n\
          # jump-command = \"zoxide query\"\n\
+         # Turn on secure keyboard entry while a program reads a password; unset uses Ghostty's\n\
+         # `macos-auto-secure-input`, then true.\n\
+         # auto-secure-input = false\n\
          \n\
          [font]\n\
          # family = {family}\n\
@@ -346,6 +356,13 @@ impl Config {
             theme,
             tabs: file.tabs.unwrap_or(defaults.tabs),
             jump_command: file.jump_command,
+            auto_secure_input: file
+                .auto_secure_input
+                .or_else(|| {
+                    ghostty_value("macos-auto-secure-input")
+                        .and_then(|value| value.parse().log_err("macos-auto-secure-input"))
+                })
+                .unwrap_or(defaults.auto_secure_input),
         }
     }
 }
@@ -585,6 +602,21 @@ mod tests {
             ["+liga"]
         );
         assert!(features(Some("[font]\nfeatures = []\n")).is_empty());
+    }
+
+    #[test]
+    fn auto_secure_input_reads_ghostty_and_config_toml_replaces_it() {
+        let auto = |config: Option<&str>, ghostty: Option<&str>| {
+            let (_root, paths) = paths(config, ghostty);
+            Config::load(&paths).auto_secure_input
+        };
+        assert!(auto(None, None));
+        assert!(!auto(None, Some("macos-auto-secure-input = false\n")));
+        assert!(auto(
+            Some("auto-secure-input = true\n"),
+            Some("macos-auto-secure-input = false\n")
+        ));
+        assert!(!auto(Some("auto-secure-input = false\n"), None));
     }
 
     #[test]
