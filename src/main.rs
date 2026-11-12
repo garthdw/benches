@@ -16,6 +16,7 @@ mod protocol;
 mod render;
 mod scenes;
 mod search;
+mod secure_input;
 mod session;
 mod sprite;
 mod terminal_input;

@@ -1,4 +1,4 @@
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::process::Child;
 use std::rc::Rc;
@@ -8,17 +8,21 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD;
 use crossbeam_channel::{Receiver, Sender, never, select};
+use libghostty_vt::effect::{ClipboardLocation, ClipboardReadError, ClipboardWriteError};
 use libghostty_vt::mode::Mode;
 use libghostty_vt::{Terminal, focus, key};
 use nix::errno::Errno;
 use nix::pty::Winsize;
 use nix::sys::signal::{Signal, killpg};
+use nix::sys::termios::{LocalFlags, tcgetattr};
 use nix::unistd::Pid;
 use rune::Waker;
 
 use crate::LogErr;
-use crate::config::Theme;
+use crate::config::{ClipboardAccess, Theme};
 use crate::grid::{
     FRAME, Grid, GridBuilder, Presentation, ScrollbarFade, Surface, apply_theme, new_terminal,
 };
@@ -30,6 +34,16 @@ use crate::terminal_input::{TerminalInput, open_link, paste_text, selection_text
 const RESIZE_SETTLE: Duration = Duration::from_millis(100);
 const HOLD_TIMEOUT: Duration = Duration::from_secs(1);
 const BLINK: Duration = Duration::from_millis(530);
+/// Ghostty's interval for watching the terminal modes that mark a password prompt.
+const PASSWORD_POLL: Duration = Duration::from_millis(200);
+
+/// Programs reading a password turn echo off while keeping line editing, as `sudo` and `ssh` do.
+fn password_prompt(master: &OwnedFd) -> bool {
+    tcgetattr(master).is_ok_and(|termios| {
+        termios.local_flags.contains(LocalFlags::ICANON)
+            && !termios.local_flags.contains(LocalFlags::ECHO)
+    })
+}
 
 fn focus_report(terminal: &Terminal<'static, '_>, focused: bool) -> Result<Option<Vec<u8>>> {
     if !terminal.mode(Mode::FOCUS_EVENT)? {
@@ -92,6 +106,8 @@ pub(crate) struct Actor {
     pub(crate) events: Sender<Event>,
     pub(crate) waker: Waker,
     pub(crate) theme: Theme,
+    pub(crate) clipboard_read: ClipboardAccess,
+    pub(crate) clipboard_write: ClipboardAccess,
 }
 
 impl Actor {
@@ -153,9 +169,23 @@ impl Actor {
         }));
 
         let pty_input = self.input.clone();
-        terminal.on_pty_write(move |_, data| {
-            pty_input.send(data.to_vec()).log_err("queue PTY reply");
+        let reply_muted = Rc::new(Cell::new(false));
+        terminal.on_pty_write({
+            let reply_muted = reply_muted.clone();
+            move |_, data| queue_reply(&pty_input, &reply_muted, data)
         })?;
+        let events = self.events.clone();
+        let waker = self.waker.clone();
+        install_clipboard(
+            &mut terminal,
+            self.clipboard_read,
+            self.clipboard_write,
+            reply_muted,
+            Rc::new(move |event| {
+                events.send(event).log_err("queue event");
+                waker();
+            }),
+        )?;
         let hold_publisher = publisher.clone();
         terminal.on_render_hold(move |terminal, held| {
             let mut publisher = hold_publisher.borrow_mut();
@@ -197,6 +227,7 @@ impl Actor {
         let mut scrollbar_hovered = false;
         let mut resize = ResizeDebounce::default();
         let mut dirty = true;
+        let mut next_password_check = Instant::now();
         let mut titles = Titles {
             sent: String::new(),
             next: Instant::now(),
@@ -210,6 +241,7 @@ impl Actor {
                 resize.due,
                 fade.next_change(now),
                 titles.due(visibility).filter(|_| title_changed.get()),
+                (visibility != Visibility::Hidden).then_some(next_password_check),
             ]
             .into_iter()
             .flatten()
@@ -294,6 +326,10 @@ impl Actor {
                             self.emit(Event::Copied(text));
                         }
                     }
+                    Ok(Msg::ClipboardReply { location, text }) => {
+                        let reply = osc52_reply(location, text.as_deref().unwrap_or_default());
+                        self.input.send(reply).log_err("queue clipboard reply");
+                    }
                     Ok(Msg::Focus(focused)) => {
                         let mut publisher = publisher.borrow_mut();
                         if focused && publisher.visible() {
@@ -373,6 +409,12 @@ impl Actor {
                 dirty = true;
             }
             let mut publisher = publisher.borrow_mut();
+            if publisher.visibility != Visibility::Hidden && Instant::now() >= next_password_check {
+                next_password_check = Instant::now() + PASSWORD_POLL;
+                let password_input = password_prompt(&self.master);
+                dirty |= publisher.presentation.password_input != password_input;
+                publisher.presentation.password_input = password_input;
+            }
             dirty |= publisher.tick_blink(Instant::now());
             let held = scrollbar_hovered || input.scrollbar_grab.is_some();
             let opacity = fade.opacity(&terminal, held, Instant::now());
@@ -414,6 +456,76 @@ impl Actor {
             }
         }
     }
+}
+
+/// Queues bytes libghostty writes to the program, unless the clipboard read callback muted the
+/// reply it automatically sends when it returns unanswered.
+fn queue_reply(input: &Sender<Vec<u8>>, reply_muted: &Cell<bool>, data: &[u8]) {
+    if !reply_muted.take() {
+        input.send(data.to_vec()).log_err("queue PTY reply");
+    }
+}
+
+/// libghostty answers a clipboard read only from inside its callback, which must not wait for
+/// the UI. So a permitted read returns unanswered, `reply_muted` swallows the empty reply that
+/// libghostty then sends, and `Msg::ClipboardReply` writes the real one later.
+fn install_clipboard(
+    terminal: &mut Terminal<'static, '_>,
+    read: ClipboardAccess,
+    write: ClipboardAccess,
+    reply_muted: Rc<Cell<bool>>,
+    emit: Rc<dyn Fn(Event)>,
+) -> Result<()> {
+    terminal.on_clipboard_write({
+        let emit = emit.clone();
+        move |_, request| {
+            let mut contents = request.contents().peekable();
+            let text = if contents.peek().is_none() {
+                Some(String::new())
+            } else {
+                contents
+                    .find(|content| content.mime == b"text/plain")
+                    .map(|content| String::from_utf8_lossy(content.data).into_owned())
+            };
+            match (write, text) {
+                (ClipboardAccess::Deny, _) => {
+                    request.reply(Err(ClipboardWriteError::Denied), false)
+                }
+                (_, None) => request.reply(Err(ClipboardWriteError::Unsupported), false),
+                (access, Some(text)) => {
+                    emit(Event::ClipboardWrite {
+                        text,
+                        ask: access == ClipboardAccess::Ask,
+                    });
+                    request.reply(Ok(()), false);
+                }
+            }
+        }
+    })?;
+    terminal.on_clipboard_read(move |_, request| {
+        let text_only = request.mimes().eq([&b"text/plain"[..]]) && !request.list();
+        match read {
+            _ if !text_only => request.reply(Err(ClipboardReadError::Unsupported), &[], false),
+            ClipboardAccess::Deny => request.reply(Err(ClipboardReadError::Denied), &[], false),
+            access => {
+                reply_muted.set(true);
+                emit(Event::ClipboardRead {
+                    location: request.location(),
+                    ask: access == ClipboardAccess::Ask,
+                });
+            }
+        }
+    })?;
+    Ok(())
+}
+
+fn osc52_reply(location: ClipboardLocation, text: &str) -> Vec<u8> {
+    let selector = match location {
+        ClipboardLocation::Standard => 'c',
+        ClipboardLocation::Selection => 's',
+        ClipboardLocation::Primary => 'p',
+    };
+    format!("\x1b]52;{selector};{}\x1b\\", STANDARD.encode(text)).into_bytes()
 }
 
 /// Sends program titles at most once a frame, and none while hidden, as animated titles can change constantly.
@@ -688,6 +800,128 @@ mod tests {
                 .cursor
                 .is_none()
         );
+    }
+    /// What the program would receive after `input` is written to a terminal with the given access.
+    fn clipboard_session(
+        read: ClipboardAccess,
+        write: ClipboardAccess,
+        input: &[u8],
+    ) -> (Vec<Event>, Vec<u8>) {
+        let mut terminal = new_terminal(10, 2).unwrap();
+        let (events_tx, events) = crossbeam_channel::unbounded();
+        let (replies_tx, replies) = crossbeam_channel::unbounded();
+        let reply_muted = Rc::new(Cell::new(false));
+        terminal
+            .on_pty_write({
+                let reply_muted = reply_muted.clone();
+                move |_, data| queue_reply(&replies_tx, &reply_muted, data)
+            })
+            .unwrap();
+        install_clipboard(
+            &mut terminal,
+            read,
+            write,
+            reply_muted,
+            Rc::new(move |event| events_tx.send(event).unwrap()),
+        )
+        .unwrap();
+        terminal.vt_write(input);
+        (
+            events.try_iter().collect(),
+            replies.try_iter().flatten().collect(),
+        )
+    }
+
+    const WRITE_HI: &[u8] = b"\x1b]52;c;aGk=\x07";
+    const READ: &[u8] = b"\x1b]52;c;?\x07";
+
+    #[test]
+    fn an_osc_52_write_reaches_the_ui_when_allowed() {
+        let (events, replies) =
+            clipboard_session(ClipboardAccess::Ask, ClipboardAccess::Allow, WRITE_HI);
+        assert!(
+            matches!(&events[..], [Event::ClipboardWrite { text, ask: false }] if text == "hi")
+        );
+        assert!(replies.is_empty());
+    }
+
+    #[test]
+    fn an_osc_52_write_waits_for_the_user_when_asking() {
+        let (events, _) = clipboard_session(ClipboardAccess::Ask, ClipboardAccess::Ask, WRITE_HI);
+        assert!(matches!(&events[..], [Event::ClipboardWrite { text, ask: true }] if text == "hi"));
+    }
+
+    #[test]
+    fn a_denied_osc_52_write_goes_nowhere() {
+        let (events, _) = clipboard_session(ClipboardAccess::Ask, ClipboardAccess::Deny, WRITE_HI);
+        assert!(events.is_empty());
+    }
+
+    #[test]
+    fn an_osc_52_read_is_held_for_the_ui_with_no_reply_yet() {
+        let (events, replies) =
+            clipboard_session(ClipboardAccess::Ask, ClipboardAccess::Allow, READ);
+        assert!(matches!(
+            &events[..],
+            [Event::ClipboardRead {
+                location: ClipboardLocation::Standard,
+                ask: true
+            }]
+        ));
+        assert!(replies.is_empty());
+    }
+
+    #[test]
+    fn an_osc_52_read_goes_ahead_without_asking_when_allowed() {
+        let (events, _) = clipboard_session(ClipboardAccess::Allow, ClipboardAccess::Allow, READ);
+        assert!(matches!(
+            &events[..],
+            [Event::ClipboardRead { ask: false, .. }]
+        ));
+    }
+
+    #[test]
+    fn a_denied_osc_52_read_gets_an_empty_clipboard() {
+        let (events, replies) =
+            clipboard_session(ClipboardAccess::Deny, ClipboardAccess::Allow, READ);
+        assert!(events.is_empty());
+        assert_eq!(replies, b"\x1b]52;c;\x07");
+    }
+
+    #[test]
+    fn the_muted_reply_does_not_swallow_later_replies() {
+        let (_, replies) = clipboard_session(
+            ClipboardAccess::Ask,
+            ClipboardAccess::Allow,
+            b"\x1b]52;c;?\x07\x1b[c",
+        );
+        assert!(replies.starts_with(b"\x1b[?"), "{replies:?}");
+    }
+
+    #[test]
+    fn a_clipboard_reply_is_an_osc_52_with_the_text_in_base64() {
+        assert_eq!(
+            osc52_reply(ClipboardLocation::Standard, "hi"),
+            b"\x1b]52;c;aGk=\x1b\\"
+        );
+        assert_eq!(
+            osc52_reply(ClipboardLocation::Primary, ""),
+            b"\x1b]52;p;\x1b\\"
+        );
+    }
+
+    #[test]
+    fn echo_off_with_line_editing_is_a_password_prompt() {
+        use nix::sys::termios::{SetArg, tcsetattr};
+        let pty = nix::pty::openpty(None, None).unwrap();
+        assert!(!password_prompt(&pty.master));
+        let mut termios = tcgetattr(&pty.slave).unwrap();
+        termios.local_flags.remove(LocalFlags::ECHO);
+        tcsetattr(&pty.slave, SetArg::TCSANOW, &termios).unwrap();
+        assert!(password_prompt(&pty.master));
+        termios.local_flags.remove(LocalFlags::ICANON);
+        tcsetattr(&pty.slave, SetArg::TCSANOW, &termios).unwrap();
+        assert!(!password_prompt(&pty.master));
     }
     #[test]
     fn focus_is_reported_only_when_the_program_asked() {

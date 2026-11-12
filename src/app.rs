@@ -2,6 +2,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use libghostty_vt::effect::ClipboardLocation;
 use rune::{
     App, AppSpec, ClipboardContent, FileDialogOptions, Ime, Key, KeyEvent, Live, Mods, Tx, Waker,
 };
@@ -17,6 +18,7 @@ use crate::palette::{
 };
 use crate::protocol::Event;
 use crate::render::TerminalSource;
+use crate::secure_input::SecureInput;
 use crate::session::{Attention, Retarget, Session};
 use crate::view::{DRAWER_MARK, OVERLAY_MARK, view, window_title};
 use crate::windows::{
@@ -81,11 +83,22 @@ pub(crate) struct State {
     pub(crate) font_zoom: f64,
     /// Unset in tests and scenes, which then read and write no files.
     pub(crate) paths: Option<config::Paths>,
+    pub(crate) secure_input: SecureInput,
 }
 
 impl State {
     pub(crate) fn font_size(&self) -> f64 {
         (self.config.font.size + self.font_zoom).clamp(MIN_FONT_SIZE, MAX_FONT_SIZE)
+    }
+
+    /// Secure input is on for the user's choice or a password prompt, only while this window has focus.
+    pub(crate) fn sync_secure_input(&mut self) -> bool {
+        let password_prompt = self.config.auto_secure_input
+            && self
+                .session()
+                .is_some_and(|session| session.grid().password_input);
+        let wanted = self.workspace.window_focused && (self.secure_input.manual || password_prompt);
+        self.secure_input.set(wanted)
     }
 
     pub(crate) fn zoom(&mut self, points: f64) {
@@ -290,6 +303,13 @@ pub(crate) fn tray_action(state: &mut State, index: usize, picked: Option<&str>)
 pub(crate) enum Confirm {
     /// The session that refused a paste, and the text.
     Paste { session: u64, text: String },
+    /// A program's OSC 52 write, held until the user agrees to replace the clipboard.
+    ClipboardWrite { session: u64, text: String },
+    /// A program's OSC 52 read; it stays blocked until this is answered, even when refused.
+    ClipboardRead {
+        session: u64,
+        location: ClipboardLocation,
+    },
     /// The session whose close waits, and the project it takes whole rather than the focused tab.
     Close {
         session: u64,
@@ -300,7 +320,10 @@ pub(crate) enum Confirm {
 impl Confirm {
     fn session(&self) -> u64 {
         match self {
-            Self::Paste { session, .. } | Self::Close { session, .. } => *session,
+            Self::Paste { session, .. }
+            | Self::ClipboardWrite { session, .. }
+            | Self::ClipboardRead { session, .. }
+            | Self::Close { session, .. } => *session,
         }
     }
 }
@@ -363,15 +386,57 @@ pub(crate) fn request_close_project(state: &mut State, index: usize) {
     }
 }
 
-pub(crate) fn resolve_confirm(state: &mut State, index: usize, confirmed: bool) {
+/// A second read while one waits is refused, so the program is never left with two to answer.
+fn asks_to_read(confirms: &[Confirm], session: u64) -> bool {
+    confirms
+        .iter()
+        .any(|confirm| matches!(confirm, Confirm::ClipboardRead { session: asking, .. } if *asking == session))
+}
+
+/// Hands the program its clipboard once the UI has read it.
+fn read_clipboard_for(tx: &mut Tx, session: u64, location: ClipboardLocation) {
+    tx.read_clipboard(
+        move |state: &mut State, content: &ClipboardContent, _: &mut Tx| {
+            answer_clipboard_read(state, session, location, Some(content.text().to_owned()));
+        },
+    );
+}
+
+fn answer_clipboard_read(
+    state: &State,
+    session: u64,
+    location: ClipboardLocation,
+    text: Option<String>,
+) {
+    if let Some(session) = state
+        .workspace
+        .sessions()
+        .find(|other| other.id() == session)
+    {
+        session.clipboard_reply(location, text);
+    }
+}
+
+pub(crate) fn resolve_confirm(state: &mut State, index: usize, confirmed: bool, tx: &mut Tx) {
     if index >= state.confirms.len() {
         return;
     }
     let confirm = state.confirms.remove(index);
-    if !confirmed || Some(confirm.session()) != state.session().map(Session::id) {
+    let active = Some(confirm.session()) == state.session().map(Session::id);
+    if let Confirm::ClipboardRead { session, location } = confirm {
+        if confirmed && active {
+            read_clipboard_for(tx, session, location);
+        } else {
+            answer_clipboard_read(state, session, location, None);
+        }
+        return;
+    }
+    if !confirmed || !active {
         return;
     }
     match confirm {
+        Confirm::ClipboardWrite { text, .. } => tx.copy(text),
+        Confirm::ClipboardRead { .. } => {}
         Confirm::Paste { text, .. } => {
             if let Some(session) = state.session() {
                 session.paste(text, true);
@@ -463,6 +528,10 @@ pub(crate) fn run_command(state: &mut State, command: Command, tx: &mut Tx) {
         Command::ToggleSidebar => state.sidebar_hidden = !state.sidebar_hidden,
         Command::ToggleDrawer => toggle_last_drawer(state),
         Command::CloseTab => request_close(state),
+        Command::ToggleSecureInput => {
+            state.secure_input.manual = !state.secure_input.manual;
+            state.sync_secure_input();
+        }
         Command::ZoomIn => state.zoom(1.0),
         Command::ZoomOut => state.zoom(-1.0),
         Command::ZoomReset => state.font_zoom = 0.0,
@@ -496,11 +565,16 @@ pub(crate) fn poll(state: &mut State, now: f64, tx: &mut Tx) -> bool {
     changed |= poll_find(state, active);
     changed |= poll_worktrees(state);
     changed |= poll_creation(state);
-    let confirms = state.confirms.len();
-    state
-        .confirms
-        .retain(|confirm| Some(confirm.session()) == active);
-    changed |= state.confirms.len() != confirms;
+    let (kept, dismissed): (Vec<_>, Vec<_>) = std::mem::take(&mut state.confirms)
+        .into_iter()
+        .partition(|confirm| Some(confirm.session()) == active);
+    state.confirms = kept;
+    changed |= !dismissed.is_empty();
+    for confirm in dismissed {
+        if let Confirm::ClipboardRead { session, location } = confirm {
+            answer_clipboard_read(state, session, location, None);
+        }
+    }
     let mut restarts = Vec::new();
     let mut exits = Vec::new();
     let mut notices = Vec::new();
@@ -514,6 +588,37 @@ pub(crate) fn poll(state: &mut State, now: f64, tx: &mut Tx) -> bool {
                     changed = true;
                 }
                 Event::PasteRejected(_) => {}
+                Event::ClipboardWrite { text, ask: false } => tx.copy(text),
+                Event::ClipboardWrite { text, ask: true } if Some(tab.session.id()) == active => {
+                    let session = tab.session.id();
+                    push_confirm(
+                        &mut state.confirms,
+                        Confirm::ClipboardWrite { session, text },
+                    );
+                    changed = true;
+                }
+                Event::ClipboardWrite { .. } => {}
+                Event::ClipboardRead {
+                    location,
+                    ask: false,
+                } => {
+                    read_clipboard_for(tx, tab.session.id(), location);
+                }
+                Event::ClipboardRead {
+                    location,
+                    ask: true,
+                } if Some(tab.session.id()) == active
+                    && !asks_to_read(&state.confirms, tab.session.id()) =>
+                {
+                    let session = tab.session.id();
+                    state
+                        .confirms
+                        .push(Confirm::ClipboardRead { session, location });
+                    changed = true;
+                }
+                Event::ClipboardRead { location, .. } => {
+                    tab.session.clipboard_reply(location, None)
+                }
                 Event::Title(title) => {
                     tab.program_title = Some(title).filter(|title| !title.is_empty());
                     changed = true;
@@ -584,12 +689,12 @@ pub(crate) fn poll(state: &mut State, now: f64, tx: &mut Tx) -> bool {
         state.alerting = alerting().collect();
         changed = true;
     }
-    changed
+    changed | state.sync_secure_input()
 }
 
 pub(crate) fn on_key(state: &mut State, event: &KeyEvent, tx: &mut Tx) -> bool {
     if !state.confirms.is_empty() && matches!(event.key, Key::Enter | Key::Escape) {
-        resolve_confirm(state, state.confirms.len() - 1, event.key == Key::Enter);
+        resolve_confirm(state, state.confirms.len() - 1, event.key == Key::Enter, tx);
         return true;
     }
     if shortcut(state, event, tx) {
@@ -702,7 +807,10 @@ pub(crate) fn window_app(
         })
         .on_quit(on_quit)
         .on_close(on_close)
-        .on_focus(|state, focused, _| state.workspace.set_window_focused(focused));
+        .on_focus(|state, focused, _| {
+            state.workspace.set_window_focused(focused);
+            state.sync_secure_input();
+        });
     let handle = app.handle();
     fleet.on_reveal(window, move |session| {
         let opener = handle.clone();
@@ -898,6 +1006,59 @@ mod tests {
             ..State::default()
         });
         assert!(composing.find("caret").is_some());
+    }
+
+    fn secure_input_state() -> State {
+        let mut state = State::default();
+        crate::scenes::show_scene(&mut state, b"");
+        state.workspace.set_window_focused(true);
+        state
+    }
+
+    #[test]
+    fn a_password_prompt_turns_secure_input_on_until_it_ends() {
+        let mut state = secure_input_state();
+        let password = Grid {
+            password_input: true,
+            ..Grid::default()
+        };
+        state.session().unwrap().publish_fixture(password);
+        assert!(state.sync_secure_input());
+        assert!(state.secure_input.enabled);
+        state.session().unwrap().publish_fixture(Grid::default());
+        assert!(state.sync_secure_input());
+        assert!(!state.secure_input.enabled);
+    }
+
+    #[test]
+    fn auto_secure_input_can_be_turned_off() {
+        let mut state = secure_input_state();
+        state.config.auto_secure_input = false;
+        let password = Grid {
+            password_input: true,
+            ..Grid::default()
+        };
+        state.session().unwrap().publish_fixture(password);
+        assert!(!state.sync_secure_input());
+        assert!(!state.secure_input.enabled);
+    }
+
+    #[test]
+    fn the_manual_toggle_survives_tabs_but_not_losing_focus() {
+        let mut state = secure_input_state();
+        let mut tx = Tx::default();
+        run_command(&mut state, Command::ToggleSecureInput, &mut tx);
+        assert!(state.secure_input.enabled);
+        open_tab(&mut state, "other", Some("cat"));
+        assert!(!state.sync_secure_input());
+        assert!(state.secure_input.enabled);
+        state.workspace.set_window_focused(false);
+        assert!(state.sync_secure_input());
+        assert!(!state.secure_input.enabled);
+        state.workspace.set_window_focused(true);
+        assert!(state.sync_secure_input());
+        run_command(&mut state, Command::ToggleSecureInput, &mut tx);
+        assert!(!state.secure_input.enabled);
     }
 
     #[test]
@@ -1606,6 +1767,65 @@ mod tests {
     fn an_empty_workspace_shows_a_hint() {
         let runtime = runtime_with(State::default());
         assert!(runtime.find("empty-hint").is_some());
+    }
+
+    fn pending_clipboard(confirm: impl FnOnce(u64) -> Confirm) -> Runtime<State> {
+        let mut state = workspace_state();
+        let session = state.session().map(Session::id).unwrap();
+        state.confirms.push(confirm(session));
+        let mut runtime = runtime_with(state);
+        runtime.on_key = Some(on_key);
+        runtime.poll = Some(poll);
+        runtime.frame(1.0 / 60.0);
+        runtime
+    }
+
+    fn pending_read(session: u64) -> Confirm {
+        Confirm::ClipboardRead {
+            session,
+            location: ClipboardLocation::Standard,
+        }
+    }
+
+    #[test]
+    fn a_clipboard_read_asks_before_answering() {
+        let runtime = pending_clipboard(pending_read);
+        assert!(runtime.find("clipboard-read-confirm").is_some());
+        assert!(runtime.find("clipboard-read-confirm-yes").is_some());
+    }
+
+    #[test]
+    fn escape_refuses_a_clipboard_read() {
+        let mut runtime = pending_clipboard(pending_read);
+        press(&mut runtime, Key::Escape, Mods::default());
+        assert!(runtime.state.confirms.is_empty());
+        assert!(runtime.find("clipboard-read-confirm").is_none());
+    }
+
+    #[test]
+    fn enter_allows_a_clipboard_read() {
+        let mut runtime = pending_clipboard(pending_read);
+        press(&mut runtime, Key::Enter, Mods::default());
+        assert!(runtime.state.confirms.is_empty());
+    }
+
+    #[test]
+    fn a_clipboard_write_asks_before_replacing_the_clipboard() {
+        let mut runtime = pending_clipboard(|session| Confirm::ClipboardWrite {
+            session,
+            text: "hi".to_owned(),
+        });
+        assert!(runtime.find("clipboard-write-confirm").is_some());
+        press(&mut runtime, Key::Enter, Mods::default());
+        assert!(runtime.state.confirms.is_empty());
+    }
+
+    #[test]
+    fn switching_tabs_dismisses_a_pending_clipboard_read() {
+        let mut runtime = pending_clipboard(pending_read);
+        click(&mut runtime, "tab-1");
+        runtime.frame(2.0 / 60.0);
+        assert!(runtime.state.confirms.is_empty());
     }
 
     #[test]

@@ -42,6 +42,12 @@ static SIDEBAR_ICON: Icon = Icon {
     body: r#"<rect x="3" y="4.5" width="18" height="15" rx="3" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="M9.5 4.5v15" stroke="currentColor" stroke-width="1.6"/>"#,
 };
 
+static LOCK_ICON: Icon = Icon {
+    name: "lock",
+    view: 24.0,
+    body: r#"<rect x="5" y="11" width="14" height="9.5" rx="2" fill="currentColor"/><path d="M8 11V8a4 4 0 0 1 8 0v3" fill="none" stroke="currentColor" stroke-width="1.8"/>"#,
+};
+
 fn dot(color: Color) -> El {
     el().size(DOT, DOT).radius(DOT / 2.0).fill(color)
 }
@@ -342,6 +348,13 @@ fn tab_strip(state: &State, theme: &tok::Theme, accent: Color, titlebar_inset: f
         .child(sidebar_toggle)
         .children(tabs)
         .children(new_tab)
+        .children(state.secure_input.enabled.then(|| {
+            row().grow(1.0).justify_end().child(
+                icon(&LOCK_ICON, 16.0)
+                    .label("Secure keyboard entry")
+                    .color(theme.text_secondary),
+            )
+        }))
 }
 
 const CONFIRM_BAR_PITCH: f32 = 40.0;
@@ -352,7 +365,7 @@ fn confirm_bar(
     message: String,
     action: &'static str,
     y: f32,
-    resolve: impl Fn(&mut State, bool) + Clone + 'static,
+    resolve: impl Fn(&mut State, &mut Tx, bool) + Clone + 'static,
 ) -> El {
     let button = |key: String, label: &'static str| {
         el().key(key)
@@ -374,13 +387,13 @@ fn confirm_bar(
         .radius(6.0)
         .fill(theme.card)
         .child(text(message).color(theme.text))
-        .child(button(format!("{key}-yes"), action).on_press({
+        .child(button(format!("{key}-yes"), action).on_press_tx({
             let resolve = resolve.clone();
-            move |state: &mut State| resolve(state, true)
+            move |state: &mut State, tx: &mut Tx| resolve(state, tx, true)
         }))
         .child(
             button(format!("{key}-no"), "Cancel")
-                .on_press(move |state: &mut State| resolve(state, false)),
+                .on_press_tx(move |state: &mut State, tx: &mut Tx| resolve(state, tx, false)),
         )
 }
 
@@ -414,6 +427,16 @@ fn focus_overlays(state: &State, theme: &tok::Theme) -> Vec<El> {
                 "This paste could run commands".to_owned(),
                 "Paste",
             ),
+            Confirm::ClipboardWrite { .. } => (
+                "clipboard-write-confirm",
+                "Replace your clipboard?".to_owned(),
+                "Allow",
+            ),
+            Confirm::ClipboardRead { .. } => (
+                "clipboard-read-confirm",
+                "Share your clipboard?".to_owned(),
+                "Allow",
+            ),
             Confirm::Close { project, .. } => {
                 let place = project
                     .as_ref()
@@ -439,7 +462,7 @@ fn focus_overlays(state: &State, theme: &tok::Theme) -> Vec<El> {
             message,
             action,
             y,
-            move |state, confirmed| resolve_confirm(state, index, confirmed),
+            move |state, tx, confirmed| resolve_confirm(state, index, confirmed, tx),
         ));
     }
     overlays.extend(find::view(state, theme));

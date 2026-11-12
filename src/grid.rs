@@ -1,3 +1,4 @@
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -156,6 +157,7 @@ pub struct Grid {
     pub cursor_style: CursorVisualStyle,
     pub cursor_blinking: bool,
     pub cursor_color: [u8; 3],
+    pub password_input: bool,
     pub metrics: Metrics,
     pub bg: [u8; 3],
     pub scrollbar: Option<Scrollbar>,
@@ -200,6 +202,7 @@ impl Default for Grid {
             cursor_style: CursorVisualStyle::Block,
             cursor_blinking: false,
             cursor_color: [0; 3],
+            password_input: false,
             metrics: Metrics::default(),
             bg: rgb(DEFAULT_BG),
             scrollbar: None,
@@ -391,6 +394,8 @@ fn faint(color: [u8; 3], background: [u8; 3]) -> [u8; 3] {
 #[derive(Clone, Copy, PartialEq)]
 pub(crate) struct Presentation {
     pub(crate) focused: bool,
+    /// The PTY is in the mode programs use to read a password, which libghostty can't see.
+    pub(crate) password_input: bool,
     pub(crate) cursor_on: bool,
     pub(crate) metrics: Metrics,
     pub(crate) scrollbar_opacity: f32,
@@ -401,6 +406,7 @@ impl Default for Presentation {
     fn default() -> Self {
         Self {
             focused: true,
+            password_input: false,
             cursor_on: true,
             metrics: Metrics::default(),
             scrollbar_opacity: 0.0,
@@ -677,6 +683,7 @@ impl GridBuilder {
             cursor_style,
             cursor_blinking,
             cursor_color: rgb(colors.cursor.unwrap_or(colors.foreground)),
+            password_input: presentation.password_input,
             metrics: presentation.metrics,
             bg: rgb(colors.background),
             scrollbar,
@@ -685,11 +692,30 @@ impl GridBuilder {
     }
 }
 
+/// The bundled compiled terminfo directory, found relative to `exe` inside a `.app`.
+pub(crate) fn bundled_terminfo(exe: &Path) -> Option<PathBuf> {
+    let dir = exe.parent()?.parent()?.join("Resources/terminfo");
+    dir.join("78/xterm-ghostty").is_file().then_some(dir)
+}
+
+pub(crate) fn terminfo_name(bundled: Option<&Path>) -> &'static str {
+    if bundled.is_some() {
+        "xterm-ghostty"
+    } else {
+        "xterm-256color"
+    }
+}
+
 pub(crate) fn new_terminal<'cb>(cols: u16, rows: u16) -> Result<Terminal<'static, 'cb>> {
     let mut terminal = Terminal::new(cols, rows)?;
     terminal
         .set_scrollback_max_lines(Some(10_000))?
-        .set_terminfo_name("xterm-256color")?
+        .set_terminfo_name(terminfo_name(
+            std::env::current_exe()
+                .ok()
+                .and_then(|exe| bundled_terminfo(&exe))
+                .as_deref(),
+        ))?
         .set_default_fg_color(Some(DEFAULT_FG))?
         .set_default_bg_color(Some(DEFAULT_BG))?;
     terminal.set_mode(Mode::GRAPHEME_CLUSTER, true)?;
@@ -716,6 +742,21 @@ mod tests {
 
     use crate::test_support::{THEME_BLUE, THEME_RED, fractional_metrics, scrolled_terminal};
     use libghostty_vt::terminal::ScrollViewport;
+
+    #[test]
+    fn terminfo_is_bundled_only_when_the_entry_exists() {
+        let root = tempfile::tempdir().unwrap();
+        let exe = root.path().join("Contents/MacOS/agentd");
+        assert_eq!(bundled_terminfo(&exe), None);
+        assert_eq!(terminfo_name(None), "xterm-256color");
+
+        let entry = root.path().join("Contents/Resources/terminfo/78");
+        std::fs::create_dir_all(&entry).unwrap();
+        std::fs::write(entry.join("xterm-ghostty"), "").unwrap();
+        let dir = bundled_terminfo(&exe);
+        assert_eq!(dir, Some(root.path().join("Contents/Resources/terminfo")));
+        assert_eq!(terminfo_name(dir.as_deref()), "xterm-ghostty");
+    }
 
     #[test]
     fn parses_text_and_colour_into_the_grid() {
