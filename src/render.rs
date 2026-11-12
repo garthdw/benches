@@ -865,6 +865,57 @@ mod tests {
         (quads, font)
     }
 
+    /// `cargo test --release -- --ignored rebuild_cost --nocapture`
+    #[test]
+    #[ignore]
+    fn rebuild_cost() {
+        let (cols, rows) = (250u16, 70u16);
+        let mut bytes = Vec::new();
+        for row in 0..rows {
+            bytes.extend_from_slice(format!("\x1b[{};1H", row + 1).as_bytes());
+            let line = format!(
+                "\x1b[3{}m-rw-r--r-- \x1b[1;3{}m{:>4}\x1b[0m garth staff \x1b[4{};30m{:>8}\x1b[0m Nov 12 \x1b[4mfile_{row}.rs\x1b[0m != -> => src/render.rs fn build_quads(grid: &Grid) {{ let x = a >= b; }} // 0123456789 \x1b[7mrev\x1b[0m",
+                row % 7 + 1,
+                row % 6 + 1,
+                row,
+                row % 6 + 1,
+                row * 977,
+            );
+            bytes.extend_from_slice(line.as_bytes());
+            bytes.extend_from_slice(line.as_bytes());
+        }
+        let grid = Grid::from_vt(&bytes, cols, rows).unwrap();
+        let font = Font::new(crate::config::DEFAULT_FONT_FAMILY, 18.0, 2.0).unwrap();
+        let metrics = metrics(&font, 0.0, 2.0);
+        let mut atlas = HashMap::new();
+        let mut quads = Vec::new();
+        let mut run = |quads: &mut Vec<Quad>| {
+            build_quads(
+                &grid,
+                [0.0, 0.0, 4000.0, 2000.0],
+                metrics,
+                &font,
+                true,
+                quads,
+                |key| {
+                    let next = atlas.len() as u32;
+                    let glyph = *atlas
+                        .entry(key)
+                        .or_insert_with(|| fake_glyph([next % 64, next / 64]));
+                    (Some(glyph), 0)
+                },
+            );
+        };
+        run(&mut quads);
+        let iterations = 200;
+        let start = std::time::Instant::now();
+        for _ in 0..iterations {
+            run(&mut quads);
+        }
+        let per = start.elapsed() / iterations;
+        println!("{cols}x{rows} full rebuild: {per:?}, {} quads", quads.len());
+    }
+
     /// The run cells `build_quads` asks the atlas for, as `(run, index)`.
     fn shaped_keys(bytes: &[u8], features: &[&str]) -> Vec<(String, u16)> {
         shaped_keys_in(bytes, 8, features)
