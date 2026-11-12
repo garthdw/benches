@@ -1125,6 +1125,16 @@ mod tests {
     }
 
     #[test]
+    fn a_shell_gets_an_answer_to_a_device_attributes_query() {
+        let session = spawn_shell();
+        type_line(
+            &session,
+            r#"sh -c "stty raw -echo; printf '\\033[c'; r=\$(dd bs=1 count=12 2>/dev/null); stty sane; echo reply:\${r#?}""#,
+        );
+        wait_for_line(&session, "reply:[?62;22;52c");
+    }
+
+    #[test]
     fn ctrl_c_interrupts_the_foreground_process() {
         let session = spawn_shell();
         type_line(&session, "sleep 30; echo slept; echo marker-2");

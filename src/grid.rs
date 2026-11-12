@@ -4,10 +4,15 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use libghostty_vt::color::Rgb;
+use libghostty_vt::effect::{
+    ConformanceLevel, DeviceAttributeFeature, DeviceAttributes, DeviceType,
+    PrimaryDeviceAttributes, SecondaryDeviceAttributes, TertiaryDeviceAttributes,
+};
 use libghostty_vt::mode::Mode;
 use libghostty_vt::render::{
     CellIteration, CellIterator, Colors, CursorVisualStyle, Dirty, RowIterator,
 };
+use libghostty_vt::report::{ColorScheme, SizeReportSize};
 use libghostty_vt::screen::{CellContentTag, CellWide, Screen, cell};
 use libghostty_vt::style::{StyleColor, Underline};
 use libghostty_vt::{RenderState, Terminal};
@@ -735,6 +740,48 @@ pub(crate) fn apply_theme(terminal: &mut Terminal<'static, '_>, theme: &Theme) -
     Ok(())
 }
 
+/// Answers the queries libghostty-vt leaves unanswered without a callback. The replies match
+/// Ghostty's, so programs that probe it for features behave the same here.
+pub(crate) fn answer_queries(terminal: &mut Terminal<'static, '_>, theme: &Theme) -> Result<()> {
+    let Rgb { r, g, b } = theme.background;
+    let luma = 0.2126 * f32::from(r) + 0.7152 * f32::from(g) + 0.0722 * f32::from(b);
+    let scheme = if luma < 128.0 {
+        ColorScheme::Dark
+    } else {
+        ColorScheme::Light
+    };
+    terminal.on_device_attributes(|_| {
+        Some(DeviceAttributes {
+            primary: PrimaryDeviceAttributes::new(
+                ConformanceLevel::LEVEL_2,
+                &[
+                    DeviceAttributeFeature::ANSI_COLOR,
+                    DeviceAttributeFeature::CLIPBOARD,
+                ],
+            ),
+            secondary: SecondaryDeviceAttributes {
+                device_type: DeviceType::VT220,
+                firmware_version: 10,
+                rom_cartridge: 0,
+            },
+            tertiary: TertiaryDeviceAttributes::default(),
+        })
+    })?;
+    terminal.on_xtversion(|_| Some(concat!("agentd ", env!("CARGO_PKG_VERSION"))))?;
+    terminal.on_enquiry(|_| None)?;
+    terminal.on_color_scheme(move |_| Some(scheme))?;
+    terminal.on_size(|terminal| {
+        let (cols, rows) = (terminal.cols().ok()?, terminal.rows().ok()?);
+        Some(SizeReportSize {
+            rows,
+            columns: cols,
+            cell_width: terminal.width_px().ok()?.checked_div(u32::from(cols))?,
+            cell_height: terminal.height_px().ok()?.checked_div(u32::from(rows))?,
+        })
+    })?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -742,6 +789,80 @@ mod tests {
 
     use crate::test_support::{THEME_BLUE, THEME_RED, fractional_metrics, scrolled_terminal};
     use libghostty_vt::terminal::ScrollViewport;
+
+    fn reply_to(theme: &Theme, query: &[u8]) -> Vec<u8> {
+        let replies = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let mut terminal = new_terminal(80, 24).unwrap();
+        terminal.resize(80, 24, 9, 18).unwrap();
+        answer_queries(&mut terminal, theme).unwrap();
+        terminal
+            .on_pty_write({
+                let replies = replies.clone();
+                move |_, data| replies.borrow_mut().extend_from_slice(data)
+            })
+            .unwrap();
+        terminal.vt_write(query);
+        replies.take()
+    }
+
+    #[test]
+    fn device_attributes_quack_as_a_level_two_terminal_with_ghosttys_features() {
+        let theme = Theme::default();
+        assert_eq!(reply_to(&theme, b"\x1b[c"), b"\x1b[?62;22;52c");
+        assert_eq!(reply_to(&theme, b"\x1b[>c"), b"\x1b[>1;10;0c");
+        assert_eq!(reply_to(&theme, b"\x1b[=c"), b"\x1bP!|00000000\x1b\\");
+    }
+
+    #[test]
+    fn xtversion_names_agentd_and_its_version() {
+        let expected = format!("\x1bP>|agentd {}\x1b\\", env!("CARGO_PKG_VERSION"));
+        assert_eq!(reply_to(&Theme::default(), b"\x1b[>q"), expected.as_bytes());
+    }
+
+    #[test]
+    fn enquiry_gets_no_answer() {
+        assert_eq!(reply_to(&Theme::default(), b"\x05"), b"");
+    }
+
+    #[test]
+    fn size_queries_report_cells_and_pixels() {
+        let theme = Theme::default();
+        assert_eq!(reply_to(&theme, b"\x1b[14t"), b"\x1b[4;432;720t");
+        assert_eq!(reply_to(&theme, b"\x1b[16t"), b"\x1b[6;18;9t");
+        assert_eq!(reply_to(&theme, b"\x1b[18t"), b"\x1b[8;24;80t");
+        assert_eq!(reply_to(&theme, b"\x1b[?2048h"), b"\x1b[48;24;80;432;720t");
+    }
+
+    #[test]
+    fn a_resize_is_reported_in_band_once_mode_2048_is_set() {
+        let replies = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let mut terminal = new_terminal(80, 24).unwrap();
+        answer_queries(&mut terminal, &Theme::default()).unwrap();
+        terminal
+            .on_pty_write({
+                let replies = replies.clone();
+                move |_, data| replies.borrow_mut().extend_from_slice(data)
+            })
+            .unwrap();
+        terminal.vt_write(b"\x1b[?2048h");
+        replies.take();
+        terminal.resize(100, 30, 10, 20).unwrap();
+        assert_eq!(replies.take(), b"\x1b[48;30;100;600;1000t");
+    }
+
+    #[test]
+    fn the_colour_scheme_follows_the_background_luminance() {
+        let light = Theme {
+            background: Rgb {
+                r: 0xfa,
+                g: 0xfa,
+                b: 0xfa,
+            },
+            ..Theme::default()
+        };
+        assert_eq!(reply_to(&Theme::default(), b"\x1b[?996n"), b"\x1b[?997;1n");
+        assert_eq!(reply_to(&light, b"\x1b[?996n"), b"\x1b[?997;2n");
+    }
 
     #[test]
     fn terminfo_is_bundled_only_when_the_entry_exists() {
