@@ -7,15 +7,16 @@ use rune::{
 };
 
 use crate::config;
-use crate::grid::Grid;
+use crate::grid::{Grid, Surface};
 use crate::input::caret_rect;
 use crate::keymap::{Command, pressed, shortcut};
 use crate::palette::{
     Action, Palette, open_palette, poll_creation, poll_jump, poll_worktrees, run_action,
 };
+use crate::render::TerminalSource;
 use crate::session::LogErr;
 use crate::session::{Attention, Event, Retarget, Session};
-use crate::view::{view, window_title};
+use crate::view::{DRAWER_MARK, OVERLAY_MARK, view, window_title};
 use crate::windows::{
     Fleet, MAIN_WINDOW, WindowId, adopt_projects, move_to_new_window, on_close, on_quit,
 };
@@ -62,6 +63,8 @@ pub(crate) struct State {
     pub(crate) drawn: [(u64, bool); 3],
     /// Sessions showing an attention dot, as the actors raise it without an event.
     pub(crate) alerting: Vec<u64>,
+    /// The project name the window title was last set for; `Some(None)` is the title with no project.
+    pub(crate) titled: Option<Option<String>>,
     /// Waiting confirmations, answered newest first; dismissed when keys move elsewhere.
     pub(crate) confirms: Vec<Confirm>,
     pub(crate) hovered_project: Option<usize>,
@@ -78,17 +81,48 @@ pub(crate) struct State {
 }
 
 impl State {
-    pub(crate) fn font(&self) -> config::FontConfig {
-        let font = &self.config.font;
-        config::FontConfig {
-            size: (font.size + self.font_zoom).clamp(MIN_FONT_SIZE, MAX_FONT_SIZE),
-            ..font.clone()
-        }
+    pub(crate) fn font_size(&self) -> f64 {
+        (self.config.font.size + self.font_zoom).clamp(MIN_FONT_SIZE, MAX_FONT_SIZE)
     }
 
     pub(crate) fn zoom(&mut self, points: f64) {
-        let size = (self.font().size + points).clamp(MIN_FONT_SIZE, MAX_FONT_SIZE);
+        let size = (self.font_size() + points).clamp(MIN_FONT_SIZE, MAX_FONT_SIZE);
         self.font_zoom = size - self.config.font.size;
+    }
+}
+
+impl TerminalSource for State {
+    fn font(&self) -> (&config::FontConfig, f64) {
+        (&self.config.font, self.font_size())
+    }
+
+    fn show(&self, mark: u32, surface: Surface) -> Option<&Session> {
+        // Hidden tabs share the visible area, as closed tray processes share the drawer's, so they are sized too.
+        let workspace = &self.workspace;
+        match mark {
+            OVERLAY_MARK => {
+                workspace
+                    .overlay_sessions()
+                    .for_each(|session| session.resize(surface));
+                workspace.overlay_session()
+            }
+            DRAWER_MARK => {
+                workspace
+                    .tray_sessions()
+                    .for_each(|session| session.resize(surface));
+                // Not `drawer_session`, which is gone once closing starts, so the drawer slides out showing its process.
+                workspace
+                    .project()
+                    .and_then(|project| project.tray.get(project.drawer))
+                    .map(|tab| &tab.session)
+            }
+            _ => {
+                workspace
+                    .tab_sessions()
+                    .for_each(|session| session.resize(surface));
+                workspace.active_session()
+            }
+        }
     }
 }
 
@@ -440,7 +474,11 @@ pub(crate) fn poll(state: &mut State, now: f64, tx: &mut Tx) -> bool {
         }
     }
     let mut changed = adopt_projects(state);
-    tx.set_title(window_title(&state.workspace));
+    let project_name = state.workspace.project().map(|project| &project.name);
+    if state.titled.as_ref().map(Option::as_ref) != Some(project_name) {
+        tx.set_title(window_title(&state.workspace));
+        state.titled = Some(project_name.cloned());
+    }
     if state.window != MAIN_WINDOW && state.workspace.projects.is_empty() {
         tx.close_window();
     }
@@ -526,14 +564,17 @@ pub(crate) fn poll(state: &mut State, now: f64, tx: &mut Tx) -> bool {
     ];
     changed |= drawn != state.drawn;
     state.drawn = drawn;
-    let alerting: Vec<u64> = state
-        .workspace
-        .sessions()
-        .filter(|session| session.attention() == Attention::Alert)
-        .map(Session::id)
-        .collect();
-    changed |= alerting != state.alerting;
-    state.alerting = alerting;
+    let alerting = || {
+        state
+            .workspace
+            .sessions()
+            .filter(|session| session.attention() == Attention::Alert)
+            .map(Session::id)
+    };
+    if !alerting().eq(state.alerting.iter().copied()) {
+        state.alerting = alerting().collect();
+        changed = true;
+    }
     changed
 }
 
@@ -936,26 +977,26 @@ mod tests {
 
     #[test]
     fn command_equals_and_minus_zoom_the_font_by_one_point() {
-        let base = State::default().font().size;
-        assert_eq!(zoomed(&['=']).state.font().size, base + 1.0);
-        assert_eq!(zoomed(&['=', '=', '-']).state.font().size, base + 1.0);
-        assert_eq!(zoomed(&['-']).state.font().size, base - 1.0);
+        let base = State::default().font_size();
+        assert_eq!(zoomed(&['=']).state.font_size(), base + 1.0);
+        assert_eq!(zoomed(&['=', '=', '-']).state.font_size(), base + 1.0);
+        assert_eq!(zoomed(&['-']).state.font_size(), base - 1.0);
     }
 
     #[test]
     fn command_zero_restores_the_configured_size() {
-        let base = State::default().font().size;
-        assert_eq!(zoomed(&['=', '=', '0']).state.font().size, base);
-        assert_eq!(zoomed(&['-', '0']).state.font().size, base);
+        let base = State::default().font_size();
+        assert_eq!(zoomed(&['=', '=', '0']).state.font_size(), base);
+        assert_eq!(zoomed(&['-', '0']).state.font_size(), base);
     }
 
     #[test]
     fn zoom_stops_at_the_limits() {
-        assert_eq!(zoomed(&['='; 80]).state.font().size, MAX_FONT_SIZE);
-        assert_eq!(zoomed(&['-'; 80]).state.font().size, MIN_FONT_SIZE);
+        assert_eq!(zoomed(&['='; 80]).state.font_size(), MAX_FONT_SIZE);
+        assert_eq!(zoomed(&['-'; 80]).state.font_size(), MIN_FONT_SIZE);
         let mut runtime = zoomed(&['-'; 80]);
         press(&mut runtime, Key::Command('='), command());
-        assert_eq!(runtime.state.font().size, MIN_FONT_SIZE + 1.0);
+        assert_eq!(runtime.state.font_size(), MIN_FONT_SIZE + 1.0);
     }
 
     #[test]

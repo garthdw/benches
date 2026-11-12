@@ -9,7 +9,6 @@ use rune::color::srgb_decode;
 use rune::compose::{Compositor, DeviceKey, Frame};
 use rune::render::EffectSite;
 
-use crate::app::State;
 use crate::font::{Font, FontStyle, GlyphKind, ShapedRun};
 use crate::grid::{Cell, Grid, Metrics, Scrollbar, Surface};
 use crate::session::Session;
@@ -670,10 +669,18 @@ fn quad_buffer(device: &wgpu::Device, size: u64) -> wgpu::Buffer {
     })
 }
 
+/// What the compositor reads from the app.
+pub trait TerminalSource: 'static {
+    /// The configured font and the size to draw it at, which zoom changes.
+    fn font(&self) -> (&crate::config::FontConfig, f64);
+    /// Resizes every session sharing the area of effect `mark` to `surface`, then returns the one to draw.
+    fn show(&self, mark: u32, surface: Surface) -> Option<&Session>;
+}
+
 #[derive(Default)]
 pub struct TerminalCompositor {
     gpu: Option<Gpu>,
-    font: Option<(f32, crate::config::FontConfig, Font)>,
+    font: Option<(f32, f64, crate::config::FontConfig, Font)>,
 }
 
 impl TerminalCompositor {
@@ -681,23 +688,24 @@ impl TerminalCompositor {
         &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
-        state: &State,
+        source: &impl TerminalSource,
         pass: &mut wgpu::RenderPass<'_>,
         site: &EffectSite<'_>,
     ) {
         let Some(gpu) = self.gpu.as_mut() else {
             return;
         };
-        let config = state.font();
-        let wanted = (site.scale, &config);
+        let (config, size) = source.font();
         if self
             .font
             .as_ref()
-            .is_none_or(|(scale, current, _)| (*scale, current) != wanted)
+            .is_none_or(|(scale, current_size, current, _)| {
+                (*scale, *current_size, current) != (site.scale, size, config)
+            })
         {
             match Font::with_symbols(
                 &config.family,
-                config.size,
+                size,
                 site.scale,
                 config.symbols_family.as_deref(),
                 &config.fallback_families,
@@ -706,7 +714,7 @@ impl TerminalCompositor {
                 Ok(mut font) => {
                     font.break_runs_at_cursor = config.shaping_breaks_at_cursor;
                     gpu.atlas.reset();
-                    self.font = Some((site.scale, config, font));
+                    self.font = Some((site.scale, size, config.clone(), font));
                 }
                 Err(error) => {
                     eprintln!("agentd: load font: {error:#}");
@@ -714,7 +722,7 @@ impl TerminalCompositor {
                 }
             }
         }
-        let Some((_, _, font)) = &self.font else {
+        let Some((_, _, _, font)) = &self.font else {
             return;
         };
         gpu.ensure_pipeline(device, site.format);
@@ -731,28 +739,7 @@ impl TerminalCompositor {
             scale: site.scale,
         };
         let surface = Surface::fit((rect[2], rect[3]), metrics);
-        // Hidden tabs share the visible area, as closed tray processes share the drawer's, so they are sized too.
-        let workspace = &state.workspace;
-        let session = if site.mark == crate::view::OVERLAY_MARK {
-            workspace
-                .overlay_sessions()
-                .for_each(|session| session.resize(surface));
-            workspace.overlay_session()
-        } else if site.mark == crate::view::DRAWER_MARK {
-            workspace
-                .tray_sessions()
-                .for_each(|session| session.resize(surface));
-            // Not `drawer_session`, which is gone once closing starts, so the drawer slides out showing its process.
-            workspace
-                .project()
-                .and_then(|project| project.tray.get(project.drawer))
-                .map(|tab| &tab.session)
-        } else {
-            workspace
-                .tab_sessions()
-                .for_each(|session| session.resize(surface));
-            workspace.active_session()
-        };
+        let session = source.show(site.mark, surface);
 
         let grid = session.map_or_else(Default::default, Session::grid);
         let built = (
@@ -814,8 +801,8 @@ impl TerminalCompositor {
     }
 }
 
-impl Compositor<State> for TerminalCompositor {
-    fn render(&mut self, frame: &mut Frame<'_, State>) {
+impl<S: TerminalSource> Compositor<S> for TerminalCompositor {
+    fn render(&mut self, frame: &mut Frame<'_, S>) {
         let key = frame.device_key();
         if self.gpu.as_ref().is_none_or(|gpu| gpu.key != key) {
             self.gpu = Some(Gpu::new(frame.device, key));
@@ -833,11 +820,11 @@ impl Compositor<State> for TerminalCompositor {
             &frame.rt.instances,
             size,
         );
-        let state = &frame.rt.state;
+        let source = &frame.rt.state;
         frame
             .ui
             .draw_with(frame.encoder, frame.target, clear, &mut |pass, site| {
-                self.draw(device, queue, state, pass, site)
+                self.draw(device, queue, source, pass, site)
             });
     }
 }
