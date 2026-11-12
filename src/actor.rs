@@ -1,5 +1,6 @@
 use std::cell::{Cell, RefCell};
 use std::os::fd::{AsRawFd, OwnedFd};
+use std::path::PathBuf;
 use std::process::Child;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -30,6 +31,7 @@ use crate::grid::{
     FRAME, Grid, GridBuilder, Presentation, ScrollbarFade, Surface, answer_queries, apply_theme,
     new_terminal,
 };
+use crate::link::reported_directory;
 use crate::protocol::{Event, Msg, Progress, ProgressKind, Visibility};
 use crate::search::Searcher;
 use crate::terminal_input::{TerminalInput, open_link, paste_text, selection_text};
@@ -162,6 +164,7 @@ pub(crate) struct Actor {
     pub(crate) slot: Arc<Mutex<Arc<Grid>>>,
     pub(crate) alerted: Arc<AtomicBool>,
     pub(crate) link_hovered: Arc<AtomicBool>,
+    pub(crate) reported_cwd: Arc<Mutex<Option<PathBuf>>>,
     pub(crate) events: Sender<Event>,
     pub(crate) waker: Waker,
     pub(crate) theme: Theme,
@@ -261,6 +264,20 @@ impl Actor {
         terminal.on_title_changed({
             let title_changed = title_changed.clone();
             move |_| title_changed.set(true)
+        })?;
+        terminal.on_pwd_changed({
+            let reported_cwd = self.reported_cwd.clone();
+            let hostname = nix::unistd::gethostname()
+                .log_err("read hostname")
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            move |terminal| {
+                let directory = terminal
+                    .pwd()
+                    .log_err("read reported directory")
+                    .and_then(|reported| reported_directory(reported, &hostname));
+                *reported_cwd.lock().unwrap_or_else(PoisonError::into_inner) = directory;
+            }
         })?;
         let alerted = Rc::new(std::cell::Cell::new(false));
         let notice = Rc::new(RefCell::new(None));
