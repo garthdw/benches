@@ -124,7 +124,7 @@ impl Default for Config {
             jump_command: None,
             working_directory: home_dir(),
             auto_secure_input: true,
-            command_finish_after: Some(DEFAULT_COMMAND_FINISH_AFTER),
+            command_finish_after: None,
             clipboard_read: ClipboardAccess::Ask,
             clipboard_write: ClipboardAccess::Allow,
         }
@@ -160,7 +160,7 @@ struct File {
     auto_secure_input: Option<bool>,
     /// Whether a command finishing out of sight marks its tab: `never`, or `unfocused` or
     /// `always`, which mean the same here as a tab in view needs no mark. Falls back to Ghostty's
-    /// `notify-on-command-finish`, then `unfocused`.
+    /// `notify-on-command-finish`, then `never`.
     #[serde(rename = "notify-on-command-finish")]
     notify_on_command_finish: Option<String>,
     /// How long a command must run to mark its tab, such as `5s` or `1m30s`. Falls back to
@@ -314,9 +314,9 @@ fn default_config_text() -> String {
          # Turn on secure keyboard entry while a program reads a password; unset uses Ghostty's\n\
          # `macos-auto-secure-input`, then true.\n\
          # auto-secure-input = false\n\
-         # Mark a tab when a command finishes out of sight (`never`, or `unfocused`) and how long\n\
-         # it must have run, as in Ghostty; unset uses Ghostty's, then `unfocused` and 5s.\n\
-         # notify-on-command-finish = \"never\"\n\
+         # Mark a tab when a command finishes out of sight (`unfocused`, or `never`) and how long\n\
+         # it must have run, as in Ghostty; unset uses Ghostty's, then `never` and 5s.\n\
+         # notify-on-command-finish = \"unfocused\"\n\
          # notify-on-command-finish-after = \"30s\"\n\
          # Whether programs may read or set the clipboard through OSC 52: \"allow\", \"deny\" or\n\
          # \"ask\". Unset uses Ghostty's, then \"ask\" for reads and \"allow\" for writes.\n\
@@ -513,15 +513,15 @@ fn ghostty_values<'a>(text: &'a str, key: &str) -> Vec<&'a str> {
 
 fn command_finish_after(mode: Option<String>, after: Option<String>) -> Option<Duration> {
     match mode.as_deref() {
-        Some("never") => None,
-        Some("unfocused" | "always") | None => Some(
+        Some("unfocused" | "always") => Some(
             after
                 .and_then(|after| parse_duration(&after).log_err("notify-on-command-finish-after"))
                 .unwrap_or(DEFAULT_COMMAND_FINISH_AFTER),
         ),
+        Some("never") | None => None,
         Some(other) => {
             eprintln!("agentd: notify-on-command-finish: unknown value {other}");
-            Some(DEFAULT_COMMAND_FINISH_AFTER)
+            None
         }
     }
 }
@@ -859,9 +859,20 @@ mod tests {
             Config::load(&paths).command_finish_after
         };
         let seconds = |seconds| Some(Duration::from_secs(seconds));
-        assert_eq!(after(None, None), seconds(5));
+        assert_eq!(after(None, None), None);
         assert_eq!(
             after(None, Some("notify-on-command-finish-after = 1m30s\n")),
+            None
+        );
+        assert_eq!(
+            after(None, Some("notify-on-command-finish = unfocused\n")),
+            seconds(5)
+        );
+        assert_eq!(
+            after(
+                None,
+                Some("notify-on-command-finish = always\nnotify-on-command-finish-after = 1m30s\n")
+            ),
             seconds(90)
         );
         assert_eq!(
@@ -878,7 +889,12 @@ mod tests {
             Some(Duration::from_millis(500))
         );
         assert_eq!(
-            after(Some("notify-on-command-finish-after = \"soon\"\n"), None),
+            after(
+                Some(
+                    "notify-on-command-finish = \"unfocused\"\nnotify-on-command-finish-after = \"soon\"\n"
+                ),
+                None
+            ),
             seconds(5)
         );
     }
