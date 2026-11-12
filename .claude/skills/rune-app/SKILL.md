@@ -8,38 +8,6 @@ description: Rune app structure as used by agentd - AppSpec, App hooks, the view
 Verified against Rune rev `ba5e7c8` (the pin in `Cargo.toml`). If the pin has moved, check anything you rely on.
 Source, when this isn't enough: `~/.cargo/git/checkouts/rune-c9b805e9ed8a3730/ba5e7c8/crates/rune`. Use the file map at the end.
 
-## Entry point
-
-```rust
-let spec = AppSpec::<State> {
-    scenes: &[("fixture", |s| /* mutate initial state */)],
-    setup: Some(|s, waker| s.waker = Some(waker)),
-    poll: Some(poll),
-    on_key: Some(on_key),
-    ..AppSpec::new("agentd", (960.0, 640.0), State::default, view)
-};
-App::new(spec).compositor(render::TerminalCompositor::default()).run();
-```
-
-`AppSpec` fields: `title, size, min_size, init, view, scenes, fonts, families, setup, poll, on_key`. Always finish a literal with `..AppSpec::new(..)`.
-
-Other hooks are builder methods on `App`, not spec fields. All are plain `fn` unless noted:
-
-| Hook | Signature | Notes |
-|---|---|---|
-| `on_focus` | `fn(&mut S, bool, &mut Tx)` | Native window focus; also fires while hidden |
-| `on_modifiers` | `fn(&mut S, Mods, &mut Tx)` | Every modifier change, regardless of focus. Cannot consume. None held after blur |
-| `on_visibility` | `fn(&mut S, bool, &mut Tx)` | Window shown or hidden (minimised, covered whole), once per change after the first frame. Native only |
-| `on_ime` | `fn(&mut S, &Ime, &mut Tx) -> bool` | See `rune-input` |
-| `on_close`, `on_quit` | `fn(&mut S, &mut Tx)` | |
-| `on_reopen` | `fn(&mut S, bool, &mut Tx) -> bool` | |
-| `on_open_url` | `fn(&mut S, &str, &mut Tx)` | |
-| `on_window`, `on_ready` | `impl FnMut(&WindowHandle)` | `WindowHandle::with_raw_handle` gives the raw handle only, no winit `Window` |
-| `on_frame_encoded`, `on_frame_drawn` | `impl FnMut` | |
-| `macos_window(MacWindowOptions)`, `window(WindowSpec)`, `overlay(..)`, `compositor(..)` | | |
-
-Do slow start-up work from `on_ready`, after the first frame.
-
 ## The loop
 
 - `view(&S, &mut Cx<S>) -> El` is pure. It re-runs after a handler or `poll` reports a change.
@@ -51,28 +19,13 @@ Do slow start-up work from `on_ready`, after the first frame.
 
 Don't assume poll runs before or after queued input within one frame. I did not confirm the order. If a handler leaves work for `poll`, also call `tx.wake_after(Duration::ZERO)`.
 
-## Tx
+## References
 
-- Timers: `tx.wake_after(Duration)`, `tx.wake_at(clock_secs)`, `tx.clock()`. Wakes schedule a frame, not a view commit, and all due ones collapse into one poll. `wake_after(Duration::ZERO)` from `poll` asks for the next frame (paced by the display link on macOS; unpaced or hidden, it waits about a frame), so a repeating poll can't spin. A timed state stores its due time and `poll` checks `clock >= due`.
-- `tx.live_only()`: this handler changed only live values, so skip the view re-run. Debug builds check the claim.
-- `tx.instant()`: land this change without animation. `tx.focus(key, ring)`: focus an element once on screen; `tx.return_focus(key, ring)` hands focus back to a menu or popover's trigger; `tx.by_keys()`: a key (or Return/Space on a control) brought this change; `tx.focused` works in every handler. `tx.relaunch()`: quit, then start again with the same args.
-- Input accessors and clipboard are in `rune-input`.
-
-## Building views
-
-```rust
-col().w_full().h_full().fill(t.bg)
-    .child(row().w_full().pl(cx.titlebar_inset() + 8.0).pr(8.0).py(6.0).child(chrome))
-    .child(effect(TERMINAL_MARK).key("terminal").w_full().grow(1.0).min_h(0.0))
-```
-
-- Constructors: `col()`, `row()`, `el()`, `text(..)`, `effect(mark)`, `text_input(&TextEdit, TextStyle)`.
-- Builders: `.key .role .label .child .children .w .h .size .w_full .h_full .grow .min_h .px .py .pl .pr .radius .fill .cursor(Cursor::Text) .absolute(left, top) .pin(l, t, r, b) .scroll(ScrollSpec{..}) .clip_soft(r)`.
-- Theme: `rune::tok::theme(dark)` has `.bg`, `.text`, `.control_off` and more.
-- `Cx`: `titlebar_inset() chrome_insets() env() system_dark() accent() caret(key) layout_size`.
-- Handlers on `El`: `on_press`, `on_press_tx`, `on_double_press`, `on_drag`, `on_key`, `on_drop_files`, `on_paste`, `on_secondary_press[_local]`, `on_pointer_move[_local]`, `on_hover_change`, `on_wheel`, `on_layout[_tx]`, `on_drawn_layout[_tx]`. Handlers that take `S` are closures: `|s: &mut State, ..|`.
-
-Performance rules from Rune's own guide: use `Cx::layout_size` rather than whole rects, so scrolling doesn't rebuild the view; use `virtual_rows` or `memo` for long lists; bound every cache in entries and bytes.
+| Task | Reference |
+|---|---|
+| `AppSpec` literal, `App` builder hooks (`on_focus`, `on_modifiers`, `on_ready`, ...) | [references/app-spec-and-hooks.md](references/app-spec-and-hooks.md) |
+| `Tx`: timers and wakes, `live_only`, focus requests, relaunch | [references/tx.md](references/tx.md) |
+| Building views: constructors, builders, theme, `Cx`, `El` handlers, performance rules | [references/views.md](references/views.md) |
 
 ## File map (under `crates/rune/`)
 
