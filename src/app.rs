@@ -61,12 +61,8 @@ pub(crate) struct State {
     pub(crate) drawn: [(u64, bool); 3],
     /// Sessions showing an attention dot, as the actors raise it without an event.
     pub(crate) alerting: Vec<u64>,
-    /// The session that refused a paste, and the text; dismissed when keys move elsewhere.
-    pub(crate) pending_paste: Option<(u64, String)>,
-    /// The session whose close waits for confirmation; dismissed when keys move elsewhere.
-    pub(crate) pending_close: Option<u64>,
-    /// The project the pending close takes whole, rather than the focused tab.
-    pub(crate) closing_project: Option<PathBuf>,
+    /// Waiting confirmations, answered newest first; dismissed when keys move elsewhere.
+    pub(crate) confirms: Vec<Confirm>,
     pub(crate) hovered_project: Option<usize>,
     pub(crate) preedit: String,
     pub(crate) option_held: bool,
@@ -249,13 +245,47 @@ pub(crate) fn tray_action(state: &mut State, index: usize, picked: Option<&str>)
     }
 }
 
+pub(crate) enum Confirm {
+    /// The session that refused a paste, and the text.
+    Paste { session: u64, text: String },
+    /// The session whose close waits, and the project it takes whole rather than the focused tab.
+    Close {
+        session: u64,
+        project: Option<PathBuf>,
+    },
+}
+
+impl Confirm {
+    fn session(&self) -> u64 {
+        match self {
+            Self::Paste { session, .. } | Self::Close { session, .. } => *session,
+        }
+    }
+}
+
+/// A repeated request replaces the pending one of its kind and becomes the newest.
+fn push_confirm(confirms: &mut Vec<Confirm>, confirm: Confirm) {
+    confirms.retain(|pending| {
+        pending.session() != confirm.session()
+            || std::mem::discriminant(pending) != std::mem::discriminant(&confirm)
+    });
+    confirms.push(confirm);
+}
+
 /// Closes the focused tab or drawer process, first asking if a program is running in it.
 fn request_close(state: &mut State) {
     let Some((_, tab)) = state.workspace.focused_tab() else {
         return;
     };
     if tab.runs_program() {
-        state.pending_close = Some(tab.session.id());
+        let session = tab.session.id();
+        push_confirm(
+            &mut state.confirms,
+            Confirm::Close {
+                session,
+                project: None,
+            },
+        );
     } else {
         close_focused(state);
     }
@@ -281,20 +311,35 @@ pub(crate) fn request_close_project(state: &mut State, index: usize) {
     if project.runs_program()
         && let Some(session) = state.session()
     {
-        state.pending_close = Some(session.id());
-        state.closing_project = Some(project.root.clone());
+        let confirm = Confirm::Close {
+            session: session.id(),
+            project: Some(project.root.clone()),
+        };
+        push_confirm(&mut state.confirms, confirm);
     } else {
         state.workspace.close_project(index);
     }
 }
 
-pub(crate) fn resolve_close(state: &mut State, confirmed: bool) {
-    let pending = state.pending_close.take();
-    let project = state.closing_project.take();
-    if confirmed && pending == state.session().map(Session::id) {
-        match project.and_then(|root| state.workspace.project_index(&root)) {
-            Some(index) => state.workspace.close_project(index),
-            None => close_focused(state),
+pub(crate) fn resolve_confirm(state: &mut State, index: usize, confirmed: bool) {
+    if index >= state.confirms.len() {
+        return;
+    }
+    let confirm = state.confirms.remove(index);
+    if !confirmed || Some(confirm.session()) != state.session().map(Session::id) {
+        return;
+    }
+    match confirm {
+        Confirm::Paste { text, .. } => {
+            if let Some(session) = state.session() {
+                session.paste(text, true);
+            }
+        }
+        Confirm::Close { project, .. } => {
+            match project.and_then(|root| state.workspace.project_index(&root)) {
+                Some(index) => state.workspace.close_project(index),
+                None => close_focused(state),
+            }
         }
     }
 }
@@ -383,16 +428,6 @@ pub(crate) fn run_command(state: &mut State, command: Command, tx: &mut Tx) {
     }
 }
 
-pub(crate) fn resolve_paste(state: &mut State, confirmed: bool) {
-    if let Some((pending, text)) = state.pending_paste.take()
-        && confirmed
-        && let Some(session) = state.session()
-        && session.id() == pending
-    {
-        session.paste(text, true);
-    }
-}
-
 pub(crate) fn poll(state: &mut State, now: f64, tx: &mut Tx) -> bool {
     if !state.started {
         state.started = true;
@@ -413,19 +448,11 @@ pub(crate) fn poll(state: &mut State, now: f64, tx: &mut Tx) -> bool {
     changed |= poll_jump(state, now, tx);
     changed |= poll_worktrees(state);
     changed |= poll_creation(state);
-    if state
-        .pending_paste
-        .as_ref()
-        .is_some_and(|(pending, _)| Some(*pending) != active)
-    {
-        state.pending_paste = None;
-        changed = true;
-    }
-    if state.pending_close.is_some() && state.pending_close != active {
-        state.pending_close = None;
-        state.closing_project = None;
-        changed = true;
-    }
+    let confirms = state.confirms.len();
+    state
+        .confirms
+        .retain(|confirm| Some(confirm.session()) == active);
+    changed |= state.confirms.len() != confirms;
     let mut restarts = Vec::new();
     let mut exits = Vec::new();
     let mut notices = Vec::new();
@@ -434,7 +461,8 @@ pub(crate) fn poll(state: &mut State, now: f64, tx: &mut Tx) -> bool {
             match event {
                 Event::Copied(text) => tx.copy(text),
                 Event::PasteRejected(text) if Some(tab.session.id()) == active => {
-                    state.pending_paste = Some((tab.session.id(), text));
+                    let session = tab.session.id();
+                    push_confirm(&mut state.confirms, Confirm::Paste { session, text });
                     changed = true;
                 }
                 Event::PasteRejected(_) => {}
@@ -509,12 +537,8 @@ pub(crate) fn poll(state: &mut State, now: f64, tx: &mut Tx) -> bool {
 }
 
 pub(crate) fn on_key(state: &mut State, event: &KeyEvent, tx: &mut Tx) -> bool {
-    if state.pending_paste.is_some() && matches!(event.key, Key::Enter | Key::Escape) {
-        resolve_paste(state, event.key == Key::Enter);
-        return true;
-    }
-    if state.pending_close.is_some() && matches!(event.key, Key::Enter | Key::Escape) {
-        resolve_close(state, event.key == Key::Enter);
+    if !state.confirms.is_empty() && matches!(event.key, Key::Enter | Key::Escape) {
+        resolve_confirm(state, state.confirms.len() - 1, event.key == Key::Enter);
         return true;
     }
     if shortcut(state, event, tx) {
@@ -760,7 +784,10 @@ mod tests {
 
     fn with_pending_paste() -> Runtime<State> {
         runtime_with(State {
-            pending_paste: Some((0, "rm -rf x\n".to_owned())),
+            confirms: vec![Confirm::Paste {
+                session: 0,
+                text: "rm -rf x\n".to_owned(),
+            }],
             ..State::default()
         })
     }
@@ -1042,6 +1069,41 @@ mod tests {
         assert!(runtime.find("close-confirm").is_some());
         press(&mut runtime, Key::Escape, Mods::default());
         assert!(runtime.find("close-confirm").is_none());
+        assert_eq!(tab_titles(&runtime), ["claude", "shell", "lazygit"]);
+    }
+
+    fn reject_paste(runtime: &mut Runtime<State>) {
+        let session = runtime.state.session().map(Session::id).unwrap();
+        runtime.state.confirms.push(Confirm::Paste {
+            session,
+            text: "rm -rf x\n".to_owned(),
+        });
+    }
+
+    #[test]
+    fn enter_answers_the_newest_confirmation_first() {
+        let mut runtime = command_tab_runtime();
+        reject_paste(&mut runtime);
+        press(&mut runtime, Key::Command('w'), command());
+        press(&mut runtime, Key::Enter, Mods::default());
+        assert_eq!(tab_titles(&runtime), ["shell", "lazygit"]);
+        assert!(matches!(
+            runtime.state.confirms[..],
+            [Confirm::Paste { .. }]
+        ));
+    }
+
+    #[test]
+    fn escape_dismisses_a_newer_paste_before_the_older_close() {
+        let mut runtime = command_tab_runtime();
+        press(&mut runtime, Key::Command('w'), command());
+        reject_paste(&mut runtime);
+        press(&mut runtime, Key::Escape, Mods::default());
+        assert!(matches!(
+            runtime.state.confirms[..],
+            [Confirm::Close { .. }]
+        ));
+        press(&mut runtime, Key::Escape, Mods::default());
         assert_eq!(tab_titles(&runtime), ["claude", "shell", "lazygit"]);
     }
 
@@ -1455,14 +1517,17 @@ mod tests {
     fn switching_tabs_dismisses_a_pending_paste() {
         let mut state = workspace_state();
         let session = state.session().map(Session::id).unwrap();
-        state.pending_paste = Some((session, "rm -rf x\n".to_owned()));
+        state.confirms.push(Confirm::Paste {
+            session,
+            text: "rm -rf x\n".to_owned(),
+        });
         let mut runtime = runtime_with(state);
         runtime.poll = Some(poll);
         runtime.frame(1.0 / 60.0);
         assert!(runtime.find("paste-confirm").is_some());
         click(&mut runtime, "tab-1");
         runtime.frame(2.0 / 60.0);
-        assert!(runtime.state.pending_paste.is_none());
+        assert!(runtime.state.confirms.is_empty());
         assert!(runtime.find("paste-confirm").is_none());
     }
 

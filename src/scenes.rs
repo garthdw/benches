@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use rune::TextEdit;
 
-use crate::app::State;
+use crate::app::{Confirm, State};
 use crate::jump;
 use crate::palette::WorktreeChoice;
 use crate::session::{Grid, Session};
@@ -154,6 +154,18 @@ pub(crate) const SCENES: &[Scene] = &[
     }),
     ("tray", show_tray_scene),
     ("lazygit", show_lazygit_scene),
+    ("confirm-stack", |state| {
+        show_workspace_scene(state);
+        let session = state.session().map_or(0, Session::id);
+        state.confirms.push(Confirm::Paste {
+            session,
+            text: "rm -rf x\n".to_owned(),
+        });
+        state.confirms.push(Confirm::Close {
+            session,
+            project: None,
+        });
+    }),
     ("empty", isolate_scene),
     ("collapsed", |state| {
         show_workspace_scene(state);
