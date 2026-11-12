@@ -1,16 +1,19 @@
 use std::fs::File;
 use std::io::{Read, Write};
-use std::os::fd::OwnedFd;
+use std::os::fd::{AsFd, AsRawFd, OwnedFd};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::thread;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use crossbeam_channel::{Receiver, Sender, bounded, unbounded};
 use nix::pty::{Winsize, openpty};
+use nix::sys::select::{FdSet, select};
+use nix::sys::time::{TimeVal, TimeValLike};
 use rune::Waker;
 
 use crate::LogErr;
@@ -19,6 +22,41 @@ use crate::config::Config;
 use crate::grid::{Grid, Surface};
 use crate::protocol::{Event, Msg, Visibility};
 use crate::terminal_input::{KeyInput, PointerInput, PointerPhase, WheelInput};
+
+const BATCH_GAP: Duration = Duration::from_micros(50);
+const BATCH_LIMIT: Duration = Duration::from_millis(1);
+
+/// macOS hands PTY output over about 1 KB at a time, so waiting up to `gap` for the next piece, for
+/// at most `limit`, keeps the actor from waking for every kilobyte of a flood.
+fn read_batch(
+    reader: &mut File,
+    buffer: &mut [u8],
+    gap: Duration,
+    limit: Duration,
+) -> std::io::Result<usize> {
+    let mut length = reader.read(buffer)?;
+    let deadline = Instant::now() + limit;
+    while length > 0 && length < buffer.len() && Instant::now() < deadline && readable(reader, gap)
+    {
+        match reader.read(&mut buffer[length..]) {
+            Ok(read @ 1..) => length += read,
+            // Ending the batch here leaves the next read to report the end or the error.
+            Ok(0) | Err(_) => break,
+        }
+    }
+    Ok(length)
+}
+
+fn readable(reader: &File, wait: Duration) -> bool {
+    // `FdSet::insert` panics past `FD_SETSIZE`; such a descriptor just reads unbatched.
+    if usize::try_from(reader.as_raw_fd()).is_ok_and(|fd| fd >= libc::FD_SETSIZE) {
+        return false;
+    }
+    let mut fds = FdSet::new();
+    fds.insert(reader.as_fd());
+    let mut timeout = TimeVal::microseconds(i64::try_from(wait.as_micros()).unwrap_or(i64::MAX));
+    select(None, &mut fds, None, None, &mut timeout).is_ok_and(|ready| ready > 0)
+}
 
 /// A waker whose target can change, so a session keeps waking the window that shows it after a move.
 #[derive(Clone)]
@@ -158,7 +196,9 @@ impl Session {
         let mut reader = File::from(master.try_clone()?);
         thread::spawn(move || {
             let mut buffer = [0; 64 * 1024];
-            while let Ok(length @ 1..) = reader.read(&mut buffer) {
+            while let Ok(length @ 1..) =
+                read_batch(&mut reader, &mut buffer, BATCH_GAP, BATCH_LIMIT)
+            {
                 if output_tx.send(buffer[..length].to_vec()).is_err() {
                     break;
                 }
@@ -416,6 +456,29 @@ mod tests {
 
     fn spawn_shell() -> Session {
         Session::spawn(None, Path::new("/tmp"), &Config::default(), Arc::new(|| {})).unwrap()
+    }
+
+    #[test]
+    fn output_written_in_pieces_arrives_in_one_batch() {
+        let pty = openpty(None, None).unwrap();
+        let mut slave = File::from(pty.slave);
+        let writer = thread::spawn(move || {
+            for _ in 0..4 {
+                slave.write_all(&[b'x'; 1000]).unwrap();
+            }
+            slave
+        });
+        let mut master = File::from(pty.master);
+        let mut buffer = [0; 64 * 1024];
+        let length = read_batch(
+            &mut master,
+            &mut buffer,
+            Duration::from_millis(500),
+            Duration::from_secs(5),
+        )
+        .unwrap();
+        assert_eq!(length, 4000);
+        writer.join().unwrap();
     }
 
     fn type_line(session: &Session, line: &str) {
