@@ -24,6 +24,7 @@ pub enum Command {
     PrevPrompt,
     NextPrompt,
     SelectLastOutput,
+    ReloadConfig,
 }
 
 pub struct CommandSpec {
@@ -96,6 +97,7 @@ pub const COMMANDS: &[CommandSpec] = &[
         "Select last command output",
         None,
     ),
+    spec(Command::ReloadConfig, "Reload config", Some("mod+shift+,")),
 ];
 
 /// A chord such as `mod+shift+]` the way macOS menus show it: `⇧⌘]`.

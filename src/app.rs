@@ -22,7 +22,8 @@ use crate::secure_input::SecureInput;
 use crate::session::{Attention, Retarget, Session};
 use crate::view::{DRAWER_MARK, OVERLAY_MARK, view, window_title};
 use crate::windows::{
-    Fleet, MAIN_WINDOW, WindowId, adopt_projects, move_to_new_window, on_close, on_quit,
+    Fleet, MAIN_WINDOW, WindowId, adopt_config, adopt_projects, move_to_new_window, on_close,
+    on_quit, reload_config,
 };
 use crate::workspace::{Project, SavedWorkspace, Slot, Status, Tab, Workspace};
 use anyhow::Context;
@@ -554,6 +555,7 @@ pub(crate) fn run_command(state: &mut State, command: Command, tx: &mut Tx) {
                 session.select_last_output();
             }
         }
+        Command::ReloadConfig => reload_config(state),
     }
 }
 
@@ -567,7 +569,7 @@ pub(crate) fn poll(state: &mut State, now: f64, tx: &mut Tx) -> bool {
             state.workspace.add_project(Project::new(root, vec![tab]));
         }
     }
-    let mut changed = adopt_projects(state);
+    let mut changed = adopt_projects(state) | adopt_config(state);
     let project_name = state.workspace.project().map(|project| &project.name);
     if state.titled.as_ref().map(Option::as_ref) != Some(project_name) {
         tx.set_title(window_title(&state.workspace));

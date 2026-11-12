@@ -6,6 +6,7 @@ use rune::{Tx, Waker, WindowSpec};
 
 use crate::LogErr;
 use crate::app::{State, save_layout, window_app};
+use crate::config::Config;
 use crate::workspace::{Project, SavedWorkspace};
 
 pub(crate) type WindowId = u32;
@@ -30,6 +31,8 @@ struct Entry {
     waker: Option<Waker>,
     reveal: Option<Rc<dyn Fn(u64)>>,
     inbox: Vec<Project>,
+    /// A config reloaded in another window, for this one to take on its next poll.
+    config: Option<Config>,
 }
 
 impl Fleet {
@@ -91,6 +94,28 @@ impl Fleet {
             .projects
             .extend(others.flat_map(|(_, layout)| layout.projects.clone()));
         Some(merged)
+    }
+
+    /// Hands `config` to every window but `from`, which applied it itself.
+    pub fn share_config(&self, from: WindowId, config: &Config) {
+        let wakers: Vec<_> = self
+            .0
+            .borrow_mut()
+            .entries
+            .iter_mut()
+            .filter(|(window, _)| **window != from)
+            .filter_map(|(_, entry)| {
+                entry.config = Some(config.clone());
+                entry.waker.clone()
+            })
+            .collect();
+        for waker in wakers {
+            waker();
+        }
+    }
+
+    fn take_config(&self, window: WindowId) -> Option<Config> {
+        self.0.borrow_mut().entries.get_mut(&window)?.config.take()
     }
 
     pub fn take(&self, window: WindowId) -> Vec<Project> {
@@ -160,6 +185,32 @@ pub(crate) fn torn_off([x, y]: [f32; 2], sidebar_width: f32) -> bool {
     x < 0.0 || y < 0.0 || x > sidebar_width + TEAR_OFF_DISTANCE
 }
 
+/// Rereads the config for every window. A config.toml that fails to parse is logged and changes nothing.
+pub(crate) fn reload_config(state: &mut State) {
+    let Some(paths) = &state.paths else { return };
+    if let Some(config) = Config::reload(paths).log_err("reload config") {
+        state.fleet.share_config(state.window, &config);
+        apply_config(state, config);
+    }
+}
+
+pub(crate) fn adopt_config(state: &mut State) -> bool {
+    let config = state.fleet.take_config(state.window);
+    let adopted = config.is_some();
+    if let Some(config) = config {
+        apply_config(state, config);
+    }
+    adopted
+}
+
+/// Running sessions take the theme and the like; the shell, tabs and folder apply to new tabs.
+fn apply_config(state: &mut State, config: Config) {
+    for tab in state.workspace.tabs_mut() {
+        tab.session.configure(&config);
+    }
+    state.config = config;
+}
+
 /// Takes the projects other windows handed over, pointing their sessions at this window.
 pub(crate) fn adopt_projects(state: &mut State) -> bool {
     let projects = state.fleet.take(state.window);
@@ -178,6 +229,7 @@ pub(crate) fn adopt_projects(state: &mut State) -> bool {
 mod tests {
     use super::*;
     use crate::app::open_tab;
+    use crate::config::Paths;
     use crate::protocol::Visibility;
     use crate::session::Session;
     use crate::test_support::*;
@@ -211,6 +263,26 @@ mod tests {
         };
         assert_eq!(shown(&runtime), Some(Visibility::Shown));
         assert_eq!(shown(&second), Some(Visibility::Shown));
+    }
+
+    #[test]
+    fn a_reloaded_config_reaches_every_window() {
+        let mut runtime = workspace_runtime();
+        move_to_new_window(&mut runtime.state, 1, None);
+        let mut second = second_window(&runtime.state.fleet, 1);
+        let root = tempfile::tempdir().unwrap();
+        let paths = Paths {
+            dir: root.path().join("agentd"),
+            ghostty_dir: root.path().join("ghostty"),
+        };
+        std::fs::create_dir_all(&paths.dir).unwrap();
+        std::fs::write(paths.dir.join("config.toml"), "jump-command = \"j\"\n").unwrap();
+        runtime.state.paths = Some(paths);
+        press(&mut runtime, rune::Key::Command(','), command_shift());
+        second.frame(2.0 / 60.0);
+        let jump = |state: &State| state.config.jump_command.clone();
+        assert_eq!(jump(&runtime.state).as_deref(), Some("j"));
+        assert_eq!(jump(&second.state).as_deref(), Some("j"));
     }
 
     #[test]

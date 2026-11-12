@@ -2,6 +2,7 @@ use std::process::ExitStatus;
 
 use libghostty_vt::effect::ClipboardLocation;
 
+use crate::config::TerminalSettings;
 use crate::grid::Surface;
 use crate::terminal_input::{KeyInput, PointerInput, PointerPhase, WheelInput};
 
@@ -36,6 +37,7 @@ pub(crate) enum Msg {
     },
     Resize(Surface),
     Visibility(Visibility),
+    Configure(TerminalSettings),
     Stop,
 }
 

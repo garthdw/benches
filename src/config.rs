@@ -341,18 +341,46 @@ fn default_config_text() -> String {
     )
 }
 
+/// What a running session takes from the config; the rest applies to tabs opened later.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TerminalSettings {
+    pub theme: Theme,
+    pub command_finish_after: Option<Duration>,
+    pub clipboard_read: ClipboardAccess,
+    pub clipboard_write: ClipboardAccess,
+}
+
+fn read_file(paths: &Paths) -> Result<File> {
+    let text = read_optional(&paths.config())?;
+    let file = text.map(|text| toml::from_str::<File>(&text).context("parse config.toml"));
+    Ok(file.transpose()?.unwrap_or_default())
+}
+
 impl Config {
     /// `config.toml`, then Ghostty's config for the font and theme it leaves out, then the defaults.
     /// Problems are logged and fall back, so the app always starts.
     pub fn load(paths: &Paths) -> Self {
-        let file = read_optional(&paths.dir.join("config.toml"))
-            .and_then(|text| {
-                text.map(|text| toml::from_str::<File>(&text).context("parse config.toml"))
-                    .transpose()
-            })
-            .log_err("config")
-            .flatten()
-            .unwrap_or_default();
+        Self::resolve(
+            read_file(paths).log_err("config").unwrap_or_default(),
+            paths,
+        )
+    }
+
+    /// As `load`, but a `config.toml` that can't be read is an error, so the running config stays.
+    pub fn reload(paths: &Paths) -> Result<Self> {
+        Ok(Self::resolve(read_file(paths)?, paths))
+    }
+
+    pub fn terminal(&self) -> TerminalSettings {
+        TerminalSettings {
+            theme: self.theme.clone(),
+            command_finish_after: self.command_finish_after,
+            clipboard_read: self.clipboard_read,
+            clipboard_write: self.clipboard_write,
+        }
+    }
+
+    fn resolve(file: File, paths: &Paths) -> Self {
         let ghostty = read_optional(&paths.ghostty_dir.join("config"))
             .log_err("ghostty config")
             .flatten()
@@ -941,6 +969,17 @@ mod tests {
     fn a_broken_config_falls_back_to_the_defaults() {
         let (_root, paths) = paths(Some("shel = 1"), None);
         assert_eq!(Config::load(&paths), Config::default());
+    }
+
+    #[test]
+    fn reload_refuses_a_broken_config_rather_than_fall_back() {
+        let (_root, broken) = paths(Some("shel = 1"), None);
+        assert!(Config::reload(&broken).is_err());
+        let (_root, good) = paths(Some("shell = \"/bin/zsh\"\n"), None);
+        assert_eq!(
+            Config::reload(&good).unwrap().shell,
+            PathBuf::from("/bin/zsh")
+        );
     }
 }
 
