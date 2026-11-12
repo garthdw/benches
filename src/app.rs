@@ -7,6 +7,7 @@ use rune::{
 };
 
 use crate::config;
+use crate::grid::{Grid, Surface};
 use crate::input::caret_rect;
 use crate::keymap::{Command, pressed, shortcut};
 use crate::palette::{
@@ -14,7 +15,7 @@ use crate::palette::{
 };
 use crate::render::TerminalSource;
 use crate::session::LogErr;
-use crate::session::{Attention, Event, Grid, Retarget, Session, Surface};
+use crate::session::{Attention, Event, Retarget, Session};
 use crate::view::{DRAWER_MARK, OVERLAY_MARK, view, window_title};
 use crate::windows::{
     Fleet, MAIN_WINDOW, WindowId, adopt_projects, move_to_new_window, on_close, on_quit,
@@ -704,10 +705,11 @@ pub(crate) fn window_app(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::grid::Metrics;
     use crate::scenes::*;
     use crate::test_support::*;
     use crate::view::{DRAWER_HEIGHT, RAIL_WIDTH, SIDEBAR_WIDTH};
-    use crate::{session, workspace};
+    use crate::workspace;
     use rune::{Cursor, Runtime};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
@@ -887,7 +889,7 @@ mod tests {
     #[test]
     fn the_caret_follows_the_cursor_in_points() {
         let mut grid = Grid::from_vt(b"ab", 10, 2).unwrap();
-        grid.metrics = session::Metrics {
+        grid.metrics = Metrics {
             cell_width: 16,
             cell_height: 32,
             padding: 12.0,
@@ -900,7 +902,7 @@ mod tests {
     fn the_caret_is_the_drawn_cell_in_points_at_fractional_scales() {
         for scale in [1.0, 1.25, 1.5, 2.0] {
             let mut grid = Grid::from_vt(b"ab", 10, 2).unwrap();
-            grid.metrics = session::Metrics {
+            grid.metrics = Metrics {
                 cell_width: 9,
                 cell_height: 19,
                 padding: 12.0 * scale,

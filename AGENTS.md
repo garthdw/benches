@@ -40,6 +40,7 @@ shell <-> PTY --reader thread--> bounded channel --> actor thread (owns Terminal
 ```
 
 - **`session.rs`**: PTY, process and actor thread. libghostty types are `!Send`, so a `Terminal` must stay on its actor thread; everything else talks to it through `Msg` over a channel. The UI only sees immutable `Arc<Grid>` snapshots swapped into a mutex slot, with a `generation` counter for change detection.
+- **`grid.rs`**: the snapshot side. `Grid` and `Cell`, `GridBuilder` (reads the render state into a `Grid`), `Presentation`, `Metrics`, `Surface` and `Scrollbar` with its fade.
 - **Back-pressure**: PTY output goes through a bounded channel and publishing is capped by `FRAME`, so output floods can't stall the UI. Publishing also respects libghostty's render hold (`on_render_hold`).
 - **Spawning**: `openpty` plus `login_tty` in `pre_exec`. Only async-signal-safe calls may run between fork and exec, because the app is multi-threaded.
 - **`render.rs`**: a Rune `Compositor` that draws into the `effect(TERMINAL_MARK)` slot declared in `view` with a custom wgpu pass (`cell.wgsl`). Glyphs live in a shared atlas and quads are instanced; a `Slot` per effect mark rebuilds only when generation, rect, atlas epoch or blend mode changes. The compositor also derives cols and rows from the slot size and sends `Session::resize`. The actor applies a new grid size, and so sends SIGWINCH, only once it has held for `RESIZE_SETTLE`, because inline TUIs such as Claude Code reprint on every SIGWINCH.
@@ -50,9 +51,9 @@ shell <-> PTY --reader thread--> bounded channel --> actor thread (owns Terminal
 - **Windows**: each window has its own `State` and `Workspace`, so selection, hidden sessions and sizing stay per window. `Fleet` (in `windows.rs`) hands a `Project` to another window's inbox, which takes it in `poll` and retargets each tab's `Retarget` waker. Closing a torn-off window merges its projects back into the main window; closing the main window quits. Torn-off windows aren't restored: the layout saved at quit lists their projects after the main window's.
 - **`app.rs`**: `State`, `window_app` (the `AppSpec` and hooks), `poll`, `on_key` and the tab, layout and close-confirm logic. `main.rs` is only the entry point and `config` CLI dispatch.
 - **`input.rs`**: maps Rune key events to `KeyInput`; the actor encodes them with libghostty's encoder using the terminal's current modes. Returning `None` from `map_key` keeps a key (such as a ⌘ chord) away from the terminal.
-- **Pointer input**: the UI sends raw `Msg::Pointer` and `Msg::Wheel`, and `TerminalInput` on the actor decides between mouse reports, selection, alt-screen arrows and scrollback, because only the actor knows the terminal's modes.
+- **Pointer input** (`terminal_input.rs`): the UI sends raw `Msg::Pointer` and `Msg::Wheel`, and `TerminalInput` on the actor decides between mouse reports, selection, alt-screen arrows and scrollback, because only the actor knows the terminal's modes.
 
-`Grid::from_vt` and `Session::fixture` give a process-free grid for tests and scenes.
+`Grid::from_vt` (`grid.rs`) and `Session::fixture` give a process-free grid for tests and scenes.
 
 ## Rust coding guidelines
 

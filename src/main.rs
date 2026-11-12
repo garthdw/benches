@@ -2,6 +2,7 @@ mod app;
 mod config;
 mod constraint;
 mod font;
+mod grid;
 mod input;
 mod jump;
 mod keymap;
@@ -13,6 +14,7 @@ mod render;
 mod scenes;
 mod session;
 mod sprite;
+mod terminal_input;
 #[cfg(test)]
 mod test_support;
 mod view;

@@ -10,7 +10,8 @@ use rune::compose::{Compositor, DeviceKey, Frame};
 use rune::render::EffectSite;
 
 use crate::font::{Font, FontStyle, GlyphKind, ShapedRun};
-use crate::session::{Cell, Grid, Metrics, Scrollbar, Session, Surface};
+use crate::grid::{Cell, Grid, Metrics, Scrollbar, Surface};
+use crate::session::Session;
 
 /// Also the width of the scrollbar's strip, which takes the right padding.
 pub const PADDING_POINTS: f32 = 6.0;
