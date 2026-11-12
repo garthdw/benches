@@ -370,7 +370,7 @@ fn confirm_bar(
         .px(10.0)
         .py(6.0)
         .radius(6.0)
-        .fill(theme.control_off)
+        .fill(theme.card)
         .child(text(message).color(theme.text))
         .child(button(format!("{key}-yes"), action).on_press({
             let resolve = resolve.clone();
@@ -450,7 +450,7 @@ fn focus_overlays(state: &State, theme: &tok::Theme) -> Vec<El> {
                 .px(10.0)
                 .py(6.0)
                 .radius(6.0)
-                .fill(theme.control_off)
+                .fill(theme.card)
                 .child(
                     text(format!("{} · Enter restarts", status_text(&tab.status)))
                         .color(theme.text),
