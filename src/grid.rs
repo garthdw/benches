@@ -150,7 +150,7 @@ pub struct Grid {
     pub generation: u64,
     pub cols: u16,
     pub cells: Arc<[Cell]>,
-    pub clusters: Arc<[String]>,
+    pub clusters: Arc<[Arc<str>]>,
     pub cursor: Option<(u16, u16)>,
     pub cursor_style: CursorVisualStyle,
     pub cursor_blinking: bool,
@@ -210,9 +210,9 @@ impl Grid {
         }
     }
 
-    pub fn cluster(&self, cell: &Cell) -> Option<&str> {
+    pub fn cluster(&self, cell: &Cell) -> Option<&Arc<str>> {
         let index = usize::try_from(cell.cluster?).ok()?;
-        self.clusters.get(index).map(String::as_str)
+        self.clusters.get(index)
     }
 
     #[cfg(test)]
@@ -379,14 +379,14 @@ impl Default for Presentation {
     }
 }
 
-type Content = (Arc<[Cell]>, Arc<[String]>);
+type Content = (Arc<[Cell]>, Arc<[Arc<str>]>);
 
 /// Reads one cell through libghostty's cell iterator, which costs several calls.
 fn read_cell(
     cell: &CellIteration<'_, '_>,
     colors: &Colors,
     (selection_background, selection_foreground): (Option<RgbColor>, Option<RgbColor>),
-    clusters: &mut Vec<String>,
+    clusters: &mut Vec<Arc<str>>,
 ) -> Result<Cell> {
     let mut fg = cell.fg_color()?.unwrap_or(colors.foreground);
     let mut bg = cell.bg_color()?;
@@ -439,7 +439,7 @@ fn read_cell(
                 let mut cluster = String::new();
                 cell.graphemes_utf8(&mut cluster)?;
                 output.cluster = Some(u32::try_from(clusters.len())?);
-                clusters.push(cluster);
+                clusters.push(cluster.into());
             }
             Err(error) => return Err(error.into()),
         }
@@ -682,8 +682,8 @@ mod tests {
         let family = "\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}";
         let text = format!("e\u{301}{family}x");
         let grid = Grid::from_vt(text.as_bytes(), 8, 1).unwrap();
-        assert_eq!(grid.cluster(&grid.cells[0]), Some("e\u{301}"));
-        assert_eq!(grid.cluster(&grid.cells[1]), Some(family));
+        assert_eq!(grid.cluster(&grid.cells[0]), Some(&"e\u{301}".into()));
+        assert_eq!(grid.cluster(&grid.cells[1]), Some(&family.into()));
         assert!(grid.cells[1].wide && grid.cells[2].spacer);
         assert_eq!(grid.cells[3].character, 'x');
         assert_eq!(grid.cluster(&grid.cells[3]), None);
@@ -919,7 +919,7 @@ mod tests {
         assert_eq!(lines[1].trim_end(), "changed");
         assert_eq!(lines[3], first.lines()[3]);
         assert_eq!(lines[4].trim_end(), "last");
-        assert_eq!(second.cluster(&second.cells[0]), Some("e\u{301}"));
+        assert_eq!(second.cluster(&second.cells[0]), Some(&"e\u{301}".into()));
     }
 
     #[test]

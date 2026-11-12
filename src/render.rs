@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::hash::BuildHasherDefault;
 use std::mem::size_of;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -17,7 +18,7 @@ use rune::render::EffectSite;
 
 use crate::LogErr;
 use crate::constraint::{Constraint, is_graphics_element, is_symbol};
-use crate::font::{Font, FontStyle, GlyphKind, ShapedRun};
+use crate::font::{Fnv, Font, FontStyle, GlyphKind, ShapedRun};
 use crate::grid::{Cell, Grid, Metrics, Scrollbar, Surface};
 use crate::session::Session;
 
@@ -78,7 +79,7 @@ impl std::hash::Hash for ShapedCell {
 #[derive(Clone, PartialEq, Eq, Hash)]
 enum GlyphText {
     Character(char),
-    Cluster(String),
+    Cluster(Arc<str>),
     Shaped(ShapedCell),
     Underline(Underline),
 }
@@ -114,7 +115,7 @@ impl From<&GlyphText> for JobText {
     fn from(text: &GlyphText) -> Self {
         match text {
             GlyphText::Character(character) => Self::Character(*character),
-            GlyphText::Cluster(cluster) => Self::Cluster(cluster.clone()),
+            GlyphText::Cluster(cluster) => Self::Cluster(cluster.to_string()),
             GlyphText::Shaped(cell) => Self::Shaped {
                 run: cell.run.to_string(),
                 index: cell.index,
@@ -256,7 +257,7 @@ enum AtlasSlot {
 }
 
 struct Atlas {
-    slots: HashMap<GlyphKey, AtlasSlot>,
+    slots: HashMap<GlyphKey, AtlasSlot, BuildHasherDefault<Fnv>>,
     /// Glyphs out with the rasterizer, by job id.
     requested: HashMap<u64, GlyphKey>,
     next_job: u64,
@@ -264,17 +265,20 @@ struct Atlas {
     epoch: u64,
     /// Whether a lookup since this was last cleared found a glyph not rasterised yet.
     missing: bool,
+    /// Ready plain ASCII glyphs by codepoint, so the commonest cells skip hashing their key.
+    ascii: [Option<AtlasGlyph>; 128],
 }
 
 impl Atlas {
     fn new(epoch: u64) -> Self {
         Self {
-            slots: HashMap::new(),
+            slots: HashMap::default(),
             requested: HashMap::new(),
             next_job: 0,
             next: [1, 1],
             epoch,
             missing: false,
+            ascii: [None; 128],
         }
     }
 
@@ -283,13 +287,30 @@ impl Atlas {
         self.slots
             .retain(|_, slot| matches!(slot, AtlasSlot::Pending));
         self.next = [1, 1];
+        self.ascii = [None; 128];
         self.epoch += 1;
     }
 
     /// The glyph if it's ready; otherwise asks `jobs` for it, once, and notes it missing.
     fn glyph(&mut self, jobs: &Sender<Job>, key: GlyphKey) -> Option<AtlasGlyph> {
+        let ascii = match key.text {
+            GlyphText::Character(character)
+                if character.is_ascii() && key.style == FontStyle::default() && key.cells == 1 =>
+            {
+                self.ascii.get_mut(character as usize)
+            }
+            _ => None,
+        };
+        if let Some(Some(glyph)) = ascii {
+            return Some(*glyph);
+        }
         match self.slots.get(&key) {
-            Some(AtlasSlot::Ready(slot)) => return *slot,
+            Some(AtlasSlot::Ready(slot)) => {
+                if let Some(cached) = ascii {
+                    *cached = *slot;
+                }
+                return *slot;
+            }
             Some(AtlasSlot::Pending) => {}
             None => {
                 let id = self.next_job;
@@ -389,7 +410,7 @@ impl Atlas {
 
 fn glyph_key(grid: &Grid, index: usize, cell: &Cell) -> Option<GlyphKey> {
     let text = match grid.cluster(cell) {
-        Some(cluster) => GlyphText::Cluster(cluster.to_owned()),
+        Some(cluster) => GlyphText::Cluster(cluster.clone()),
         None if cell.spacer || cell.character == ' ' => return None,
         None => GlyphText::Character(cell.character),
     };
@@ -1087,6 +1108,40 @@ mod tests {
     }
 
     #[test]
+    fn a_reset_forgets_ready_ascii_glyphs() {
+        let (jobs, queued) = crossbeam_channel::unbounded();
+        let mut atlas = Atlas::new(0);
+        let key = GlyphKey {
+            text: GlyphText::Character('a'),
+            style: FontStyle::default(),
+            cells: 1,
+        };
+        atlas
+            .slots
+            .insert(key.clone(), AtlasSlot::Ready(Some(fake_glyph([16, 0]))));
+        assert!(atlas.glyph(&jobs, key.clone()).is_some());
+        atlas.reset();
+        assert!(atlas.glyph(&jobs, key).is_none());
+        assert_eq!(queued.len(), 1);
+    }
+
+    #[test]
+    fn a_cluster_finds_its_ready_glyph_in_a_later_grid() {
+        let (jobs, queued) = crossbeam_channel::unbounded();
+        let mut atlas = Atlas::new(0);
+        let first = Grid::from_vt("e\u{301}".as_bytes(), 10, 1).unwrap();
+        let key = glyph_key(&first, 0, &first.cells[0]).unwrap();
+        assert!(atlas.glyph(&jobs, key).is_none());
+        for slot in atlas.slots.values_mut() {
+            *slot = AtlasSlot::Ready(Some(fake_glyph([16, 0])));
+        }
+        let second = Grid::from_vt("e\u{301}".as_bytes(), 10, 1).unwrap();
+        let key = glyph_key(&second, 0, &second.cells[0]).unwrap();
+        assert!(atlas.glyph(&jobs, key).is_some());
+        assert_eq!(queued.len(), 1);
+    }
+
+    #[test]
     fn a_worker_rasterises_as_the_ui_thread_would() {
         let config = crate::config::Config::default().font;
         let rasterizer = Rasterizer::new(&config, 18.0, 2.0, Arc::new(|| {}));
@@ -1546,7 +1601,7 @@ mod tests {
         for row in 0..60 {
             bytes.extend(
                 format!(
-                    "\x1b[3{}mline {row} the quick brown fox \x1b[1;4{}mjumps\x1b[0m over 世界 the lazy dog é\r\n",
+                    "\x1b[3{}mline {row} the quick brown fox \x1b[1;4{}mjumps\x1b[0m over 世界 the lazy dog e\u{301} \u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467} a\u{308}o\u{308} \x1b[3mitalic {row}\x1b[0m\r\n",
                     row % 8,
                     row % 7
                 )
@@ -1555,29 +1610,42 @@ mod tests {
         }
         let grid = Grid::from_vt(&bytes, 200, 60).unwrap();
         let font = Font::new(crate::config::DEFAULT_FONT_FAMILY, 18.0, 2.0).unwrap();
-        let mut slots: HashMap<GlyphKey, [u32; 2]> = HashMap::new();
+        let (jobs, _queued) = crossbeam_channel::unbounded();
+        let mut atlas = Atlas::new(0);
         let mut quads = Vec::new();
-        let frames = 300u32;
-        let start = std::time::Instant::now();
-        for _ in 0..frames {
+        let build = |atlas: &mut Atlas, quads: &mut Vec<Quad>| {
             build_quads(
                 &grid,
                 [0.0, 0.0, 2000.0, 1500.0],
                 metrics(&font, 0.0, 2.0),
                 &font,
                 true,
-                &mut quads,
-                |key| {
-                    let next = [slots.len() as u32 * 16, 0];
-                    let position = *slots.entry(key).or_insert(next);
-                    (Some(fake_glyph(position)), 0)
-                },
+                quads,
+                |key| (atlas.glyph(&jobs, key), atlas.epoch),
             );
+        };
+        build(&mut atlas, &mut quads);
+        for (index, slot) in atlas.slots.values_mut().enumerate() {
+            *slot = AtlasSlot::Ready(Some(fake_glyph([index as u32 * 16, 0])));
         }
+        atlas.requested.clear();
+        // The fastest batch, as other load on the machine only ever slows one down.
+        let frames = 50u32;
+        let fastest = (0..40)
+            .map(|_| {
+                let start = std::time::Instant::now();
+                for _ in 0..frames {
+                    build(&mut atlas, &mut quads);
+                }
+                start.elapsed() / frames
+            })
+            .min()
+            .unwrap_or_default();
         println!(
-            "build_quads 200x60: {} ns/frame, {} quads",
-            start.elapsed().as_nanos() / u128::from(frames),
-            quads.len()
+            "build_quads 200x60: {} ns/frame, {} quads, {} clusters",
+            fastest.as_nanos(),
+            quads.len(),
+            grid.clusters.len()
         );
     }
 

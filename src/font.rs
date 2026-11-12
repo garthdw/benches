@@ -157,9 +157,10 @@ impl ShapedRun {
     }
 }
 
-/// FNV-1a, because the run cache hashes every word of every rebuild and its keys are short.
+/// FNV-1a, because the run cache and glyph atlas hash every word and cell of every rebuild and
+/// their keys are short.
 #[derive(Default)]
-struct Fnv(u64);
+pub(crate) struct Fnv(u64);
 
 impl Hasher for Fnv {
     fn finish(&self) -> u64 {
