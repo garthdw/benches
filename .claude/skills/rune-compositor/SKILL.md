@@ -5,7 +5,7 @@ description: Rune's custom GPU drawing contract as used by agentd - Compositor, 
 
 # Rune compositor and effect slots
 
-Verified against Rune rev `ba5e7c8` (wgpu `~30.0.1`). If the pin has moved, check anything you rely on.
+Verified against Rune rev `7dfaa8f` (wgpu `~30.0.1`). If the pin has moved, check anything you rely on.
 
 ## Pattern
 

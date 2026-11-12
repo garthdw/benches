@@ -20,7 +20,7 @@ Driving input (points, window space):
 - Pointer: `pointer_move, pointer_down, pointer_up, pointer_leave, button_down(x, y, PointerButton), button_up`.
 - Wheel: `wheel(x, y, dy)`, or `wheel_event(WheelEvent::new(dx, dy).at(x, y).mods(m).phase(p).precise(true))`.
 - Keys: `key, repeat_key, key_up, physical_input(PhysicalInput)`.
-- Text: `ime(Ime), cancel_composition(), paste(text), paste_content(content)`.
+- Text: `ime(Ime), finish_composition(), paste(text), paste_content(content)`. `finish_composition` is what window deactivation does: an open composition becomes text (see `rune-input`).
 - Gestures: `magnify_event, rotate_event, smart_magnify`.
 
 Inspect with:

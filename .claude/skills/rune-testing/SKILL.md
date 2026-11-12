@@ -5,7 +5,7 @@ description: Testing and verifying Rune apps in agentd - the headless Runtime ha
 
 # Testing Rune apps
 
-Verified against Rune rev `ba5e7c8`. If the pin has moved, check anything you rely on.
+Verified against Rune rev `7dfaa8f`. If the pin has moved, check anything you rely on.
 
 ## agentd specifics
 

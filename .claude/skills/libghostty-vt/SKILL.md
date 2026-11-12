@@ -5,8 +5,8 @@ description: libghostty-vt Rust bindings as used by agentd - threading, render s
 
 # libghostty-vt
 
-Verified against libghostty-rs rev `768add9` (the pin in `Cargo.toml`). The API is marked unstable upstream, so if the pin has moved, check anything you rely on.
-Source: `~/.cargo/git/checkouts/libghostty-rs-28fee7453bdb2b25/768add9/crates/libghostty-vt/src`.
+Verified against libghostty-rs rev `cd4d497` (the pin in `Cargo.toml`). The API is marked unstable upstream, so if the pin has moved, check anything you rely on.
+Source: `~/.cargo/git/checkouts/libghostty-rs-28fee7453bdb2b25/cd4d497/crates/libghostty-vt/src`.
 
 ## Threading
 
@@ -27,9 +27,13 @@ Read the one that matches the task:
 
 | Topic | Path |
 |---|---|
-| Terminal, modes, callbacks | `libghostty-vt/src/terminal.rs` |
+| Terminal, scrollback | `libghostty-vt/src/terminal.rs` |
+| Modes | `libghostty-vt/src/mode.rs` |
+| Callbacks (`on_*`), `ClipboardMime` | `libghostty-vt/src/effect.rs` |
+| `Point`, `Coordinate` | `libghostty-vt/src/point.rs` |
 | Render iterators | `libghostty-vt/src/render.rs` |
-| Cells, `GridRef`, `Screen` | `libghostty-vt/src/screen.rs` |
+| Cells, `Screen` | `libghostty-vt/src/screen.rs` |
+| `GridRef` | `libghostty-vt/src/grid_ref.rs` |
 | Selection | `libghostty-vt/src/selection.rs`, `selection/gesture.rs` |
 | Encoders | `libghostty-vt/src/key.rs`, `mouse.rs`, `focus.rs` |
 | Paste, formatting | `libghostty-vt/src/paste.rs`, `fmt.rs` |

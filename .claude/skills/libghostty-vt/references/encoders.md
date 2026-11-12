@@ -28,7 +28,7 @@ event.set_action(Action::Press /* Release, Motion */).set_button(Some(Button::Le
 encoder.encode_to_vec(&event, &mut out)?;
 ```
 
-`Button::{Left, Right, Middle, Four, Five, Six, ...}`; Four and Five are wheel up and down. Motion needs no button. Check the `Action` variant name for motion in `mouse.rs` when first used.
+`Button::{Left, Right, Middle, Four, Five, Six, ...}`; Four and Five are wheel up and down. `Action::{Press, Release, Motion}`; motion needs no button.
 
 ## Focus events
 

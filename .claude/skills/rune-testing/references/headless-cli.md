@@ -1,6 +1,6 @@
 # Headless CLI
 
-Rune intercepts these flags on the app binary and renders with no window. The compositor still runs, on the same native Metal backend as the window; `RUNE_GPU_BACKEND=wgpu` forces wgpu-hal. At `ba5e7c8` the `fixture`, `unicode` and `tray` scenes snap byte-identical on both.
+Rune intercepts these flags on the app binary and renders with no window. The compositor still runs, on the same native Metal backend as the window; `RUNE_GPU_BACKEND=wgpu` forces wgpu-hal. At `7dfaa8f` the `fixture`, `unicode` and `tray` scenes snap byte-identical on both.
 
 ```sh
 cargo run -- --snap "$SCRATCH/out.png" --scene fixture --size 960x640 --scale 2
@@ -31,5 +31,6 @@ cargo run -- --snap "$SCRATCH/out.png" --scene fixture --size 960x640 --scale 2
 - `{"hold": "alt"}` until `{"hold": ""}`
 - `{"type": "mark", "name": N}`, `{"type": "shortcut", "chord": "cmd+space"}`
 - `paste` content takes `{"text", "html", "rtf", "png"}`
+- `{"type": "ime", "commit": "…"}` or `{"type": "ime", "preedit": "…", "cursor": [start, end]}`; an empty preedit ends the composition
 - Pointer: `{"t": 0.5, "type": "move", "key": "project-1"}` (or `"x"`, `"y"` in points) hovers an element, so a hover state snapshots with `--snap --at 1`. Also `down`, `up`, `tap`/`click`, `double-click`, `drag`, `wheel`, `scroll`, `secondary-click`, `"button": "middle"`.
 - Keys and the rest: read `src/tooling/script.rs` for exact field names.

@@ -5,6 +5,7 @@
 - `render(&mut self, &mut Frame<S>)`, required. Runs after `Runtime::frame` built the instances.
 - `features() -> wgpu::Features`, optional device features. Default empty; keep it so on macOS (see [metal-backend.md](metal-backend.md)).
 - `animating() -> bool`, default false. True keeps the display link running. Leave it false for a terminal: frames come from `poll` and wakes.
+- `draws_own() -> bool`, default true. False tells the window the last frame drew nothing beyond `Frame::draw_ui`, so a due timer whose frame would build the same instances draws nothing. Leave it true while the terminal slot is drawn.
 - `summary(&mut self, &Device) -> Option<String>`, printed after a headless run.
 
 ## Frame

@@ -5,8 +5,8 @@ description: Rune app structure as used by agentd - AppSpec, App hooks, the view
 
 # Rune app structure
 
-Verified against Rune rev `ba5e7c8` (the pin in `Cargo.toml`). If the pin has moved, check anything you rely on.
-Source, when this isn't enough: `~/.cargo/git/checkouts/rune-c9b805e9ed8a3730/ba5e7c8/crates/rune`. Use the file map at the end.
+Verified against Rune rev `7dfaa8f` (the pin in `Cargo.toml`). If the pin has moved, check anything you rely on.
+Source, when this isn't enough: `~/.cargo/git/checkouts/rune-c9b805e9ed8a3730/7dfaa8f/crates/rune`. Use the file map at the end.
 
 ## The loop
 

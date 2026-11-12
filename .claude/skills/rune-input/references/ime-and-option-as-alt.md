@@ -6,10 +6,11 @@
 - `App::on_ime` gets `Ime::Preedit(String, Option<(usize, usize)>)` (empty ends it), `Ime::Commit(String)`, `Ime::Enabled`, `Ime::Disabled`. Return true if taken. Native windows only.
 - Plain typing still arrives once, as `Key::Text`. `Commit` only carries what the IME composed.
 - Toggling `.ime_cursor()` off cancels a composition, so keep it stable. Programs hide the cursor while redrawing, so remember the last caret position rather than dropping the element.
+- When the window goes inactive mid-composition, `on_ime` hears `Ime::Commit` with the last preedit (`Runtime::finish_composition`), as a browser keeps it; the composition is not discarded.
 
 ## Option as Alt: the constraint
 
-Still true at `ba5e7c8`: Rune has no `option_as_alt` setting (no use of it or of winit's `WindowExtMacOS`), and `WindowHandle` doesn't expose the winit `Window` that would set it (`window()` is `pub(super)`; only `with_raw_handle` is public).
+Still true at `7dfaa8f`: Rune has no `option_as_alt` setting (no use of it or of winit's `WindowExtMacOS`), and `WindowHandle` doesn't expose the winit `Window` that would set it (`window()` is `pub(super)`; only `with_raw_handle` is public).
 
 In winit's `keyDown`, when `ime_allowed` is true, `interpretKeyEvents` runs first. ⌥E, ⌥U, ⌥I, ⌥N and ⌥\` on a US layout become marked text and no `KeyboardInput` is queued, so neither `on_key` nor physical input sees them.
 

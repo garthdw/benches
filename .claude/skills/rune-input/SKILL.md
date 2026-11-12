@@ -5,7 +5,7 @@ description: Rune input behaviour as used by agentd - key routing, physical keys
 
 # Rune input
 
-Verified against Rune rev `ba5e7c8` and winit 0.30.13. If the pin has moved, check anything you rely on.
+Verified against Rune rev `7dfaa8f` and winit 0.30.13. If the pin has moved, check anything you rely on.
 
 ## Key routing (first taker wins)
 
@@ -42,6 +42,6 @@ Making the terminal `.focusable(true)` moves it out of step 3 and exposes Tab an
 | Physical dispatch | `src/runtime/input/physical.rs`, `src/input/physical_input.rs` |
 | App IME | `src/runtime/input/app_ime.rs`, `src/edit/ime.rs` |
 | Wheel, buttons | `src/input/canvas_input.rs`, `src/runtime/input/gesture.rs` |
-| `Drag`, `PointerEvent` | `src/el.rs` |
+| `Drag`, `PointerEvent` | `src/el/handlers.rs` |
 | Clipboard | `src/clipboard/tx.rs`, `src/clipboard/content.rs` |
 | Worked example | `examples/canvas_input.rs` |
