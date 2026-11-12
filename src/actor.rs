@@ -186,11 +186,15 @@ impl Actor {
         })?;
         terminal.on_pwd_changed({
             let reported_cwd = self.reported_cwd.clone();
+            let hostname = nix::unistd::gethostname()
+                .log_err("read hostname")
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_default();
             move |terminal| {
                 let directory = terminal
                     .pwd()
                     .log_err("read reported directory")
-                    .and_then(reported_directory);
+                    .and_then(|reported| reported_directory(reported, &hostname));
                 *reported_cwd.lock().unwrap_or_else(PoisonError::into_inner) = directory;
             }
         })?;

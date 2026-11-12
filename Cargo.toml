@@ -13,7 +13,7 @@ wgpu = { version = "~30.0.1", default-features = false }
 bytemuck = { version = "1", features = ["derive"] }
 crossbeam-channel = "0.5"
 libc = "0.2"
-nix = { version = "0.31", features = ["term", "fs", "signal", "poll"] }
+nix = { version = "0.31", features = ["term", "fs", "signal", "poll", "hostname"] }
 objc2-core-foundation = "0.3"
 objc2-core-graphics = "0.3"
 objc2-core-text = "0.3"
