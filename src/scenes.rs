@@ -116,21 +116,21 @@ pub(crate) const SCENES: &[Scene] = &[
     ("workspace", show_workspace_scene),
     ("palette", |state| {
         show_workspace_scene(state);
-        state.palette = TextEdit::new("lz");
-        state.palette_open = true;
+        state.palette.edit = TextEdit::new("lz");
+        state.palette.open = true;
     }),
     ("palette-error", |state| {
         show_workspace_scene(state);
         add_scene_tray(state);
-        state.palette = TextEdit::new("site");
-        state.palette_open = true;
-        state.palette_error = Some("✗ Branch site already exists".to_owned());
+        state.palette.edit = TextEdit::new("site");
+        state.palette.open = true;
+        state.palette.error = Some("✗ Branch site already exists".to_owned());
     }),
     ("worktrees", |state| {
         show_workspace_scene(state);
-        state.palette = TextEdit::new("site");
-        state.palette_open = true;
-        state.worktrees = Some(WorktreeChoice {
+        state.palette.edit = TextEdit::new("site");
+        state.palette.open = true;
+        state.palette.worktrees = Some(WorktreeChoice {
             root: PathBuf::from("/Users/me/dev/site"),
             pending: None,
             found: vec![
