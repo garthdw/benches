@@ -5,13 +5,15 @@ edition = "2024"
 publish = false
 
 [dependencies]
-rune = { git = "https://github.com/anomalyco/rune", rev = "7dfaa8fb1fa8281e6e2ccc92568d95262e9c6f3c", features = [
+rune = { git = "https://github.com/anomalyco/rune", rev = "05d1ddf0480c35484e22380d729388b8e14609a1", features = [
   "native-file-dialog",
 ] }
-libghostty-vt = { git = "https://github.com/Uzaaft/libghostty-rs", rev = "cd4d497e8c698b27054a677ce19d1bd1a1a4d8bf", features = ["png"] }
+libghostty-vt = { git = "https://github.com/Uzaaft/libghostty-rs", rev = "cd4d497e8c698b27054a677ce19d1bd1a1a4d8bf", features = [
+  "png",
+] }
 wgpu = { version = "~30.0.1", default-features = false }
 bytemuck = { version = "1", features = ["derive"] }
-base64 = "0.22"
+base64 = "0.23.1"
 crossbeam-channel = "0.5"
 libc = "0.2"
 nix = { version = "0.31", features = ["term", "fs", "signal", "poll", "hostname", "user"] }
@@ -46,6 +48,12 @@ objc2-user-notifications = { version = "0.3", default-features = false, features
 
 [dev-dependencies]
 tempfile = "3.27.0"
+
+# Rune's vendored copies (its macOS IME calls need its winit); a dependency's `[patch]` doesn't
+# reach the app's workspace. The wgpu-hal and accesskit_windows patches are Windows-only.
+[patch.crates-io]
+winit = { git = "https://github.com/anomalyco/rune", rev = "05d1ddf0480c35484e22380d729388b8e14609a1" }
+parley_engine = { git = "https://github.com/anomalyco/rune", rev = "05d1ddf0480c35484e22380d729388b8e14609a1" }
 
 [profile.release]
 lto = "thin"

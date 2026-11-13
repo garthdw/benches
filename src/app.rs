@@ -776,7 +776,7 @@ pub(crate) fn on_key(state: &mut State, event: &KeyEvent, tx: &mut Tx) -> bool {
 
 pub(crate) fn on_ime(state: &mut State, ime: &Ime, _: &mut Tx) -> bool {
     match ime {
-        Ime::Preedit(preedit, _) => {
+        Ime::Preedit(preedit, ..) => {
             state.preedit.clone_from(preedit);
             true
         }
@@ -1109,7 +1109,7 @@ mod tests {
         state.workspace.set_window_focused(true);
         on_ime(
             &mut state,
-            &Ime::Preedit("leaked".to_owned(), None),
+            &Ime::Preedit("leaked".to_owned(), None, Vec::new()),
             &mut tx,
         );
         state.workspace.set_window_focused(false);
