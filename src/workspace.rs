@@ -476,11 +476,13 @@ impl Workspace {
                 Slot::Tab(index) => {
                     project.active_tab = index;
                     project.drawer_focused = false;
+                    project.overlay_open = false;
                 }
                 Slot::Tray(index) => {
                     project.drawer = index;
                     project.drawer_open = true;
                     project.drawer_focused = true;
+                    project.overlay_open = false;
                 }
                 Slot::Overlay => project.overlay_open = true,
             }
@@ -1044,6 +1046,24 @@ mod tests {
         assert_eq!(workspace.focused_session().map(Session::id), Some(vim));
         workspace.reveal(0);
         assert_eq!(workspace.focused_session().map(Session::id), Some(vim));
+    }
+
+    #[test]
+    fn revealing_a_tab_or_tray_process_closes_the_overlay() {
+        let mut workspace = tray_workspace();
+        let vim = workspace.projects[1].tabs[0].session.id();
+        let test = workspace.projects[1].tray[1].session.id();
+        for target in [vim, test] {
+            workspace.show_overlay(Some(tab("lazygit")));
+            workspace.reveal(target);
+            let project = &workspace.projects[1];
+            assert!(!project.overlay_open);
+            assert_eq!(workspace.focused_session().map(Session::id), Some(target));
+            assert_eq!(
+                project.overlay.as_ref().map(|tab| tab.session.visibility()),
+                Some(Visibility::Hidden)
+            );
+        }
     }
 
     #[test]
