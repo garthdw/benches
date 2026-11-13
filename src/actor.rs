@@ -251,6 +251,7 @@ impl Actor {
             presentation: Presentation::default(),
             next_blink: None,
             visibility: Visibility::Shown,
+            failing: false,
         }));
 
         let pty_input = self.input.clone();
@@ -264,7 +265,7 @@ impl Actor {
             publisher.hold_started = held.then(Instant::now);
             // Keep the finished frame from before the hold, or a program that redraws constantly looks frozen.
             if held && publisher.visible() && Instant::now() >= publisher.next_frame {
-                publisher.publish(terminal).log_err("publish held frame");
+                publisher.publish_logged(terminal);
             }
         })?;
 
@@ -588,7 +589,7 @@ impl Actor {
                 && (tick_animation || animation_due.is_some_and(|due| Instant::now() >= due))
             {
                 tick_animation = false;
-                let elapsed = u64::try_from(animation_epoch.elapsed().as_millis())?;
+                let elapsed = animation_epoch.elapsed().as_millis() as u64;
                 animation_due = terminal
                     .kitty_graphics_animation_tick(elapsed)
                     .log_err("tick animations")
@@ -631,8 +632,8 @@ impl Actor {
                 {
                     publisher.builder.set_search(highlights, found);
                 }
-                publisher.publish(&terminal)?;
-                dirty = false;
+                // A failed publish stays dirty so the next frame retries, rather than ending the tab.
+                dirty = !publisher.publish_logged(&terminal);
             }
         }
     }
@@ -741,6 +742,7 @@ struct Publisher {
     presentation: Presentation,
     next_blink: Option<Instant>,
     visibility: Visibility,
+    failing: bool,
 }
 
 impl Publisher {
@@ -774,6 +776,26 @@ impl Publisher {
             self.presentation.cursor_on = true;
             self.next_blink = Some(now + BLINK);
         }
+    }
+
+    /// A publish that keeps failing is retried every frame, so only the first failure of a streak is logged.
+    fn publish_logged(&mut self, terminal: &Terminal<'static, '_>) -> bool {
+        match self.publish(terminal) {
+            Ok(()) => self.note_publish(false),
+            Err(error) => {
+                if self.note_publish(true) {
+                    eprintln!("agentd: publish: {error:#}");
+                }
+                false
+            }
+        }
+    }
+
+    /// Records an attempt's outcome; true when it is the first failure since a success.
+    fn note_publish(&mut self, failed: bool) -> bool {
+        let first_failure = failed && !self.failing;
+        self.failing = failed;
+        first_failure
     }
 
     fn publish(&mut self, terminal: &Terminal<'static, '_>) -> Result<()> {
@@ -845,6 +867,7 @@ mod tests {
             presentation: Presentation::default(),
             next_blink: None,
             visibility: Visibility::Shown,
+            failing: false,
         }
     }
     const DUPLICATED_COMMAND: &[u8] =
@@ -984,6 +1007,15 @@ mod tests {
         };
         debounce.request(rescaled, now);
         assert_eq!(debounce.take_due(now), Some(rescaled));
+    }
+    #[test]
+    fn only_the_first_failure_of_a_streak_is_logged() {
+        let mut publisher = idle_publisher(Instant::now());
+        let logged: Vec<bool> = [true, true, false, true, true]
+            .into_iter()
+            .map(|failed| publisher.note_publish(failed))
+            .collect();
+        assert_eq!(logged, [true, false, false, true, false]);
     }
     #[test]
     fn a_held_frame_sleeps_until_the_hold_deadline() {
