@@ -385,9 +385,14 @@ mod tests {
         move_to_new_window(&mut state, 0, None);
 
         let (second_waker, second_wakes) = counting_waker();
-        let mut second = second_window(&state.fleet, 1);
-        second.state.waker = Some(second_waker);
-        second.frame(1.0 / 60.0);
+        let second_state = State {
+            fleet: state.fleet.clone(),
+            window: 1,
+            waker: Some(second_waker),
+            ..State::default()
+        };
+        second_state.fleet.register(1, std::sync::Arc::new(|| {}));
+        let mut second = runtime_with(second_state);
         assert_eq!(second.state.workspace.projects.len(), 1);
         let before = first_wakes.load(Ordering::Relaxed);
 

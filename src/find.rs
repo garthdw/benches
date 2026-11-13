@@ -151,7 +151,6 @@ mod tests {
     fn the_find_bar_closes_when_keys_move_to_another_tab() {
         let mut runtime = workspace_runtime();
         runtime.state.started = true;
-        runtime.poll = Some(crate::app::poll);
         press(&mut runtime, Key::Command('f'), command());
         runtime.frame(2.0 / 60.0);
         press(&mut runtime, Key::Command('2'), command());
