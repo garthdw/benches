@@ -1286,6 +1286,11 @@ impl TerminalCompositor {
                 slot.quads = quad_buffer(device, (bytes.len() as u64).next_power_of_two());
             }
             queue.write_buffer(&slot.quads, 0, bytes);
+            // A reset in this build garbled slots built earlier this frame; their stale epoch
+            // rebuilds them, but only if a frame comes.
+            if built.3 != atlas.epoch {
+                (source.waker())();
+            }
             // Left unbuilt while glyphs are missing, so the frame their arrival wakes redraws it.
             built.3 = atlas.epoch;
             slot.built = (!atlas.missing).then_some(built);
