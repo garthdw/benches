@@ -1,6 +1,6 @@
 ---
 name: rune-input
-description: Rune input behaviour as used by agentd - key routing, physical keys, IME, the Option-as-Alt constraint, pointer drag, wheel, clipboard. Use when changing input.rs, on_key, mouse reporting, selection gestures, scrolling, paste/copy or IME, instead of reading the Rune source.
+description: Rune input behaviour as used by agentd - key routing, physical keys, IME, Option as Alt, pointer drag, wheel, clipboard. Use when changing input.rs, on_key, mouse reporting, selection gestures, scrolling, paste/copy or IME, instead of reading the Rune source.
 ---
 
 # Rune input
@@ -28,7 +28,7 @@ Making the terminal `.focusable(true)` moves it out of step 3 and exposes Tab an
 | Task | Reference |
 |---|---|
 | `Key`, `Mods`, `Command(c)`, Ctrl and dead-key quirks, `on_physical_input` | [references/keys.md](references/keys.md) |
-| IME preedit and commit, `.ime_cursor()`, why Option-as-Alt is limited | [references/ime-and-option-as-alt.md](references/ime-and-option-as-alt.md) |
+| IME preedit and commit, `.ime_cursor()`, Option as Alt | [references/ime-and-option-as-alt.md](references/ime-and-option-as-alt.md) |
 | `on_drag`, pointer move, hover, buttons, `on_wheel` | [references/pointer-and-wheel.md](references/pointer-and-wheel.md) |
 | Copy, read, paste, ⌘C/⌘V routing | [references/clipboard.md](references/clipboard.md) |
 

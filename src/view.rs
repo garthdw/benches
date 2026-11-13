@@ -432,15 +432,13 @@ fn confirm_bar(
 fn focus_overlays(state: &State, theme: &tok::Theme) -> Vec<El> {
     let mut overlays = Vec::new();
     if let Some([x, y, width, height]) = state.caret {
-        // winit routes Option through the input method while one is active, which eats Alt chords.
-        if !state.option_held || !state.preedit.is_empty() {
-            overlays.push(
-                el().key("caret")
-                    .absolute(x, y)
-                    .size(width, height)
-                    .ime_cursor(),
-            );
-        }
+        overlays.push(
+            el().key("caret")
+                .absolute(x, y)
+                .size(width, height)
+                .ime_cursor()
+                .ime_option_as_alt(true),
+        );
         if !state.preedit.is_empty() {
             overlays.push(
                 el().key("preedit")

@@ -76,7 +76,6 @@ pub(crate) struct State {
     pub(crate) confirms: Vec<Confirm>,
     pub(crate) hovered_project: Option<usize>,
     pub(crate) preedit: String,
-    pub(crate) option_held: bool,
     pub(crate) caret: Option<[f32; 4]>,
     pub(crate) palette: Palette,
     pub(crate) find: Find,
@@ -847,7 +846,6 @@ pub(crate) fn window_app(
         .compositor(crate::render::TerminalCompositor::default())
         .on_ime(on_ime)
         .on_modifiers(|state, mods, _| {
-            state.option_held = mods.alt;
             for tab in state.workspace.tabs_mut() {
                 tab.session.command_held(mods.logo);
             }
@@ -1016,33 +1014,6 @@ mod tests {
         runtime.frame(1.0 / 60.0);
         runtime.frame(2.0 / 60.0);
         assert!(runtime.find("paste-confirm").is_none());
-    }
-
-    #[test]
-    fn holding_option_removes_the_ime_caret() {
-        let caret = Some([1.0, 1.0, 8.0, 16.0]);
-        let shown = runtime_with(State {
-            caret,
-            ..State::default()
-        });
-        assert!(shown.find("caret").is_some());
-        let held = runtime_with(State {
-            caret,
-            option_held: true,
-            ..State::default()
-        });
-        assert!(held.find("caret").is_none());
-    }
-
-    #[test]
-    fn holding_option_keeps_the_caret_during_a_composition() {
-        let composing = runtime_with(State {
-            caret: Some([1.0, 1.0, 8.0, 16.0]),
-            option_held: true,
-            preedit: "に".to_owned(),
-            ..State::default()
-        });
-        assert!(composing.find("caret").is_some());
     }
 
     fn secure_input_state() -> State {
