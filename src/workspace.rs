@@ -170,14 +170,20 @@ impl Project {
         }
     }
 
-    /// The strongest signal among its tabs; a failed tray process alerts too.
+    /// The strongest signal among its sessions; a failed tray process alerts too.
     pub fn attention(&self) -> Attention {
         let failed = self
             .tray
             .iter()
             .any(|tab| matches!(tab.status, Status::Failed(_)));
-        let tabs = self.tabs.iter().map(|tab| tab.session.attention()).max();
-        tabs.unwrap_or_default().max(if failed {
+        let sessions = self
+            .tabs
+            .iter()
+            .chain(&self.tray)
+            .chain(&self.overlay)
+            .map(|tab| tab.session.attention())
+            .max();
+        sessions.unwrap_or_default().max(if failed {
             Attention::Alert
         } else {
             Attention::None
@@ -1062,6 +1068,31 @@ mod tests {
         let mut workspace = tray_workspace();
         workspace.projects[1].tray[0].exited(exit_status(1));
         assert_eq!(workspace.projects[1].attention(), Attention::Alert);
+    }
+
+    #[test]
+    fn an_alerted_tray_process_alerts_its_project() {
+        let mut workspace = tray_workspace();
+        workspace.projects[1].tray[0].session.alert();
+        assert_eq!(workspace.projects[1].attention(), Attention::Alert);
+        workspace.toggle_drawer(0);
+        assert_eq!(workspace.projects[1].attention(), Attention::None);
+    }
+
+    #[test]
+    fn an_alerted_overlay_alerts_its_project() {
+        let mut workspace = workspace();
+        workspace.show_overlay(Some(tab("lazygit")));
+        workspace.hide_overlay();
+        workspace.projects[1]
+            .overlay
+            .as_ref()
+            .unwrap()
+            .session
+            .alert();
+        assert_eq!(workspace.projects[1].attention(), Attention::Alert);
+        workspace.show_overlay(None);
+        assert_eq!(workspace.projects[1].attention(), Attention::None);
     }
 
     #[test]
