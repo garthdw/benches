@@ -16,12 +16,16 @@ use crate::view::view;
 use crate::windows::{Fleet, WindowId};
 use crate::workspace::{Project, Workspace};
 
-pub(crate) fn runtime_with(state: State) -> Runtime<State> {
+// `started` keeps the first poll from spawning a real shell.
+pub(crate) fn runtime_with(mut state: State) -> Runtime<State> {
     let env = Env {
         system_dark: true,
         scale: 2.0,
     };
+    state.started = true;
     let mut runtime = Runtime::new(state, view, (960.0, 640.0), env);
+    runtime.poll = Some(poll);
+    runtime.on_key = Some(on_key);
     runtime.frame(0.0);
     runtime
 }
@@ -33,9 +37,7 @@ pub(crate) fn workspace_state() -> State {
 }
 
 pub(crate) fn workspace_runtime() -> Runtime<State> {
-    let mut runtime = runtime_with(workspace_state());
-    runtime.on_key = Some(on_key);
-    runtime
+    runtime_with(workspace_state())
 }
 
 pub(crate) fn palette_runtime() -> Runtime<State> {
@@ -106,13 +108,10 @@ pub(crate) fn second_window(fleet: &Fleet, window: WindowId) -> Runtime<State> {
     let state = State {
         fleet: fleet.clone(),
         window,
-        started: true,
         ..State::default()
     };
     state.fleet.register(window, Arc::new(|| {}));
-    let mut runtime = runtime_with(state);
-    runtime.poll = Some(poll);
-    runtime
+    runtime_with(state)
 }
 
 /// Stands in for the login shell, so no real `wt` runs. It records its arguments and runs `body`.

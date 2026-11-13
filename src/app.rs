@@ -897,7 +897,6 @@ mod tests {
         let mut state = State::default();
         show_scene(&mut state, b"$ ");
         let mut runtime = runtime_with(state);
-        runtime.poll = Some(poll);
         runtime.frame(1.0 / 60.0);
         let commits = runtime.stats.commits;
         let session = runtime.state.workspace.active_session().unwrap();
@@ -993,19 +992,9 @@ mod tests {
         assert_eq!(KEYS_AFTER_TERMINAL_CLICK.load(Ordering::SeqCst), 1);
     }
 
-    fn with_pending_paste() -> Runtime<State> {
-        runtime_with(State {
-            confirms: vec![Confirm::Paste {
-                session: 0,
-                text: "rm -rf x\n".to_owned(),
-            }],
-            ..State::default()
-        })
-    }
-
     #[test]
     fn cancel_dismisses_the_paste_bar() {
-        let mut runtime = with_pending_paste();
+        let mut runtime = pending_clipboard(pending_paste);
         let (x, y) = runtime.find("paste-confirm-no").unwrap();
         runtime.pointer_down(x, y);
         runtime.pointer_up(x, y);
@@ -1016,8 +1005,7 @@ mod tests {
 
     #[test]
     fn escape_dismisses_the_paste_bar() {
-        let mut runtime = with_pending_paste();
-        runtime.on_key = Some(on_key);
+        let mut runtime = pending_clipboard(pending_paste);
         runtime.key(KeyEvent {
             key: Key::Escape,
             mods: Mods::default(),
@@ -1227,7 +1215,6 @@ mod tests {
         let mut state = State::default();
         show_scene(&mut state, SCENE_FIXTURE);
         let mut runtime = runtime_with(state);
-        runtime.on_key = Some(on_key);
         for chord in chords {
             press(&mut runtime, Key::Command(*chord), command());
         }
@@ -1279,7 +1266,6 @@ mod tests {
         let mut state = State::default();
         show_scene(&mut state, SCENE_FIXTURE);
         let mut runtime = runtime_with(state);
-        runtime.on_key = Some(on_key);
         press(&mut runtime, Key::Command('b'), command());
         runtime.frame(2.0 / 60.0);
         let sliding = sidebar_width(&runtime);
@@ -1354,9 +1340,7 @@ mod tests {
     fn command_tab_runtime() -> Runtime<State> {
         let mut state = workspace_state();
         state.workspace.projects[0].tabs[0].command = Some("claude".to_owned());
-        let mut runtime = runtime_with(state);
-        runtime.on_key = Some(on_key);
-        runtime
+        runtime_with(state)
     }
 
     fn tab_titles(runtime: &Runtime<State>) -> Vec<&str> {
@@ -1547,9 +1531,7 @@ mod tests {
     fn tray_runtime() -> Runtime<State> {
         let mut state = workspace_state();
         add_scene_tray(&mut state);
-        let mut runtime = runtime_with(state);
-        runtime.on_key = Some(on_key);
-        runtime
+        runtime_with(state)
     }
 
     fn drawer_height(runtime: &Runtime<State>) -> f32 {
@@ -1620,9 +1602,7 @@ mod tests {
             .workspace
             .show_overlay(Some(fixture_tab("lazygit", b"")));
         state.workspace.hide_overlay();
-        let mut runtime = runtime_with(state);
-        runtime.on_key = Some(on_key);
-        runtime
+        runtime_with(state)
     }
 
     #[test]
@@ -1648,7 +1628,6 @@ mod tests {
     #[test]
     fn the_first_command_g_starts_an_overlay_for_the_project() {
         let mut runtime = runtime_with(workspace_state());
-        runtime.on_key = Some(on_key);
         press(&mut runtime, Key::Command('g'), command());
         assert!(overlay_id(&runtime).is_some());
         let titles: Vec<_> = runtime.state.workspace.projects[0]
@@ -1699,7 +1678,6 @@ mod tests {
         );
         state.workspace.show_overlay(Some(tab));
         let mut runtime = runtime_with(state);
-        runtime.poll = Some(poll);
         let deadline = std::time::Instant::now() + Duration::from_secs(15);
         let mut frame = 1.0;
         while runtime
@@ -1730,7 +1708,6 @@ mod tests {
         let tab = state.spawn_tab("lazygit", Some("sleep 0.2"), Path::new("/tmp"));
         state.workspace.show_overlay(Some(tab));
         let mut runtime = runtime_with(state);
-        runtime.poll = Some(poll);
         let deadline = std::time::Instant::now() + Duration::from_secs(15);
         let mut frame = 1.0;
         while runtime.state.workspace.overlay_sessions().count() > 0 {
@@ -1765,9 +1742,7 @@ mod tests {
             .workspace
             .add_project(Project::new("/tmp".into(), vec![]));
         open_tray(&mut state, command);
-        let mut runtime = runtime_with(state);
-        runtime.poll = Some(poll);
-        runtime
+        runtime_with(state)
     }
 
     fn poll_until(runtime: &mut Runtime<State>, done: impl Fn(&Tab) -> bool) {
@@ -1811,7 +1786,6 @@ mod tests {
         }
         state.workspace.select_tab(0);
         let mut runtime = runtime_with(state);
-        runtime.poll = Some(poll);
         let mut frame = 1.0;
         wait_until(
             Duration::from_secs(15),
@@ -1855,7 +1829,6 @@ mod tests {
     }
 
     fn run_tray_action_from_palette(runtime: &mut Runtime<State>, query: &str) {
-        runtime.on_key = Some(on_key);
         press(runtime, Key::Command('p'), command());
         press(runtime, Key::Text(query.into()), Mods::default());
         runtime.state.palette.selected = 2;
@@ -1896,7 +1869,6 @@ mod tests {
         }
         open_tray(&mut state, "sleep 100");
         let mut runtime = runtime_with(state);
-        runtime.poll = Some(poll);
         let in_usr_bin = |tab: &Tab| tab.session.cwd() == Some("/usr/bin".into());
         poll_until(&mut runtime, in_usr_bin);
         let old = runtime.state.workspace.projects[0].tray[0].session.id();
@@ -1923,10 +1895,15 @@ mod tests {
         let session = state.session().map(Session::id).unwrap();
         state.confirms.push(confirm(session));
         let mut runtime = runtime_with(state);
-        runtime.on_key = Some(on_key);
-        runtime.poll = Some(poll);
         runtime.frame(1.0 / 60.0);
         runtime
+    }
+
+    fn pending_paste(session: u64) -> Confirm {
+        Confirm::Paste {
+            session,
+            text: "rm -rf x\n".to_owned(),
+        }
     }
 
     fn pending_read(session: u64) -> Confirm {
@@ -1986,7 +1963,6 @@ mod tests {
             text: "rm -rf x\n".to_owned(),
         });
         let mut runtime = runtime_with(state);
-        runtime.poll = Some(poll);
         runtime.frame(1.0 / 60.0);
         assert!(runtime.find("paste-confirm").is_some());
         click(&mut runtime, "tab-1");
@@ -2038,7 +2014,7 @@ mod tests {
         let mut state = State::default();
         state.config.working_directory = tmp.clone();
         let mut runtime = runtime_with(state);
-        runtime.poll = Some(poll);
+        runtime.state.started = false;
         runtime.frame(1.0 / 60.0);
         let project = &runtime.state.workspace.projects[0];
         assert_eq!(project.root, tmp);
@@ -2058,7 +2034,6 @@ mod tests {
             started: true,
             ..State::default()
         });
-        runtime.poll = Some(poll);
         runtime.frame(1.0 / 60.0);
         let launched = |runtime: &Runtime<State>| -> Vec<bool> {
             let projects = &runtime.state.workspace.projects;
@@ -2111,8 +2086,6 @@ mod tests {
             .add_project(Project::new("/tmp".into(), vec![]));
         open_tab(&mut state, "quick", Some("sh -c 'exit 0'"));
         let mut runtime = runtime_with(state);
-        runtime.poll = Some(poll);
-        runtime.on_key = Some(on_key);
         let old = runtime.state.workspace.active_session().map(Session::id);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
         let mut frame = 1.0;
@@ -2232,6 +2205,7 @@ mod tests {
             .state
             .workspace
             .add_project(Project::new("/tmp".into(), vec![]));
+        second.shell_request = None;
         second.frame(2.0 / 60.0);
         assert_eq!(second.shell_request, None);
     }

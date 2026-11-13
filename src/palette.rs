@@ -642,7 +642,6 @@ pub(crate) fn view(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::{on_key, poll};
     use crate::scenes::*;
     use crate::test_support::*;
     use rune::{Mods, Runtime};
@@ -1113,8 +1112,6 @@ mod tests {
         state.config.shell = shell;
         state.workspace.projects[0].root = std::env::temp_dir();
         let mut runtime = runtime_with(state);
-        runtime.on_key = Some(on_key);
-        runtime.poll = Some(poll);
         press(&mut runtime, Key::Command('p'), command());
         press(
             &mut runtime,
@@ -1222,8 +1219,6 @@ mod tests {
         state.config.shell = shell;
         state.config.jump_command = Some("j".to_owned());
         let mut runtime = runtime_with(state);
-        runtime.on_key = Some(on_key);
-        runtime.poll = Some(poll);
         press(&mut runtime, Key::Command('p'), command());
         press(&mut runtime, Key::Text("site".into()), Mods::default());
         runtime.frame(0.0);
