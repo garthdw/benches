@@ -997,7 +997,15 @@ mod tests {
 
     #[test]
     fn the_reported_directory_wins_over_the_process_directory() {
-        let session = spawn_shell();
+        let fish = Path::new("/opt/homebrew/bin/fish");
+        if !fish.exists() {
+            return;
+        }
+        let config = Config {
+            shell: fish.into(),
+            ..Config::default()
+        };
+        let session = Session::spawn(None, Path::new("/tmp"), &config, Arc::new(|| {})).unwrap();
         // Fish reports the symlink `/tmp`, where the process's directory reads `/private/tmp`.
         type_line(&session, "cd /tmp");
         wait_until(
@@ -1391,7 +1399,7 @@ mod tests {
     fn child_programs_see_the_launch_shell() {
         let session = spawn_shell();
         type_line(&session, "echo $SHELL");
-        wait_for_line(&session, "/opt/homebrew/bin/fish");
+        wait_for_line(&session, &Config::default().shell.to_string_lossy());
     }
 
     #[test]

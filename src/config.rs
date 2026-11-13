@@ -1,3 +1,4 @@
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -12,7 +13,7 @@ use crate::LogErr;
 use crate::constraint::Modifier;
 use crate::grid::{DEFAULT_BG, DEFAULT_FG};
 
-const DEFAULT_SHELL: &str = "/opt/homebrew/bin/fish";
+const FALLBACK_SHELL: &str = "/bin/zsh";
 pub const DEFAULT_FONT_FAMILY: &str = "Monaspace Neon";
 const DEFAULT_FONT_SIZE: f64 = 18.0;
 /// Ghostty's default for `notify-on-command-finish-after`.
@@ -100,7 +101,14 @@ impl Default for Theme {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            shell: PathBuf::from(DEFAULT_SHELL),
+            shell: default_shell(
+                std::env::var_os("SHELL"),
+                nix::unistd::User::from_uid(nix::unistd::getuid())
+                    .ok()
+                    .flatten()
+                    .map(|user| user.shell),
+                is_executable_file,
+            ),
             font: FontConfig {
                 family: DEFAULT_FONT_FAMILY.to_owned(),
                 size: DEFAULT_FONT_SIZE,
@@ -111,16 +119,11 @@ impl Default for Config {
                 adjust_icon_height: None,
             },
             theme: Theme::default(),
-            tabs: vec![
-                TabSpec {
-                    title: "claude".to_owned(),
-                    command: Some("claude".to_owned()),
-                },
-                TabSpec {
-                    title: "shell".to_owned(),
-                    command: None,
-                },
-            ],
+            tabs: default_tabs(claude_installed(
+                std::env::var_os("PATH"),
+                &home_dir(),
+                is_executable_file,
+            )),
             jump_command: None,
             working_directory: home_dir(),
             auto_secure_input: true,
@@ -303,7 +306,7 @@ fn default_config_text() -> String {
     format!(
         "{SCHEMA_DIRECTIVE}\n\
          # The shell new tabs run.\n\
-         shell = {shell}\n\
+         # shell = {shell}\n\
          # A Ghostty theme name or absolute path; unset uses Ghostty's theme.\n\
          # theme = \"dusk\"\n\
          # A command the command centre runs through `shell` with the query to find a folder.\n\
@@ -486,6 +489,60 @@ impl Config {
             ),
         }
     }
+}
+
+/// `$SHELL`, else the login shell from the password database, else `/bin/zsh`; the first that
+/// is an executable file. Unlike the environment, the password database is right when Finder
+/// launches the app.
+fn default_shell(
+    env_shell: Option<std::ffi::OsString>,
+    login_shell: Option<PathBuf>,
+    is_executable: impl Fn(&Path) -> bool,
+) -> PathBuf {
+    env_shell
+        .map(PathBuf::from)
+        .into_iter()
+        .chain(login_shell)
+        .find(|path| path.is_absolute() && is_executable(path))
+        .unwrap_or_else(|| PathBuf::from(FALLBACK_SHELL))
+}
+
+fn is_executable_file(path: &Path) -> bool {
+    std::fs::metadata(path)
+        .is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
+}
+
+/// Whether `claude` is installed. Tabs run through the login shell, whose `PATH` a Finder-launched
+/// app doesn't have, so the usual install directories are checked as well.
+fn claude_installed(
+    path: Option<std::ffi::OsString>,
+    home: &Path,
+    is_executable: impl Fn(&Path) -> bool,
+) -> bool {
+    let known = [
+        home.join(".local/bin"),
+        home.join(".claude/local"),
+        "/opt/homebrew/bin".into(),
+        "/usr/local/bin".into(),
+    ];
+    path.iter()
+        .flat_map(std::env::split_paths)
+        .chain(known)
+        .any(|dir| is_executable(&dir.join("claude")))
+}
+
+fn default_tabs(claude: bool) -> Vec<TabSpec> {
+    let claude = claude.then(|| TabSpec {
+        title: "claude".to_owned(),
+        command: Some("claude".to_owned()),
+    });
+    claude
+        .into_iter()
+        .chain([TabSpec {
+            title: "shell".to_owned(),
+            command: None,
+        }])
+        .collect()
 }
 
 fn home_dir() -> PathBuf {
@@ -750,6 +807,57 @@ mod tests {
         assert_eq!(font.family, "JetBrains Mono");
         assert_eq!(font.fallback_families, ["Symbols"]);
         assert!(font.features.is_empty());
+    }
+
+    #[test]
+    fn the_default_shell_prefers_the_environment_then_the_login_shell_then_zsh() {
+        let exists = |path: &Path| path.starts_with("/usr/bin");
+        let shell = |env: Option<&str>, login: Option<&str>| {
+            default_shell(env.map(Into::into), login.map(PathBuf::from), exists)
+        };
+        assert_eq!(
+            shell(Some("/usr/bin/fish"), Some("/usr/bin/bash")),
+            Path::new("/usr/bin/fish")
+        );
+        assert_eq!(
+            shell(Some("/gone/fish"), Some("/usr/bin/bash")),
+            Path::new("/usr/bin/bash")
+        );
+        assert_eq!(
+            shell(Some(""), Some("/usr/bin/bash")),
+            Path::new("/usr/bin/bash")
+        );
+        assert_eq!(shell(None, None), Path::new("/bin/zsh"));
+        assert_eq!(
+            shell(Some("fish"), Some("/gone/bash")),
+            Path::new("/bin/zsh")
+        );
+    }
+
+    #[test]
+    fn claude_is_found_on_the_path_or_in_the_usual_install_directories() {
+        let home = Path::new("/home/me");
+        let check = |path: Option<&str>, found: &'static str| {
+            claude_installed(path.map(Into::into), home, |p| p == Path::new(found))
+        };
+        assert!(check(Some("/a:/opt/x"), "/opt/x/claude"));
+        assert!(check(None, "/home/me/.local/bin/claude"));
+        assert!(check(None, "/home/me/.claude/local/claude"));
+        assert!(check(Some("/a"), "/opt/homebrew/bin/claude"));
+        assert!(check(Some("/a"), "/usr/local/bin/claude"));
+        assert!(!check(Some("/a:/b"), "/elsewhere/claude"));
+    }
+
+    #[test]
+    fn without_claude_the_default_tabs_are_just_the_shell() {
+        let titles = |claude| -> Vec<String> {
+            default_tabs(claude)
+                .into_iter()
+                .map(|tab| tab.title)
+                .collect()
+        };
+        assert_eq!(titles(true), ["claude", "shell"]);
+        assert_eq!(titles(false), ["shell"]);
     }
 
     #[test]
