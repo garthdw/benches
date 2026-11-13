@@ -5,7 +5,7 @@ use std::rc::Rc;
 use rune::{Tx, Waker, WindowSpec};
 
 use crate::LogErr;
-use crate::app::{State, save_layout, window_app};
+use crate::app::{State, refuse_clipboard_reads, save_layout, window_app};
 use crate::config::Config;
 use crate::workspace::{Project, SavedWorkspace};
 
@@ -150,6 +150,8 @@ pub(crate) fn on_close(state: &mut State, tx: &mut Tx) {
 }
 
 fn merge_into_main(state: &mut State) {
+    let confirms = std::mem::take(&mut state.confirms);
+    refuse_clipboard_reads(state, confirms);
     while let Some(project) = state.workspace.take_project(0) {
         state.fleet.send(MAIN_WINDOW, project);
     }
@@ -254,12 +256,13 @@ pub(crate) fn adopt_projects(state: &mut State) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::open_tab;
+    use crate::app::{Confirm, open_tab};
     use crate::config::Paths;
     use crate::protocol::Visibility;
     use crate::session::Session;
     use crate::test_support::*;
     use crate::view::SIDEBAR_WIDTH;
+    use libghostty_vt::effect::ClipboardLocation;
     use rune::Runtime;
     use std::cell::Cell;
     use std::sync::atomic::Ordering;
@@ -440,6 +443,47 @@ mod tests {
             Some(Visibility::Shown)
         );
         assert!(!adopt_projects(&mut main));
+    }
+
+    #[test]
+    fn closing_a_window_refuses_its_pending_clipboard_read() {
+        let (main_waker, _) = counting_waker();
+        let mut main = State {
+            waker: Some(main_waker),
+            ..State::default()
+        };
+        let mut second = State {
+            fleet: main.fleet.clone(),
+            window: 1,
+            started: true,
+            ..State::default()
+        };
+        second
+            .workspace
+            .add_project(Project::new("/tmp".into(), vec![]));
+        open_tab(
+            &mut second,
+            "ask",
+            Some(r#"sh -c 'printf "\\033]52;c;?\\007"; cat'"#),
+        );
+        let session = second.workspace.active_session().map(Session::id).unwrap();
+        second.confirms.push(Confirm::ClipboardRead {
+            session,
+            location: ClipboardLocation::Standard,
+        });
+        merge_into_main(&mut second);
+
+        assert!(adopt_projects(&mut main));
+        let session = main.workspace.active_session().unwrap();
+        wait_until(
+            std::time::Duration::from_secs(5),
+            || "the read was never refused".to_owned(),
+            || {
+                (session.grid().lines().iter())
+                    .any(|line| line.contains("]52;c;"))
+                    .then_some(())
+            },
+        );
     }
 
     #[test]
