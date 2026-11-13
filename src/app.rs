@@ -315,20 +315,20 @@ pub(crate) enum Confirm {
         session: u64,
         location: ClipboardLocation,
     },
-    /// The session whose close waits, and the project it takes whole rather than the focused tab.
-    Close {
-        session: u64,
-        project: Option<PathBuf>,
-    },
+    /// The session whose close waits.
+    Close { session: u64 },
+    /// A project's close, held whichever tab or project is focused until it is answered.
+    CloseProject { root: PathBuf },
 }
 
 impl Confirm {
-    fn session(&self) -> u64 {
+    fn session(&self) -> Option<u64> {
         match self {
             Self::Paste { session, .. }
             | Self::ClipboardWrite { session, .. }
             | Self::ClipboardRead { session, .. }
-            | Self::Close { session, .. } => *session,
+            | Self::Close { session } => Some(*session),
+            Self::CloseProject { .. } => None,
         }
     }
 }
@@ -349,13 +349,7 @@ fn request_close(state: &mut State) {
     };
     if tab.runs_program() {
         let session = tab.session.id();
-        push_confirm(
-            &mut state.confirms,
-            Confirm::Close {
-                session,
-                project: None,
-            },
-        );
+        push_confirm(&mut state.confirms, Confirm::Close { session });
     } else {
         close_focused(state);
     }
@@ -378,14 +372,9 @@ pub(crate) fn request_close_project(state: &mut State, index: usize) {
     let Some(project) = state.workspace.projects.get(index) else {
         return;
     };
-    if project.runs_program()
-        && let Some(session) = state.session()
-    {
-        let confirm = Confirm::Close {
-            session: session.id(),
-            project: Some(project.root.clone()),
-        };
-        push_confirm(&mut state.confirms, confirm);
+    if project.runs_program() {
+        let root = project.root.clone();
+        push_confirm(&mut state.confirms, Confirm::CloseProject { root });
     } else {
         state.workspace.close_project(index);
     }
@@ -435,7 +424,13 @@ pub(crate) fn resolve_confirm(state: &mut State, index: usize, confirmed: bool, 
         return;
     }
     let confirm = state.confirms.remove(index);
-    let active = Some(confirm.session()) == state.session().map(Session::id);
+    if let Confirm::CloseProject { root } = &confirm {
+        if confirmed && let Some(index) = state.workspace.project_index(root) {
+            state.workspace.close_project(index);
+        }
+        return;
+    }
+    let active = confirm.session() == state.session().map(Session::id);
     if let Confirm::ClipboardRead { session, location } = confirm {
         if confirmed && active {
             read_clipboard_for(tx, session, location);
@@ -455,12 +450,8 @@ pub(crate) fn resolve_confirm(state: &mut State, index: usize, confirmed: bool, 
                 session.paste(text, true);
             }
         }
-        Confirm::Close { project, .. } => {
-            match project.and_then(|root| state.workspace.project_index(&root)) {
-                Some(index) => state.workspace.close_project(index),
-                None => close_focused(state),
-            }
-        }
+        Confirm::Close { .. } => close_focused(state),
+        Confirm::CloseProject { .. } => {}
     }
 }
 
@@ -598,7 +589,10 @@ pub(crate) fn poll(state: &mut State, now: f64, tx: &mut Tx) -> bool {
     changed |= poll_creation(state);
     let (kept, dismissed): (Vec<_>, Vec<_>) = std::mem::take(&mut state.confirms)
         .into_iter()
-        .partition(|confirm| Some(confirm.session()) == active);
+        .partition(|confirm| match confirm {
+            Confirm::CloseProject { root } => state.workspace.project_index(root).is_some(),
+            _ => confirm.session() == active,
+        });
     state.confirms = kept;
     changed |= !dismissed.is_empty();
     refuse_clipboard_reads(state, dismissed);
@@ -1433,6 +1427,47 @@ mod tests {
         assert_eq!(runtime.state.workspace.projects[0].tray.len(), 3);
         press(&mut runtime, Key::Enter, Mods::default());
         assert_eq!(runtime.state.workspace.projects[0].tray.len(), 2);
+    }
+
+    #[test]
+    fn closing_a_background_project_asks_and_survives_polls() {
+        let mut runtime = workspace_runtime();
+        runtime.poll = Some(poll);
+        runtime.state.workspace.projects[1].tabs[0].command = Some("claude".to_owned());
+        let count = runtime.state.workspace.projects.len();
+        runtime.update(|state, _| {
+            request_close_project(state, 1);
+            request_close_project(state, 1);
+        });
+        runtime.state.workspace.select_project(1);
+        runtime.frame(1.0);
+        assert_eq!(runtime.state.confirms.len(), 1);
+        assert_eq!(runtime.state.workspace.projects.len(), count);
+        press(&mut runtime, Key::Enter, Mods::default());
+        assert_eq!(runtime.state.workspace.projects.len(), count - 1);
+    }
+
+    #[test]
+    fn closing_a_project_asks_without_a_focused_session() {
+        let mut runtime = workspace_runtime();
+        runtime.poll = Some(poll);
+        runtime.state.workspace.projects[0].tabs.clear();
+        runtime.state.workspace.projects[1].tabs[0].command = Some("claude".to_owned());
+        assert!(runtime.state.session().is_none());
+        runtime.update(|state, _| request_close_project(state, 1));
+        runtime.frame(1.0);
+        assert_eq!(runtime.state.confirms.len(), 1);
+    }
+
+    #[test]
+    fn a_project_confirm_is_dropped_once_the_project_is_gone() {
+        let mut runtime = workspace_runtime();
+        runtime.poll = Some(poll);
+        runtime.state.workspace.projects[1].tabs[0].command = Some("claude".to_owned());
+        runtime.update(|state, _| request_close_project(state, 1));
+        runtime.update(|state, _| state.workspace.close_project(1));
+        runtime.frame(1.0);
+        assert!(runtime.state.confirms.is_empty());
     }
 
     #[test]

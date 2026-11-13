@@ -467,15 +467,20 @@ fn focus_overlays(state: &State, theme: &tok::Theme) -> Vec<El> {
                 "Share your clipboard?".to_owned(),
                 "Allow",
             ),
-            Confirm::Close { project, .. } => {
-                let place = project
-                    .as_ref()
-                    .and_then(|root| state.workspace.project_index(root))
+            Confirm::Close { .. } => (
+                "close-confirm",
+                "A program is still running here".to_owned(),
+                "Close",
+            ),
+            Confirm::CloseProject { root } => {
+                let name = state
+                    .workspace
+                    .project_index(root)
                     .and_then(|index| state.workspace.projects.get(index))
-                    .map_or("here".to_owned(), |project| format!("in {}", project.name));
+                    .map_or("here", |project| &project.name);
                 (
                     "close-confirm",
-                    format!("A program is still running {place}"),
+                    format!("A program is still running in {name}"),
                     "Close",
                 )
             }
