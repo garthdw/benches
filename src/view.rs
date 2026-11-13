@@ -359,7 +359,7 @@ fn tab_strip(state: &State, theme: &tok::Theme, accent: Color, titlebar_inset: f
             |_: &mut State, tx: &mut Tx| {
                 let menu = PopupMenu::new()
                     .item(PopupItem::new("shell", "Shell"))
-                    .item(PopupItem::new("lazygit", "lazygit"))
+                    .item(PopupItem::new("git", "Git"))
                     .item(PopupItem::new("tray", "Background command…"))
                     .item(PopupItem::new("palette", "Command centre…"));
                 tx.popup_menu(menu, "new-tab", pick_new_tab);

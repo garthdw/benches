@@ -6,7 +6,7 @@ use crate::workspace::Workspace;
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Command {
     NewShell,
-    ToggleLazygit,
+    ToggleGit,
     OpenProject,
     ChangeFolder,
     MoveToNewWindow,
@@ -54,11 +54,7 @@ const fn default(mut spec: CommandSpec) -> CommandSpec {
 /// Palette rows appear in this order, ahead of every dynamic action.
 pub const COMMANDS: &[CommandSpec] = &[
     default(spec(Command::NewShell, "New shell tab", Some("mod+t"))),
-    default(spec(
-        Command::ToggleLazygit,
-        "Toggle lazygit",
-        Some("mod+g"),
-    )),
+    default(spec(Command::ToggleGit, "Toggle git", Some("mod+g"))),
     default(spec(Command::OpenProject, "Open project…", Some("mod+n"))),
     default(CommandSpec {
         enabled: |workspace| workspace.project().is_some(),
