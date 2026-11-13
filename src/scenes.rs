@@ -256,10 +256,7 @@ pub(crate) const SCENES: &[Scene] = &[
             session,
             text: "rm -rf x\n".to_owned(),
         });
-        state.confirms.push(Confirm::Close {
-            session,
-            project: None,
-        });
+        state.confirms.push(Confirm::Close { session });
     }),
     ("secure-input", |state| {
         let mut grid = fixture_grid(b"[sudo] password for me: ");
