@@ -8,6 +8,7 @@ use rune::{El, Key, KeyEvent, TextEdit, Tx, col, text, text_input};
 
 use crate::LogErr;
 use crate::app::{State, open_project, open_tab, open_tray, run_command, tray_action};
+use crate::config::Config;
 use crate::jump;
 use crate::keymap::{COMMANDS, Command, CommandSpec, chord_hint};
 use crate::workspace::{Status, Workspace};
@@ -215,6 +216,7 @@ pub(crate) fn palette_actions(
     query: &str,
     jump: Option<&Path>,
     workspace: &Workspace,
+    config: &Config,
 ) -> Vec<Action> {
     let query = query.trim();
     let needle = query.to_lowercase();
@@ -225,7 +227,7 @@ pub(crate) fn palette_actions(
         actions.extend(
             COMMANDS
                 .iter()
-                .filter(|spec| spec.default && (spec.enabled)(workspace))
+                .filter(|spec| spec.default && (spec.enabled)(workspace, config))
                 .map(|spec| Action::Command(spec.command)),
         );
         actions.extend(jump.map(|root| Action::Jump(root.to_owned())));
@@ -233,7 +235,7 @@ pub(crate) fn palette_actions(
     }
     let mut matched: Vec<(&CommandSpec, Match)> = COMMANDS
         .iter()
-        .filter(|spec| (spec.enabled)(workspace))
+        .filter(|spec| (spec.enabled)(workspace, config))
         .filter_map(|spec| Some((spec, fuzzy_match(spec.label, query)?)))
         .collect();
     matched.sort_by_key(|(_, found)| Reverse(found.score));
@@ -333,6 +335,7 @@ fn run_palette(state: &mut State, index: usize, tx: &mut Tx) {
         &state.palette.edit.text,
         state.jump_target(),
         &state.workspace,
+        &state.config,
     );
     let Some(action) = actions.get(index.min(actions.len().saturating_sub(1))) else {
         return;
@@ -445,6 +448,7 @@ fn palette_key(state: &mut State, event: &KeyEvent, tx: &mut Tx) -> bool {
         &state.palette.edit.text,
         state.jump_target(),
         &state.workspace,
+        &state.config,
     );
     let last = actions.len().saturating_sub(1);
     match event.key {
@@ -560,6 +564,7 @@ pub(crate) fn view(
                 &state.palette.edit.text,
                 state.jump_target(),
                 &state.workspace,
+                &state.config,
             );
             let selected = state.palette.selected.min(actions.len().saturating_sub(1));
             actions
@@ -705,7 +710,7 @@ mod tests {
     #[test]
     fn the_command_centre_filters_by_letters_in_order() {
         assert_eq!(
-            palette_actions("tlgt", None, &one_project()),
+            palette_actions("tlgt", None, &one_project(), &Config::default()),
             [
                 Action::Run("tlgt".to_owned()),
                 Action::Tray("tlgt".to_owned()),
@@ -713,7 +718,7 @@ mod tests {
             ]
         );
         assert_eq!(
-            palette_actions("", None, &one_project()),
+            palette_actions("", None, &one_project(), &Config::default()),
             [
                 Action::Command(Command::NewShell),
                 Action::Command(Command::ToggleGit),
@@ -722,13 +727,27 @@ mod tests {
             ]
         );
         assert!(
-            !palette_actions("", None, &Workspace::default())
+            !palette_actions("", None, &Workspace::default(), &Config::default())
                 .contains(&Action::Command(Command::ChangeFolder))
         );
     }
 
+    #[test]
+    fn a_blank_git_command_hides_toggle_git() {
+        let config = Config {
+            git_command: Some(" ".to_owned()),
+            ..Config::default()
+        };
+        for query in ["", "git"] {
+            assert!(
+                !palette_actions(query, None, &one_project(), &config)
+                    .contains(&Action::Command(Command::ToggleGit))
+            );
+        }
+    }
+
     fn first_action(query: &str) -> Action {
-        palette_actions(query, None, &one_project()).remove(0)
+        palette_actions(query, None, &one_project(), &Config::default()).remove(0)
     }
 
     #[test]
@@ -764,19 +783,19 @@ mod tests {
 
     #[test]
     fn loose_matches_follow_the_run_and_tray_rows() {
-        let actions = palette_actions("ls", None, &one_project());
+        let actions = palette_actions("ls", None, &one_project(), &Config::default());
         assert_eq!(actions[2], Action::Command(Command::ToggleSidebar));
-        let actions = palette_actions("zi", None, &one_project());
+        let actions = palette_actions("zi", None, &one_project(), &Config::default());
         assert_eq!(actions[2], Action::Command(Command::ZoomIn));
     }
 
     #[test]
     fn every_command_is_searchable_but_the_palette_itself() {
-        let actions = palette_actions("tab", None, &one_project());
+        let actions = palette_actions("tab", None, &one_project(), &Config::default());
         assert!(actions.contains(&Action::Command(Command::CloseTab)));
         assert!(actions.contains(&Action::Command(Command::NextTab)));
         assert!(
-            !palette_actions("palette", None, &one_project())
+            !palette_actions("palette", None, &one_project(), &Config::default())
                 .contains(&Action::Command(Command::Palette))
         );
     }
@@ -793,7 +812,7 @@ mod tests {
     fn the_jump_commands_folder_follows_the_fixed_actions() {
         let root = Path::new("/dev/site");
         assert_eq!(
-            palette_actions("site", Some(root), &one_project()),
+            palette_actions("site", Some(root), &one_project(), &Config::default()),
             [
                 Action::Jump(root.to_owned()),
                 Action::Run("site".to_owned()),
@@ -818,7 +837,7 @@ mod tests {
     #[test]
     fn typing_a_project_or_tab_name_offers_switching_to_it() {
         let state = workspace_state();
-        let actions = palette_actions("sit", None, &state.workspace);
+        let actions = palette_actions("sit", None, &state.workspace, &Config::default());
         assert_eq!(
             actions[..3],
             [
@@ -827,10 +846,10 @@ mod tests {
                 Action::SwitchProject(1, "site".to_owned()),
             ]
         );
-        let actions = palette_actions("lazy", None, &state.workspace);
+        let actions = palette_actions("lazy", None, &state.workspace, &Config::default());
         assert!(actions.contains(&Action::SwitchTab(0, 2, "lazygit (agentd)".to_owned())));
         assert!(
-            !palette_actions("", None, &state.workspace)
+            !palette_actions("", None, &state.workspace, &Config::default())
                 .iter()
                 .any(|action| matches!(action, Action::SwitchProject(..) | Action::SwitchTab(..)))
         );
@@ -839,7 +858,7 @@ mod tests {
     #[test]
     fn switching_comes_after_running_the_query_and_exact_names_lead_the_switches() {
         let state = workspace_state();
-        let actions = palette_actions("shell", None, &state.workspace);
+        let actions = palette_actions("shell", None, &state.workspace, &Config::default());
         assert_eq!(actions[0], Action::Command(Command::NewShell));
         assert_eq!(actions[1], Action::Run("shell".to_owned()));
         assert_eq!(actions[2], Action::Tray("shell".to_owned()));
@@ -853,7 +872,7 @@ mod tests {
     fn the_jump_folder_replaces_the_switch_to_its_open_project() {
         let state = workspace_state();
         let root = Path::new("/dev/site");
-        let actions = palette_actions("site", Some(root), &state.workspace);
+        let actions = palette_actions("site", Some(root), &state.workspace, &Config::default());
         assert_eq!(actions[0], Action::Jump(root.to_owned()));
         assert!(
             !actions
@@ -864,7 +883,7 @@ mod tests {
 
     fn enter_on_switch_row(runtime: &mut Runtime<State>, query: &str, row: Action) {
         press(runtime, Key::Text(query.into()), Mods::default());
-        let actions = palette_actions(query, None, &runtime.state.workspace);
+        let actions = palette_actions(query, None, &runtime.state.workspace, &Config::default());
         runtime.state.palette.selected = actions.iter().position(|action| *action == row).unwrap();
         press(runtime, Key::Enter, Mods::default());
     }
@@ -1085,7 +1104,7 @@ mod tests {
     fn the_wt_prefix_offers_creating_a_worktree_first() {
         let workspace = one_project();
         let create = Action::CreateWorktree("feature-x".to_owned());
-        let actions = palette_actions("wt feature-x", None, &workspace);
+        let actions = palette_actions("wt feature-x", None, &workspace, &Config::default());
         assert_eq!(actions[0], create);
         assert!(actions.contains(&Action::Run("wt feature-x".to_owned())));
         for query in [
@@ -1098,13 +1117,18 @@ mod tests {
             "",
         ] {
             assert!(
-                !palette_actions(query, None, &workspace)
+                !palette_actions(query, None, &workspace, &Config::default())
                     .iter()
                     .any(|action| matches!(action, Action::CreateWorktree(_))),
                 "{query:?}"
             );
         }
-        let none = palette_actions("wt feature-x", None, &Workspace::default());
+        let none = palette_actions(
+            "wt feature-x",
+            None,
+            &Workspace::default(),
+            &Config::default(),
+        );
         assert!(!none.contains(&create));
     }
 
@@ -1260,14 +1284,14 @@ mod tests {
         stopped.status = Status::Stopped;
         workspace.add_tray(stopped);
         state.workspace = workspace;
-        let actions = palette_actions("stop", None, &state.workspace);
+        let actions = palette_actions("stop", None, &state.workspace, &Config::default());
         assert!(actions.contains(&Action::StopTray(0, "pnpm dev".to_owned())));
         assert!(
             !actions
                 .iter()
                 .any(|action| matches!(action, Action::StopTray(1, _)))
         );
-        let actions = palette_actions("restart", None, &state.workspace);
+        let actions = palette_actions("restart", None, &state.workspace, &Config::default());
         assert_eq!(
             actions[2..4],
             [
@@ -1275,10 +1299,10 @@ mod tests {
                 Action::RestartTray(1, "storybook".to_owned()),
             ]
         );
-        let actions = palette_actions("restart sto", None, &state.workspace);
+        let actions = palette_actions("restart sto", None, &state.workspace, &Config::default());
         assert_eq!(actions[2], Action::RestartTray(1, "storybook".to_owned()));
         assert!(
-            palette_actions("", None, &state.workspace)
+            palette_actions("", None, &state.workspace, &Config::default())
                 .iter()
                 .all(|action| {
                     !matches!(action, Action::RestartTray(..) | Action::StopTray(..))
@@ -1289,7 +1313,7 @@ mod tests {
     #[test]
     fn moving_a_project_is_offered_only_beside_another_project() {
         let moves = |workspace: &Workspace| {
-            palette_actions("", None, workspace)
+            palette_actions("", None, workspace, &Config::default())
                 .contains(&Action::Command(Command::MoveToNewWindow))
         };
         assert!(!moves(&one_project()));

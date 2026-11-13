@@ -121,6 +121,13 @@
       "$ref": "#/$defs/FontFile",
       "description": "The terminal font. Each key falls back to Ghostty's config."
     },
+    "git-command": {
+      "description": "The command the git overlay runs in the project's folder through `shell`. Unset runs\n`lazygit`; an empty value hides the overlay's command, chord and menu item.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
     "jump-command": {
       "description": "A command such as `j` or `zoxide query` that the command centre runs through `shell`\nwith the query to find a folder to open as a project.",
       "type": [

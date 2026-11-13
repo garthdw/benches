@@ -29,6 +29,8 @@ pub struct Config {
     /// `jump-command`: a command such as `j` or `zoxide query` that the command centre runs
     /// through `shell` with the query to find a folder to open as a project.
     pub jump_command: Option<String>,
+    /// `git-command`: the command the git overlay runs; unset is `lazygit`, blank disables it.
+    pub git_command: Option<String>,
     /// `working-directory`: the folder new projects start in, already checked to exist.
     pub working_directory: PathBuf,
     /// `auto-secure-input`: turn secure keyboard entry on while a program reads a password.
@@ -122,6 +124,7 @@ impl Default for Config {
                 },
             ],
             jump_command: None,
+            git_command: None,
             working_directory: home_dir(),
             auto_secure_input: true,
             command_finish_after: None,
@@ -149,6 +152,10 @@ struct File {
     /// with the query to find a folder to open as a project.
     #[serde(rename = "jump-command")]
     jump_command: Option<String>,
+    /// The command the git overlay runs in the project's folder through `shell`. Unset runs
+    /// `lazygit`; an empty value hides the overlay's command, chord and menu item.
+    #[serde(rename = "git-command")]
+    git_command: Option<String>,
     /// The folder new projects start in: an absolute path, `~/...`, `home`, or `inherit` (the
     /// folder agentd was launched from, which is home unless that was a terminal). Falls back to
     /// Ghostty's `working-directory`, then home.
@@ -308,6 +315,9 @@ fn default_config_text() -> String {
          # theme = \"dusk\"\n\
          # A command the command centre runs through `shell` with the query to find a folder.\n\
          # jump-command = \"zoxide query\"\n\
+         # The command the git overlay runs in the project's folder; unset runs `lazygit`, and an\n\
+         # empty value hides the overlay.\n\
+         # git-command = \"gitui\"\n\
          # The folder new projects start in: a path, `~/...`, `home` or `inherit`; unset uses\n\
          # Ghostty's `working-directory`, then home.\n\
          # working-directory = \"~/dev\"\n\
@@ -357,6 +367,12 @@ fn read_file(paths: &Paths) -> Result<File> {
 }
 
 impl Config {
+    /// The git overlay's command, or `None` when `git-command` is blank.
+    pub fn git_command(&self) -> Option<&str> {
+        let command = self.git_command.as_deref().unwrap_or("lazygit").trim();
+        (!command.is_empty()).then_some(command)
+    }
+
     /// `config.toml`, then Ghostty's config for the font and theme it leaves out, then the defaults.
     /// Problems fall back, so the app always starts; the error is why `config.toml` was skipped.
     pub fn load(paths: &Paths) -> (Self, Option<anyhow::Error>) {
@@ -454,6 +470,7 @@ impl Config {
             theme,
             tabs: file.tabs.unwrap_or(defaults.tabs),
             jump_command: file.jump_command,
+            git_command: file.git_command,
             working_directory: resolve_working_directory(
                 file.working_directory
                     .or_else(|| ghostty_value("working-directory"))
@@ -843,6 +860,21 @@ mod tests {
     fn an_unknown_ghostty_clipboard_value_falls_back_to_the_default() {
         let (_root, paths) = paths(None, Some("clipboard-read = sometimes\n"));
         assert_eq!(Config::load(&paths).0.clipboard_read, ClipboardAccess::Ask);
+    }
+
+    #[test]
+    fn git_command_defaults_to_lazygit_and_blank_disables_it() {
+        let git_command = |config: Option<&str>| {
+            let (_root, paths) = paths(config, None);
+            Config::load(&paths).0.git_command().map(str::to_owned)
+        };
+        assert_eq!(git_command(None).as_deref(), Some("lazygit"));
+        assert_eq!(
+            git_command(Some("git-command = \"gitui -t mocha\"\n")).as_deref(),
+            Some("gitui -t mocha")
+        );
+        assert_eq!(git_command(Some("git-command = \"\"\n")), None);
+        assert_eq!(git_command(Some("git-command = \"  \"\n")), None);
     }
 
     #[test]
