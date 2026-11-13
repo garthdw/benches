@@ -1410,7 +1410,7 @@ mod tests {
     #[test]
     fn a_background_job_ends_with_its_dropped_shell() {
         let session = spawn_shell();
-        type_line(&session, "sleep 4242 &; echo started");
+        type_line(&session, "sleep 4242 & echo started");
         wait_for_line(&session, "started");
         let finished = session.finished();
         drop(session);
@@ -1467,7 +1467,7 @@ mod tests {
     #[test]
     fn ctrl_c_interrupts_the_foreground_process() {
         let session = spawn_shell();
-        type_line(&session, "echo started; sleep 4343; echo slept");
+        type_line(&session, "echo started; sleep 4343 && echo slept");
         wait_for_line(&session, "started");
         wait_for_busy(&session, true);
         let ctrl_c = crate::input::map_text(

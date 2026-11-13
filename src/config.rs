@@ -103,14 +103,19 @@ impl Default for Theme {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            shell: default_shell(
-                std::env::var_os("SHELL"),
-                nix::unistd::User::from_uid(nix::unistd::getuid())
-                    .ok()
-                    .flatten()
-                    .map(|user| user.shell),
-                is_executable_file,
-            ),
+            // Tests must not start the developer's own shell and rc files.
+            shell: if cfg!(test) {
+                PathBuf::from("/bin/sh")
+            } else {
+                default_shell(
+                    std::env::var_os("SHELL"),
+                    nix::unistd::User::from_uid(nix::unistd::getuid())
+                        .ok()
+                        .flatten()
+                        .map(|user| user.shell),
+                    is_executable_file,
+                )
+            },
             font: FontConfig {
                 family: DEFAULT_FONT_FAMILY.to_owned(),
                 size: DEFAULT_FONT_SIZE,

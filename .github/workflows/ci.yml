@@ -23,7 +23,7 @@ jobs:
           version: 0.17.1
 
       # Tests use the default shell and font, and the Nerd Font `font.rs` draws icons with.
-      - run: brew install fish font-monaspace
+      - run: brew install font-monaspace
 
       - run: cargo fmt --check
       - run: cargo clippy --all-targets -- -D warnings
