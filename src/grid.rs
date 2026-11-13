@@ -508,17 +508,20 @@ fn read_cell(
     Ok(output)
 }
 
+type Shown = (
+    CursorVisualStyle,
+    bool,
+    Presentation,
+    Option<Scrollbar>,
+    u64,
+    Option<(u16, u16)>,
+);
+
 pub(crate) struct GridBuilder {
     state: RenderState<'static>,
     rows: RowIterator<'static>,
     cells: CellIterator<'static>,
-    last_shown: Option<(
-        CursorVisualStyle,
-        bool,
-        Presentation,
-        Option<Scrollbar>,
-        u64,
-    )>,
+    last_shown: Option<Shown>,
     images: ImageReader,
     /// The cells and clusters of the last build, for frames where only the presentation changed.
     content: Option<Content>,
@@ -589,14 +592,23 @@ impl GridBuilder {
             ..scrollbar
         });
         let image_generation = snapshot.image_placements_generation()?;
+        let cursor = if snapshot.cursor_visible()? && (presentation.cursor_on || !cursor_blinking) {
+            snapshot.cursor_viewport()?.map(|viewport| {
+                let x = viewport.x.saturating_sub(u16::from(viewport.at_wide_tail));
+                (x, viewport.y)
+            })
+        } else {
+            None
+        };
         let shown = (
             cursor_style,
             cursor_blinking,
             presentation,
             scrollbar,
             image_generation,
+            cursor,
         );
-        // libghostty leaves the render state clean when only the cursor's style or the scrollback length changes.
+        // libghostty leaves the render state clean when only the cursor moves within a row, hides, or changes style, or the scrollback length changes.
         let unchanged = self.last_shown.replace(shown) == Some(shown);
         if matches!(snapshot.dirty()?, Dirty::Clean) && unchanged {
             return Ok(None);
@@ -710,14 +722,6 @@ impl GridBuilder {
                 }
             }
             painted.into()
-        };
-        let cursor = if snapshot.cursor_visible()? && (presentation.cursor_on || !cursor_blinking) {
-            snapshot.cursor_viewport()?.map(|viewport| {
-                let x = viewport.x.saturating_sub(u16::from(viewport.at_wide_tail));
-                (x, viewport.y)
-            })
-        } else {
-            None
         };
         let images = self.images.read(&snapshot, terminal, image_generation)?;
         snapshot.clean()?;
@@ -1060,6 +1064,34 @@ mod tests {
         assert_eq!(
             builder.build(&terminal, 3, shown).unwrap().unwrap().cursor,
             Some((3, 2))
+        );
+    }
+
+    #[test]
+    fn a_cursor_move_within_a_row_builds_a_grid() {
+        let mut terminal = new_terminal(10, 4).unwrap();
+        let mut builder = GridBuilder::new().unwrap();
+        terminal.vt_write(b"hi");
+        let shown = Presentation::default();
+        builder.build(&terminal, 1, shown).unwrap().unwrap();
+        terminal.vt_write(b"\x1b[D");
+        assert_eq!(
+            builder.build(&terminal, 2, shown).unwrap().unwrap().cursor,
+            Some((1, 0))
+        );
+    }
+
+    #[test]
+    fn hiding_a_steady_cursor_builds_a_grid() {
+        let mut terminal = new_terminal(10, 4).unwrap();
+        let mut builder = GridBuilder::new().unwrap();
+        terminal.vt_write(b"\x1b[2 qhi");
+        let shown = Presentation::default();
+        builder.build(&terminal, 1, shown).unwrap().unwrap();
+        terminal.vt_write(b"\x1b[?25l");
+        assert_eq!(
+            builder.build(&terminal, 2, shown).unwrap().unwrap().cursor,
+            None
         );
     }
 
