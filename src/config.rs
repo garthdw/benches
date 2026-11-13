@@ -655,7 +655,7 @@ fn parse_theme(text: &str) -> Result<Theme> {
 
 fn parse_color(value: &str) -> Result<Rgb> {
     let hex = value.trim().trim_start_matches('#');
-    if hex.len() != 6 {
+    if hex.len() != 6 || !hex.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         bail!("colour {value} isn't #rrggbb");
     }
     let channel =
@@ -670,6 +670,14 @@ fn parse_color(value: &str) -> Result<Rgb> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_color_rejects_non_hex_without_panicking() {
+        for value in ["#1ä234", "#+f+f+f", "#12345g", "#12345"] {
+            assert!(parse_color(value).is_err(), "{value}");
+        }
+        assert_eq!(parse_color("#0a1B2c").unwrap().g, 0x1b);
+    }
 
     fn paths(config: Option<&str>, ghostty: Option<&str>) -> (tempfile::TempDir, Paths) {
         let root = tempfile::tempdir().unwrap();
