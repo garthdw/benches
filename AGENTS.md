@@ -13,6 +13,7 @@ cargo run                                   # open the app with a live shell
 cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test
 cargo test ctrl_c_interrupts                # single test, by name substring; some tests spawn real shells
 cargo run -- --snap out.png --scene fixture --size 620x300   # headless render of fixture VT content
+cargo run --release --features tooling -- --snap out.png --scene fixture   # release builds need `tooling` for headless flags
 cargo run -- config init                    # write a commented config.toml and its schema file; refuses to overwrite
 cargo run -- config migrate                 # refresh the schema file and the `#:schema` line of an existing config.toml
 cargo run -- config schema > schema/config.schema.json   # regenerate the committed schema

@@ -46,6 +46,10 @@ objc2-user-notifications = { version = "0.3", default-features = false, features
   "UNUserNotificationCenter",
 ] }
 
+[features]
+# Rune's headless flags (`--snap`, `--scene`) in a release build.
+tooling = ["rune/tooling"]
+
 [dev-dependencies]
 tempfile = "3.27.0"
 
