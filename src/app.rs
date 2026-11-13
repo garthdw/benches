@@ -1417,7 +1417,6 @@ mod tests {
     #[test]
     fn closing_a_background_project_asks_and_survives_polls() {
         let mut runtime = workspace_runtime();
-        runtime.poll = Some(poll);
         runtime.state.workspace.projects[1].tabs[0].command = Some("claude".to_owned());
         let count = runtime.state.workspace.projects.len();
         runtime.update(|state, _| {
@@ -1435,7 +1434,6 @@ mod tests {
     #[test]
     fn closing_a_project_asks_without_a_focused_session() {
         let mut runtime = workspace_runtime();
-        runtime.poll = Some(poll);
         runtime.state.workspace.projects[0].tabs.clear();
         runtime.state.workspace.projects[1].tabs[0].command = Some("claude".to_owned());
         assert!(runtime.state.session().is_none());
@@ -1447,7 +1445,6 @@ mod tests {
     #[test]
     fn a_project_confirm_is_dropped_once_the_project_is_gone() {
         let mut runtime = workspace_runtime();
-        runtime.poll = Some(poll);
         runtime.state.workspace.projects[1].tabs[0].command = Some("claude".to_owned());
         runtime.update(|state, _| request_close_project(state, 1));
         runtime.update(|state, _| state.workspace.close_project(1));
@@ -1631,7 +1628,6 @@ mod tests {
         let mut state = workspace_state();
         state.config.git_command = Some("sleep 5".to_owned());
         let mut runtime = runtime_with(state);
-        runtime.on_key = Some(on_key);
         press(&mut runtime, Key::Command('g'), command());
         let tab = runtime.state.workspace.projects[0]
             .overlay
@@ -1646,7 +1642,6 @@ mod tests {
         let mut state = workspace_state();
         state.config.git_command = Some(String::new());
         let mut runtime = runtime_with(state);
-        runtime.on_key = Some(on_key);
         press(&mut runtime, Key::Command('g'), command());
         assert!(runtime.state.workspace.projects[0].overlay.is_none());
         assert_eq!(overlay_id(&runtime), None);
