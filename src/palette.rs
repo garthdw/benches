@@ -40,6 +40,7 @@ pub(crate) struct JumpLookup {
     /// When to start the lookup, once typing pauses.
     due: Option<f64>,
     pending: Option<mpsc::Receiver<Option<PathBuf>>>,
+    cancel: jump::Cancel,
     found: Option<PathBuf>,
 }
 
@@ -486,6 +487,7 @@ pub(crate) fn poll_jump(state: &mut State, now: f64, tx: &mut Tx) -> bool {
         changed = jump.found.take().is_some();
         jump.query = query.to_owned();
         jump.pending = None;
+        jump.cancel.cancel().log_err("cancel jump command");
         jump.due = (!query.is_empty()).then(|| {
             tx.wake_after(JUMP_DEBOUNCE);
             now + JUMP_DEBOUNCE.as_secs_f64()
@@ -495,6 +497,8 @@ pub(crate) fn poll_jump(state: &mut State, now: f64, tx: &mut Tx) -> bool {
         jump.due = None;
         let (sender, receiver) = mpsc::channel();
         jump.pending = Some(receiver);
+        jump.cancel = jump::Cancel::default();
+        let cancel = jump.cancel.clone();
         let (shell, command, query) = (
             state.config.shell.clone(),
             command.clone(),
@@ -502,7 +506,7 @@ pub(crate) fn poll_jump(state: &mut State, now: f64, tx: &mut Tx) -> bool {
         );
         let waker = state.waker.clone();
         std::thread::spawn(move || {
-            let found = jump::lookup(&shell, &command, &query, JUMP_TIMEOUT)
+            let found = jump::lookup(&shell, &command, &query, JUMP_TIMEOUT, &cancel)
                 .log_err("jump command")
                 .flatten();
             if sender.send(found).is_ok()
@@ -1187,6 +1191,45 @@ mod tests {
         }
         runtime.frame(1000.0);
         assert_eq!(runtime.state.workspace.projects.len(), 2);
+    }
+
+    #[test]
+    fn a_changed_query_kills_the_superseded_jump_lookup() {
+        let pids = tempfile::tempdir().unwrap();
+        let pid_file = pids.path().join("pid");
+        let (_directory, shell, _) =
+            stub_shell(&format!("echo $$ > '{}'; sleep 30", pid_file.display()));
+        let mut state = workspace_state();
+        state.config.shell = shell;
+        state.config.jump_command = Some("j".to_owned());
+        let mut runtime = runtime_with(state);
+        runtime.on_key = Some(on_key);
+        runtime.poll = Some(poll);
+        press(&mut runtime, Key::Command('p'), command());
+        press(&mut runtime, Key::Text("site".into()), Mods::default());
+        runtime.frame(0.0);
+        runtime.frame(1000.0);
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        let pid = loop {
+            if let Some(pid) = std::fs::read_to_string(&pid_file)
+                .ok()
+                .and_then(|text| text.trim().parse::<i32>().ok())
+            {
+                break pid;
+            }
+            assert!(std::time::Instant::now() < deadline, "timed out");
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        press(&mut runtime, Key::Text("x".into()), Mods::default());
+        runtime.frame(2000.0);
+        let deadline = std::time::Instant::now() + JUMP_TIMEOUT / 2;
+        while nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None).is_ok() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "lookup was not killed"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
     }
 
     #[test]

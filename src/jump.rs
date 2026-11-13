@@ -21,16 +21,10 @@ pub fn lookup(
     command: &str,
     query: &str,
     timeout: Duration,
+    cancel: &Cancel,
 ) -> Result<Option<PathBuf>> {
     let args = shell_args(shell, command, query);
-    let output = run(
-        shell,
-        &args,
-        Path::new(START),
-        timeout,
-        command,
-        &Cancel::default(),
-    )?;
+    let output = run(shell, &args, Path::new(START), timeout, command, cancel)?;
     Ok(output
         .status
         .success()
@@ -363,7 +357,7 @@ mod tests {
         let query = folder.to_str().unwrap();
         for shell in ["/bin/sh", "/bin/zsh"] {
             assert_eq!(
-                lookup(Path::new(shell), "cd", query, TIMEOUT).unwrap(),
+                lookup(Path::new(shell), "cd", query, TIMEOUT, &Cancel::default()).unwrap(),
                 Some(folder.clone()),
                 "{shell}"
             );
@@ -377,7 +371,14 @@ mod tests {
             return;
         }
         let (_root, folder) = awkward_folder();
-        let found = lookup(fish, "cd", folder.to_str().unwrap(), TIMEOUT).unwrap();
+        let found = lookup(
+            fish,
+            "cd",
+            folder.to_str().unwrap(),
+            TIMEOUT,
+            &Cancel::default(),
+        )
+        .unwrap();
         assert_eq!(found, Some(folder));
     }
 
@@ -386,7 +387,14 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let script = format!("echo {}; false", root.path().display());
         assert_eq!(
-            lookup(Path::new("/bin/sh"), &script, "", TIMEOUT).unwrap(),
+            lookup(
+                Path::new("/bin/sh"),
+                &script,
+                "",
+                TIMEOUT,
+                &Cancel::default()
+            )
+            .unwrap(),
             None
         );
     }
@@ -439,6 +447,15 @@ mod tests {
     #[test]
     fn a_slow_command_times_out() {
         let shell = Path::new("/bin/sh");
-        assert!(lookup(shell, "sleep 10;", "", Duration::from_millis(200)).is_err());
+        assert!(
+            lookup(
+                shell,
+                "sleep 10;",
+                "",
+                Duration::from_millis(200),
+                &Cancel::default()
+            )
+            .is_err()
+        );
     }
 }
