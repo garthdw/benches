@@ -175,7 +175,7 @@ fn show_lazygit_scene(state: &mut State) {
     show_workspace_scene(state);
     state
         .workspace
-        .show_overlay(Some(fixture_tab("lazygit", SCENE_LAZYGIT)));
+        .show_overlay(Some(fixture_tab("git", SCENE_LAZYGIT)));
 }
 
 type Scene = (&'static str, fn(&mut State));

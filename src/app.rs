@@ -465,7 +465,7 @@ pub(crate) fn resolve_confirm(state: &mut State, index: usize, confirmed: bool, 
 }
 
 /// Starts lazygit in the project's folder the first time, and after it has ended.
-fn toggle_lazygit(state: &mut State) {
+fn toggle_git(state: &mut State) {
     let Some(project) = state.workspace.project() else {
         return;
     };
@@ -477,7 +477,7 @@ fn toggle_lazygit(state: &mut State) {
         .overlay
         .as_ref()
         .is_some_and(|tab| tab.status == Status::Running);
-    let tab = (!running).then(|| state.spawn_tab("lazygit", Some("lazygit"), &project.root));
+    let tab = (!running).then(|| state.spawn_tab("git", Some("lazygit"), &project.root));
     state.workspace.show_overlay(tab);
 }
 
@@ -524,7 +524,7 @@ fn pick_folder(tx: &mut Tx, directory: Option<PathBuf>, replace_active: bool) {
 pub(crate) fn pick_new_tab(state: &mut State, picked: Option<&str>, tx: &mut Tx) {
     match picked {
         Some("shell") => run_action(state, &Action::Command(Command::NewShell), tx),
-        Some("lazygit") => run_action(state, &Action::Command(Command::ToggleLazygit), tx),
+        Some("git") => run_action(state, &Action::Command(Command::ToggleGit), tx),
         Some("palette" | "tray") => open_palette(state, tx),
         _ => {}
     }
@@ -533,7 +533,7 @@ pub(crate) fn pick_new_tab(state: &mut State, picked: Option<&str>, tx: &mut Tx)
 pub(crate) fn run_command(state: &mut State, command: Command, tx: &mut Tx) {
     match command {
         Command::NewShell => open_tab(state, "shell", None),
-        Command::ToggleLazygit => toggle_lazygit(state),
+        Command::ToggleGit => toggle_git(state),
         Command::OpenProject => {
             pick_folder(tx, Some(state.config.working_directory.clone()), false)
         }

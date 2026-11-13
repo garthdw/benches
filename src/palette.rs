@@ -705,18 +705,18 @@ mod tests {
     #[test]
     fn the_command_centre_filters_by_letters_in_order() {
         assert_eq!(
-            palette_actions("lzg", None, &one_project()),
+            palette_actions("tlgt", None, &one_project()),
             [
-                Action::Run("lzg".to_owned()),
-                Action::Tray("lzg".to_owned()),
-                Action::Command(Command::ToggleLazygit),
+                Action::Run("tlgt".to_owned()),
+                Action::Tray("tlgt".to_owned()),
+                Action::Command(Command::ToggleGit),
             ]
         );
         assert_eq!(
             palette_actions("", None, &one_project()),
             [
                 Action::Command(Command::NewShell),
-                Action::Command(Command::ToggleLazygit),
+                Action::Command(Command::ToggleGit),
                 Action::Command(Command::OpenProject),
                 Action::Command(Command::ChangeFolder)
             ]
