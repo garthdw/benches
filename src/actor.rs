@@ -588,7 +588,7 @@ impl Actor {
                 && (tick_animation || animation_due.is_some_and(|due| Instant::now() >= due))
             {
                 tick_animation = false;
-                let elapsed = u64::try_from(animation_epoch.elapsed().as_millis())?;
+                let elapsed = animation_epoch.elapsed().as_millis() as u64;
                 animation_due = terminal
                     .kitty_graphics_animation_tick(elapsed)
                     .log_err("tick animations")
@@ -631,8 +631,8 @@ impl Actor {
                 {
                     publisher.builder.set_search(highlights, found);
                 }
-                publisher.publish(&terminal)?;
-                dirty = false;
+                // A failed publish stays dirty so the next frame retries, rather than ending the tab.
+                dirty = publisher.publish(&terminal).log_err("publish").is_none();
             }
         }
     }
