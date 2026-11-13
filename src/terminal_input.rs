@@ -22,7 +22,7 @@ use crate::link;
 const AUTOSCROLL: Duration = Duration::from_millis(50);
 const MULTI_CLICK: Duration = Duration::from_millis(500);
 
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct KeyInput {
     pub key: Vt,
     pub mods: VtMods,
