@@ -26,6 +26,8 @@ pub(crate) struct Palette {
     pub(crate) edit: TextEdit,
     pub(crate) open: bool,
     pub(crate) selected: usize,
+    /// The query `selected` was chosen for.
+    selected_query: String,
     pub(crate) jump: JumpLookup,
     pub(crate) worktrees: Option<WorktreeChoice>,
     /// A `wt switch --create` running off the UI thread, answering with the new worktree's path.
@@ -501,6 +503,18 @@ fn palette_key(state: &mut State, event: &KeyEvent, tx: &mut Tx) -> bool {
     true
 }
 
+/// An edit reorders the rows, so the selection goes back to the top one. Checked after the edit
+/// lands, as the input applies it only after `palette_key` passes the key on.
+pub(crate) fn poll_selection(state: &mut State) -> bool {
+    let palette = &mut state.palette;
+    if palette.edit.text == palette.selected_query {
+        return false;
+    }
+    palette.selected_query.clone_from(&palette.edit.text);
+    palette.selected = 0;
+    true
+}
+
 /// Looks the command centre's query up with the jump command once typing pauses.
 pub(crate) fn poll_jump(state: &mut State, now: f64, tx: &mut Tx) -> bool {
     let Some(command) = &state.config.jump_command else {
@@ -946,6 +960,7 @@ mod tests {
 
     fn enter_on_switch_row(runtime: &mut Runtime<State>, query: &str, row: Action) {
         press(runtime, Key::Text(query.into()), Mods::default());
+        runtime.frame(0.0);
         let actions = palette_actions(query, None, &runtime.state.workspace, &Config::default());
         runtime.state.palette.selected = actions.iter().position(|action| *action == row).unwrap();
         press(runtime, Key::Enter, Mods::default());
@@ -1161,6 +1176,20 @@ mod tests {
             press(&mut runtime, Key::Down, Mods::default());
         }
         assert_eq!(runtime.state.palette.selected, 4);
+    }
+
+    #[test]
+    fn typing_selects_the_top_row_again() {
+        let mut runtime = palette_runtime();
+        press(&mut runtime, Key::Down, Mods::default());
+        press(&mut runtime, Key::Down, Mods::default());
+        assert_eq!(runtime.state.palette.selected, 2);
+        press(&mut runtime, Key::Text("s".into()), Mods::default());
+        runtime.frame(0.0);
+        assert_eq!(runtime.state.palette.selected, 0);
+        press(&mut runtime, Key::Down, Mods::default());
+        runtime.frame(0.0);
+        assert_eq!(runtime.state.palette.selected, 1);
     }
 
     #[test]
