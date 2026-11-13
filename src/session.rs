@@ -568,6 +568,14 @@ mod tests {
         );
     }
 
+    fn wait_for_busy(session: &Session, busy: bool) {
+        wait_until(
+            Duration::from_secs(15),
+            || format!("never {}", if busy { "busy" } else { "idle" }),
+            || (session.busy() == busy).then_some(()),
+        );
+    }
+
     #[test]
     fn a_paste_reaches_a_real_shell() {
         let session = spawn_shell();
@@ -1321,11 +1329,9 @@ mod tests {
     #[test]
     fn a_shell_is_busy_only_while_a_program_runs_in_the_foreground() {
         let session = spawn_shell();
-        let idle = || (!session.busy()).then_some(());
-        wait_until(Duration::from_secs(15), || "never idle".to_owned(), idle);
+        wait_for_busy(&session, false);
         type_line(&session, "sleep 5");
-        let busy = || session.busy().then_some(());
-        wait_until(Duration::from_secs(15), || "never busy".to_owned(), busy);
+        wait_for_busy(&session, true);
     }
 
     #[test]
@@ -1408,32 +1414,38 @@ mod tests {
     #[test]
     fn ctrl_c_interrupts_the_foreground_process() {
         let session = spawn_shell();
-        type_line(&session, "echo started; sleep 30; echo slept");
+        type_line(&session, "echo started; sleep 4343; echo slept");
         wait_for_line(&session, "started");
-        wait_until(
-            Duration::from_secs(15),
-            || "sleep never started".to_owned(),
-            || session.busy().then_some(()),
-        );
-        let ctrl = rune::Mods {
-            ctrl: true,
-            ..rune::Mods::default()
-        };
-        // A ^C landing before the shell has put the job in the foreground group is lost, so repeat it.
-        wait_until(
-            Duration::from_secs(15),
-            || "sleep was never interrupted".to_owned(),
-            || {
-                session.key(crate::input::map_text(
-                    "c",
-                    ctrl,
-                    Some(rune::PhysicalKeyCode::KeyC),
-                    Some('c'),
-                ));
-                thread::sleep(Duration::from_millis(50));
-                (!session.busy()).then_some(())
+        wait_for_busy(&session, true);
+        let ctrl_c = crate::input::map_text(
+            "c",
+            rune::Mods {
+                ctrl: true,
+                ..rune::Mods::default()
             },
+            Some(rune::PhysicalKeyCode::KeyC),
+            Some('c'),
         );
+        let sleeping = || {
+            Command::new("pgrep")
+                .args(["-f", "sleep 4343"])
+                .output()
+                .unwrap()
+                .status
+                .success()
+        };
+        // `sleep` holds the terminal before it resets its signal handling, so an early ^C is lost.
+        // Resend only after the previous one has had time to take effect.
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while sleeping() {
+            assert!(Instant::now() < deadline, "sleep was never interrupted");
+            session.key(ctrl_c.clone());
+            let settled = Instant::now() + Duration::from_secs(1);
+            while sleeping() && Instant::now() < settled {
+                thread::sleep(Duration::from_millis(20));
+            }
+        }
+        wait_for_busy(&session, false);
         type_line(&session, "echo after-4");
         wait_for_line(&session, "after-4");
         assert!(
