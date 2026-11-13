@@ -407,6 +407,14 @@ fn read_clipboard_for(tx: &mut Tx, session: u64, location: ClipboardLocation) {
     );
 }
 
+pub(crate) fn refuse_clipboard_reads(state: &State, dismissed: Vec<Confirm>) {
+    for confirm in dismissed {
+        if let Confirm::ClipboardRead { session, location } = confirm {
+            answer_clipboard_read(state, session, location, None);
+        }
+    }
+}
+
 fn answer_clipboard_read(
     state: &State,
     session: u64,
@@ -593,11 +601,7 @@ pub(crate) fn poll(state: &mut State, now: f64, tx: &mut Tx) -> bool {
         .partition(|confirm| Some(confirm.session()) == active);
     state.confirms = kept;
     changed |= !dismissed.is_empty();
-    for confirm in dismissed {
-        if let Confirm::ClipboardRead { session, location } = confirm {
-            answer_clipboard_read(state, session, location, None);
-        }
-    }
+    refuse_clipboard_reads(state, dismissed);
     let mut restarts = Vec::new();
     let mut exits = Vec::new();
     let mut notices = Vec::new();
