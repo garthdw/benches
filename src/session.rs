@@ -170,7 +170,7 @@ impl Session {
         let mut process = Command::new(&config.shell);
         process.args(["-l", "-i"]);
         if let Some(command) = command {
-            process.arg("-c").arg(format!("exec {command}"));
+            process.arg("-c").arg(command);
         }
         let terminfo = std::env::current_exe()
             .ok()
@@ -957,6 +957,19 @@ mod tests {
         assert_eq!(wait_for_exit(&session).code(), Some(3));
     }
 
+    #[test]
+    fn a_command_may_use_shell_syntax() {
+        let session = Session::spawn(
+            Some("cd /usr && echo a | tr a b; exit 4"),
+            Path::new("/tmp"),
+            &Config::default(),
+            Arc::new(|| {}),
+        )
+        .unwrap();
+        wait_for_line(&session, "b");
+        assert_eq!(wait_for_exit(&session).code(), Some(4));
+    }
+
     /// A reaped pid can be reused, so `cwd` would read another process's folder.
     #[test]
     fn exited_and_stopped_sessions_forget_their_pid() {
@@ -1353,6 +1366,37 @@ mod tests {
         ));
         let alive = nix::sys::signal::kill(Pid::from_raw(pid), None);
         assert_eq!(alive, Err(Errno::ESRCH));
+    }
+
+    fn pgrep(pattern: &str) -> bool {
+        Command::new("pgrep")
+            .args(["-f", pattern])
+            .output()
+            .is_ok_and(|output| !output.stdout.is_empty())
+    }
+
+    #[test]
+    fn a_dropped_session_takes_its_command_with_it() {
+        let session = Session::spawn(
+            Some("sleep 4243"),
+            Path::new("/tmp"),
+            &Config::default(),
+            Arc::new(|| {}),
+        )
+        .unwrap();
+        wait_until(
+            Duration::from_secs(15),
+            || "sleep never started".to_owned(),
+            || pgrep("sleep 4243").then_some(()),
+        );
+        let finished = session.finished();
+        drop(session);
+        assert!(finished.recv_timeout(Duration::from_secs(5)).is_err());
+        let survivors = Command::new("pgrep")
+            .args(["-f", "sleep 4243"])
+            .output()
+            .unwrap();
+        assert_eq!(String::from_utf8_lossy(&survivors.stdout), "");
     }
 
     #[test]
