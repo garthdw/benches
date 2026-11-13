@@ -197,12 +197,14 @@ impl Session {
                 Ok(())
             });
         }
+        // Cloned before spawning so a failure can't leave a started child unreaped.
+        let mut reader = File::from(pty.master.try_clone()?);
+        let mut writer = File::from(pty.master.try_clone()?);
         let child = process.spawn()?;
         let pid = Arc::new(Mutex::new(Some(child.id() as i32)));
 
         let master = pty.master;
         let (output_tx, output_rx) = bounded(64);
-        let mut reader = File::from(master.try_clone()?);
         thread::spawn(move || {
             let mut buffer = [0; 64 * 1024];
             while let Ok(length @ 1..) =
@@ -214,7 +216,6 @@ impl Session {
             }
         });
         let (input_tx, input_rx) = unbounded::<Vec<u8>>();
-        let mut writer = File::from(master.try_clone()?);
         thread::spawn(move || {
             for bytes in input_rx {
                 if writer.write_all(&bytes).is_err() {
