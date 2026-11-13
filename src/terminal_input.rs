@@ -8,7 +8,7 @@ use libghostty_vt::effect::ClipboardMime;
 use libghostty_vt::key::{Key as Vt, Mods as VtMods};
 use libghostty_vt::mode::Mode;
 use libghostty_vt::point::{Coordinate, Point};
-use libghostty_vt::screen::Screen;
+use libghostty_vt::screen::{CellWide, Screen};
 use libghostty_vt::selection::gesture::{
     Autoscroll, AutoscrollTickEvent, DragEvent, Geometry, Gesture, PressEvent, ReleaseEvent,
 };
@@ -404,11 +404,23 @@ impl TerminalInput {
             first -= 1;
         }
         let mut row = Vec::new();
+        let mut column = 0;
         let mut y = first;
         loop {
             for x in 0..surface.cols {
+                let cell = grid_ref(x, y)?;
+                let spacer = matches!(
+                    cell.cell()?.wide()?,
+                    CellWide::SpacerTail | CellWide::SpacerHead
+                );
+                if (x, y) == (position.x, position.y) {
+                    column = row.len().saturating_sub(usize::from(spacer));
+                }
+                if spacer {
+                    continue;
+                }
                 let mut character = [' '];
-                row.push(match grid_ref(x, y)?.graphemes(&mut character) {
+                row.push(match cell.graphemes(&mut character) {
                     Ok(_) => character[0],
                     // A cluster of several codepoints; any non-delimiter stands in for it.
                     Err(libghostty_vt::Error::OutOfSpace { .. }) => '\u{fffd}',
@@ -420,8 +432,6 @@ impl TerminalInput {
                 break;
             }
         }
-        let column =
-            (position.y - first) as usize * usize::from(surface.cols) + usize::from(position.x);
         Ok(link::url_at(&row, column))
     }
 
@@ -631,6 +641,21 @@ mod tests {
         assert_eq!(link.as_deref(), Some("https://a.te/x"));
         let off_link = input.link_under(&terminal, command_press(1, 1)).unwrap();
         assert_eq!(off_link, None);
+    }
+
+    #[test]
+    fn command_click_finds_a_url_containing_wide_characters() {
+        let mut terminal = new_terminal(20, 5).unwrap();
+        terminal.vt_write("http://a.te/日本語/x".as_bytes());
+        let input = input_for_test();
+        for column in [5, 12, 13, 17, 19] {
+            let link = input.link_under(&terminal, command_press(column, 0));
+            assert_eq!(
+                link.unwrap().as_deref(),
+                Some("http://a.te/日本語/x"),
+                "at {column}"
+            );
+        }
     }
 
     #[test]
