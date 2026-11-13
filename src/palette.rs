@@ -383,6 +383,10 @@ fn list_worktrees(state: &mut State, root: PathBuf, tx: &mut Tx) {
 }
 
 pub(crate) fn poll_worktrees(state: &mut State) -> bool {
+    if !state.palette.open {
+        state.palette.worktrees = None;
+        return false;
+    }
     let Some(choice) = &mut state.palette.worktrees else {
         return false;
     };
@@ -1021,6 +1025,21 @@ mod tests {
         let workspace = &runtime.state.workspace;
         assert_eq!(workspace.projects[2].root, Path::new("/dev/elsewhere"));
         assert!(!runtime.state.palette.open);
+    }
+
+    #[test]
+    fn closing_the_palette_while_worktrees_load_does_not_open_a_project() {
+        let mut runtime = jump_runtime();
+        let (sender, receiver) = mpsc::channel();
+        press(&mut runtime, Key::Enter, command());
+        if let Some(choice) = &mut runtime.state.palette.worktrees {
+            choice.root = PathBuf::from("/dev/elsewhere");
+            choice.pending = Some(receiver);
+        }
+        press(&mut runtime, Key::Escape, Mods::default());
+        sender.send(Vec::new()).unwrap();
+        poll_worktrees(&mut runtime.state);
+        assert_eq!(runtime.state.workspace.projects.len(), 2);
     }
 
     #[test]
