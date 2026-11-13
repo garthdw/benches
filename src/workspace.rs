@@ -151,7 +151,7 @@ impl Project {
     }
 
     pub fn runs_program(&self) -> bool {
-        self.tabs.iter().chain(&self.tray).any(Tab::runs_program)
+        self.launched && self.tabs.iter().chain(&self.tray).any(Tab::runs_program)
     }
 
     pub fn tab(&self, slot: Slot) -> Option<&Tab> {
@@ -826,6 +826,18 @@ mod tests {
         assert!(!workspace.projects[0].runs_program());
         workspace.projects[0].tray.push(tab("pnpm dev"));
         workspace.projects[0].tray[0].command = Some("pnpm dev".to_owned());
+        assert!(workspace.projects[0].runs_program());
+    }
+
+    #[test]
+    fn an_unlaunched_project_runs_no_program_until_launched() {
+        let mut workspace = Workspace::restore(SavedWorkspace {
+            active: 0,
+            sidebar_hidden: false,
+            projects: vec![saved_project("/", 0)],
+        });
+        assert!(!workspace.projects[0].runs_program());
+        workspace.projects[0].launched = true;
         assert!(workspace.projects[0].runs_program());
     }
 
