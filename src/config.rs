@@ -530,13 +530,21 @@ pub fn read_optional(path: &Path) -> Result<Option<String>> {
     }
 }
 
-/// Every value of `key` in a Ghostty-style `key = value` file, in order.
+/// Every value of `key` in a Ghostty-style `key = value` file, in order. An empty value resets
+/// the key, dropping it and everything before it.
 fn ghostty_values<'a>(text: &'a str, key: &str) -> Vec<&'a str> {
-    text.lines()
+    let mut values = Vec::new();
+    for (_, value) in text
+        .lines()
         .filter_map(|line| line.trim().split_once('='))
         .filter(|(name, _)| name.trim() == key)
-        .map(|(_, value)| value.trim().trim_matches('"'))
-        .collect()
+    {
+        match value.trim().trim_matches('"') {
+            "" => values.clear(),
+            value => values.push(value),
+        }
+    }
+    values
 }
 
 fn command_finish_after(mode: Option<String>, after: Option<String>) -> Option<Duration> {
@@ -724,6 +732,16 @@ mod tests {
         assert_eq!(load(Some(&toml), Some(&ghostty)), folder.path());
         assert_eq!(load(None, Some(&ghostty)), other.path());
         assert_eq!(load(None, None), home_dir());
+    }
+
+    #[test]
+    fn ghostty_empty_value_resets_a_list() {
+        let ghostty = "font-family = Old\nfont-family = \"\"\nfont-family = JetBrains Mono\nfont-family = Symbols\nfont-feature = -calt\nfont-feature =\n";
+        let (_root, paths) = paths(None, Some(ghostty));
+        let font = Config::load(&paths).0.font;
+        assert_eq!(font.family, "JetBrains Mono");
+        assert_eq!(font.fallback_families, ["Symbols"]);
+        assert!(font.features.is_empty());
     }
 
     #[test]
