@@ -15,7 +15,8 @@ use crate::grid::{Grid, Surface};
 use crate::input::caret_rect;
 use crate::keymap::{Command, pressed, shortcut};
 use crate::palette::{
-    Action, Palette, open_palette, poll_creation, poll_jump, poll_worktrees, run_action,
+    Action, Palette, open_palette, poll_creation, poll_jump, poll_selection, poll_worktrees,
+    run_action,
 };
 use crate::protocol::Event;
 use crate::render::TerminalSource;
@@ -584,6 +585,7 @@ pub(crate) fn poll(state: &mut State, now: f64, tx: &mut Tx) -> bool {
     }
     launch_active(state);
     let active = state.session().map(Session::id);
+    changed |= poll_selection(state);
     changed |= poll_jump(state, now, tx);
     changed |= poll_find(state, active);
     changed |= poll_worktrees(state);
@@ -1853,6 +1855,7 @@ mod tests {
     fn run_tray_action_from_palette(runtime: &mut Runtime<State>, query: &str) {
         press(runtime, Key::Command('p'), command());
         press(runtime, Key::Text(query.into()), Mods::default());
+        runtime.frame(0.0);
         runtime.state.palette.selected = 2;
         press(runtime, Key::Enter, Mods::default());
     }

@@ -26,6 +26,8 @@ pub(crate) struct Palette {
     pub(crate) edit: TextEdit,
     pub(crate) open: bool,
     pub(crate) selected: usize,
+    /// The query `selected` was chosen for.
+    selected_query: String,
     pub(crate) jump: JumpLookup,
     pub(crate) worktrees: Option<WorktreeChoice>,
     /// A `wt switch --create` running off the UI thread, answering with the new worktree's path.
@@ -207,8 +209,9 @@ fn switch_actions(
     found
 }
 
-/// The commands strongly matching the query, best first, then the jump command's folder, then
-/// running the query, so Enter on a typed command always runs it. Below those come the commands
+/// The jump command's folder first, unless a command label or project or tab name equals the
+/// query, which goes just above it. Then the commands strongly matching the query, best first,
+/// then running the query, so Enter on a typed command always runs it. Below those come the commands
 /// matching only loosely, then the open projects and tabs matching the query, exact names first, then the active project's
 /// tray restarts and stops. A query of `wt` and one branch name puts creating that worktree
 /// first. Everything but the fixed actions appears only once something is typed.
@@ -241,15 +244,36 @@ pub(crate) fn palette_actions(
     matched.sort_by_key(|(_, found)| Reverse(found.score));
     let (strong, weak): (Vec<_>, Vec<_>) = matched.into_iter().partition(|(_, found)| found.strong);
     let command = |(spec, _): (&CommandSpec, Match)| Action::Command(spec.command);
-    actions.extend(strong.into_iter().map(command));
+    let (exact_switches, partial_switches): (Vec<_>, Vec<_>) =
+        switch_actions(&needle, jump, workspace)
+            .into_iter()
+            .partition(|(name, _)| name.to_lowercase() == needle);
+    // With a jump result, exact matches go just above it and everything else below.
+    let (exact_commands, strong) = if jump.is_some() {
+        strong
+            .into_iter()
+            .partition(|(spec, _)| spec.label.to_lowercase() == needle)
+    } else {
+        (Vec::new(), strong)
+    };
+    let (leading_switches, exact_switches) = if jump.is_some() {
+        (exact_switches, Vec::new())
+    } else {
+        (Vec::new(), exact_switches)
+    };
+    actions.extend(exact_commands.into_iter().map(command));
+    actions.extend(leading_switches.into_iter().map(|(_, action)| action));
     actions.extend(jump.map(|root| Action::Jump(root.to_owned())));
+    actions.extend(strong.into_iter().map(command));
     actions.push(Action::Run(query.to_owned()));
     actions.push(Action::Tray(query.to_owned()));
     actions.extend(weak.into_iter().map(command));
-    let (exact, partial): (Vec<_>, Vec<_>) = switch_actions(&needle, jump, workspace)
-        .into_iter()
-        .partition(|(name, _)| name.to_lowercase() == needle);
-    actions.extend(exact.into_iter().chain(partial).map(|(_, action)| action));
+    actions.extend(
+        exact_switches
+            .into_iter()
+            .chain(partial_switches)
+            .map(|(_, action)| action),
+    );
     let tray = workspace.project().map_or(&[][..], |project| &project.tray);
     for (index, tab) in tray.iter().enumerate() {
         let restart = Action::RestartTray(index, tab.label().to_owned());
@@ -476,6 +500,18 @@ fn palette_key(state: &mut State, event: &KeyEvent, tx: &mut Tx) -> bool {
             return false;
         }
     }
+    true
+}
+
+/// An edit reorders the rows, so the selection goes back to the top one. Checked after the edit
+/// lands, as the input applies it only after `palette_key` passes the key on.
+pub(crate) fn poll_selection(state: &mut State) -> bool {
+    let palette = &mut state.palette;
+    if palette.edit.text == palette.selected_query {
+        return false;
+    }
+    palette.selected_query.clone_from(&palette.edit.text);
+    palette.selected = 0;
     true
 }
 
@@ -880,8 +916,51 @@ mod tests {
         );
     }
 
+    #[test]
+    fn the_jump_folder_leads_the_strong_command_matches() {
+        let root = Path::new("/dev/pr");
+        let actions = palette_actions("pr", Some(root), &one_project(), &Config::default());
+        assert_eq!(actions[0], Action::Jump(root.to_owned()));
+        assert!(actions.contains(&Action::Command(Command::PrevTab)));
+    }
+
+    #[test]
+    fn an_exact_command_label_leads_the_jump_folder() {
+        let root = Path::new("/dev/find");
+        let actions = palette_actions(
+            " Find In Scrollback ",
+            Some(root),
+            &one_project(),
+            &Config::default(),
+        );
+        assert_eq!(actions[0], Action::Command(Command::Find));
+        assert_eq!(actions[1], Action::Jump(root.to_owned()));
+    }
+
+    #[test]
+    fn an_exact_switch_name_leads_the_jump_folder_once() {
+        let state = workspace_state();
+        let root = Path::new("/dev/else");
+        let actions = palette_actions("Shell", Some(root), &state.workspace, &Config::default());
+        let tab = Action::SwitchTab(1, 1, "shell (site)".to_owned());
+        assert_eq!(actions[..2], [tab.clone(), Action::Jump(root.to_owned())]);
+        assert_eq!(actions[2], Action::Command(Command::NewShell));
+        assert_eq!(actions.iter().filter(|action| **action == tab).count(), 1);
+        let actions = palette_actions("site", Some(root), &state.workspace, &Config::default());
+        let project = Action::SwitchProject(1, "site".to_owned());
+        assert_eq!(
+            actions[..2],
+            [project.clone(), Action::Jump(root.to_owned())]
+        );
+        assert_eq!(
+            actions.iter().filter(|action| **action == project).count(),
+            1
+        );
+    }
+
     fn enter_on_switch_row(runtime: &mut Runtime<State>, query: &str, row: Action) {
         press(runtime, Key::Text(query.into()), Mods::default());
+        runtime.frame(0.0);
         let actions = palette_actions(query, None, &runtime.state.workspace, &Config::default());
         runtime.state.palette.selected = actions.iter().position(|action| *action == row).unwrap();
         press(runtime, Key::Enter, Mods::default());
@@ -1097,6 +1176,20 @@ mod tests {
             press(&mut runtime, Key::Down, Mods::default());
         }
         assert_eq!(runtime.state.palette.selected, 4);
+    }
+
+    #[test]
+    fn typing_selects_the_top_row_again() {
+        let mut runtime = palette_runtime();
+        press(&mut runtime, Key::Down, Mods::default());
+        press(&mut runtime, Key::Down, Mods::default());
+        assert_eq!(runtime.state.palette.selected, 2);
+        press(&mut runtime, Key::Text("s".into()), Mods::default());
+        runtime.frame(0.0);
+        assert_eq!(runtime.state.palette.selected, 0);
+        press(&mut runtime, Key::Down, Mods::default());
+        runtime.frame(0.0);
+        assert_eq!(runtime.state.palette.selected, 1);
     }
 
     #[test]
