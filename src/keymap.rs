@@ -1,6 +1,7 @@
 use rune::{Chord, Key, KeyEvent, Tx};
 
 use crate::app::{State, run_command};
+use crate::config::Config;
 use crate::workspace::Workspace;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -33,7 +34,7 @@ pub struct CommandSpec {
     pub chord: Option<&'static str>,
     /// Listed in the palette before anything is typed.
     pub default: bool,
-    pub enabled: fn(&Workspace) -> bool,
+    pub enabled: fn(&Workspace, &Config) -> bool,
 }
 
 const fn spec(command: Command, label: &'static str, chord: Option<&'static str>) -> CommandSpec {
@@ -42,7 +43,7 @@ const fn spec(command: Command, label: &'static str, chord: Option<&'static str>
         label,
         chord,
         default: false,
-        enabled: |_| true,
+        enabled: |_, _| true,
     }
 }
 
@@ -54,18 +55,21 @@ const fn default(mut spec: CommandSpec) -> CommandSpec {
 /// Palette rows appear in this order, ahead of every dynamic action.
 pub const COMMANDS: &[CommandSpec] = &[
     default(spec(Command::NewShell, "New shell tab", Some("mod+t"))),
-    default(spec(Command::ToggleGit, "Toggle git", Some("mod+g"))),
+    default(CommandSpec {
+        enabled: |_, config| config.git_command().is_some(),
+        ..spec(Command::ToggleGit, "Toggle git", Some("mod+g"))
+    }),
     default(spec(Command::OpenProject, "Open project…", Some("mod+n"))),
     default(CommandSpec {
-        enabled: |workspace| workspace.project().is_some(),
+        enabled: |workspace, _| workspace.project().is_some(),
         ..spec(Command::ChangeFolder, "Change project folder…", None)
     }),
     default(CommandSpec {
-        enabled: |workspace| workspace.projects.len() > 1,
+        enabled: |workspace, _| workspace.projects.len() > 1,
         ..spec(Command::MoveToNewWindow, "Move project to new window", None)
     }),
     CommandSpec {
-        enabled: |_| false,
+        enabled: |_, _| false,
         ..spec(Command::Palette, "Command palette", Some("mod+p"))
     },
     spec(Command::Find, "Find in scrollback", Some("mod+f")),

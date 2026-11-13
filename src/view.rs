@@ -356,10 +356,11 @@ fn tab_strip(state: &State, theme: &tok::Theme, accent: Color, titlebar_inset: f
         .on_press(|state: &mut State| state.sidebar_hidden = !state.sidebar_hidden);
     let new_tab = state.workspace.project().map(|_| {
         pill(theme, "new-tab".to_owned(), "+", false, None).on_press_tx(
-            |_: &mut State, tx: &mut Tx| {
+            |state: &mut State, tx: &mut Tx| {
+                let git = state.config.git_command().is_some();
                 let menu = PopupMenu::new()
                     .item(PopupItem::new("shell", "Shell"))
-                    .item(PopupItem::new("git", "Git"))
+                    .items(git.then(|| PopupItem::new("git", "Git")))
                     .item(PopupItem::new("tray", "Background command…"))
                     .item(PopupItem::new("palette", "Command centre…"));
                 tx.popup_menu(menu, "new-tab", pick_new_tab);

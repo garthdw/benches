@@ -455,9 +455,10 @@ pub(crate) fn resolve_confirm(state: &mut State, index: usize, confirmed: bool, 
     }
 }
 
-/// Starts lazygit in the project's folder the first time, and after it has ended.
+/// Starts the git command in the project's folder the first time, and after it has ended.
 fn toggle_git(state: &mut State) {
-    let Some(project) = state.workspace.project() else {
+    let (Some(project), Some(command)) = (state.workspace.project(), state.config.git_command())
+    else {
         return;
     };
     if project.overlay_open {
@@ -468,7 +469,7 @@ fn toggle_git(state: &mut State) {
         .overlay
         .as_ref()
         .is_some_and(|tab| tab.status == Status::Running);
-    let tab = (!running).then(|| state.spawn_tab("git", Some("lazygit"), &project.root));
+    let tab = (!running).then(|| state.spawn_tab("git", Some(command), &project.root));
     state.workspace.show_overlay(tab);
 }
 
@@ -1623,6 +1624,32 @@ mod tests {
         assert_eq!(overlay_id(&runtime), None);
         press(&mut runtime, Key::Command('g'), command());
         assert_eq!(overlay_id(&runtime), kept);
+    }
+
+    #[test]
+    fn the_overlay_runs_the_configured_git_command_titled_git() {
+        let mut state = workspace_state();
+        state.config.git_command = Some("sleep 5".to_owned());
+        let mut runtime = runtime_with(state);
+        runtime.on_key = Some(on_key);
+        press(&mut runtime, Key::Command('g'), command());
+        let tab = runtime.state.workspace.projects[0]
+            .overlay
+            .as_ref()
+            .unwrap();
+        assert_eq!(tab.command.as_deref(), Some("sleep 5"));
+        assert_eq!(tab.title, "git");
+    }
+
+    #[test]
+    fn command_g_does_nothing_when_the_git_command_is_blank() {
+        let mut state = workspace_state();
+        state.config.git_command = Some(String::new());
+        let mut runtime = runtime_with(state);
+        runtime.on_key = Some(on_key);
+        press(&mut runtime, Key::Command('g'), command());
+        assert!(runtime.state.workspace.projects[0].overlay.is_none());
+        assert_eq!(overlay_id(&runtime), None);
     }
 
     #[test]
