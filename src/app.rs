@@ -1850,11 +1850,7 @@ mod tests {
         state
             .workspace
             .add_project(Project::new("/tmp".into(), vec![]));
-        open_tab(
-            &mut state,
-            "shell",
-            Some("sh -c 'cd /usr/bin && exec sleep 100'"),
-        );
+        open_tab(&mut state, "shell", Some("cd /usr/bin && sleep 100"));
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         while state.session().and_then(Session::cwd) != Some("/usr/bin".into()) {
             assert!(
