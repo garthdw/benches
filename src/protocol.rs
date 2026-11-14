@@ -1,6 +1,7 @@
 use std::process::ExitStatus;
 
 use libghostty_vt::effect::ClipboardLocation;
+use libghostty_vt::key;
 
 use crate::config::TerminalSettings;
 use crate::grid::Surface;
@@ -16,7 +17,7 @@ pub(crate) enum Msg {
         y: f32,
     },
     ScrollbarHover(bool),
-    CommandHeld(bool),
+    Modifiers(key::Mods),
     Copy,
     /// Scroll to the previous (negative) or next prompt marked by the shell.
     PromptJump(isize),
@@ -86,8 +87,8 @@ pub enum Event {
     CommandFinished {
         failed: bool,
     },
-    /// ⌘ moved onto or off a link; read `Session::link_hovered`.
-    LinkHover,
+    /// What the pointer over the terminal would do changed; read `Session::hover`.
+    Hover,
 }
 
 /// How much of a session the UI shows, which decides what it publishes.

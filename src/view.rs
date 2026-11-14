@@ -16,7 +16,7 @@ use crate::palette::{self, open_palette};
 use crate::protocol::{Progress, ProgressKind};
 use crate::render;
 use crate::session::{Attention, Session};
-use crate::terminal_input::{PointerPhase, WheelInput};
+use crate::terminal_input::{Hover, PointerPhase, WheelInput};
 use crate::windows::{move_to_new_window, torn_off};
 use crate::workspace::{Project, Status, Tab, Workspace};
 
@@ -91,10 +91,10 @@ fn terminal_surface(
         _ => Some(mark == DRAWER_MARK),
     };
     let scrollable = pick(workspace).is_some_and(|session| session.grid().scrollbar.is_some());
-    let cursor = if pick(workspace).is_some_and(Session::link_hovered) {
-        Cursor::Pointer
-    } else {
-        Cursor::Text
+    let cursor = match pick(workspace).map(Session::hover) {
+        Some(Hover::Link) => Cursor::Pointer,
+        Some(Hover::Report) => Cursor::Default,
+        Some(Hover::Text) | None => Cursor::Text,
     };
     effect(mark)
         .key(key)
@@ -287,6 +287,11 @@ fn sidebar(state: &State, theme: &tok::Theme, accent: Color) -> El {
                 }))
             };
             project_tab
+                .cursor(if state.dragged_project == Some(index) {
+                    Cursor::Grabbing
+                } else {
+                    Cursor::Default
+                })
                 .on_hover_change(move |state: &mut State, hovered, _: &mut Tx| {
                     if hovered {
                         state.hovered_project = Some(index);
@@ -296,6 +301,7 @@ fn sidebar(state: &State, theme: &tok::Theme, accent: Color) -> El {
                 })
                 .on_press(move |state: &mut State| state.workspace.select_project(index))
                 .on_drag(move |state: &mut State, drag: &mut Drag, _: &mut Tx| {
+                    state.dragged_project = (drag.phase == Phase::Move).then_some(index);
                     if drag.phase == Phase::Up
                         && !drag.cancelled()
                         && torn_off(drag.window_point(), sidebar_width)
