@@ -3,7 +3,7 @@ use std::os::fd::{AsRawFd, OwnedFd};
 use std::path::PathBuf;
 use std::process::Child;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -165,7 +165,7 @@ pub(crate) struct Actor {
     pub(crate) master: OwnedFd,
     pub(crate) slot: Arc<Mutex<Arc<Grid>>>,
     pub(crate) alerted: Arc<AtomicBool>,
-    pub(crate) link_hovered: Arc<AtomicBool>,
+    pub(crate) hover: Arc<AtomicU8>,
     pub(crate) reported_cwd: Arc<Mutex<Option<PathBuf>>>,
     pub(crate) events: Sender<Event>,
     pub(crate) waker: Waker,
@@ -173,15 +173,15 @@ pub(crate) struct Actor {
 }
 
 impl Actor {
-    fn update_link_hover(
+    fn update_hover(
         &self,
         input: &mut TerminalInput,
         terminal: &Terminal<'static, '_>,
-        command: bool,
+        mods: key::Mods,
     ) {
-        if let Some(Some(hovered)) = input.link_hover(terminal, command).log_err("find link") {
-            self.link_hovered.store(hovered, Ordering::Release);
-            self.emit(Event::LinkHover);
+        if let Some(Some(hover)) = input.hover(terminal, mods).log_err("find hover") {
+            self.hover.store(hover as u8, Ordering::Release);
+            self.emit(Event::Hover);
         }
     }
 
@@ -352,6 +352,7 @@ impl Actor {
         let mut fade = ScrollbarFade::default();
         fade.follow(&terminal);
         let mut scrollbar_hovered = false;
+        let mut mods = key::Mods::empty();
         let mut resize = ResizeDebounce::default();
         let mut dirty = true;
         // libghostty keeps no timer for animated images; this clock and the due time drive it.
@@ -385,6 +386,8 @@ impl Actor {
                     Ok(bytes) => {
                         terminal.vt_write(&bytes);
                         fade.follow(&terminal);
+                        // A program turns mouse tracking on and off under a still pointer.
+                        self.update_hover(&mut input, &terminal, mods);
                         dirty = true;
                         tick_animation = true;
                         let alerted = alerted.replace(false);
@@ -448,8 +451,8 @@ impl Actor {
                         {
                             self.input.send(bytes).log_err("queue mouse report");
                         }
-                        let command = pointer.mods.contains(key::Mods::SUPER);
-                        self.update_link_hover(&mut input, &terminal, command);
+                        mods = pointer.mods;
+                        self.update_hover(&mut input, &terminal, mods);
                     }
                     Ok(Msg::Wheel(wheel)) => {
                         match input.wheel(&mut terminal, wheel).log_err("handle wheel") {
@@ -460,6 +463,8 @@ impl Actor {
                             Some(None) => fade.show(Instant::now()),
                             _ => {}
                         }
+                        // Scrolling moves another link, or none, under the pointer.
+                        self.update_hover(&mut input, &terminal, mods);
                         dirty = true;
                     }
                     Ok(Msg::Scrollbar { phase, y }) => {
@@ -467,7 +472,10 @@ impl Actor {
                         dirty = true;
                     }
                     Ok(Msg::ScrollbarHover(hovered)) => scrollbar_hovered = hovered,
-                    Ok(Msg::CommandHeld(held)) => self.update_link_hover(&mut input, &terminal, held),
+                    Ok(Msg::Modifiers(held)) => {
+                        mods = held;
+                        self.update_hover(&mut input, &terminal, mods);
+                    }
                     Ok(Msg::Copy) => {
                         if let Some(Some(text)) = selection_text(&terminal).log_err("copy selection") {
                             self.emit(Event::Copied(text));
@@ -603,6 +611,8 @@ impl Actor {
             dirty |=
                 (presentation.scrollbar_opacity, presentation.scrollbar_wide) != (opacity, held);
             (presentation.scrollbar_opacity, presentation.scrollbar_wide) = (opacity, held);
+            dirty |= presentation.link != input.link;
+            presentation.link = input.link;
             input
                 .tick_autoscroll(&terminal, Instant::now())
                 .log_err("autoscroll selection");

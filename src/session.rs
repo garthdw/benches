@@ -4,7 +4,7 @@ use std::os::fd::{AsFd, AsRawFd, OwnedFd};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 use crossbeam_channel::{Receiver, Sender, bounded, unbounded};
 use libghostty_vt::effect::ClipboardLocation;
+use libghostty_vt::key;
 use nix::pty::{Winsize, openpty};
 use nix::sys::select::{FdSet, select};
 use nix::sys::time::{TimeVal, TimeValLike};
@@ -22,7 +23,7 @@ use crate::actor::{Actor, store, terminate};
 use crate::config::Config;
 use crate::grid::{Grid, Surface, bundled_terminfo, terminfo_name};
 use crate::protocol::{Event, Msg, Visibility};
-use crate::terminal_input::{KeyInput, PointerInput, PointerPhase, WheelInput};
+use crate::terminal_input::{Hover, KeyInput, PointerInput, PointerPhase, WheelInput};
 
 const BATCH_GAP: Duration = Duration::from_micros(50);
 const BATCH_LIMIT: Duration = Duration::from_millis(1);
@@ -142,7 +143,7 @@ pub struct Session {
     grid: Arc<Mutex<Arc<Grid>>>,
     /// Set by the actor when an alert arrives while not shown; cleared when it is shown.
     alerted: Arc<AtomicBool>,
-    link_hovered: Arc<AtomicBool>,
+    hover: Arc<AtomicU8>,
     /// The directory the shell last reported with OSC 7, which is right inside ssh or a subshell.
     reported_cwd: Arc<Mutex<Option<PathBuf>>>,
     events: Receiver<Event>,
@@ -227,7 +228,7 @@ impl Session {
         let (commands, commands_rx) = unbounded();
         let grid = Arc::new(Mutex::new(Arc::new(Grid::default())));
         let alerted = Arc::new(AtomicBool::new(false));
-        let link_hovered = Arc::new(AtomicBool::new(false));
+        let hover = Arc::new(AtomicU8::new(Hover::Text as u8));
         let reported_cwd = Arc::new(Mutex::new(None));
         let (events_tx, events) = unbounded();
         let (finished_tx, finished) = bounded::<()>(0);
@@ -242,7 +243,7 @@ impl Session {
             master,
             slot: grid.clone(),
             alerted: alerted.clone(),
-            link_hovered: link_hovered.clone(),
+            hover: hover.clone(),
             reported_cwd: reported_cwd.clone(),
             events: events_tx,
             waker,
@@ -265,7 +266,7 @@ impl Session {
             commands: Some(commands),
             grid,
             alerted,
-            link_hovered,
+            hover,
             reported_cwd,
             events,
             sent_surface: std::cell::Cell::new(None),
@@ -283,7 +284,7 @@ impl Session {
             commands: None,
             grid: Arc::new(Mutex::new(Arc::new(grid))),
             alerted: Arc::default(),
-            link_hovered: Arc::default(),
+            hover: Arc::default(),
             reported_cwd: Arc::default(),
             events: unbounded().1,
             sent_surface: std::cell::Cell::new(None),
@@ -299,8 +300,8 @@ impl Session {
     }
 
     #[cfg(test)]
-    pub fn set_link_hovered(&self, hovered: bool) {
-        self.link_hovered.store(hovered, Ordering::Release);
+    pub fn set_hover(&self, hover: Hover) {
+        self.hover.store(hover as u8, Ordering::Release);
     }
 
     /// The process's pid and its `proc_pidinfo` of `flavor`, which must fill a `T`.
@@ -380,13 +381,17 @@ impl Session {
         self.send(Msg::Scrollbar { phase, y });
     }
 
-    /// Whether ⌘ is held over a link, which the terminal shows with a pointing hand.
-    pub fn link_hovered(&self) -> bool {
-        self.link_hovered.load(Ordering::Acquire)
+    /// What the pointer over the terminal would do, which picks its cursor.
+    pub fn hover(&self) -> Hover {
+        match self.hover.load(Ordering::Acquire) {
+            value if value == Hover::Link as u8 => Hover::Link,
+            value if value == Hover::Report as u8 => Hover::Report,
+            _ => Hover::Text,
+        }
     }
 
-    pub fn command_held(&self, held: bool) {
-        self.send(Msg::CommandHeld(held));
+    pub fn modifiers(&self, mods: key::Mods) {
+        self.send(Msg::Modifiers(mods));
     }
 
     pub fn hover_scrollbar(&self, hovered: bool) {
@@ -501,6 +506,7 @@ mod tests {
     use crate::test_support::{TEST_SURFACE, pointer_at, wait_until, wheel_by};
     use libghostty_vt::color::Rgb;
     use libghostty_vt::render::CursorVisualStyle;
+    use libghostty_vt::style::Underline;
     use nix::errno::Errno;
     use nix::unistd::Pid;
     use std::process::ExitStatus;
@@ -806,6 +812,59 @@ mod tests {
         type_line(&session, "seq 100");
         wait_for_line(&session, "100");
         session
+    }
+
+    #[test]
+    fn mouse_tracking_output_changes_the_hover_under_a_still_pointer() {
+        let session = spawn_shell();
+        session.resize(TEST_SURFACE);
+        let wait_for_hover = |want: Hover| {
+            wait_until(
+                Duration::from_secs(15),
+                || format!("hover never became {want:?}"),
+                || (session.hover() == want).then_some(()),
+            );
+        };
+        type_line(&session, r"printf '\033[?1000h'");
+        wait_for_hover(Hover::Report);
+        type_line(&session, r"printf '\033[?1000l'");
+        wait_for_hover(Hover::Text);
+    }
+
+    #[test]
+    fn command_over_a_url_underlines_it_until_released() {
+        let session = spawn_shell();
+        session.resize(TEST_SURFACE);
+        type_line(&session, "echo https://a.te/x");
+        wait_for_line(&session, "https://a.te/x");
+        let row = session
+            .grid()
+            .lines()
+            .iter()
+            .position(|line| line.trim_end() == "https://a.te/x")
+            .unwrap();
+        let underlined = |session: &Session| {
+            let grid = session.grid();
+            let start = row * usize::from(grid.cols);
+            grid.cells[start..start + 14]
+                .iter()
+                .all(|cell| cell.underline == Underline::Single)
+        };
+        session.pointer(PointerInput {
+            mods: key::Mods::SUPER,
+            ..pointer_at(PointerPhase::Move, 3, u16::try_from(row).unwrap())
+        });
+        wait_until(
+            Duration::from_secs(15),
+            || "the link was never underlined".to_owned(),
+            || underlined(&session).then_some(()),
+        );
+        session.modifiers(key::Mods::empty());
+        wait_until(
+            Duration::from_secs(15),
+            || "the underline never cleared".to_owned(),
+            || (!underlined(&session)).then_some(()),
+        );
     }
 
     fn wait_for_scrollbar(session: &Session, want: &str, shown: impl Fn(Scrollbar) -> bool) {

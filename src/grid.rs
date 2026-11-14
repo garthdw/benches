@@ -421,6 +421,8 @@ pub(crate) struct Presentation {
     pub(crate) metrics: Metrics,
     pub(crate) scrollbar_opacity: f32,
     pub(crate) scrollbar_wide: bool,
+    /// The viewport cells, `start..end` counted row by row, of the link ⌘ is over.
+    pub(crate) link: Option<(usize, usize)>,
 }
 
 impl Default for Presentation {
@@ -432,6 +434,7 @@ impl Default for Presentation {
             metrics: Metrics::default(),
             scrollbar_opacity: 0.0,
             scrollbar_wide: false,
+            link: None,
         }
     }
 }
@@ -708,10 +711,17 @@ impl GridBuilder {
                 content
             }
         };
-        let cells = if self.highlights.is_empty() {
+        let cells = if self.highlights.is_empty() && presentation.link.is_none() {
             cells
         } else {
             let mut painted = cells.to_vec();
+            if let Some((start, end)) = presentation.link {
+                for cell in painted.get_mut(start..end).unwrap_or_default() {
+                    if cell.underline == Underline::None {
+                        cell.underline = Underline::Single;
+                    }
+                }
+            }
             for highlight in &self.highlights {
                 let (background, foreground) = match_colors(highlight.current);
                 let start = usize::from(highlight.row) * usize::from(cols);
@@ -1025,6 +1035,26 @@ mod tests {
         assert_eq!(grid.cells[0].underline_color, Some([1, 2, 3]));
         assert_eq!(grid.cells[1].underline, Underline::Single);
         assert_eq!(grid.cells[1].underline_color, None);
+    }
+
+    #[test]
+    fn a_hovered_link_is_underlined_without_losing_its_own_underline() {
+        let mut terminal = new_terminal(6, 2).unwrap();
+        terminal.vt_write(b"ab\x1b[4:3mc\x1b[0mdef");
+        let mut builder = GridBuilder::new().unwrap();
+        let hovered = Presentation {
+            link: Some((1, 4)),
+            ..Presentation::default()
+        };
+        let grid = builder.build(&terminal, 1, hovered).unwrap().unwrap();
+        let underlines: Vec<_> = grid.cells[..5].iter().map(|cell| cell.underline).collect();
+        use Underline::{Curly, None as Plain, Single};
+        assert_eq!(underlines, [Plain, Single, Curly, Single, Plain]);
+        let grid = builder
+            .build(&terminal, 2, Presentation::default())
+            .unwrap()
+            .unwrap();
+        assert!(grid.cells[..5].iter().all(|cell| cell.underline != Single));
     }
 
     #[test]

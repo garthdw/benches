@@ -69,8 +69,8 @@ fn percent_decode(text: &str) -> String {
     String::from_utf8_lossy(&decoded).into_owned()
 }
 
-/// The URL under `column` in a logical line of cells, one `char` per column.
-pub fn url_at(row: &[char], column: usize) -> Option<String> {
+/// The URL under `column` in a logical line of cells, one `char` per column, and the columns it spans.
+pub fn url_at(row: &[char], column: usize) -> Option<(std::ops::Range<usize>, String)> {
     let delimiter = |character: &char| character.is_whitespace() || "<>\"'`".contains(*character);
     if row.get(column).is_none_or(delimiter) {
         return None;
@@ -109,7 +109,7 @@ pub fn url_at(row: &[char], column: usize) -> Option<String> {
     }
     let span = start + offset..start + offset + url.len();
     let url: String = url.iter().collect();
-    (span.contains(&column) && openable(&url)).then_some(url)
+    (span.contains(&column) && openable(&url)).then_some((span, url))
 }
 
 #[cfg(test)]
@@ -146,7 +146,14 @@ mod tests {
     fn at(text: &str, needle: &str) -> Option<String> {
         let row: Vec<char> = text.chars().collect();
         let column = text.find(needle)?;
-        url_at(&row, text[..column].chars().count())
+        url_at(&row, text[..column].chars().count()).map(|(_, url)| url)
+    }
+
+    #[test]
+    fn a_url_comes_with_the_columns_it_spans() {
+        let row: Vec<char> = "go to https://a.te/x. ok".chars().collect();
+        let (span, url) = url_at(&row, 10).unwrap();
+        assert_eq!((span, url.as_str()), (6..20, "https://a.te/x"));
     }
 
     #[test]

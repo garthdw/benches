@@ -49,6 +49,18 @@ pub struct PointerInput {
     pub mods: key::Mods,
 }
 
+/// What the pointer over the terminal would do, which picks its cursor.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[repr(u8)]
+pub enum Hover {
+    #[default]
+    Text,
+    /// ⌘ is held over a link, which a click opens.
+    Link,
+    /// The program tracks the mouse, so a click reaches it instead of selecting.
+    Report,
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct WheelInput {
     pub dy: f32,
@@ -122,7 +134,9 @@ pub(crate) struct TerminalInput {
     pub(crate) scrollbar_grab: Option<f32>,
     /// Set by `select` for the actor to take, as libghostty doesn't mark the render state dirty.
     pub(crate) selection_changed: bool,
-    link_hovered: bool,
+    hover: Hover,
+    /// The viewport cells, `start..end` counted row by row, of the link ⌘ is over.
+    pub(crate) link: Option<(usize, usize)>,
 }
 
 impl TerminalInput {
@@ -148,7 +162,8 @@ impl TerminalInput {
             wheel_remainder: 0.0,
             scrollbar_grab: None,
             selection_changed: false,
-            link_hovered: false,
+            hover: Hover::Text,
+            link: None,
         })
     }
 
@@ -343,22 +358,31 @@ impl TerminalInput {
         Ok(())
     }
 
-    /// The new state when whether ⌘ is held over a link at the last pointer position changed.
-    pub(crate) fn link_hover(
+    /// The new hover at the last pointer position, when it changed.
+    pub(crate) fn hover(
         &mut self,
         terminal: &Terminal<'static, '_>,
-        command: bool,
-    ) -> Result<Option<bool>> {
+        mods: key::Mods,
+    ) -> Result<Option<Hover>> {
         let Some(surface) = self.surface else {
             return Ok(None);
         };
-        let over_link = command && {
+        self.link = if mods.contains(key::Mods::SUPER) {
             let position = Self::viewport_point(surface, self.position);
-            Self::link_at(terminal, surface, position)?.is_some()
+            Self::link_at(terminal, surface, position)?.map(|(cells, _)| cells)
+        } else {
+            None
         };
-        Ok((over_link != self.link_hovered).then(|| {
-            self.link_hovered = over_link;
-            over_link
+        let hover = if self.link.is_some() {
+            Hover::Link
+        } else if terminal.is_mouse_tracking()? && !mods.contains(key::Mods::SHIFT) {
+            Hover::Report
+        } else {
+            Hover::Text
+        };
+        Ok((hover != self.hover).then(|| {
+            self.hover = hover;
+            hover
         }))
     }
 
@@ -380,30 +404,48 @@ impl TerminalInput {
         }
         let scale = surface.metrics.scale;
         let position = Self::viewport_point(surface, (input.x * scale, input.y * scale));
-        Self::link_at(terminal, surface, position)
+        Ok(Self::link_at(terminal, surface, position)?.map(|(_, uri)| uri))
     }
 
-    /// An OSC 8 hyperlink, or else a URL in the text, which may wrap across rows.
+    /// An OSC 8 hyperlink, or else a URL in the text, which may wrap across rows, with the
+    /// viewport cells it covers, `start..end` counted row by row.
     fn link_at(
         terminal: &Terminal<'static, '_>,
         surface: Surface,
         position: Coordinate,
-    ) -> Result<Option<String>> {
-        let mut uri = [0; 4096];
-        let length = terminal
-            .grid_ref(Point::Viewport(position))?
-            .hyperlink_uri(&mut uri)?;
-        if let Ok(uri) = std::str::from_utf8(&uri[..length])
+    ) -> Result<Option<((usize, usize), String)>> {
+        let columns = usize::from(surface.cols);
+        let index = |x: u16, y: u32| y as usize * columns + usize::from(x);
+        let grid_ref = |x, y| terminal.grid_ref(Point::Viewport(Coordinate { x, y }));
+        let uri_at = |at: usize| -> Result<Vec<u8>> {
+            let mut uri = [0; 4096];
+            let x = u16::try_from(at % columns)?;
+            let length = grid_ref(x, u32::try_from(at / columns)?)?.hyperlink_uri(&mut uri)?;
+            Ok(uri[..length].to_vec())
+        };
+        let at = index(position.x, position.y);
+        let hyperlink = uri_at(at)?;
+        if let Ok(uri) = std::str::from_utf8(&hyperlink)
             && link::openable(uri)
         {
-            return Ok(Some(uri.to_owned()));
+            let cells = columns * usize::from(surface.rows);
+            let mut start = at;
+            while start > 0 && uri_at(start - 1)? == hyperlink {
+                start -= 1;
+            }
+            let mut end = at + 1;
+            while end < cells && uri_at(end)? == hyperlink {
+                end += 1;
+            }
+            return Ok(Some(((start, end), uri.to_owned())));
         }
-        let grid_ref = |x, y| terminal.grid_ref(Point::Viewport(Coordinate { x, y }));
         let mut first = position.y;
         while first > 0 && grid_ref(0, first)?.row()?.is_wrap_continuation()? {
             first -= 1;
         }
         let mut row = Vec::new();
+        // The viewport index of each character in `row`.
+        let mut indices = Vec::new();
         let mut column = 0;
         let mut y = first;
         loop {
@@ -426,13 +468,21 @@ impl TerminalInput {
                     Err(libghostty_vt::Error::OutOfSpace { .. }) => '\u{fffd}',
                     Err(error) => return Err(error.into()),
                 });
+                indices.push(index(x, y));
             }
             y += 1;
             if y >= surface.rows.into() || !grid_ref(0, y - 1)?.row()?.is_wrapped()? {
                 break;
             }
         }
-        Ok(link::url_at(&row, column))
+        Ok(link::url_at(&row, column).and_then(|(span, url)| {
+            let start = *indices.get(span.start)?;
+            let end = match indices.get(span.end) {
+                Some(&next) => next,
+                None => indices.last()? + 1,
+            };
+            Some(((start, end), url))
+        }))
     }
 
     pub(crate) fn pointer(
@@ -684,15 +734,60 @@ mod tests {
             let hover = pointer_at(PointerPhase::Move, column, 0);
             input.pointer(&terminal, hover).unwrap();
         };
+        let none = key::Mods::empty();
+        let command = key::Mods::SUPER;
         move_to(&mut input, 5);
-        assert_eq!(input.link_hover(&terminal, false).unwrap(), None);
-        assert_eq!(input.link_hover(&terminal, true).unwrap(), Some(true));
-        assert_eq!(input.link_hover(&terminal, true).unwrap(), None);
+        assert_eq!(input.hover(&terminal, none).unwrap(), None);
+        assert_eq!(input.hover(&terminal, command).unwrap(), Some(Hover::Link));
+        assert_eq!(input.hover(&terminal, command).unwrap(), None);
         move_to(&mut input, 0);
-        assert_eq!(input.link_hover(&terminal, true).unwrap(), Some(false));
+        assert_eq!(input.hover(&terminal, command).unwrap(), Some(Hover::Text));
         move_to(&mut input, 5);
-        assert_eq!(input.link_hover(&terminal, true).unwrap(), Some(true));
-        assert_eq!(input.link_hover(&terminal, false).unwrap(), Some(false));
+        assert_eq!(input.hover(&terminal, command).unwrap(), Some(Hover::Link));
+        assert_eq!(input.hover(&terminal, none).unwrap(), Some(Hover::Text));
+    }
+
+    #[test]
+    fn command_hover_spans_the_cells_of_the_link_under_it() {
+        let span_at = |text: &[u8], column, row| {
+            let mut terminal = new_terminal(20, 5).unwrap();
+            terminal.vt_write(text);
+            let mut input = input_for_test();
+            input
+                .pointer(&terminal, pointer_at(PointerPhase::Move, column, row))
+                .unwrap();
+            input.hover(&terminal, key::Mods::SUPER).unwrap();
+            let command = input.link;
+            input.hover(&terminal, key::Mods::empty()).unwrap();
+            assert_eq!(input.link, None, "released");
+            command
+        };
+        assert_eq!(span_at(b"a https://a.te/x ok", 5, 0), Some((2, 16)));
+        assert_eq!(span_at(b"a https://a.te/x ok", 0, 0), None);
+        // Wraps from row 0, column 15 onto row 1.
+        let wrapped = b"abcdefghijklmn https://a.te/xyz/long ok";
+        assert_eq!(span_at(wrapped, 2, 1), Some((15, 36)));
+        let osc8 = b"\x1b]8;;https://b.te\x1b\\click here\x1b]8;;\x1b\\ x";
+        assert_eq!(span_at(osc8, 7, 0), Some((0, 10)));
+    }
+
+    #[test]
+    fn hover_reports_while_tracking_unless_shift_is_held() {
+        let mut terminal = new_terminal(20, 5).unwrap();
+        terminal.vt_write(b"a https://a.te/x ok");
+        let mut input = input_for_test();
+        input
+            .pointer(&terminal, pointer_at(PointerPhase::Move, 5, 0))
+            .unwrap();
+        terminal.vt_write(b"\x1b[?1000h");
+        let none = key::Mods::empty();
+        assert_eq!(input.hover(&terminal, none).unwrap(), Some(Hover::Report));
+        let shift = key::Mods::SHIFT;
+        assert_eq!(input.hover(&terminal, shift).unwrap(), Some(Hover::Text));
+        let command = key::Mods::SUPER;
+        assert_eq!(input.hover(&terminal, command).unwrap(), Some(Hover::Link));
+        terminal.vt_write(b"\x1b[?1000l");
+        assert_eq!(input.hover(&terminal, none).unwrap(), Some(Hover::Text));
     }
 
     #[test]

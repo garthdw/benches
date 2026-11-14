@@ -75,6 +75,8 @@ pub(crate) struct State {
     /// Waiting confirmations, answered newest first; dismissed when keys move elsewhere.
     pub(crate) confirms: Vec<Confirm>,
     pub(crate) hovered_project: Option<usize>,
+    /// The sidebar project being dragged, which shows a closed hand.
+    pub(crate) dragged_project: Option<usize>,
     pub(crate) preedit: String,
     pub(crate) caret: Option<[f32; 4]>,
     pub(crate) palette: Palette,
@@ -659,7 +661,7 @@ pub(crate) fn poll(state: &mut State, now: f64, tx: &mut Tx) -> bool {
                 Event::CommandFinished { failed } => {
                     changed |= std::mem::replace(&mut tab.command_failed, failed) != failed;
                 }
-                Event::LinkHover => changed = true,
+                Event::Hover => changed = true,
                 Event::Progress(progress) => {
                     tab.progress = progress;
                     changed = true;
@@ -847,7 +849,7 @@ pub(crate) fn window_app(
         .on_ime(on_ime)
         .on_modifiers(|state, mods, _| {
             for tab in state.workspace.tabs_mut() {
-                tab.session.command_held(mods.logo);
+                tab.session.modifiers(crate::input::vt_mods(mods));
             }
         })
         .menu_item(reload_menu_item())
@@ -876,6 +878,7 @@ mod tests {
     use crate::grid::Metrics;
     use crate::protocol::{Progress, ProgressKind};
     use crate::scenes::*;
+    use crate::terminal_input::Hover;
     use crate::test_support::*;
     use crate::view::{DRAWER_HEIGHT, RAIL_WIDTH, SIDEBAR_WIDTH};
     use crate::workspace;
@@ -944,11 +947,27 @@ mod tests {
         assert_eq!(runtime.cursor(), Cursor::Text);
         runtime.update(|state, _| {
             if let Some(session) = state.workspace.active_session() {
-                session.set_link_hovered(true);
+                session.set_hover(Hover::Link);
             }
         });
         runtime.frame(2.0 / 60.0);
         assert_eq!(runtime.cursor(), Cursor::Pointer);
+    }
+
+    #[test]
+    fn a_mouse_tracking_terminal_shows_an_arrow() {
+        let mut state = State::default();
+        show_scene(&mut state, b"$ ");
+        let mut runtime = runtime_with(state);
+        let (x, y) = runtime.find("terminal").unwrap();
+        runtime.pointer_move(x, y);
+        runtime.update(|state, _| {
+            if let Some(session) = state.workspace.active_session() {
+                session.set_hover(Hover::Report);
+            }
+        });
+        runtime.frame(1.0 / 60.0);
+        assert_eq!(runtime.cursor(), Cursor::Default);
     }
 
     #[test]
@@ -1291,6 +1310,28 @@ mod tests {
         let workspace = &runtime.state.workspace;
         assert_eq!(workspace.projects.len(), 1);
         assert_eq!(workspace.active, 0);
+    }
+
+    #[test]
+    fn dragging_a_project_shows_a_closed_hand_and_a_click_does_not() {
+        let mut runtime = runtime_with(workspace_state());
+        let (x, y) = runtime.find("project-0").unwrap();
+        runtime.pointer_move(x, y);
+        runtime.pointer_down(x, y);
+        runtime.frame(1.0 / 60.0);
+        assert_eq!(
+            runtime.cursor(),
+            Cursor::Default,
+            "pressed, not yet dragged"
+        );
+        runtime.pointer_move(x + 10.0, y + 10.0);
+        runtime.pointer_move(x + 40.0, y + 20.0);
+        runtime.frame(2.0 / 60.0);
+        assert_eq!(runtime.cursor(), Cursor::Grabbing);
+        runtime.pointer_up(x, y);
+        runtime.frame(3.0 / 60.0);
+        assert_eq!(runtime.cursor(), Cursor::Default);
+        assert_eq!(runtime.state.dragged_project, None);
     }
 
     #[test]
