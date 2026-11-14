@@ -1,6 +1,7 @@
 @group(0) @binding(0) var<uniform> frame: vec4f;
 @group(0) @binding(1) var atlas: texture_2d<f32>;
 @group(0) @binding(2) var atlas_sampler: sampler;
+@group(0) @binding(3) var coverage_atlas: texture_2d<f32>;
 
 const MODE_COVERAGE: u32 = 1u;
 const MODE_COLOR: u32 = 2u;
@@ -25,8 +26,9 @@ fn srgb_decode(c: vec3f) -> vec3f {
 
 @fragment fn fs(v: Out) -> @location(0) vec4f {
     let texel = textureSample(atlas, atlas_sampler, v.uv);
+    let coverage = textureSample(coverage_atlas, atlas_sampler, v.uv).r;
     if v.mode == MODE_COVERAGE {
-        return vec4f(v.color * texel.a, texel.a);
+        return vec4f(v.color * coverage, coverage);
     }
     if v.mode == MODE_COLOR {
         return texel;

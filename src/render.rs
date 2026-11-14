@@ -27,9 +27,12 @@ use crate::session::Session;
 pub const PADDING_POINTS: f32 = 6.0;
 const SCROLLBAR_POINTS: f32 = 3.0;
 const WIDE_SCROLLBAR_POINTS: f32 = 5.0;
-/// Where the atlas texture starts; it doubles when full, up to `MAX_ATLAS_SIZE`.
+/// Where the coverage atlas texture starts; it doubles when full, up to `MAX_ATLAS_SIZE`.
 const ATLAS_SIZE: u32 = 1024;
-const MAX_ATLAS_SIZE: u32 = 8192;
+/// The colour atlas holds only emoji and bitmap glyphs, which most sessions never draw. A
+/// quarter of a megabyte costs little, and growing it is one texture copy.
+const COLOR_ATLAS_SIZE: u32 = 256;
+const MAX_ATLAS_SIZE: u32 = 4096;
 const MODE_SOLID: u32 = 0;
 const MODE_COVERAGE: u32 = 1;
 const MODE_COLOR: u32 = 2;
@@ -292,8 +295,14 @@ struct AtlasTexture {
     view: wgpu::TextureView,
 }
 
+/// A coverage glyph is premultiplied white, so its alpha plane is all the shader needs.
+fn alpha_plane(bitmap: &[u8]) -> Vec<u8> {
+    let (texels, _) = bitmap.as_chunks::<4>();
+    texels.iter().map(|texel| texel[3]).collect()
+}
+
 impl AtlasTexture {
-    fn new(device: &wgpu::Device, size: u32) -> Self {
+    fn new(device: &wgpu::Device, size: u32, format: wgpu::TextureFormat) -> Self {
         let texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("terminal atlas"),
             size: wgpu::Extent3d {
@@ -304,7 +313,7 @@ impl AtlasTexture {
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba8Unorm,
+            format,
             usage: wgpu::TextureUsages::TEXTURE_BINDING
                 | wgpu::TextureUsages::COPY_DST
                 | wgpu::TextureUsages::COPY_SRC,
@@ -323,7 +332,7 @@ impl AtlasTexture {
         if size <= old_size {
             return;
         }
-        let grown = Self::new(device, size);
+        let grown = Self::new(device, size, self.texture.format());
         let mut encoder = device.create_command_encoder(&Default::default());
         encoder.copy_texture_to_texture(
             self.texture.as_image_copy(),
@@ -339,6 +348,62 @@ impl AtlasTexture {
     }
 }
 
+struct AtlasTextures {
+    coverage: AtlasTexture,
+    color: AtlasTexture,
+}
+
+impl AtlasTextures {
+    fn new(device: &wgpu::Device) -> Self {
+        Self {
+            coverage: AtlasTexture::new(device, ATLAS_SIZE, wgpu::TextureFormat::R8Unorm),
+            color: AtlasTexture::new(device, COLOR_ATLAS_SIZE, wgpu::TextureFormat::Rgba8Unorm),
+        }
+    }
+
+    fn of(&self, kind: GlyphKind) -> &AtlasTexture {
+        match kind {
+            GlyphKind::Coverage => &self.coverage,
+            GlyphKind::Color => &self.color,
+        }
+    }
+
+    /// The sides of the coverage and colour textures.
+    fn sizes(&self) -> [u32; 2] {
+        [self.coverage.texture.width(), self.color.texture.width()]
+    }
+}
+
+/// The glyph positions of one atlas texture.
+#[derive(Clone, Copy)]
+struct Plane {
+    next: [u32; 2],
+    /// The texture's side in pixels once the glyphs placed so far are uploaded.
+    size: u32,
+    max_size: u32,
+}
+
+impl Plane {
+    fn new(size: u32) -> Self {
+        Self {
+            next: [1, 1],
+            size,
+            max_size: MAX_ATLAS_SIZE,
+        }
+    }
+
+    fn try_reserve(&mut self, width: u32, height: u32) -> Option<[u32; 2]> {
+        let mut position = self.next;
+        if position[0] + width + 1 > self.size {
+            position = [1, position[1] + height + 1];
+        }
+        (position[1] + height < self.size).then(|| {
+            self.next = [position[0] + width + 1, position[1]];
+            position
+        })
+    }
+}
+
 struct Atlas {
     slots: FnvMap<GlyphKey, AtlasSlot>,
     /// Glyphs out with the rasterizer, by job id.
@@ -346,11 +411,9 @@ struct Atlas {
     next_job: u64,
     /// Counts builds, to tell the rasterizer which requests are stale.
     frame: u64,
-    next: [u32; 2],
-    /// The texture's side in pixels once the glyphs placed so far are uploaded.
-    size: u32,
-    max_size: u32,
-    /// Bumped when glyph positions or the texture size change, so cached quads rebuild.
+    coverage: Plane,
+    color: Plane,
+    /// Bumped when glyph positions or either texture's size change, so cached quads rebuild.
     epoch: u64,
     /// Whether a lookup since this was last cleared found a glyph not rasterised yet.
     missing: bool,
@@ -365,41 +428,69 @@ impl Atlas {
             requested: HashMap::new(),
             next_job: 0,
             frame: 0,
-            next: [1, 1],
-            size: ATLAS_SIZE,
-            max_size: MAX_ATLAS_SIZE,
+            coverage: Plane::new(ATLAS_SIZE),
+            color: Plane::new(COLOR_ATLAS_SIZE),
             epoch,
             missing: false,
             ascii: [None; 128],
         }
     }
 
-    /// Empties the texture; glyphs still out with the rasterizer land in the new one.
-    fn reset(&mut self) {
-        self.slots
-            .retain(|_, slot| matches!(slot, AtlasSlot::Pending(_)));
-        self.next = [1, 1];
-        self.ascii = [None; 128];
+    /// The same sizes with nothing placed, for a new font.
+    fn restarted(&self) -> Self {
+        Self {
+            coverage: Plane {
+                next: [1, 1],
+                ..self.coverage
+            },
+            color: Plane {
+                next: [1, 1],
+                ..self.color
+            },
+            ..Self::new(self.epoch + 1)
+        }
+    }
+
+    fn plane(&mut self, kind: GlyphKind) -> &mut Plane {
+        match kind {
+            GlyphKind::Coverage => &mut self.coverage,
+            GlyphKind::Color => &mut self.color,
+        }
+    }
+
+    /// The sides of the coverage and colour atlases, as `AtlasTextures::sizes` orders them.
+    fn sizes(&self) -> [u32; 2] {
+        [self.coverage.size, self.color.size]
+    }
+
+    /// Empties one texture; glyphs still out with the rasterizer land in the new one.
+    fn reset(&mut self, kind: GlyphKind) {
+        self.slots.retain(|_, slot| match slot {
+            AtlasSlot::Ready(Some(glyph)) => glyph.kind != kind,
+            _ => true,
+        });
+        self.plane(kind).next = [1, 1];
+        for cached in &mut self.ascii {
+            if cached.is_some_and(|glyph| glyph.kind == kind) {
+                *cached = None;
+            }
+        }
         self.epoch += 1;
     }
 
-    /// Where a `width` by `height` glyph goes, doubling `size` when the rows run out and
-    /// resetting only once it can't grow.
-    fn reserve(&mut self, width: u32, height: u32) -> [u32; 2] {
+    /// Where a `width` by `height` glyph goes in the `kind` atlas, doubling its size when the
+    /// rows run out and resetting it only once it can't grow.
+    fn reserve(&mut self, kind: GlyphKind, width: u32, height: u32) -> [u32; 2] {
         loop {
-            let mut position = self.next;
-            if position[0] + width + 1 > self.size {
-                position = [1, position[1] + height + 1];
-            }
-            if position[1] + height < self.size {
-                self.next = [position[0] + width + 1, position[1]];
+            let plane = self.plane(kind);
+            if let Some(position) = plane.try_reserve(width, height) {
                 return position;
             }
-            if self.size < self.max_size {
-                self.size = (self.size * 2).min(self.max_size);
+            if plane.size < plane.max_size {
+                plane.size = (plane.size * 2).min(plane.max_size);
                 self.epoch += 1;
             } else {
-                self.reset();
+                self.reset(kind);
             }
         }
     }
@@ -451,7 +542,7 @@ impl Atlas {
         &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
-        texture: &mut AtlasTexture,
+        textures: &mut AtlasTextures,
         font: &Font,
         rasterizer: &Rasterizer,
         wait: Wait,
@@ -468,7 +559,7 @@ impl Atlas {
             let Some(result) = result else {
                 break;
             };
-            landed |= self.place(device, queue, texture, font, result);
+            landed |= self.place(device, queue, textures, font, result);
         }
         landed
     }
@@ -484,7 +575,7 @@ impl Atlas {
         &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
-        texture: &mut AtlasTexture,
+        textures: &mut AtlasTextures,
         font: &Font,
         result: Rasterized,
     ) -> bool {
@@ -497,25 +588,35 @@ impl Atlas {
         };
         let (width, height) = (font.cell_width * key.cells, font.cell_height);
         let slot = result.kind.map(|kind| AtlasGlyph {
-            position: self.reserve(width, height),
+            position: self.reserve(kind, width, height),
             kind,
         });
-        texture.grow(device, queue, self.size);
+        textures.coverage.grow(device, queue, self.coverage.size);
+        textures.color.grow(device, queue, self.color.size);
         if let Some(AtlasGlyph {
-            position: [x, y], ..
+            position: [x, y],
+            kind,
         }) = slot
         {
+            let alpha;
+            let (texels, bytes_per_row) = match kind {
+                GlyphKind::Coverage => {
+                    alpha = alpha_plane(&result.bitmap);
+                    (&alpha, width)
+                }
+                GlyphKind::Color => (&result.bitmap, width * 4),
+            };
             queue.write_texture(
                 wgpu::TexelCopyTextureInfo {
-                    texture: &texture.texture,
+                    texture: &textures.of(kind).texture,
                     mip_level: 0,
                     origin: wgpu::Origin3d { x, y, z: 0 },
                     aspect: wgpu::TextureAspect::All,
                 },
-                &result.bitmap,
+                texels,
                 wgpu::TexelCopyBufferLayout {
                     offset: 0,
-                    bytes_per_row: Some(width * 4),
+                    bytes_per_row: Some(bytes_per_row),
                     rows_per_image: Some(height),
                 },
                 wgpu::Extent3d {
@@ -727,7 +828,7 @@ fn build_quads(
     metrics: Metrics,
     font: &Font,
     srgb_blend: bool,
-    atlas_size: u32,
+    atlas_sizes: [u32; 2],
     quads: &mut Vec<Quad>,
     mut glyph: impl FnMut(GlyphKey) -> (Option<AtlasGlyph>, u64),
 ) -> usize {
@@ -784,6 +885,10 @@ fn build_quads(
     let underline_top = font.underline_top as f32;
     let textured = |found: AtlasGlyph, left: f32, top: f32, cells: f32, fg: [u8; 3]| {
         let [x, y] = found.position;
+        let atlas_size = atlas_sizes[match found.kind {
+            GlyphKind::Coverage => 0,
+            GlyphKind::Color => 1,
+        }];
         Quad {
             rect: [left, top, width * cells, height],
             uv: [
@@ -1059,8 +1164,8 @@ fn thumb_color(bg: [u8; 3], opacity: f32) -> [u8; 3] {
 }
 
 struct Slot {
-    /// The side of the atlas texture `bind_group` was made from.
-    bound_size: u32,
+    /// The sides of the coverage and colour textures `bind_group` was made from.
+    bound_sizes: [u32; 2],
     quads: wgpu::Buffer,
     scratch: Vec<Quad>,
     uniforms: wgpu::Buffer,
@@ -1078,7 +1183,7 @@ struct Gpu {
     key: DeviceKey,
     layout: wgpu::BindGroupLayout,
     module: wgpu::ShaderModule,
-    texture: AtlasTexture,
+    textures: AtlasTextures,
     sampler: wgpu::Sampler,
     atlas: Atlas,
     /// By target format: the cells' pipeline, then the images'.
@@ -1122,6 +1227,14 @@ impl Gpu {
                     2,
                     wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                 ),
+                entry(
+                    3,
+                    wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                ),
             ],
         });
         Self {
@@ -1131,11 +1244,14 @@ impl Gpu {
                 label: Some("terminal cells"),
                 source: wgpu::ShaderSource::Wgsl(include_str!("cell.wgsl").into()),
             }),
-            texture: AtlasTexture::new(device, ATLAS_SIZE),
+            textures: AtlasTextures::new(device),
             sampler: device.create_sampler(&Default::default()),
-            atlas: Atlas {
-                max_size: MAX_ATLAS_SIZE.min(device.limits().max_texture_dimension_2d),
-                ..Atlas::new(0)
+            atlas: {
+                let mut atlas = Atlas::new(0);
+                let limit = device.limits().max_texture_dimension_2d;
+                atlas.coverage.max_size = MAX_ATLAS_SIZE.min(limit);
+                atlas.color.max_size = MAX_ATLAS_SIZE.min(limit);
+                atlas
             },
             pipelines: Vec::new(),
             images: ImageTextures::new(device),
@@ -1193,7 +1309,7 @@ fn atlas_bind_group(
     device: &wgpu::Device,
     layout: &wgpu::BindGroupLayout,
     uniforms: &wgpu::Buffer,
-    view: &wgpu::TextureView,
+    textures: &AtlasTextures,
     sampler: &wgpu::Sampler,
 ) -> wgpu::BindGroup {
     device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -1206,11 +1322,15 @@ fn atlas_bind_group(
             },
             wgpu::BindGroupEntry {
                 binding: 1,
-                resource: wgpu::BindingResource::TextureView(view),
+                resource: wgpu::BindingResource::TextureView(&textures.color.view),
             },
             wgpu::BindGroupEntry {
                 binding: 2,
                 resource: wgpu::BindingResource::Sampler(sampler),
+            },
+            wgpu::BindGroupEntry {
+                binding: 3,
+                resource: wgpu::BindingResource::TextureView(&textures.coverage.view),
             },
         ],
     })
@@ -1219,7 +1339,7 @@ fn atlas_bind_group(
 fn new_slot(
     device: &wgpu::Device,
     layout: &wgpu::BindGroupLayout,
-    texture: &AtlasTexture,
+    textures: &AtlasTextures,
     sampler: &wgpu::Sampler,
 ) -> Slot {
     let uniforms = device.create_buffer(&wgpu::BufferDescriptor {
@@ -1228,9 +1348,9 @@ fn new_slot(
         usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         mapped_at_creation: false,
     });
-    let bind_group = atlas_bind_group(device, layout, &uniforms, &texture.view, sampler);
+    let bind_group = atlas_bind_group(device, layout, &uniforms, textures, sampler);
     Slot {
-        bound_size: texture.texture.width(),
+        bound_sizes: textures.sizes(),
         quads: quad_buffer(device, 4096 * size_of::<Quad>() as u64),
         scratch: Vec::new(),
         uniforms,
@@ -1295,11 +1415,7 @@ impl TerminalCompositor {
             match load_font(config, size, site.scale) {
                 Ok(font) => {
                     // Glyphs still out with the old rasterizer never come back, so none stay pending.
-                    gpu.atlas = Atlas {
-                        size: gpu.atlas.size,
-                        max_size: gpu.atlas.max_size,
-                        ..Atlas::new(gpu.atlas.epoch + 1)
-                    };
+                    gpu.atlas = gpu.atlas.restarted();
                     self.font = Some(LoadedFont {
                         scale: site.scale,
                         size,
@@ -1323,7 +1439,7 @@ impl TerminalCompositor {
         gpu.atlas.receive(
             device,
             queue,
-            &mut gpu.texture,
+            &mut gpu.textures,
             font,
             rasterizer,
             Wait::Ready,
@@ -1332,7 +1448,7 @@ impl TerminalCompositor {
         let slot = gpu
             .slots
             .entry(site.mark)
-            .or_insert_with(|| new_slot(device, &gpu.layout, &gpu.texture, &gpu.sampler));
+            .or_insert_with(|| new_slot(device, &gpu.layout, &gpu.textures, &gpu.sampler));
 
         let rect = site.instance.rect;
         let metrics = Metrics {
@@ -1359,7 +1475,7 @@ impl TerminalCompositor {
             } else {
                 Wait::Until(Instant::now() + GLYPH_WAIT)
             };
-            let (atlas, texture) = (&mut gpu.atlas, &mut gpu.texture);
+            let (atlas, textures) = (&mut gpu.atlas, &mut gpu.textures);
             atlas.frame += 1;
             rasterizer
                 .latest_frame
@@ -1372,14 +1488,14 @@ impl TerminalCompositor {
                     metrics,
                     font,
                     site.srgb_blend,
-                    atlas.size,
+                    atlas.sizes(),
                     &mut slot.scratch,
                     |key| (atlas.glyph(&rasterizer.jobs, key), atlas.epoch),
                 );
                 // Glyphs keep landing while the workers run, so past the deadline the frame draws what it has.
                 if !atlas.missing
                     || wait.expired()
-                    || !atlas.receive(device, queue, texture, font, rasterizer, wait)
+                    || !atlas.receive(device, queue, textures, font, rasterizer, wait)
                 {
                     break glyphs_start;
                 }
@@ -1431,13 +1547,13 @@ impl TerminalCompositor {
             slot.built = (!atlas.missing).then_some(built);
         }
 
-        if slot.bound_size != gpu.texture.texture.width() {
-            slot.bound_size = gpu.texture.texture.width();
+        if slot.bound_sizes != gpu.textures.sizes() {
+            slot.bound_sizes = gpu.textures.sizes();
             slot.bind_group = atlas_bind_group(
                 device,
                 &gpu.layout,
                 &slot.uniforms,
-                &gpu.texture.view,
+                &gpu.textures,
                 &gpu.sampler,
             );
         }
@@ -1553,7 +1669,7 @@ mod tests {
             .slots
             .insert(key.clone(), AtlasSlot::Ready(Some(fake_glyph([16, 0]))));
         assert!(atlas.glyph(&jobs, key.clone()).is_some());
-        atlas.reset();
+        atlas.reset(GlyphKind::Coverage);
         assert!(atlas.glyph(&jobs, key).is_none());
         assert_eq!(queued.len(), 1);
     }
@@ -1563,21 +1679,23 @@ mod tests {
         let mut atlas = Atlas::new(0);
         // Regular and bold ASCII, plus a prompt's icons, at 23x45 pixel cells.
         for _ in 0..(95 * 2 + 20) {
-            atlas.reserve(23, 45);
+            atlas.reserve(GlyphKind::Coverage, 23, 45);
         }
         assert_eq!(atlas.epoch, 0);
-        assert!(u64::from(ATLAS_SIZE).pow(2) * 4 <= 4 << 20);
+        assert!(u64::from(ATLAS_SIZE).pow(2) <= 1 << 20);
     }
 
     #[test]
     fn a_full_atlas_grows_before_it_resets() {
         let mut atlas = Atlas::new(0);
-        let first = atlas.reserve(23, 45);
+        let first = atlas.reserve(GlyphKind::Coverage, 23, 45);
         let start_epoch = atlas.epoch;
         let rows = ATLAS_SIZE / 46;
         let per_row = ATLAS_SIZE / 24;
-        let last = (0..=rows * per_row).map(|_| atlas.reserve(23, 45)).last();
-        assert_eq!(atlas.size, ATLAS_SIZE * 2);
+        let last = (0..=rows * per_row)
+            .map(|_| atlas.reserve(GlyphKind::Coverage, 23, 45))
+            .last();
+        assert_eq!(atlas.coverage.size, ATLAS_SIZE * 2);
         assert!(atlas.epoch > start_epoch);
         assert_eq!(first, [1, 1]);
         assert!(last.is_some_and(|[_, y]| y > 1));
@@ -1594,9 +1712,12 @@ mod tests {
         atlas
             .slots
             .insert(key.clone(), AtlasSlot::Ready(Some(fake_glyph([1, 1]))));
-        atlas.next = [ATLAS_SIZE - 10, ATLAS_SIZE - 50];
-        assert_eq!(atlas.reserve(23, 45), [ATLAS_SIZE - 10, ATLAS_SIZE - 50]);
-        assert_eq!(atlas.size, ATLAS_SIZE * 2);
+        atlas.coverage.next = [ATLAS_SIZE - 10, ATLAS_SIZE - 50];
+        assert_eq!(
+            atlas.reserve(GlyphKind::Coverage, 23, 45),
+            [ATLAS_SIZE - 10, ATLAS_SIZE - 50]
+        );
+        assert_eq!(atlas.coverage.size, ATLAS_SIZE * 2);
         assert!(matches!(
             atlas.slots.get(&key),
             Some(AtlasSlot::Ready(Some(_)))
@@ -1606,12 +1727,66 @@ mod tests {
     #[test]
     fn an_atlas_at_its_maximum_resets() {
         let mut atlas = Atlas::new(0);
-        atlas.max_size = ATLAS_SIZE;
-        atlas.next = [1, ATLAS_SIZE - 10];
+        atlas.coverage.max_size = ATLAS_SIZE;
+        atlas.coverage.next = [1, ATLAS_SIZE - 10];
         let epoch = atlas.epoch;
-        assert_eq!(atlas.reserve(23, 45), [1, 1]);
-        assert_eq!(atlas.size, ATLAS_SIZE);
+        assert_eq!(atlas.reserve(GlyphKind::Coverage, 23, 45), [1, 1]);
+        assert_eq!(atlas.coverage.size, ATLAS_SIZE);
         assert_eq!(atlas.epoch, epoch + 1);
+    }
+
+    #[test]
+    fn coverage_and_colour_glyphs_have_separate_position_spaces() {
+        let mut atlas = Atlas::new(0);
+        assert_eq!(atlas.reserve(GlyphKind::Coverage, 23, 45), [1, 1]);
+        assert_eq!(atlas.reserve(GlyphKind::Color, 46, 45), [1, 1]);
+        assert_eq!(atlas.reserve(GlyphKind::Coverage, 23, 45), [25, 1]);
+        assert_eq!(atlas.sizes(), [ATLAS_SIZE, COLOR_ATLAS_SIZE]);
+    }
+
+    #[test]
+    fn growing_one_atlas_bumps_the_epoch_and_leaves_the_other_alone() {
+        let mut atlas = Atlas::new(0);
+        atlas.reserve(GlyphKind::Coverage, 23, 45);
+        let epoch = atlas.epoch;
+        let coverage_next = atlas.coverage.next;
+        let colour_slots = (COLOR_ATLAS_SIZE / 46) * (COLOR_ATLAS_SIZE / 47);
+        for _ in 0..=colour_slots {
+            atlas.reserve(GlyphKind::Color, 46, 45);
+        }
+        assert_eq!(atlas.color.size, COLOR_ATLAS_SIZE * 2);
+        assert!(atlas.epoch > epoch);
+        assert_eq!(atlas.coverage.size, ATLAS_SIZE);
+        assert_eq!(atlas.coverage.next, coverage_next);
+    }
+
+    #[test]
+    fn resetting_one_atlas_keeps_the_other_kinds_glyphs() {
+        let mut atlas = Atlas::new(0);
+        let key = |character| GlyphKey {
+            text: GlyphText::Character(character),
+            style: FontStyle::default(),
+            cells: 1,
+        };
+        let colour = AtlasGlyph {
+            position: [1, 1],
+            kind: GlyphKind::Color,
+        };
+        atlas
+            .slots
+            .insert(key('a'), AtlasSlot::Ready(Some(fake_glyph([1, 1]))));
+        atlas.slots.insert(key('b'), AtlasSlot::Ready(Some(colour)));
+        atlas.color.max_size = COLOR_ATLAS_SIZE;
+        atlas.color.next = [1, COLOR_ATLAS_SIZE - 10];
+        atlas.reserve(GlyphKind::Color, 46, 45);
+        assert!(!atlas.slots.contains_key(&key('b')));
+        assert!(atlas.slots.contains_key(&key('a')));
+    }
+
+    #[test]
+    fn coverage_uploads_only_the_alpha_plane() {
+        let bitmap = [255, 255, 255, 255, 0, 0, 0, 0, 128, 128, 128, 128];
+        assert_eq!(alpha_plane(&bitmap), [255, 0, 128]);
     }
 
     #[test]
@@ -1747,7 +1922,7 @@ mod tests {
             metrics(&font, 0.0, scale),
             &font,
             true,
-            ATLAS_SIZE,
+            [ATLAS_SIZE; 2],
             &mut quads,
             |_| (Some(fake_glyph([0, 0])), 0),
         );
@@ -1785,7 +1960,7 @@ mod tests {
                 metrics,
                 &font,
                 true,
-                ATLAS_SIZE,
+                [ATLAS_SIZE; 2],
                 quads,
                 |key| {
                     let next = atlas.len() as u32;
@@ -1949,7 +2124,7 @@ mod tests {
             metrics(&font, 0.0, 2.0),
             &font,
             true,
-            ATLAS_SIZE,
+            [ATLAS_SIZE; 2],
             &mut Vec::new(),
             |key| {
                 if let GlyphText::Shaped(cell) = key.text {
@@ -2100,7 +2275,7 @@ mod tests {
             metrics(&font, 0.0, 2.0),
             &font,
             true,
-            ATLAS_SIZE,
+            [ATLAS_SIZE; 2],
             &mut Vec::new(),
             |key| {
                 keys += usize::from(matches!(key.text, GlyphText::Shaped { .. }));
@@ -2294,7 +2469,7 @@ mod tests {
                 metrics(&font, 0.0, 2.0),
                 &font,
                 true,
-                ATLAS_SIZE,
+                [ATLAS_SIZE; 2],
                 quads,
                 |key| (atlas.glyph(&jobs, key), atlas.epoch),
             );
@@ -2358,7 +2533,7 @@ mod tests {
                 metrics(&font, 0.0, 2.0),
                 &font,
                 true,
-                ATLAS_SIZE,
+                [ATLAS_SIZE; 2],
                 &mut quads,
                 |_| (Some(fake_glyph([0, 0])), 0),
             );
@@ -2441,7 +2616,7 @@ mod tests {
             metrics(&font, 0.0, 1.0),
             &font,
             true,
-            ATLAS_SIZE,
+            [ATLAS_SIZE; 2],
             &mut quads,
             |key| {
                 if !slots.contains_key(&key) {
