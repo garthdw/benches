@@ -3,7 +3,7 @@ use std::mem::size_of;
 use std::ops::Range;
 use std::rc::Rc;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -106,6 +106,10 @@ const WORKERS: usize = 2;
 /// How long a frame waits for glyphs it asked for before drawing without them, so ordinary
 /// screens never show missing text while a screen of new glyphs can't stall every surface.
 const GLYPH_WAIT: Duration = Duration::from_millis(4);
+/// Builds a queued glyph stays worth rasterising for. Under a flood of new glyphs the queue
+/// outgrows what is on screen, and rasterising the backlog would refill a fresh atlas with
+/// glyphs no frame asks for any more.
+const STALE_AFTER: u64 = 4;
 
 /// What a worker rasterises; `GlyphText` without its `Rc`, which can't leave the UI thread.
 enum JobText {
@@ -131,6 +135,8 @@ impl From<&GlyphText> for JobText {
 
 struct Job {
     id: u64,
+    /// The newest build to have asked for it.
+    wanted: Arc<AtomicU64>,
     text: JobText,
     style: FontStyle,
     cells: u32,
@@ -138,6 +144,8 @@ struct Job {
 
 struct Rasterized {
     id: u64,
+    /// Dropped unrasterised as no recent build still wanted it.
+    skipped: bool,
     kind: Option<GlyphKind>,
     bitmap: Vec<u8>,
 }
@@ -188,6 +196,8 @@ struct Rasterizer {
     done: Receiver<Rasterized>,
     /// Set once a result is waiting, so a burst of glyphs wakes the window once.
     woken: Arc<AtomicBool>,
+    /// The newest build to have asked for glyphs.
+    latest_frame: Arc<AtomicU64>,
 }
 
 impl Rasterizer {
@@ -195,13 +205,15 @@ impl Rasterizer {
         let (jobs, queued) = unbounded::<Job>();
         let (finished, done) = unbounded();
         let woken = Arc::new(AtomicBool::new(false));
+        let latest_frame = Arc::new(AtomicU64::new(0));
         for _ in 0..WORKERS {
-            let (queued, finished, config, wake, woken) = (
+            let (queued, finished, config, wake, woken, latest_frame) = (
                 queued.clone(),
                 finished.clone(),
                 config.clone(),
                 wake.clone(),
                 woken.clone(),
+                latest_frame.clone(),
             );
             thread::spawn(move || {
                 // Utility QoS leaves the performance cores to the PTY readers and actors, which a
@@ -219,10 +231,17 @@ impl Rasterizer {
                 };
                 for job in queued {
                     let mut bitmap = Vec::new();
-                    let kind = rasterize(&font, &job.text, job.style, job.cells, &mut bitmap);
+                    let skipped = job.wanted.load(Ordering::Acquire) + STALE_AFTER
+                        < latest_frame.load(Ordering::Acquire);
+                    let kind = if skipped {
+                        None
+                    } else {
+                        rasterize(&font, &job.text, job.style, job.cells, &mut bitmap)
+                    };
                     if finished
                         .send(Rasterized {
                             id: job.id,
+                            skipped,
                             kind,
                             bitmap,
                         })
@@ -236,7 +255,12 @@ impl Rasterizer {
                 }
             });
         }
-        Self { jobs, done, woken }
+        Self {
+            jobs,
+            done,
+            woken,
+            latest_frame,
+        }
     }
 }
 
@@ -256,7 +280,8 @@ impl Wait {
 }
 
 enum AtlasSlot {
-    Pending,
+    /// Out with the rasterizer, with the newest build that asked for it.
+    Pending(Arc<AtomicU64>),
     Ready(Option<AtlasGlyph>),
 }
 
@@ -265,6 +290,8 @@ struct Atlas {
     /// Glyphs out with the rasterizer, by job id.
     requested: HashMap<u64, GlyphKey>,
     next_job: u64,
+    /// Counts builds, to tell the rasterizer which requests are stale.
+    frame: u64,
     next: [u32; 2],
     epoch: u64,
     /// Whether a lookup since this was last cleared found a glyph not rasterised yet.
@@ -279,6 +306,7 @@ impl Atlas {
             slots: FnvMap::default(),
             requested: HashMap::new(),
             next_job: 0,
+            frame: 0,
             next: [1, 1],
             epoch,
             missing: false,
@@ -289,7 +317,7 @@ impl Atlas {
     /// Empties the texture; glyphs still out with the rasterizer land in the new one.
     fn reset(&mut self) {
         self.slots
-            .retain(|_, slot| matches!(slot, AtlasSlot::Pending));
+            .retain(|_, slot| matches!(slot, AtlasSlot::Pending(_)));
         self.next = [1, 1];
         self.ascii = [None; 128];
         self.epoch += 1;
@@ -315,18 +343,20 @@ impl Atlas {
                 }
                 return *slot;
             }
-            Some(AtlasSlot::Pending) => {}
+            Some(AtlasSlot::Pending(wanted)) => wanted.store(self.frame, Ordering::Release),
             None => {
+                let wanted = Arc::new(AtomicU64::new(self.frame));
                 let id = self.next_job;
                 self.next_job += 1;
                 let job = Job {
                     id,
+                    wanted: wanted.clone(),
                     text: JobText::from(&key.text),
                     style: key.style,
                     cells: key.cells,
                 };
                 if jobs.send(job).log_err("queue glyph").is_some() {
-                    self.slots.insert(key.clone(), AtlasSlot::Pending);
+                    self.slots.insert(key.clone(), AtlasSlot::Pending(wanted));
                     self.requested.insert(id, key);
                 }
             }
@@ -361,6 +391,13 @@ impl Atlas {
         landed
     }
 
+    /// Forgets a request the rasterizer dropped, so a build that still wants it asks again.
+    fn skip(&mut self, id: u64) {
+        if let Some(key) = self.requested.remove(&id) {
+            self.slots.remove(&key);
+        }
+    }
+
     fn place(
         &mut self,
         queue: &wgpu::Queue,
@@ -368,6 +405,10 @@ impl Atlas {
         font: &Font,
         result: Rasterized,
     ) -> bool {
+        if result.skipped {
+            self.skip(result.id);
+            return false;
+        }
         let Some(key) = self.requested.remove(&result.id) else {
             return false;
         };
@@ -1230,6 +1271,10 @@ impl TerminalCompositor {
                 Wait::Until(Instant::now() + GLYPH_WAIT)
             };
             let (atlas, texture) = (&mut gpu.atlas, &gpu.texture);
+            atlas.frame += 1;
+            rasterizer
+                .latest_frame
+                .store(atlas.frame, Ordering::Release);
             let glyphs_start = loop {
                 atlas.missing = false;
                 let glyphs_start = build_quads(
@@ -1444,6 +1489,7 @@ mod tests {
                 .jobs
                 .send(Job {
                     id,
+                    wanted: Arc::default(),
                     text,
                     style: FontStyle::default(),
                     cells,
@@ -1453,6 +1499,71 @@ mod tests {
             assert_eq!((done.id, done.kind), (id, expected_kind));
             assert!(done.bitmap == expected);
         }
+    }
+
+    #[test]
+    fn a_worker_skips_a_job_no_recent_build_wants() {
+        let config = crate::config::Config::default().font;
+        let rasterizer = Rasterizer::new(&config, 18.0, 2.0, Arc::new(|| {}));
+        rasterizer
+            .latest_frame
+            .store(STALE_AFTER + 1, Ordering::Release);
+        for (id, frame) in [(1, 0), (2, 1)] {
+            rasterizer
+                .jobs
+                .send(Job {
+                    id,
+                    wanted: Arc::new(AtomicU64::new(frame)),
+                    text: JobText::Character('世'),
+                    style: FontStyle::default(),
+                    cells: 2,
+                })
+                .unwrap();
+        }
+        let mut done = [
+            rasterizer.done.recv().unwrap(),
+            rasterizer.done.recv().unwrap(),
+        ];
+        done.sort_by_key(|result| result.id);
+        assert!(done[0].skipped && !done[1].skipped);
+        assert!(done[0].bitmap.is_empty());
+    }
+
+    #[test]
+    fn a_pending_glyph_a_recent_build_asked_for_again_is_not_skipped() {
+        let config = crate::config::Config::default().font;
+        let rasterizer = Rasterizer::new(&config, 18.0, 2.0, Arc::new(|| {}));
+        let mut atlas = Atlas::new(0);
+        let key = GlyphKey {
+            text: GlyphText::Character('世'),
+            style: FontStyle::default(),
+            cells: 2,
+        };
+        let (jobs, queued) = crossbeam_channel::unbounded();
+        assert!(atlas.glyph(&jobs, key.clone()).is_none());
+        atlas.frame = STALE_AFTER + 1;
+        assert!(atlas.glyph(&jobs, key).is_none());
+        rasterizer
+            .latest_frame
+            .store(atlas.frame, Ordering::Release);
+        rasterizer.jobs.send(queued.recv().unwrap()).unwrap();
+        assert!(!rasterizer.done.recv().unwrap().skipped);
+    }
+
+    #[test]
+    fn a_skipped_glyph_is_requested_again() {
+        let (jobs, queued) = crossbeam_channel::unbounded();
+        let mut atlas = Atlas::new(0);
+        let key = GlyphKey {
+            text: GlyphText::Character('世'),
+            style: FontStyle::default(),
+            cells: 2,
+        };
+        assert!(atlas.glyph(&jobs, key.clone()).is_none());
+        atlas.skip(queued.recv().unwrap().id);
+        assert!(atlas.requested.is_empty());
+        assert!(atlas.glyph(&jobs, key).is_none());
+        assert_eq!(queued.len(), 1);
     }
 
     fn fake_glyph(position: [u32; 2]) -> AtlasGlyph {
