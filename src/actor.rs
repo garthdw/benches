@@ -38,6 +38,8 @@ use crate::terminal_input::{TerminalInput, open_link, paste_text, selection_text
 
 /// How long the size must hold before the program sees it, as each SIGWINCH makes inline TUIs reprint.
 const RESIZE_SETTLE: Duration = Duration::from_millis(100);
+/// Later than `RESIZE_SETTLE`, so background tabs' programs reprint after the shown one has.
+const BACKGROUND_RESIZE_SETTLE: Duration = Duration::from_millis(400);
 /// Ghostty's: a program that dies mid-task never removes its progress. Short in tests.
 const PROGRESS_TIMEOUT: Duration = Duration::from_millis(if cfg!(test) { 1000 } else { 15_000 });
 const HOLD_TIMEOUT: Duration = Duration::from_secs(1);
@@ -136,12 +138,22 @@ struct ResizeDebounce {
 
 impl ResizeDebounce {
     /// The first size, and changes that keep the grid size, apply at once.
-    fn request(&mut self, surface: Surface, now: Instant) {
+    fn request(&mut self, surface: Surface, now: Instant, shown: bool) {
         let same_grid = self
             .applied
             .is_none_or(|applied| (applied.cols, applied.rows) == (surface.cols, surface.rows));
         self.pending = Some(surface);
-        self.due = Some(if same_grid { now } else { now + RESIZE_SETTLE });
+        let settle = if shown {
+            RESIZE_SETTLE
+        } else {
+            BACKGROUND_RESIZE_SETTLE
+        };
+        self.due = Some(if same_grid { now } else { now + settle });
+    }
+
+    /// Applies a pending size at once, for a tab about to be shown.
+    fn hurry(&mut self, now: Instant) {
+        self.due = self.due.map(|due| due.min(now));
     }
 
     fn take_due(&mut self, now: Instant) -> Option<Surface> {
@@ -389,7 +401,9 @@ impl Actor {
                 recv(self.output) -> bytes => match bytes {
                     Ok(bytes) => {
                         terminal.vt_write(&bytes);
-                        fade.follow(&terminal);
+                        if publisher.borrow().visible() {
+                            fade.follow(&terminal);
+                        }
                         // A program turns mouse tracking on and off under a still pointer.
                         self.update_hover(&mut input, &terminal, mods, publisher.borrow().visible());
                         dirty = true;
@@ -531,7 +545,7 @@ impl Actor {
                         dirty = true;
                     }
                     Ok(Msg::Resize(surface)) => {
-                        resize.request(surface, Instant::now());
+                        resize.request(surface, Instant::now(), publisher.borrow().visible());
                     }
                     Ok(Msg::Stop) => terminate(&mut self.child, &self.pid),
                     Ok(Msg::Configure(settings)) => {
@@ -544,7 +558,10 @@ impl Actor {
                     Ok(Msg::Visibility(visibility)) => {
                         if visibility == Visibility::Shown {
                             self.alerted.store(false, Ordering::Release);
+                            resize.hurry(Instant::now());
                         }
+                        // Output while not shown didn't follow the viewport, so it mustn't read as a scroll.
+                        fade.hide(&terminal);
                         // The UI's hover and pointer move to whichever session takes this one's place.
                         if visibility != Visibility::Shown {
                             scrollbar_hovered = false;
@@ -611,12 +628,15 @@ impl Actor {
                     .map(|next| animation_epoch + Duration::from_millis(next));
                 dirty |= animation_due.is_some();
             }
-            let held = scrollbar_hovered || input.scrollbar_grab.is_some();
-            let opacity = fade.opacity(&terminal, held, Instant::now());
+            if publisher.visible() {
+                let held = scrollbar_hovered || input.scrollbar_grab.is_some();
+                let opacity = fade.opacity(&terminal, held, Instant::now());
+                let presentation = &mut publisher.presentation;
+                dirty |= (presentation.scrollbar_opacity, presentation.scrollbar_wide)
+                    != (opacity, held);
+                (presentation.scrollbar_opacity, presentation.scrollbar_wide) = (opacity, held);
+            }
             let presentation = &mut publisher.presentation;
-            dirty |=
-                (presentation.scrollbar_opacity, presentation.scrollbar_wide) != (opacity, held);
-            (presentation.scrollbar_opacity, presentation.scrollbar_wide) = (opacity, held);
             dirty |= presentation.link != input.link;
             presentation.link = input.link;
             input
@@ -974,7 +994,7 @@ mod tests {
     fn the_first_resize_applies_at_once() {
         let now = Instant::now();
         let mut debounce = ResizeDebounce::default();
-        debounce.request(TEST_SURFACE, now);
+        debounce.request(TEST_SURFACE, now, true);
         assert_eq!(debounce.take_due(now), Some(TEST_SURFACE));
         assert_eq!(debounce.due, None);
     }
@@ -982,7 +1002,7 @@ mod tests {
     fn a_burst_of_resizes_applies_once_it_settles() {
         let now = Instant::now();
         let mut debounce = ResizeDebounce::default();
-        debounce.request(TEST_SURFACE, now);
+        debounce.request(TEST_SURFACE, now, true);
         debounce.take_due(now);
         let mut at = now;
         for cols in 21..40 {
@@ -993,6 +1013,7 @@ mod tests {
                     ..TEST_SURFACE
                 },
                 at,
+                true,
             );
             assert_eq!(debounce.take_due(at), None);
         }
@@ -1009,10 +1030,29 @@ mod tests {
         assert_eq!(debounce.due, None);
     }
     #[test]
+    fn a_background_resize_settles_later_unless_shown() {
+        let now = Instant::now();
+        let mut debounce = ResizeDebounce::default();
+        debounce.request(TEST_SURFACE, now, false);
+        debounce.take_due(now);
+        let wider = Surface {
+            cols: 30,
+            ..TEST_SURFACE
+        };
+        debounce.request(wider, now, false);
+        assert_eq!(debounce.due, Some(now + BACKGROUND_RESIZE_SETTLE));
+        assert_eq!(debounce.take_due(now + RESIZE_SETTLE), None);
+        debounce.hurry(now + RESIZE_SETTLE);
+        assert_eq!(debounce.take_due(now + RESIZE_SETTLE), Some(wider));
+        debounce.hurry(now + RESIZE_SETTLE);
+        assert_eq!(debounce.due, None);
+    }
+
+    #[test]
     fn a_change_of_scale_alone_applies_at_once() {
         let now = Instant::now();
         let mut debounce = ResizeDebounce::default();
-        debounce.request(TEST_SURFACE, now);
+        debounce.request(TEST_SURFACE, now, true);
         debounce.take_due(now);
         let rescaled = Surface {
             metrics: Metrics {
@@ -1021,7 +1061,7 @@ mod tests {
             },
             ..TEST_SURFACE
         };
-        debounce.request(rescaled, now);
+        debounce.request(rescaled, now, true);
         assert_eq!(debounce.take_due(now), Some(rescaled));
     }
     #[test]

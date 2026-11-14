@@ -358,6 +358,12 @@ impl ScrollbarFade {
         self.until = Some(now + SCROLLBAR_HOLD);
     }
 
+    /// Ends any fade and takes the current viewport as unscrolled.
+    pub(crate) fn hide(&mut self, terminal: &Terminal<'static, '_>) {
+        *self = Self::default();
+        self.follow(terminal);
+    }
+
     pub(crate) fn follow(&mut self, terminal: &Terminal<'static, '_>) {
         self.offset = terminal
             .scrollbar()
@@ -1409,6 +1415,20 @@ mod tests {
         let gone = now + SCROLLBAR_HOLD + SCROLLBAR_FADE;
         assert_eq!(fade.opacity(&terminal, false, gone), 0.0);
         assert_eq!(fade.next_change(gone), None);
+    }
+
+    #[test]
+    fn hiding_the_scrollbar_ends_its_fade_and_ignores_output_meanwhile() {
+        let mut terminal = scrolled_terminal();
+        let (mut fade, now) = faded(&terminal);
+        terminal.scroll_viewport(ScrollViewport::Delta(-3));
+        assert_eq!(fade.opacity(&terminal, true, now), 1.0);
+        fade.hide(&terminal);
+        assert_eq!(fade.next_change(now), None);
+        terminal.vt_write(b"more\r\n");
+        fade.hide(&terminal);
+        assert_eq!(fade.opacity(&terminal, false, now), 0.0);
+        assert_eq!(fade.next_change(now), None);
     }
 
     #[test]

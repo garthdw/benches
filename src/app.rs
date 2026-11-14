@@ -18,7 +18,7 @@ use crate::palette::{
     Action, Palette, open_palette, poll_creation, poll_jump, poll_selection, poll_worktrees,
     run_action,
 };
-use crate::protocol::Event;
+use crate::protocol::{Event, Visibility};
 use crate::render::TerminalSource;
 use crate::secure_input::SecureInput;
 use crate::session::{Attention, Retarget, Session};
@@ -848,8 +848,12 @@ pub(crate) fn window_app(
         .compositor(crate::render::TerminalCompositor::default())
         .on_ime(on_ime)
         .on_modifiers(|state, mods, _| {
-            for tab in state.workspace.tabs_mut() {
-                tab.session.modifiers(crate::input::vt_mods(mods));
+            let shown = state
+                .workspace
+                .sessions()
+                .filter(|session| session.visibility() == Visibility::Shown);
+            for session in shown {
+                session.modifiers(crate::input::vt_mods(mods));
             }
         })
         .menu_item(reload_menu_item())

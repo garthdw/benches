@@ -468,7 +468,6 @@ impl Session {
         self.alerted.store(true, Ordering::Release);
     }
 
-    #[cfg(test)]
     pub fn visibility(&self) -> Visibility {
         self.visibility.get()
     }
