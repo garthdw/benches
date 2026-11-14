@@ -28,7 +28,7 @@ pub const PADDING_POINTS: f32 = 6.0;
 const SCROLLBAR_POINTS: f32 = 3.0;
 const WIDE_SCROLLBAR_POINTS: f32 = 5.0;
 /// Where the atlas texture starts; it doubles when full, up to `MAX_ATLAS_SIZE`.
-const ATLAS_SIZE: u32 = 2048;
+const ATLAS_SIZE: u32 = 1024;
 const MAX_ATLAS_SIZE: u32 = 8192;
 const MODE_SOLID: u32 = 0;
 const MODE_COVERAGE: u32 = 1;
@@ -1559,6 +1559,17 @@ mod tests {
     }
 
     #[test]
+    fn a_typical_shell_session_fits_a_small_starting_atlas() {
+        let mut atlas = Atlas::new(0);
+        // Regular and bold ASCII, plus a prompt's icons, at 23x45 pixel cells.
+        for _ in 0..(95 * 2 + 20) {
+            atlas.reserve(23, 45);
+        }
+        assert_eq!(atlas.epoch, 0);
+        assert!(u64::from(ATLAS_SIZE).pow(2) * 4 <= 4 << 20);
+    }
+
+    #[test]
     fn a_full_atlas_grows_before_it_resets() {
         let mut atlas = Atlas::new(0);
         let first = atlas.reserve(23, 45);
@@ -1793,6 +1804,112 @@ mod tests {
         }
         let per = start.elapsed() / iterations;
         println!("{cols}x{rows} full rebuild: {per:?}, {} quads", quads.len());
+    }
+
+    /// `cargo test --release -- --ignored atlas_waste --nocapture`
+    #[test]
+    #[ignore]
+    fn atlas_waste() {
+        let font = Font::new(crate::config::DEFAULT_FONT_FAMILY, 18.0, 2.0).unwrap();
+        let range = |from: u32, to: u32| {
+            (from..to)
+                .filter_map(char::from_u32)
+                .map(String::from)
+                .collect::<Vec<_>>()
+        };
+        let icons = "\u{e0a0}\u{f015}\u{f07b}\u{f121}\u{e725}\u{f09b}\u{f408}\u{e62b}\u{f489}\u{f0e7}\u{e606}\u{e7a8}\u{f023}\u{f00c}\u{f06a}"
+            .chars()
+            .map(String::from)
+            .collect();
+        let emoji = [
+            "\u{1f600}",
+            "\u{1f680}",
+            "\u{2705}",
+            "\u{1f389}",
+            "\u{1f525}",
+            "\u{1f44d}",
+            "\u{1f4a1}",
+            "\u{26a0}\u{fe0f}",
+        ]
+        .map(String::from)
+        .to_vec();
+        let sets: [(&str, Vec<String>, u32); 7] = [
+            ("ascii", range(0x20, 0x7f), 1),
+            ("cjk", range(0x4e00, 0x4e00 + 300), 2),
+            ("box+block", range(0x2500, 0x25a0), 1),
+            ("powerline", range(0xe0b0, 0xe0c0), 1),
+            ("nerd", icons, 1),
+            ("emoji", emoji, 2),
+            ("arrows", range(0x2190, 0x21a0), 1),
+        ];
+        let (cell_width, cell_height) = (font.cell_width as usize, font.cell_height as usize);
+        println!("cell {cell_width}x{cell_height}");
+        // Pixels per kind: [whole cell, bounding box], each with the 1 px gap.
+        let mut total = [[0usize; 2]; 2];
+        let mut counts = [0usize; 2];
+        println!("set          n coverage colour  bbox/cell");
+        for (name, texts, cells) in &sets {
+            let mut out = Vec::new();
+            let (mut n, mut colour, mut bbox_sum, mut cell_sum) = (0, 0, 0, 0);
+            for text in texts {
+                let Some(kind) = font.rasterize(text, FontStyle::default(), *cells, &mut out)
+                else {
+                    continue;
+                };
+                let width = cell_width * *cells as usize;
+                let (mut min_x, mut min_y, mut max_x, mut max_y) = (width, cell_height, 0, 0);
+                for (index, pixel) in out.as_chunks::<4>().0.iter().enumerate() {
+                    if pixel[3] != 0 {
+                        let (x, y) = (index % width, index / width);
+                        min_x = min_x.min(x);
+                        max_x = max_x.max(x);
+                        min_y = min_y.min(y);
+                        max_y = max_y.max(y);
+                    }
+                }
+                let bbox = if max_x >= min_x {
+                    (max_x - min_x + 2) * (max_y - min_y + 2)
+                } else {
+                    0
+                };
+                let cell = (width + 1) * (cell_height + 1);
+                let slot = usize::from(kind == GlyphKind::Color);
+                n += 1;
+                colour += slot;
+                bbox_sum += bbox;
+                cell_sum += cell;
+                total[slot][0] += cell;
+                total[slot][1] += bbox;
+                counts[slot] += 1;
+            }
+            println!(
+                "{name:<10} {n:>4} {:>8} {colour:>6}  {:.0}% ({} / {} px)",
+                n - colour,
+                100.0 * bbox_sum as f64 / cell_sum as f64,
+                bbox_sum / n.max(1),
+                cell_sum / n.max(1)
+            );
+        }
+        let [coverage, colour] = total;
+        let glyphs = counts[0] + counts[1];
+        println!(
+            "glyphs {glyphs}: {} coverage, {} colour",
+            counts[0], counts[1]
+        );
+        let options = [
+            ("(i)   whole-cell RGBA", 4 * (coverage[0] + colour[0])),
+            ("(ii)  whole-cell R8+RGBA", coverage[0] + 4 * colour[0]),
+            ("(iii) bbox RGBA", 4 * (coverage[1] + colour[1])),
+            ("(iv)  bbox R8+RGBA", coverage[1] + 4 * colour[1]),
+        ];
+        for (name, bytes) in options {
+            let per_glyph = bytes as f64 / glyphs as f64;
+            println!(
+                "{name:<26} {bytes:>9} B {per_glyph:>7.0} B/glyph  cap@2048 {:>6.0}  cap@4096 {:>6.0}  (at the RGBA atlas's memory)",
+                4.0 * 2048.0 * 2048.0 / per_glyph,
+                4.0 * 4096.0 * 4096.0 / per_glyph,
+            );
+        }
     }
 
     /// The run cells `build_quads` asks the atlas for, as `(run, index)`.
