@@ -178,7 +178,11 @@ impl Actor {
         input: &mut TerminalInput,
         terminal: &Terminal<'static, '_>,
         mods: key::Mods,
+        shown: bool,
     ) {
+        if !shown {
+            return;
+        }
         if let Some(Some(hover)) = input.hover(terminal, mods).log_err("find hover") {
             self.hover.store(hover as u8, Ordering::Release);
             self.emit(Event::Hover);
@@ -387,7 +391,7 @@ impl Actor {
                         terminal.vt_write(&bytes);
                         fade.follow(&terminal);
                         // A program turns mouse tracking on and off under a still pointer.
-                        self.update_hover(&mut input, &terminal, mods);
+                        self.update_hover(&mut input, &terminal, mods, publisher.borrow().visible());
                         dirty = true;
                         tick_animation = true;
                         let alerted = alerted.replace(false);
@@ -452,7 +456,7 @@ impl Actor {
                             self.input.send(bytes).log_err("queue mouse report");
                         }
                         mods = pointer.mods;
-                        self.update_hover(&mut input, &terminal, mods);
+                        self.update_hover(&mut input, &terminal, mods, publisher.borrow().visible());
                     }
                     Ok(Msg::Wheel(wheel)) => {
                         match input.wheel(&mut terminal, wheel).log_err("handle wheel") {
@@ -464,7 +468,7 @@ impl Actor {
                             _ => {}
                         }
                         // Scrolling moves another link, or none, under the pointer.
-                        self.update_hover(&mut input, &terminal, mods);
+                        self.update_hover(&mut input, &terminal, mods, publisher.borrow().visible());
                         dirty = true;
                     }
                     Ok(Msg::Scrollbar { phase, y }) => {
@@ -474,7 +478,7 @@ impl Actor {
                     Ok(Msg::ScrollbarHover(hovered)) => scrollbar_hovered = hovered,
                     Ok(Msg::Modifiers(held)) => {
                         mods = held;
-                        self.update_hover(&mut input, &terminal, mods);
+                        self.update_hover(&mut input, &terminal, mods, publisher.borrow().visible());
                     }
                     Ok(Msg::Copy) => {
                         if let Some(Some(text)) = selection_text(&terminal).log_err("copy selection") {
@@ -549,6 +553,8 @@ impl Actor {
                             {
                                 self.input.send(release).log_err("queue mouse release");
                             }
+                            mods = key::Mods::empty();
+                            self.update_hover(&mut input, &terminal, mods, publisher.borrow().visible());
                         }
                         publisher.borrow_mut().visibility = visibility;
                         dirty = true;

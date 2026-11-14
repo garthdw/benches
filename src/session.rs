@@ -867,6 +867,34 @@ mod tests {
         );
     }
 
+    #[test]
+    fn hiding_a_session_clears_its_link_hover() {
+        let session = spawn_shell();
+        session.resize(TEST_SURFACE);
+        type_line(&session, "echo https://a.te/x");
+        wait_for_line(&session, "https://a.te/x");
+        let row = session
+            .grid()
+            .lines()
+            .iter()
+            .position(|line| line.trim_end() == "https://a.te/x")
+            .unwrap();
+        session.pointer(PointerInput {
+            mods: key::Mods::SUPER,
+            ..pointer_at(PointerPhase::Move, 3, u16::try_from(row).unwrap())
+        });
+        let wait_for_hover = |want: Hover| {
+            wait_until(
+                Duration::from_secs(15),
+                || format!("hover never became {want:?}"),
+                || (session.hover() == want).then_some(()),
+            );
+        };
+        wait_for_hover(Hover::Link);
+        session.set_visibility(Visibility::Hidden);
+        wait_for_hover(Hover::Text);
+    }
+
     fn wait_for_scrollbar(session: &Session, want: &str, shown: impl Fn(Scrollbar) -> bool) {
         wait_until(
             Duration::from_secs(5),
