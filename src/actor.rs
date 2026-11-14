@@ -379,7 +379,7 @@ impl Actor {
                 animation_due.filter(|_| visibility == Visibility::Shown),
                 titles.due(visibility).filter(|_| title_changed.get()),
                 progress_due,
-                (visibility != Visibility::Hidden).then_some(next_password_check),
+                (visibility == Visibility::Shown).then_some(next_password_check),
             ]
             .into_iter()
             .flatten()
@@ -591,7 +591,7 @@ impl Actor {
                 dirty = true;
             }
             let mut publisher = publisher.borrow_mut();
-            if publisher.visibility != Visibility::Hidden && Instant::now() >= next_password_check {
+            if publisher.visible() && Instant::now() >= next_password_check {
                 next_password_check = Instant::now() + PASSWORD_POLL;
                 let password_input = password_prompt(&self.master);
                 dirty |= publisher.presentation.password_input != password_input;
