@@ -5,18 +5,18 @@ edition = "2024"
 publish = false
 
 [dependencies]
-rune = { git = "https://github.com/anomalyco/rune", rev = "05d1ddf0480c35484e22380d729388b8e14609a1", features = [
+rune = { git = "https://github.com/anomalyco/rune", rev = "958743308f36fdf1c568c513badc96ddb0c7f040", features = [
   "native-file-dialog",
 ] }
-libghostty-vt = { git = "https://github.com/Uzaaft/libghostty-rs", rev = "cd4d497e8c698b27054a677ce19d1bd1a1a4d8bf", features = [
+libghostty-vt = { git = "https://github.com/Uzaaft/libghostty-rs", rev = "483ea3d5247b214060da58ef6037a95f30ae89fb", features = [
   "png",
 ] }
-wgpu = { version = "~30.0.1", default-features = false }
+wgpu = { version = "~30.0.2", default-features = false }
 bytemuck = { version = "1", features = ["derive"] }
 base64 = "0.23.1"
 crossbeam-channel = "0.5"
 libc = "0.2"
-nix = { version = "0.31", features = ["term", "fs", "signal", "poll", "hostname", "user"] }
+nix = { version = "0.32", features = ["term", "fs", "signal", "poll", "hostname", "user"] }
 objc2-core-foundation = "0.3"
 objc2-core-graphics = "0.3"
 objc2-core-text = "0.3"
@@ -56,8 +56,9 @@ tempfile = "3.27.0"
 # Rune's vendored copies (its macOS IME calls need its winit); a dependency's `[patch]` doesn't
 # reach the app's workspace. The wgpu-hal and accesskit_windows patches are Windows-only.
 [patch.crates-io]
-winit = { git = "https://github.com/anomalyco/rune", rev = "05d1ddf0480c35484e22380d729388b8e14609a1" }
-parley_engine = { git = "https://github.com/anomalyco/rune", rev = "05d1ddf0480c35484e22380d729388b8e14609a1" }
+accesskit_macos = { git = "https://github.com/anomalyco/rune", rev = "958743308f36fdf1c568c513badc96ddb0c7f040" }
+winit = { git = "https://github.com/anomalyco/rune", rev = "958743308f36fdf1c568c513badc96ddb0c7f040" }
+parley_engine = { git = "https://github.com/anomalyco/rune", rev = "958743308f36fdf1c568c513badc96ddb0c7f040" }
 
 [profile.release]
 lto = "thin"
