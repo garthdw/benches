@@ -127,6 +127,10 @@ impl Project {
         )
     }
 
+    pub fn tabs(&self) -> impl Iterator<Item = &Tab> {
+        self.tabs.iter().chain(&self.tray).chain(&self.overlay)
+    }
+
     pub fn tabs_mut(&mut self) -> impl Iterator<Item = &mut Tab> {
         self.tabs
             .iter_mut()
@@ -176,13 +180,7 @@ impl Project {
             .tray
             .iter()
             .any(|tab| matches!(tab.status, Status::Failed(_)));
-        let sessions = self
-            .tabs
-            .iter()
-            .chain(&self.tray)
-            .chain(&self.overlay)
-            .map(|tab| tab.session.attention())
-            .max();
+        let sessions = self.tabs().map(|tab| tab.session.attention()).max();
         sessions.unwrap_or_default().max(if failed {
             Attention::Alert
         } else {

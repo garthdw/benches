@@ -24,8 +24,8 @@ use crate::secure_input::SecureInput;
 use crate::session::{Attention, Retarget, Session};
 use crate::view::{DRAWER_MARK, OVERLAY_MARK, view, window_title};
 use crate::windows::{
-    Fleet, MAIN_WINDOW, WindowId, adopt_config, adopt_projects, move_to_new_window, on_close,
-    on_quit, reload_config,
+    Fleet, MAIN_WINDOW, WindowId, adopt_config, adopt_projects, move_to_main_window,
+    move_to_new_window, on_close, on_quit, reload_config,
 };
 use crate::workspace::{Project, SavedWorkspace, Slot, Status, Tab, Workspace};
 use anyhow::Context;
@@ -94,6 +94,11 @@ pub(crate) struct State {
 }
 
 impl State {
+    /// Any window but the main one, which closes once its projects are gone.
+    pub(crate) fn is_torn_off(&self) -> bool {
+        self.window != MAIN_WINDOW
+    }
+
     pub(crate) fn font_size(&self) -> f64 {
         (self.config.font.size + self.font_zoom).clamp(MIN_FONT_SIZE, MAX_FONT_SIZE)
     }
@@ -324,7 +329,7 @@ pub(crate) enum Confirm {
 }
 
 impl Confirm {
-    fn session(&self) -> Option<u64> {
+    pub(crate) fn session(&self) -> Option<u64> {
         match self {
             Self::Paste { session, .. }
             | Self::ClipboardWrite { session, .. }
@@ -398,12 +403,22 @@ fn read_clipboard_for(tx: &mut Tx, session: u64, location: ClipboardLocation) {
     );
 }
 
-pub(crate) fn refuse_clipboard_reads(state: &State, dismissed: Vec<Confirm>) {
+/// Drops the confirms `keep` turns down, refusing their clipboard reads. Answers whether any went.
+pub(crate) fn dismiss_confirms(
+    state: &mut State,
+    keep: impl Fn(&Workspace, &Confirm) -> bool,
+) -> bool {
+    let (kept, dismissed): (Vec<_>, Vec<_>) = std::mem::take(&mut state.confirms)
+        .into_iter()
+        .partition(|confirm| keep(&state.workspace, confirm));
+    state.confirms = kept;
+    let any = !dismissed.is_empty();
     for confirm in dismissed {
         if let Confirm::ClipboardRead { session, location } = confirm {
             answer_clipboard_read(state, session, location, None);
         }
     }
+    any
 }
 
 fn answer_clipboard_read(
@@ -533,6 +548,8 @@ pub(crate) fn run_command(state: &mut State, command: Command, tx: &mut Tx) {
         }
         Command::ChangeFolder => pick_folder(tx, None, true),
         Command::MoveToNewWindow => move_to_new_window(state, state.workspace.active, None),
+        Command::MoveToMainWindow => move_to_main_window(state, state.workspace.active),
+        Command::MergeIntoMain => tx.close_window(),
         Command::Palette => open_palette(state, tx),
         Command::Find => open_find(state, tx),
         Command::ToggleSidebar => state.sidebar_hidden = !state.sidebar_hidden,
@@ -581,7 +598,7 @@ pub(crate) fn poll(state: &mut State, now: f64, tx: &mut Tx) -> bool {
         tx.set_title(window_title(&state.workspace));
         state.titled = Some(project_name.cloned());
     }
-    if state.window != MAIN_WINDOW && state.workspace.projects.is_empty() {
+    if state.is_torn_off() && state.workspace.projects.is_empty() {
         tx.close_window();
     }
     launch_active(state);
@@ -591,15 +608,10 @@ pub(crate) fn poll(state: &mut State, now: f64, tx: &mut Tx) -> bool {
     changed |= poll_find(state, active);
     changed |= poll_worktrees(state);
     changed |= poll_creation(state);
-    let (kept, dismissed): (Vec<_>, Vec<_>) = std::mem::take(&mut state.confirms)
-        .into_iter()
-        .partition(|confirm| match confirm {
-            Confirm::CloseProject { root } => state.workspace.project_index(root).is_some(),
-            _ => confirm.session() == active,
-        });
-    state.confirms = kept;
-    changed |= !dismissed.is_empty();
-    refuse_clipboard_reads(state, dismissed);
+    changed |= dismiss_confirms(state, |workspace, confirm| match confirm {
+        Confirm::CloseProject { root } => workspace.project_index(root).is_some(),
+        _ => confirm.session() == active,
+    });
     let mut restarts = Vec::new();
     let mut exits = Vec::new();
     let mut notices = Vec::new();
@@ -867,6 +879,8 @@ pub(crate) fn window_app(
     fleet.on_reveal(window, move |session| {
         let opener = handle.clone();
         handle.update(move |state, _| {
+            // A project just handed over from another window may still wait in the inbox.
+            adopt_projects(state);
             if state.workspace.locate(session).is_some() {
                 state.workspace.reveal(session);
                 opener.open();
@@ -1776,6 +1790,20 @@ mod tests {
         assert_eq!(titles, ["pnpm dev", "storybook"]);
     }
 
+    #[test]
+    fn a_chip_menu_acts_on_the_process_it_opened_on_after_the_tray_changes() {
+        let mut runtime = tray_runtime();
+        open_menu(&mut runtime, "chip-1");
+        runtime.state.workspace.projects[0].tray.remove(0);
+        pick(&mut runtime, "remove").unwrap();
+        let titles: Vec<_> = runtime.state.workspace.projects[0]
+            .tray
+            .iter()
+            .map(|tab| tab.title.as_str())
+            .collect();
+        assert_eq!(titles, ["storybook"]);
+    }
+
     fn live_tray(command: &str) -> Runtime<State> {
         let mut state = State::default();
         state
@@ -2180,17 +2208,112 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_project_menu_moves_it_to_a_new_window() {
-        let mut runtime = workspace_runtime();
-        let (x, y) = runtime.find("project-1").unwrap();
+    fn open_menu(runtime: &mut Runtime<State>, key: &str) {
+        let (x, y) = runtime.find(key).unwrap();
         runtime.secondary_down(x, y);
         runtime.secondary_up(x, y);
         runtime.frame(1.0 / 60.0);
-        runtime.resolve_popup(Some("move")).unwrap();
+    }
+
+    fn pick(runtime: &mut Runtime<State>, item: &str) -> Result<(), rune::PopupMenuError> {
+        let picked = runtime.resolve_popup(Some(item));
         runtime.frame(2.0 / 60.0);
+        picked
+    }
+
+    fn pick_from_menu(
+        runtime: &mut Runtime<State>,
+        key: &str,
+        item: &str,
+    ) -> Result<(), rune::PopupMenuError> {
+        open_menu(runtime, key);
+        pick(runtime, item)
+    }
+
+    #[test]
+    fn a_project_menu_moves_it_to_a_new_window() {
+        let mut runtime = workspace_runtime();
+        pick_from_menu(&mut runtime, "project-1", "move").unwrap();
         assert_eq!(runtime.state.workspace.projects.len(), 1);
         assert_eq!(runtime.state.fleet.take(1).len(), 1);
+    }
+
+    #[test]
+    fn a_torn_off_windows_project_menu_moves_its_last_project_to_the_main_window() {
+        let fleet = Fleet::default();
+        fleet.send(1, Project::new("/tmp".into(), vec![]));
+        let mut second = second_window(&fleet, 1);
+        assert_eq!(second.shell_request, None);
+        pick_from_menu(&mut second, "project-0", "main").unwrap();
+        assert_eq!(fleet.take(MAIN_WINDOW).len(), 1);
+        assert_eq!(second.shell_request, Some(rune::Shell::Close));
+    }
+
+    #[test]
+    fn a_lone_projects_menu_offers_no_move_to_a_new_window() {
+        let fleet = Fleet::default();
+        fleet.send(1, Project::new("/tmp".into(), vec![]));
+        let mut second = second_window(&fleet, 1);
+        assert!(pick_from_menu(&mut second, "project-0", "move").is_err());
+        assert_eq!(second.state.workspace.projects.len(), 1);
+    }
+
+    #[test]
+    fn the_main_windows_lone_project_opens_no_empty_menu() {
+        let mut state = State::default();
+        let tabs = vec![fixture_tab("shell", b"$ ")];
+        state
+            .workspace
+            .add_project(Project::new("/tmp".into(), tabs));
+        let mut runtime = runtime_with(state);
+        open_menu(&mut runtime, "project-0");
+        assert!(runtime.popup_menu().is_none());
+    }
+
+    #[test]
+    fn the_main_windows_project_menu_offers_no_move_to_itself() {
+        let mut runtime = workspace_runtime();
+        assert!(pick_from_menu(&mut runtime, "project-1", "main").is_err());
+        assert_eq!(runtime.state.workspace.projects.len(), 2);
+    }
+
+    #[test]
+    fn merging_a_torn_off_window_moves_every_project_to_the_main_window() {
+        let fleet = Fleet::default();
+        for root in ["/tmp", "/usr"] {
+            fleet.send(1, Project::new(root.into(), vec![]));
+        }
+        let mut second = second_window(&fleet, 1);
+        assert_eq!(second.shell_request, None);
+        press(&mut second, Key::Command('p'), command());
+        press(
+            &mut second,
+            Key::Text("merge window".into()),
+            Mods::default(),
+        );
+        press(&mut second, Key::Enter, Mods::default());
+        second.frame(2.0 / 60.0);
+        assert_eq!(second.shell_request, Some(rune::Shell::Close));
+        // The headless runtime doesn't run `on_close`, which hands the projects over.
+        assert!(fleet.take(MAIN_WINDOW).is_empty());
+        on_close(&mut second.state, &mut Tx::default());
+        assert_eq!(fleet.take(MAIN_WINDOW).len(), 2);
+    }
+
+    #[test]
+    fn a_project_menu_moves_the_project_it_opened_on_after_the_projects_change() {
+        let fleet = Fleet::default();
+        for root in ["/tmp", "/usr", "/var"] {
+            fleet.send(1, Project::new(root.into(), vec![]));
+        }
+        let mut second = second_window(&fleet, 1);
+        open_menu(&mut second, "project-1");
+        second.state.workspace.take_project(0);
+        pick(&mut second, "main").unwrap();
+        let moved: Vec<_> = (fleet.take(MAIN_WINDOW).into_iter())
+            .map(|project| project.root)
+            .collect();
+        assert_eq!(moved, [PathBuf::from("/usr")]);
     }
 
     #[test]

@@ -220,6 +220,7 @@ pub(crate) fn palette_actions(
     jump: Option<&Path>,
     workspace: &Workspace,
     config: &Config,
+    torn_off: bool,
 ) -> Vec<Action> {
     let query = query.trim();
     let needle = query.to_lowercase();
@@ -230,7 +231,7 @@ pub(crate) fn palette_actions(
         actions.extend(
             COMMANDS
                 .iter()
-                .filter(|spec| spec.default && (spec.enabled)(workspace, config))
+                .filter(|spec| spec.default && (spec.enabled)(workspace, config, torn_off))
                 .map(|spec| Action::Command(spec.command)),
         );
         actions.extend(jump.map(|root| Action::Jump(root.to_owned())));
@@ -238,7 +239,7 @@ pub(crate) fn palette_actions(
     }
     let mut matched: Vec<(&CommandSpec, Match)> = COMMANDS
         .iter()
-        .filter(|spec| (spec.enabled)(workspace, config))
+        .filter(|spec| (spec.enabled)(workspace, config, torn_off))
         .filter_map(|spec| Some((spec, fuzzy_match(spec.label, query)?)))
         .collect();
     matched.sort_by_key(|(_, found)| Reverse(found.score));
@@ -354,13 +355,19 @@ pub(crate) fn poll_creation(state: &mut State) -> bool {
     true
 }
 
-fn run_palette(state: &mut State, index: usize, tx: &mut Tx) {
-    let actions = palette_actions(
+/// The palette's actions for what `state` has typed and shows.
+fn shown_actions(state: &State) -> Vec<Action> {
+    palette_actions(
         &state.palette.edit.text,
         state.jump_target(),
         &state.workspace,
         &state.config,
-    );
+        state.is_torn_off(),
+    )
+}
+
+fn run_palette(state: &mut State, index: usize, tx: &mut Tx) {
+    let actions = shown_actions(state);
     let Some(action) = actions.get(index.min(actions.len().saturating_sub(1))) else {
         return;
     };
@@ -468,12 +475,7 @@ fn palette_key(state: &mut State, event: &KeyEvent, tx: &mut Tx) -> bool {
     if state.palette.worktrees.is_some() {
         return worktree_key(state, event);
     }
-    let actions = palette_actions(
-        &state.palette.edit.text,
-        state.jump_target(),
-        &state.workspace,
-        &state.config,
-    );
+    let actions = shown_actions(state);
     let last = actions.len().saturating_sub(1);
     match event.key {
         Key::Escape => state.palette.open = false,
@@ -596,12 +598,7 @@ pub(crate) fn view(
             });
             placeholder.into_iter().chain(worktrees).collect()
         } else {
-            let actions = palette_actions(
-                &state.palette.edit.text,
-                state.jump_target(),
-                &state.workspace,
-                &state.config,
-            );
+            let actions = shown_actions(state);
             let selected = state.palette.selected.min(actions.len().saturating_sub(1));
             actions
                 .iter()
@@ -687,6 +684,16 @@ mod tests {
     use crate::test_support::*;
     use rune::{Mods, Runtime};
 
+    /// The main window's actions, which most tests want.
+    fn main_window_actions(
+        query: &str,
+        jump: Option<&Path>,
+        workspace: &Workspace,
+        config: &Config,
+    ) -> Vec<Action> {
+        palette_actions(query, jump, workspace, config, false)
+    }
+
     #[test]
     fn command_p_opens_the_command_centre_and_escape_closes_it() {
         let mut runtime = palette_runtime();
@@ -745,7 +752,7 @@ mod tests {
     #[test]
     fn the_command_centre_filters_by_letters_in_order() {
         assert_eq!(
-            palette_actions("tlgt", None, &one_project(), &Config::default()),
+            main_window_actions("tlgt", None, &one_project(), &Config::default()),
             [
                 Action::Run("tlgt".to_owned()),
                 Action::Tray("tlgt".to_owned()),
@@ -753,7 +760,7 @@ mod tests {
             ]
         );
         assert_eq!(
-            palette_actions("", None, &one_project(), &Config::default()),
+            main_window_actions("", None, &one_project(), &Config::default()),
             [
                 Action::Command(Command::NewShell),
                 Action::Command(Command::ToggleGit),
@@ -762,7 +769,7 @@ mod tests {
             ]
         );
         assert!(
-            !palette_actions("", None, &Workspace::default(), &Config::default())
+            !main_window_actions("", None, &Workspace::default(), &Config::default())
                 .contains(&Action::Command(Command::ChangeFolder))
         );
     }
@@ -775,14 +782,14 @@ mod tests {
         };
         for query in ["", "git"] {
             assert!(
-                !palette_actions(query, None, &one_project(), &config)
+                !main_window_actions(query, None, &one_project(), &config)
                     .contains(&Action::Command(Command::ToggleGit))
             );
         }
     }
 
     fn first_action(query: &str) -> Action {
-        palette_actions(query, None, &one_project(), &Config::default()).remove(0)
+        main_window_actions(query, None, &one_project(), &Config::default()).remove(0)
     }
 
     #[test]
@@ -818,19 +825,19 @@ mod tests {
 
     #[test]
     fn loose_matches_follow_the_run_and_tray_rows() {
-        let actions = palette_actions("ls", None, &one_project(), &Config::default());
+        let actions = main_window_actions("ls", None, &one_project(), &Config::default());
         assert_eq!(actions[2], Action::Command(Command::ToggleSidebar));
-        let actions = palette_actions("zi", None, &one_project(), &Config::default());
+        let actions = main_window_actions("zi", None, &one_project(), &Config::default());
         assert_eq!(actions[2], Action::Command(Command::ZoomIn));
     }
 
     #[test]
     fn every_command_is_searchable_but_the_palette_itself() {
-        let actions = palette_actions("tab", None, &one_project(), &Config::default());
+        let actions = main_window_actions("tab", None, &one_project(), &Config::default());
         assert!(actions.contains(&Action::Command(Command::CloseTab)));
         assert!(actions.contains(&Action::Command(Command::NextTab)));
         assert!(
-            !palette_actions("palette", None, &one_project(), &Config::default())
+            !main_window_actions("palette", None, &one_project(), &Config::default())
                 .contains(&Action::Command(Command::Palette))
         );
     }
@@ -847,7 +854,7 @@ mod tests {
     fn the_jump_commands_folder_follows_the_fixed_actions() {
         let root = Path::new("/dev/site");
         assert_eq!(
-            palette_actions("site", Some(root), &one_project(), &Config::default()),
+            main_window_actions("site", Some(root), &one_project(), &Config::default()),
             [
                 Action::Jump(root.to_owned()),
                 Action::Run("site".to_owned()),
@@ -872,7 +879,7 @@ mod tests {
     #[test]
     fn typing_a_project_or_tab_name_offers_switching_to_it() {
         let state = workspace_state();
-        let actions = palette_actions("sit", None, &state.workspace, &Config::default());
+        let actions = main_window_actions("sit", None, &state.workspace, &Config::default());
         assert_eq!(
             actions[..3],
             [
@@ -881,10 +888,10 @@ mod tests {
                 Action::SwitchProject(1, "site".to_owned()),
             ]
         );
-        let actions = palette_actions("lazy", None, &state.workspace, &Config::default());
+        let actions = main_window_actions("lazy", None, &state.workspace, &Config::default());
         assert!(actions.contains(&Action::SwitchTab(0, 2, "lazygit (agentd)".to_owned())));
         assert!(
-            !palette_actions("", None, &state.workspace, &Config::default())
+            !main_window_actions("", None, &state.workspace, &Config::default())
                 .iter()
                 .any(|action| matches!(action, Action::SwitchProject(..) | Action::SwitchTab(..)))
         );
@@ -893,7 +900,7 @@ mod tests {
     #[test]
     fn switching_comes_after_running_the_query_and_exact_names_lead_the_switches() {
         let state = workspace_state();
-        let actions = palette_actions("shell", None, &state.workspace, &Config::default());
+        let actions = main_window_actions("shell", None, &state.workspace, &Config::default());
         assert_eq!(actions[0], Action::Command(Command::NewShell));
         assert_eq!(actions[1], Action::Run("shell".to_owned()));
         assert_eq!(actions[2], Action::Tray("shell".to_owned()));
@@ -907,7 +914,7 @@ mod tests {
     fn the_jump_folder_replaces_the_switch_to_its_open_project() {
         let state = workspace_state();
         let root = Path::new("/dev/site");
-        let actions = palette_actions("site", Some(root), &state.workspace, &Config::default());
+        let actions = main_window_actions("site", Some(root), &state.workspace, &Config::default());
         assert_eq!(actions[0], Action::Jump(root.to_owned()));
         assert!(
             !actions
@@ -919,7 +926,7 @@ mod tests {
     #[test]
     fn the_jump_folder_leads_the_strong_command_matches() {
         let root = Path::new("/dev/pr");
-        let actions = palette_actions("pr", Some(root), &one_project(), &Config::default());
+        let actions = main_window_actions("pr", Some(root), &one_project(), &Config::default());
         assert_eq!(actions[0], Action::Jump(root.to_owned()));
         assert!(actions.contains(&Action::Command(Command::PrevTab)));
     }
@@ -927,7 +934,7 @@ mod tests {
     #[test]
     fn an_exact_command_label_leads_the_jump_folder() {
         let root = Path::new("/dev/find");
-        let actions = palette_actions(
+        let actions = main_window_actions(
             " Find In Scrollback ",
             Some(root),
             &one_project(),
@@ -941,12 +948,13 @@ mod tests {
     fn an_exact_switch_name_leads_the_jump_folder_once() {
         let state = workspace_state();
         let root = Path::new("/dev/else");
-        let actions = palette_actions("Shell", Some(root), &state.workspace, &Config::default());
+        let actions =
+            main_window_actions("Shell", Some(root), &state.workspace, &Config::default());
         let tab = Action::SwitchTab(1, 1, "shell (site)".to_owned());
         assert_eq!(actions[..2], [tab.clone(), Action::Jump(root.to_owned())]);
         assert_eq!(actions[2], Action::Command(Command::NewShell));
         assert_eq!(actions.iter().filter(|action| **action == tab).count(), 1);
-        let actions = palette_actions("site", Some(root), &state.workspace, &Config::default());
+        let actions = main_window_actions("site", Some(root), &state.workspace, &Config::default());
         let project = Action::SwitchProject(1, "site".to_owned());
         assert_eq!(
             actions[..2],
@@ -961,7 +969,8 @@ mod tests {
     fn enter_on_switch_row(runtime: &mut Runtime<State>, query: &str, row: Action) {
         press(runtime, Key::Text(query.into()), Mods::default());
         runtime.frame(0.0);
-        let actions = palette_actions(query, None, &runtime.state.workspace, &Config::default());
+        let actions =
+            main_window_actions(query, None, &runtime.state.workspace, &Config::default());
         runtime.state.palette.selected = actions.iter().position(|action| *action == row).unwrap();
         press(runtime, Key::Enter, Mods::default());
     }
@@ -1196,7 +1205,7 @@ mod tests {
     fn the_wt_prefix_offers_creating_a_worktree_first() {
         let workspace = one_project();
         let create = Action::CreateWorktree("feature-x".to_owned());
-        let actions = palette_actions("wt feature-x", None, &workspace, &Config::default());
+        let actions = main_window_actions("wt feature-x", None, &workspace, &Config::default());
         assert_eq!(actions[0], create);
         assert!(actions.contains(&Action::Run("wt feature-x".to_owned())));
         for query in [
@@ -1209,13 +1218,13 @@ mod tests {
             "",
         ] {
             assert!(
-                !palette_actions(query, None, &workspace, &Config::default())
+                !main_window_actions(query, None, &workspace, &Config::default())
                     .iter()
                     .any(|action| matches!(action, Action::CreateWorktree(_))),
                 "{query:?}"
             );
         }
-        let none = palette_actions(
+        let none = main_window_actions(
             "wt feature-x",
             None,
             &Workspace::default(),
@@ -1372,14 +1381,14 @@ mod tests {
         stopped.status = Status::Stopped;
         workspace.add_tray(stopped);
         state.workspace = workspace;
-        let actions = palette_actions("stop", None, &state.workspace, &Config::default());
+        let actions = main_window_actions("stop", None, &state.workspace, &Config::default());
         assert!(actions.contains(&Action::StopTray(0, "pnpm dev".to_owned())));
         assert!(
             !actions
                 .iter()
                 .any(|action| matches!(action, Action::StopTray(1, _)))
         );
-        let actions = palette_actions("restart", None, &state.workspace, &Config::default());
+        let actions = main_window_actions("restart", None, &state.workspace, &Config::default());
         assert_eq!(
             actions[2..4],
             [
@@ -1387,10 +1396,11 @@ mod tests {
                 Action::RestartTray(1, "storybook".to_owned()),
             ]
         );
-        let actions = palette_actions("restart sto", None, &state.workspace, &Config::default());
+        let actions =
+            main_window_actions("restart sto", None, &state.workspace, &Config::default());
         assert_eq!(actions[2], Action::RestartTray(1, "storybook".to_owned()));
         assert!(
-            palette_actions("", None, &state.workspace, &Config::default())
+            main_window_actions("", None, &state.workspace, &Config::default())
                 .iter()
                 .all(|action| {
                     !matches!(action, Action::RestartTray(..) | Action::StopTray(..))
@@ -1401,7 +1411,7 @@ mod tests {
     #[test]
     fn moving_a_project_is_offered_only_beside_another_project() {
         let moves = |workspace: &Workspace| {
-            palette_actions("", None, workspace, &Config::default())
+            main_window_actions("", None, workspace, &Config::default())
                 .contains(&Action::Command(Command::MoveToNewWindow))
         };
         assert!(!moves(&one_project()));
@@ -1410,5 +1420,25 @@ mod tests {
             Action::Command(Command::MoveToNewWindow).label(),
             "Move project to new window"
         );
+    }
+
+    #[test]
+    fn rejoining_the_main_window_is_offered_only_in_a_torn_off_window() {
+        let workspace = one_project();
+        let rejoins = |query, torn_off| {
+            palette_actions(query, None, &workspace, &Config::default(), torn_off)
+                .into_iter()
+                .filter(|action| {
+                    matches!(
+                        action,
+                        Action::Command(Command::MoveToMainWindow | Command::MergeIntoMain)
+                    )
+                })
+                .count()
+        };
+        for query in ["", "main"] {
+            assert_eq!(rejoins(query, false), 0);
+            assert_eq!(rejoins(query, true), 2);
+        }
     }
 }

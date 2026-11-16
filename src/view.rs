@@ -17,7 +17,7 @@ use crate::protocol::{Progress, ProgressKind};
 use crate::render;
 use crate::session::{Attention, Session};
 use crate::terminal_input::{Hover, PointerPhase, WheelInput};
-use crate::windows::{move_to_new_window, torn_off};
+use crate::windows::{move_to_main_window, move_to_new_window, torn_off};
 use crate::workspace::{Project, Status, Tab, Workspace};
 
 pub(crate) const TERMINAL_MARK: u32 = 1;
@@ -309,11 +309,29 @@ fn sidebar(state: &State, theme: &tok::Theme, accent: Color) -> El {
                         move_to_new_window(state, index, drag.screen_point());
                     }
                 })
-                .on_secondary_press(move |_: &mut State, _, tx: &mut Tx| {
-                    let menu = PopupMenu::new().item(PopupItem::new("move", "Move to new window"));
+                .on_secondary_press(move |state: &mut State, _, tx: &mut Tx| {
+                    let to_main = state
+                        .is_torn_off()
+                        .then(|| PopupItem::new("main", "Move to main window"));
+                    let to_new = (state.workspace.projects.len() > 1)
+                        .then(|| PopupItem::new("move", "Move to new window"));
+                    let items: Vec<_> = to_new.into_iter().chain(to_main).collect();
+                    if items.is_empty() {
+                        return;
+                    }
+                    let menu = PopupMenu::new().items(items);
+                    let Some(project) = state.workspace.projects.get(index) else {
+                        return;
+                    };
+                    let root = project.root.clone();
                     tx.popup_menu(menu, &menu_key, move |state: &mut State, picked, _| {
+                        let Some(index) = state.workspace.project_index(&root) else {
+                            return;
+                        };
                         if picked == Some("move") {
                             move_to_new_window(state, index, None);
+                        } else if picked == Some("main") {
+                            move_to_main_window(state, index);
                         }
                     });
                 })
@@ -531,6 +549,7 @@ fn tray_bar(project: &Project, theme: &tok::Theme, accent: Color) -> Option<El> 
         let chips = project.tray.iter().enumerate().map(|(index, tab)| {
             let key = format!("chip-{index}");
             let open = project.drawer_shows(index);
+            let session = tab.session.id();
             pill(
                 theme,
                 key.clone(),
@@ -543,7 +562,12 @@ fn tray_bar(project: &Project, theme: &tok::Theme, accent: Color) -> Option<El> 
             .on_press(move |state: &mut State| state.workspace.toggle_drawer(index))
             .on_secondary_press(move |_: &mut State, _, tx: &mut Tx| {
                 tx.popup_menu(tray_menu(), &key, move |state: &mut State, picked, _| {
-                    tray_action(state, index, picked);
+                    let index = (state.workspace.project()).and_then(|project| {
+                        (project.tray.iter()).position(|tab| tab.session.id() == session)
+                    });
+                    if let Some(index) = index {
+                        tray_action(state, index, picked);
+                    }
                 });
             })
         });
