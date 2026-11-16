@@ -5,6 +5,7 @@ mod constraint;
 mod find;
 mod font;
 mod grid;
+mod history;
 mod images;
 mod input;
 mod jump;

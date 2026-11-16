@@ -15,8 +15,8 @@ use crate::grid::{Grid, Surface};
 use crate::input::caret_rect;
 use crate::keymap::{Command, pressed, shortcut};
 use crate::palette::{
-    Action, Palette, open_palette, poll_creation, poll_jump, poll_selection, poll_worktrees,
-    run_action,
+    Action, Palette, open_palette, poll_creation, poll_history, poll_jump, poll_selection,
+    poll_worktrees, run_action,
 };
 use crate::protocol::{Event, Visibility};
 use crate::render::TerminalSource;
@@ -91,6 +91,8 @@ pub(crate) struct State {
     /// Unset in tests and scenes, which then read and write no files.
     pub(crate) paths: Option<config::Paths>,
     pub(crate) secure_input: SecureInput,
+    /// Whether ⌘ is held, as the window last reported, which turns `!` rows into tray runs.
+    pub(crate) command_held: bool,
 }
 
 impl State {
@@ -208,7 +210,7 @@ pub(crate) fn open_tab(state: &mut State, title: &str, command: Option<&str>) {
 pub(crate) fn open_tray(state: &mut State, command: &str) {
     let cwd = state.session().and_then(Session::cwd);
     if let Some(cwd) = cwd.or_else(|| state.active_root()) {
-        let tab = state.spawn_tab(command, Some(command), &cwd);
+        let tab = state.spawn_tab(&crate::history::flattened(command), Some(command), &cwd);
         state.workspace.add_tray(tab);
     }
 }
@@ -608,6 +610,7 @@ pub(crate) fn poll(state: &mut State, now: f64, tx: &mut Tx) -> bool {
     changed |= poll_find(state, active);
     changed |= poll_worktrees(state);
     changed |= poll_creation(state);
+    changed |= poll_history(state);
     changed |= dismiss_confirms(state, |workspace, confirm| match confirm {
         Confirm::CloseProject { root } => workspace.project_index(root).is_some(),
         _ => confirm.session() == active,
@@ -860,6 +863,7 @@ pub(crate) fn window_app(
         .compositor(crate::render::TerminalCompositor::default())
         .on_ime(on_ime)
         .on_modifiers(|state, mods, _| {
+            state.command_held = mods.cmd;
             let shown = state
                 .workspace
                 .sessions()
