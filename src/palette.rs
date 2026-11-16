@@ -1,14 +1,16 @@
 use std::cmp::Reverse;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc;
+use std::sync::mpsc::{self, TryRecvError};
 use std::time::Duration;
 
+use rune::color::Color;
 use rune::tok;
-use rune::{El, Key, KeyEvent, TextEdit, Tx, col, text, text_input};
+use rune::{El, Key, KeyEvent, Mods, Span, TextEdit, Tx, Waker, col, el, text, text_input};
 
 use crate::LogErr;
 use crate::app::{State, open_project, open_tab, open_tray, run_command, tray_action};
 use crate::config::Config;
+use crate::history;
 use crate::jump;
 use crate::keymap::{COMMANDS, Command, CommandSpec, chord_hint};
 use crate::workspace::{Status, Workspace};
@@ -20,6 +22,11 @@ const JUMP_DEBOUNCE: Duration = Duration::from_millis(250);
 const JUMP_TIMEOUT: Duration = Duration::from_secs(5);
 /// Longer than a lookup, as `wt switch --create` runs the project's `pre-start` hooks first.
 const WORKTREE_TIMEOUT: Duration = Duration::from_secs(120);
+const HISTORY_ROWS: usize = 8;
+const PALETTE_PADDING: f32 = 8.0;
+const INPUT_PADDING_X: f32 = 10.0;
+const INPUT_PADDING_Y: f32 = 6.0;
+const INPUT_TEXT_WIDTH: f32 = PALETTE_WIDTH - 2.0 * (PALETTE_PADDING + INPUT_PADDING_X);
 
 #[derive(Default)]
 pub(crate) struct Palette {
@@ -34,6 +41,34 @@ pub(crate) struct Palette {
     pub(crate) creation: Option<Creation>,
     /// Why the last worktree creation failed, shown in the command centre until the next edit.
     pub(crate) error: Option<String>,
+    /// The login shell's history, newest first, suggested for `!` commands.
+    pub(crate) history: Vec<String>,
+    history_stamp: history::Stamp,
+    history_pending: Option<mpsc::Receiver<Option<history::Loaded>>>,
+}
+
+/// What the command centre's query asks for.
+enum Query<'a> {
+    /// The command after a leading `!`, which every row runs. A trailing space stays, as it
+    /// narrows the suggestions.
+    Shell(&'a str),
+    Search(&'a str),
+}
+
+impl<'a> Query<'a> {
+    fn of(text: &'a str) -> Self {
+        match text.trim_start().strip_prefix('!') {
+            Some(command) => Query::Shell(command.trim_start()),
+            None => Query::Search(text.trim()),
+        }
+    }
+}
+
+pub(crate) struct Rows {
+    pub(crate) actions: Vec<Action>,
+    /// For a `!` command, the input's text completed with the newest history entry it starts,
+    /// as fish suggests it.
+    ghost: Option<String>,
 }
 
 /// The jump command's folder for the command centre's query.
@@ -82,6 +117,57 @@ impl State {
             .as_deref()
             .filter(|_| self.palette.jump.query == self.palette.edit.text.trim())
     }
+
+    /// `tray` makes `!` rows run in the tray.
+    pub(crate) fn palette_rows(&self, tray: bool) -> Rows {
+        let Query::Shell(typed) = Query::of(&self.palette.edit.text) else {
+            return Rows {
+                actions: palette_actions(
+                    &self.palette.edit.text,
+                    self.jump_target(),
+                    &self.workspace,
+                    &self.config,
+                    self.is_torn_off(),
+                ),
+                ghost: None,
+            };
+        };
+        let command = typed.trim_end();
+        let history = &self.palette.history;
+        let prefixed = history.iter().filter(|entry| entry.starts_with(typed));
+        let contained = history
+            .iter()
+            .filter(|entry| !entry.starts_with(typed) && entry.contains(typed));
+        let mut suggested = prefixed
+            .chain(contained)
+            .map(String::as_str)
+            .filter(|entry| *entry != command)
+            .peekable();
+        let edit = &self.palette.edit;
+        // The suggestion follows neither a composition nor the input scrolling sideways.
+        let ghost = suggested
+            .peek()
+            .filter(|_| !typed.is_empty() && !edit.is_composing())
+            .and_then(|entry| history::single_line(entry))
+            .and_then(|line| Some(format!("{}{}", edit.text, line.strip_prefix(typed)?)))
+            .filter(|line| {
+                line.len() > edit.text.len()
+                    && rune::text::advance(line, tok::type_::BODY) <= INPUT_TEXT_WIDTH
+            });
+        let actions = (!command.is_empty())
+            .then_some(command)
+            .into_iter()
+            .chain(suggested.take(HISTORY_ROWS))
+            .map(|command| {
+                if tray {
+                    Action::Tray(command.to_owned())
+                } else {
+                    Action::Run(command.to_owned())
+                }
+            })
+            .collect();
+        Rows { actions, ghost }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -107,8 +193,10 @@ impl Action {
             Action::RestartTray(_, title) => format!("Restart {title}"),
             Action::StopTray(_, title) => format!("Stop {title}"),
             Action::CreateWorktree(branch) => format!("Create worktree “{branch}”"),
-            Action::Run(command) => format!("Run “{command}” in a new tab"),
-            Action::Tray(command) => format!("Run “{command}” in the tray"),
+            Action::Run(command) => format!("Run “{}” in a new tab", history::flattened(command)),
+            Action::Tray(command) => {
+                format!("Run “{}” in the tray", history::flattened(command))
+            }
         }
     }
 }
@@ -305,6 +393,52 @@ pub(crate) fn open_palette(state: &mut State, tx: &mut Tx) {
     state.palette.worktrees = None;
     state.palette.error = None;
     tx.focus("palette-input", false);
+    if state.paths.is_some() {
+        let shell = state.config.shell.clone();
+        let known = state.palette.history_stamp.clone();
+        state.palette.history_pending = Some(spawn_waking(state.waker.clone(), move || {
+            history::load(&shell, &known)
+                .log_err("shell history")
+                .flatten()
+        }));
+    }
+}
+
+/// Runs `work` off the UI thread, then wakes the window to take its answer.
+fn spawn_waking<T: Send + 'static>(
+    waker: Option<Waker>,
+    work: impl FnOnce() -> T + Send + 'static,
+) -> mpsc::Receiver<T> {
+    let (sender, receiver) = mpsc::channel();
+    std::thread::spawn(move || {
+        if sender.send(work()).is_ok()
+            && let Some(waker) = waker
+        {
+            waker();
+        }
+    });
+    receiver
+}
+
+pub(crate) fn poll_history(state: &mut State) -> bool {
+    let palette = &mut state.palette;
+    let Some(pending) = &palette.history_pending else {
+        return false;
+    };
+    let found = match pending.try_recv() {
+        Err(TryRecvError::Empty) => return false,
+        found => found.ok().flatten(),
+    };
+    palette.history_pending = None;
+    let Some((stamp, found)) = found else {
+        return false;
+    };
+    palette.history_stamp = stamp;
+    palette.history = found;
+    // The rows change under the selection, so it goes back to the top one rather than pointing
+    // at a different command.
+    palette.selected = 0;
+    true
 }
 
 /// Keeps the command centre open until `wt` answers, as its hooks can take a while.
@@ -312,24 +446,15 @@ fn create_worktree(state: &mut State, branch: &str) {
     let Some(root) = state.active_root() else {
         return;
     };
-    let (sender, receiver) = mpsc::channel();
     let cancel = jump::Cancel::default();
-    state.palette.creation = Some(Creation {
-        result: receiver,
-        cancel: cancel.clone(),
+    let (shell, branch) = (state.config.shell.clone(), branch.to_owned());
+    let result = spawn_waking(state.waker.clone(), {
+        let cancel = cancel.clone();
+        move || jump::create_worktree(&shell, &root, &branch, WORKTREE_TIMEOUT, &cancel)
     });
+    state.palette.creation = Some(Creation { result, cancel });
     state.palette.open = true;
     state.palette.error = None;
-    let (shell, branch) = (state.config.shell.clone(), branch.to_owned());
-    let waker = state.waker.clone();
-    std::thread::spawn(move || {
-        let created = jump::create_worktree(&shell, &root, &branch, WORKTREE_TIMEOUT, &cancel);
-        if sender.send(created).is_ok()
-            && let Some(waker) = waker
-        {
-            waker();
-        }
-    });
 }
 
 pub(crate) fn poll_creation(state: &mut State) -> bool {
@@ -355,19 +480,8 @@ pub(crate) fn poll_creation(state: &mut State) -> bool {
     true
 }
 
-/// The palette's actions for what `state` has typed and shows.
-fn shown_actions(state: &State) -> Vec<Action> {
-    palette_actions(
-        &state.palette.edit.text,
-        state.jump_target(),
-        &state.workspace,
-        &state.config,
-        state.is_torn_off(),
-    )
-}
-
-fn run_palette(state: &mut State, index: usize, tx: &mut Tx) {
-    let actions = shown_actions(state);
+fn run_palette(state: &mut State, index: usize, tray: bool, tx: &mut Tx) {
+    let actions = state.palette_rows(tray).actions;
     let Some(action) = actions.get(index.min(actions.len().saturating_sub(1))) else {
         return;
     };
@@ -387,33 +501,28 @@ pub(crate) fn run_action(state: &mut State, action: &Action, tx: &mut Tx) {
         Action::RestartTray(index, _) => tray_action(state, *index, Some("restart")),
         Action::StopTray(index, _) => tray_action(state, *index, Some("stop")),
         Action::CreateWorktree(branch) => create_worktree(state, branch),
-        Action::Run(command) => open_tab(state, command, Some(command)),
+        Action::Run(command) => open_tab(state, &history::flattened(command), Some(command)),
         Action::Tray(command) => open_tray(state, command),
     }
 }
 
 fn list_worktrees(state: &mut State, root: PathBuf, tx: &mut Tx) {
-    let (sender, receiver) = mpsc::channel();
+    let pending = spawn_waking(state.waker.clone(), {
+        let (shell, root) = (state.config.shell.clone(), root.clone());
+        move || {
+            jump::worktrees(&shell, &root, JUMP_TIMEOUT)
+                .log_err("wt list")
+                .unwrap_or_default()
+        }
+    });
     state.palette.worktrees = Some(WorktreeChoice {
-        root: root.clone(),
-        pending: Some(receiver),
+        root,
+        pending: Some(pending),
         found: Vec::new(),
     });
     state.palette.edit = TextEdit::new("");
     state.palette.selected = 0;
     tx.focus("palette-input", false);
-    let shell = state.config.shell.clone();
-    let waker = state.waker.clone();
-    std::thread::spawn(move || {
-        let found = jump::worktrees(&shell, &root, JUMP_TIMEOUT)
-            .log_err("wt list")
-            .unwrap_or_default();
-        if sender.send(found).is_ok()
-            && let Some(waker) = waker
-        {
-            waker();
-        }
-    });
 }
 
 pub(crate) fn poll_worktrees(state: &mut State) -> bool {
@@ -475,26 +584,39 @@ fn palette_key(state: &mut State, event: &KeyEvent, tx: &mut Tx) -> bool {
     if state.palette.worktrees.is_some() {
         return worktree_key(state, event);
     }
-    let actions = shown_actions(state);
-    let last = actions.len().saturating_sub(1);
-    match event.key {
-        Key::Escape => state.palette.open = false,
-        Key::Up => state.palette.selected = state.palette.selected.min(last).saturating_sub(1),
-        Key::Down => state.palette.selected = (state.palette.selected + 1).min(last),
-        Key::Enter
+    let rows = state.palette_rows(event.mods.cmd);
+    let last = rows.actions.len().saturating_sub(1);
+    match (&event.key, Query::of(&state.palette.edit.text)) {
+        (Key::Escape, _) => state.palette.open = false,
+        (Key::Up, _) => state.palette.selected = state.palette.selected.min(last).saturating_sub(1),
+        (Key::Down, _) => state.palette.selected = (state.palette.selected + 1).min(last),
+        (Key::Tab | Key::Right, Query::Shell(_))
+            if event.mods == Mods::default()
+                && state.palette.edit.range()
+                    == (state.palette.edit.text.len(), state.palette.edit.text.len())
+                && let Some(line) = rows.ghost.as_deref() =>
+        {
+            state
+                .palette
+                .edit
+                .insert(&line[state.palette.edit.text.len()..]);
+            state.palette.error = None;
+        }
+        (Key::Enter, Query::Search(_))
             if event.mods.cmd
-                && let Some(Action::Jump(root)) = actions.get(state.palette.selected.min(last)) =>
+                && let Some(Action::Jump(root)) =
+                    rows.actions.get(state.palette.selected.min(last)) =>
         {
             list_worktrees(state, root.clone(), tx);
         }
-        Key::Enter if event.mods.cmd => {
-            let query = state.palette.edit.text.trim().to_owned();
+        (Key::Enter, Query::Search(query)) if event.mods.cmd => {
             if !query.is_empty() {
+                let query = query.to_owned();
                 state.palette.open = false;
                 open_tray(state, &query);
             }
         }
-        Key::Enter => run_palette(state, state.palette.selected, tx),
+        (Key::Enter, _) => run_palette(state, state.palette.selected, event.mods.cmd, tx),
         _ => {
             // A poll after the edit lands starts the jump lookup's debounce.
             tx.wake_after(Duration::ZERO);
@@ -522,10 +644,9 @@ pub(crate) fn poll_jump(state: &mut State, now: f64, tx: &mut Tx) -> bool {
     let Some(command) = &state.config.jump_command else {
         return false;
     };
-    let query = if state.palette.open {
-        state.palette.edit.text.trim()
-    } else {
-        ""
+    let query = match Query::of(&state.palette.edit.text) {
+        Query::Search(query) if state.palette.open => query,
+        _ => "",
     };
     let jump = &mut state.palette.jump;
     let mut changed = false;
@@ -541,8 +662,6 @@ pub(crate) fn poll_jump(state: &mut State, now: f64, tx: &mut Tx) -> bool {
     }
     if jump.due.is_some_and(|due| now >= due) {
         jump.due = None;
-        let (sender, receiver) = mpsc::channel();
-        jump.pending = Some(receiver);
         jump.cancel = jump::Cancel::default();
         let cancel = jump.cancel.clone();
         let (shell, command, query) = (
@@ -550,17 +669,11 @@ pub(crate) fn poll_jump(state: &mut State, now: f64, tx: &mut Tx) -> bool {
             command.clone(),
             jump.query.clone(),
         );
-        let waker = state.waker.clone();
-        std::thread::spawn(move || {
-            let found = jump::lookup(&shell, &command, &query, JUMP_TIMEOUT, &cancel)
+        jump.pending = Some(spawn_waking(state.waker.clone(), move || {
+            jump::lookup(&shell, &command, &query, JUMP_TIMEOUT, &cancel)
                 .log_err("jump command")
-                .flatten();
-            if sender.send(found).is_ok()
-                && let Some(waker) = waker
-            {
-                waker();
-            }
-        });
+                .flatten()
+        }));
     }
     if let Some(found) = jump
         .pending
@@ -580,7 +693,8 @@ pub(crate) fn view(
     pill: &impl Fn(String, &str, bool, Option<El>) -> El,
 ) -> Option<El> {
     state.palette.open.then(|| {
-        let rows: Vec<El> = if state.palette.creation.is_some() {
+        let rows = state.palette_rows(state.command_held);
+        let elements: Vec<El> = if state.palette.creation.is_some() {
             vec![pill("palette-0".to_owned(), "Creating worktree…", false, None).w_full()]
         } else if let Some(choice) = &state.palette.worktrees {
             let visible = state.visible_worktrees();
@@ -598,14 +712,18 @@ pub(crate) fn view(
             });
             placeholder.into_iter().chain(worktrees).collect()
         } else {
-            let actions = shown_actions(state);
-            let selected = state.palette.selected.min(actions.len().saturating_sub(1));
-            actions
+            let shell = matches!(Query::of(&state.palette.edit.text), Query::Shell(_));
+            let selected = state
+                .palette
+                .selected
+                .min(rows.actions.len().saturating_sub(1));
+            rows.actions
                 .iter()
                 .enumerate()
                 .map(|(index, action)| {
                     let shortcut = match action {
                         Action::Tray(_) => Some("⌘↵".to_owned()),
+                        Action::Run(_) if shell => Some("⌘↵".to_owned()),
                         Action::Jump(_) => Some("⌘↵ worktrees".to_owned()),
                         Action::Command(command) => COMMANDS
                             .iter()
@@ -629,7 +747,7 @@ pub(crate) fn view(
                     .justify_between()
                     .w_full()
                     .on_press_tx(move |state: &mut State, tx: &mut Tx| {
-                        run_palette(state, index, tx)
+                        run_palette(state, index, state.command_held, tx)
                     })
                 })
                 .collect()
@@ -644,7 +762,7 @@ pub(crate) fn view(
                 col()
                     .key("palette")
                     .w(PALETTE_WIDTH)
-                    .padding(8.0)
+                    .padding(PALETTE_PADDING)
                     .gap(4.0)
                     .radius(10.0)
                     .fill(theme.card)
@@ -652,18 +770,35 @@ pub(crate) fn view(
                     // Keeps clicks between rows from reaching the layer, which closes it.
                     .on_press(|_: &mut State| {})
                     .child(
-                        text_input(&state.palette.edit, tok::type_::BODY)
-                            .key("palette-input")
-                            .label("Command")
-                            .single_line()
-                            .w_full()
-                            .px(10.0)
-                            .py(6.0)
-                            .radius(6.0)
-                            .fill(theme.control_track)
-                            .color(theme.text)
-                            .on_edit(|state: &mut State| &mut state.palette.edit)
-                            .on_input_key(palette_key),
+                        el().w_full()
+                            .child(
+                                text_input(&state.palette.edit, tok::type_::BODY)
+                                    .key("palette-input")
+                                    .label("Command")
+                                    .single_line()
+                                    .w_full()
+                                    .px(INPUT_PADDING_X)
+                                    .py(INPUT_PADDING_Y)
+                                    .radius(6.0)
+                                    .fill(theme.control_track)
+                                    .color(theme.text)
+                                    .on_edit(|state: &mut State| &mut state.palette.edit)
+                                    .on_input_key(palette_key),
+                            )
+                            .children(rows.ghost.map(|line| {
+                                // The typed text is drawn clear, so the rest lines up after it.
+                                let span = Span::new(state.palette.edit.text.len(), line.len())
+                                    .color(theme.text_secondary);
+                                text(line)
+                                    .key("palette-ghost")
+                                    .font(tok::type_::BODY)
+                                    .color(Color::TRANSPARENT)
+                                    .spans([span])
+                                    .pin(Some(0.0), Some(0.0), Some(0.0), Some(0.0))
+                                    .px(INPUT_PADDING_X)
+                                    .py(INPUT_PADDING_Y)
+                                    .inert()
+                            })),
                     )
                     .children(state.palette.error.as_deref().map(|error| {
                         text(error)
@@ -672,7 +807,7 @@ pub(crate) fn view(
                             .px(10.0)
                             .py(4.0)
                     }))
-                    .children(rows),
+                    .children(elements),
             )
     })
 }
@@ -1406,6 +1541,259 @@ mod tests {
                     !matches!(action, Action::RestartTray(..) | Action::StopTray(..))
                 })
         );
+    }
+
+    fn history_runtime() -> Runtime<State> {
+        let mut runtime = palette_runtime();
+        runtime.state.palette.history = ["git status", "ls", "git push", "make git"]
+            .map(str::to_owned)
+            .into();
+        runtime
+    }
+
+    fn shell(command: &str) -> Action {
+        Action::Run(command.to_owned())
+    }
+
+    fn rows(runtime: &Runtime<State>) -> Vec<Action> {
+        runtime.state.palette_rows(false).actions
+    }
+
+    #[test]
+    fn a_bang_query_offers_only_running_it_and_matching_history() {
+        let mut runtime = history_runtime();
+        press(&mut runtime, Key::Text("! git".into()), Mods::default());
+        assert_eq!(
+            rows(&runtime),
+            [
+                shell("git"),
+                shell("git status"),
+                shell("git push"),
+                shell("make git")
+            ]
+        );
+        press(&mut runtime, Key::Text(" status".into()), Mods::default());
+        assert_eq!(rows(&runtime), [shell("git status")]);
+    }
+
+    #[test]
+    fn a_lone_bang_lists_recent_history_and_nothing_else() {
+        let mut runtime = history_runtime();
+        press(&mut runtime, Key::Text("!".into()), Mods::default());
+        assert_eq!(
+            rows(&runtime),
+            [
+                shell("git status"),
+                shell("ls"),
+                shell("git push"),
+                shell("make git")
+            ]
+        );
+        runtime.state.palette.history.clear();
+        assert_eq!(rows(&runtime), []);
+        press(&mut runtime, Key::Enter, command());
+        press(&mut runtime, Key::Enter, Mods::default());
+        let project = &runtime.state.workspace.projects[0];
+        assert!(project.tray.is_empty());
+        assert_eq!(project.tabs.len(), 3);
+    }
+
+    #[test]
+    fn tab_or_right_accepts_the_suggested_history_entry() {
+        let mut runtime = history_runtime();
+        press(&mut runtime, Key::Text("!git p".into()), Mods::default());
+        assert!(runtime.find("palette-ghost").is_some());
+        runtime.state.palette.error = Some("failed".to_owned());
+        press(&mut runtime, Key::Tab, Mods::default());
+        assert_eq!(runtime.state.palette.edit.text, "!git push");
+        assert_eq!(runtime.state.palette.error, None);
+        assert!(runtime.find("palette-ghost").is_none());
+        let mut runtime = history_runtime();
+        press(&mut runtime, Key::Text("!g".into()), Mods::default());
+        press(&mut runtime, Key::Right, Mods::default());
+        assert_eq!(runtime.state.palette.edit.text, "!git status");
+        assert!(runtime.state.palette.open);
+    }
+
+    #[test]
+    fn modified_tab_and_right_leave_the_suggestion() {
+        for mods in [
+            Mods {
+                shift: true,
+                ..Mods::default()
+            },
+            Mods {
+                alt: true,
+                ..Mods::default()
+            },
+            command(),
+        ] {
+            for key in [Key::Tab, Key::Right] {
+                let mut runtime = history_runtime();
+                press(&mut runtime, Key::Text("!g".into()), Mods::default());
+                press(&mut runtime, key.clone(), mods);
+                assert_eq!(runtime.state.palette.edit.text, "!g", "{key:?} {mods:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_suggestion_too_long_for_the_input_is_not_offered() {
+        let mut runtime = history_runtime();
+        let long = format!("git {}", "x".repeat(200));
+        runtime.state.palette.history.insert(0, long.clone());
+        press(&mut runtime, Key::Text("!git".into()), Mods::default());
+        assert!(runtime.find("palette-ghost").is_none());
+        press(&mut runtime, Key::Tab, Mods::default());
+        assert_eq!(runtime.state.palette.edit.text, "!git");
+        assert_eq!(rows(&runtime)[1], shell(&long));
+    }
+
+    #[test]
+    fn right_away_from_the_end_only_moves_the_caret() {
+        let mut runtime = history_runtime();
+        press(&mut runtime, Key::Text("!g".into()), Mods::default());
+        press(&mut runtime, Key::Left, Mods::default());
+        press(&mut runtime, Key::Right, Mods::default());
+        assert_eq!(runtime.state.palette.edit.text, "!g");
+    }
+
+    #[test]
+    fn enter_runs_the_bang_command_in_a_new_tab() {
+        let mut runtime = history_runtime();
+        press(&mut runtime, Key::Text("!make".into()), Mods::default());
+        press(&mut runtime, Key::Enter, Mods::default());
+        let project = &runtime.state.workspace.projects[0];
+        assert_eq!(project.tabs.len(), 4);
+        assert_eq!(project.tabs[3].title, "make");
+        assert!(project.tray.is_empty());
+        assert!(!runtime.state.palette.open);
+    }
+
+    #[test]
+    fn command_enter_runs_the_selected_history_row_in_the_tray() {
+        let mut runtime = history_runtime();
+        press(&mut runtime, Key::Text("!git".into()), Mods::default());
+        press(&mut runtime, Key::Down, Mods::default());
+        press(&mut runtime, Key::Down, Mods::default());
+        press(&mut runtime, Key::Enter, command());
+        let project = &runtime.state.workspace.projects[0];
+        let tray: Vec<_> = project.tray.iter().map(|tab| tab.title.as_str()).collect();
+        assert_eq!(tray, ["git push"]);
+        assert_eq!(project.tabs.len(), 3);
+    }
+
+    #[test]
+    fn run_rows_offer_the_tray_while_command_is_held() {
+        let mut runtime = history_runtime();
+        press(&mut runtime, Key::Text("!ls".into()), Mods::default());
+        assert_eq!(
+            runtime.state.palette_rows(true).actions,
+            [Action::Tray("ls".to_owned())]
+        );
+        runtime.state.palette.edit = TextEdit::new("ls");
+        assert_eq!(
+            runtime.state.palette_rows(true).actions[..2],
+            [Action::Run("ls".to_owned()), Action::Tray("ls".to_owned())]
+        );
+    }
+
+    #[test]
+    fn loaded_history_replaces_the_previous_one_and_selects_the_top_row() {
+        let mut runtime = history_runtime();
+        press(&mut runtime, Key::Text("!".into()), Mods::default());
+        press(&mut runtime, Key::Down, Mods::default());
+        let (sender, receiver) = mpsc::channel();
+        runtime.state.palette.history_pending = Some(receiver);
+        assert!(!poll_history(&mut runtime.state));
+        sender
+            .send(Some((history::Stamp::default(), vec!["htop".to_owned()])))
+            .unwrap();
+        assert!(poll_history(&mut runtime.state));
+        assert_eq!(runtime.state.palette.history, ["htop"]);
+        assert_eq!(runtime.state.palette.selected, 0);
+        assert!(runtime.state.palette.history_pending.is_none());
+    }
+
+    #[test]
+    fn an_unchanged_or_failed_load_keeps_the_history() {
+        let mut runtime = history_runtime();
+        for answer in [Some(None), None] {
+            let (sender, receiver) = mpsc::channel();
+            runtime.state.palette.history_pending = Some(receiver);
+            if let Some(answer) = answer {
+                sender.send(answer).unwrap();
+            }
+            drop(sender);
+            assert!(!poll_history(&mut runtime.state));
+            assert!(runtime.state.palette.history_pending.is_none());
+            assert_eq!(runtime.state.palette.history.len(), 4);
+        }
+    }
+
+    fn multi_line_runtime() -> Runtime<State> {
+        let mut runtime = history_runtime();
+        runtime.state.palette.history = ["for x in a b; do\necho $x\ndone", "echo 'a\nb'"]
+            .map(str::to_owned)
+            .into();
+        runtime
+    }
+
+    #[test]
+    fn multi_line_history_rows_show_marked_newlines_and_run_the_original() {
+        let mut runtime = multi_line_runtime();
+        press(&mut runtime, Key::Text("!for".into()), Mods::default());
+        let original = "for x in a b; do\necho $x\ndone";
+        assert_eq!(rows(&runtime)[1], shell(original));
+        assert_eq!(
+            rows(&runtime)[1].label(),
+            "Run “for x in a b; do ⏎ echo $x ⏎ done” in a new tab"
+        );
+        press(&mut runtime, Key::Down, Mods::default());
+        press(&mut runtime, Key::Enter, Mods::default());
+        let tab = &runtime.state.workspace.projects[0].tabs[3];
+        assert_eq!(tab.command.as_deref(), Some(original));
+        assert_eq!(tab.title, "for x in a b; do ⏎ echo $x ⏎ done");
+    }
+
+    #[test]
+    fn accepting_a_multi_line_suggestion_joins_it_into_one_line() {
+        let mut runtime = multi_line_runtime();
+        press(&mut runtime, Key::Text("!for".into()), Mods::default());
+        press(&mut runtime, Key::Tab, Mods::default());
+        assert_eq!(
+            runtime.state.palette.edit.text,
+            "!for x in a b; do echo $x; done"
+        );
+    }
+
+    #[test]
+    fn a_newline_inside_quotes_offers_the_row_but_no_suggestion() {
+        let mut runtime = multi_line_runtime();
+        press(&mut runtime, Key::Text("!echo".into()), Mods::default());
+        assert_eq!(rows(&runtime)[1], shell("echo 'a\nb'"));
+        assert!(runtime.find("palette-ghost").is_none());
+        press(&mut runtime, Key::Tab, Mods::default());
+        assert_eq!(runtime.state.palette.edit.text, "!echo");
+    }
+
+    #[test]
+    fn bang_rows_always_show_the_tray_shortcut() {
+        let mut runtime = history_runtime();
+        press(&mut runtime, Key::Text("!ls".into()), Mods::default());
+        runtime.frame(0.0);
+        assert!(runtime.find("palette-shortcut").is_some());
+    }
+
+    #[test]
+    fn a_bang_query_skips_the_jump_lookup() {
+        let mut state = workspace_state();
+        state.config.jump_command = Some("j".to_owned());
+        let mut runtime = runtime_with(state);
+        press(&mut runtime, Key::Command('p'), command());
+        press(&mut runtime, Key::Text("!site".into()), Mods::default());
+        runtime.frame(0.5);
+        assert!(runtime.state.palette.jump.due.is_none());
     }
 
     #[test]

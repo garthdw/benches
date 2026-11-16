@@ -220,6 +220,20 @@ pub(crate) const SCENES: &[Scene] = &[
         state.palette.edit = TextEdit::new("zoom");
         state.palette.open = true;
     }),
+    ("palette-history", |state| {
+        show_workspace_scene(state);
+        state.palette.edit = TextEdit::new("!git");
+        state.palette.open = true;
+        state.palette.history = [
+            "git status",
+            "git stash pop",
+            "for branch in $(git branch --format='%(refname:short)'); do\ngit log -1 $branch\ndone",
+            "ls",
+            "git push",
+        ]
+        .map(str::to_owned)
+        .into();
+    }),
     ("palette-error", |state| {
         show_workspace_scene(state);
         add_scene_tray(state);
