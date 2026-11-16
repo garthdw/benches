@@ -5,7 +5,7 @@ use std::rc::Rc;
 use rune::{Tx, Waker, WindowSpec};
 
 use crate::LogErr;
-use crate::app::{State, refuse_clipboard_reads, save_layout, window_app};
+use crate::app::{State, dismiss_confirms, save_layout, window_app};
 use crate::config::Config;
 use crate::workspace::{Project, SavedWorkspace};
 
@@ -142,18 +142,16 @@ pub(crate) fn on_close(state: &mut State, tx: &mut Tx) {
     if rune::quitting() {
         return;
     }
-    if state.window == MAIN_WINDOW {
-        tx.quit();
-    } else {
+    if state.is_torn_off() {
         merge_into_main(state);
+    } else {
+        tx.quit();
     }
 }
 
 fn merge_into_main(state: &mut State) {
-    let confirms = std::mem::take(&mut state.confirms);
-    refuse_clipboard_reads(state, confirms);
-    while let Some(project) = state.workspace.take_project(0) {
-        state.fleet.send(MAIN_WINDOW, project);
+    while let Some(project) = release_project(state, 0) {
+        hand_to_main(state, project);
     }
     state.fleet.unregister(state.window);
 }
@@ -170,7 +168,7 @@ pub(crate) fn move_to_new_window(state: &mut State, index: usize, position: Opti
     if state.workspace.projects.len() < 2 {
         return;
     }
-    let Some(project) = state.workspace.take_project(index) else {
+    let Some(project) = release_project(state, index) else {
         return;
     };
     let window = state.fleet.reserve_window();
@@ -184,6 +182,34 @@ pub(crate) fn move_to_new_window(state: &mut State, index: usize, position: Opti
     let mut spec = WindowSpec::from_app(format!("agentd-{window}"), app);
     spec.options.position = position;
     rune::open_window(spec);
+}
+
+/// Hands project `index`, still running, back to the main window. Unlike a move to a new
+/// window this takes a window's last project too, as the emptied window then closes.
+pub(crate) fn move_to_main_window(state: &mut State, index: usize) {
+    if let Some(project) = release_project(state, index) {
+        hand_to_main(state, project);
+    }
+}
+
+/// Sends `project`, still running, to the main window and brings that window forward on it.
+fn hand_to_main(state: &State, project: Project) {
+    let session = project.active_tab().map(|tab| tab.session.id());
+    state.fleet.send(MAIN_WINDOW, project);
+    if let Some(session) = session {
+        state.fleet.reveal(session);
+    }
+}
+
+/// Takes project `index` out of this window. Its sessions' pending confirms go first, refusing
+/// their clipboard reads while the sessions are still here to answer, so no program waits on one.
+fn release_project(state: &mut State, index: usize) -> Option<Project> {
+    let project = state.workspace.projects.get(index)?;
+    let sessions: Vec<u64> = project.tabs().map(|tab| tab.session.id()).collect();
+    dismiss_confirms(state, |_, confirm| {
+        !(confirm.session()).is_some_and(|session| sessions.contains(&session))
+    });
+    state.workspace.take_project(index)
 }
 
 /// Whether a project dragged from the sidebar was let go far enough outside it, or off the
@@ -259,12 +285,14 @@ mod tests {
     use crate::app::{Confirm, open_tab};
     use crate::config::Paths;
     use crate::protocol::Visibility;
+    use crate::scenes::fixture_tab;
     use crate::session::Session;
     use crate::test_support::*;
     use crate::view::SIDEBAR_WIDTH;
     use libghostty_vt::effect::ClipboardLocation;
     use rune::Runtime;
     use std::cell::Cell;
+    use std::path::Path;
     use std::sync::atomic::Ordering;
 
     #[test]
@@ -452,43 +480,48 @@ mod tests {
 
     #[test]
     fn closing_a_window_refuses_its_pending_clipboard_read() {
-        let (main_waker, _) = counting_waker();
-        let mut main = State {
-            waker: Some(main_waker),
-            ..State::default()
-        };
-        let mut second = State {
-            fleet: main.fleet.clone(),
-            window: 1,
-            started: true,
-            ..State::default()
-        };
-        second
-            .workspace
-            .add_project(Project::new("/tmp".into(), vec![]));
-        open_tab(
-            &mut second,
-            "ask",
-            Some(r#"sh -c 'printf "\\033]52;c;?\\007"; cat'"#),
-        );
-        let session = second.workspace.active_session().map(Session::id).unwrap();
-        second.confirms.push(Confirm::ClipboardRead {
-            session,
-            location: ClipboardLocation::Standard,
-        });
+        let mut second = window_asking_to_read(1);
         merge_into_main(&mut second);
+        assert!(second.confirms.is_empty());
+        assert_read_refused(&second.fleet, MAIN_WINDOW);
+    }
 
-        assert!(adopt_projects(&mut main));
-        let session = main.workspace.active_session().unwrap();
-        wait_until(
-            std::time::Duration::from_secs(5),
-            || "the read was never refused".to_owned(),
-            || {
-                (session.grid().lines().iter())
-                    .any(|line| line.contains("]52;c;"))
-                    .then_some(())
-            },
-        );
+    /// A torn-off window holding `roots`, each with a shell tab, and what the main window was
+    /// last asked to reveal.
+    fn window_watching_main_reveal(roots: &[&str]) -> (State, Rc<Cell<Option<u64>>>) {
+        let mut second = State {
+            window: 1,
+            ..State::default()
+        };
+        for root in roots {
+            let tabs = vec![fixture_tab("shell", b"$ ")];
+            second
+                .workspace
+                .add_project(Project::new(root.into(), tabs));
+        }
+        let revealed = Rc::new(Cell::new(None));
+        second.fleet.on_reveal(MAIN_WINDOW, {
+            let revealed = revealed.clone();
+            move |session| revealed.set(Some(session))
+        });
+        (second, revealed)
+    }
+
+    #[test]
+    fn moving_a_project_to_the_main_window_reveals_it_there() {
+        let (mut second, revealed) = window_watching_main_reveal(&["/tmp", "/usr"]);
+        second.workspace.select_project(0);
+        let session = second.workspace.active_session().map(Session::id);
+        move_to_main_window(&mut second, 0);
+        assert_eq!(revealed.get(), session);
+    }
+
+    #[test]
+    fn merging_a_window_into_the_main_window_reveals_its_projects_there() {
+        let (mut second, revealed) = window_watching_main_reveal(&["/tmp", "/usr"]);
+        let last = second.workspace.active_session().map(Session::id);
+        merge_into_main(&mut second);
+        assert_eq!(revealed.get(), last);
     }
 
     #[test]
@@ -506,6 +539,74 @@ mod tests {
 
         closed.fleet.reveal(0);
         assert!(!revealed.get());
+    }
+
+    /// A window whose first project's program waits on a clipboard read, beside a project with
+    /// a close of its own pending.
+    fn window_asking_to_read(window: WindowId) -> State {
+        let mut state = State {
+            window,
+            started: true,
+            ..State::default()
+        };
+        state
+            .workspace
+            .add_project(Project::new("/tmp".into(), vec![]));
+        open_tab(
+            &mut state,
+            "ask",
+            Some(r#"sh -c 'printf "\\033]52;c;?\\007"; cat'"#),
+        );
+        let session = state.workspace.active_session().map(Session::id).unwrap();
+        state.confirms.push(Confirm::ClipboardRead {
+            session,
+            location: ClipboardLocation::Standard,
+        });
+        let tabs = vec![fixture_tab("shell", b"$ ")];
+        state
+            .workspace
+            .add_project(Project::new("/usr".into(), tabs));
+        let session = state.workspace.active_session().map(Session::id).unwrap();
+        state.confirms.push(Confirm::Close { session });
+        state
+    }
+
+    /// Takes the moved projects into `window` and waits for the asking program to hear the refusal.
+    fn assert_read_refused(fleet: &Fleet, window: WindowId) {
+        let mut receiver = State {
+            fleet: fleet.clone(),
+            window,
+            ..State::default()
+        };
+        assert!(adopt_projects(&mut receiver));
+        let asking = receiver.workspace.project_index(Path::new("/tmp")).unwrap();
+        receiver.workspace.select_project(asking);
+        let session = receiver.workspace.active_session().unwrap();
+        wait_until(
+            std::time::Duration::from_secs(5),
+            || "the read was never refused".to_owned(),
+            || {
+                (session.grid().lines().iter())
+                    .any(|line| line.contains("]52;c;"))
+                    .then_some(())
+            },
+        );
+    }
+
+    #[test]
+    fn moving_a_project_to_the_main_window_refuses_only_its_own_clipboard_read() {
+        let mut second = window_asking_to_read(1);
+        move_to_main_window(&mut second, 0);
+        assert!(matches!(second.confirms[..], [Confirm::Close { .. }]));
+        assert_read_refused(&second.fleet, MAIN_WINDOW);
+    }
+
+    #[test]
+    fn moving_a_project_to_a_new_window_refuses_only_its_own_clipboard_read() {
+        let mut main = window_asking_to_read(MAIN_WINDOW);
+        move_to_new_window(&mut main, 0, None);
+        assert!(matches!(main.confirms[..], [Confirm::Close { .. }]));
+        assert_read_refused(&main.fleet, 1);
     }
 
     #[test]

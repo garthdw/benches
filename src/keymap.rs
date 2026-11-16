@@ -11,6 +11,8 @@ pub enum Command {
     OpenProject,
     ChangeFolder,
     MoveToNewWindow,
+    MoveToMainWindow,
+    MergeIntoMain,
     Palette,
     Find,
     ToggleSidebar,
@@ -34,7 +36,8 @@ pub struct CommandSpec {
     pub chord: Option<&'static str>,
     /// Listed in the palette before anything is typed.
     pub default: bool,
-    pub enabled: fn(&Workspace, &Config) -> bool,
+    /// Offered for this workspace and config, in a torn-off window or not.
+    pub enabled: fn(&Workspace, &Config, bool) -> bool,
 }
 
 const fn spec(command: Command, label: &'static str, chord: Option<&'static str>) -> CommandSpec {
@@ -43,7 +46,7 @@ const fn spec(command: Command, label: &'static str, chord: Option<&'static str>
         label,
         chord,
         default: false,
-        enabled: |_, _| true,
+        enabled: |_, _, _| true,
     }
 }
 
@@ -56,20 +59,32 @@ const fn default(mut spec: CommandSpec) -> CommandSpec {
 pub const COMMANDS: &[CommandSpec] = &[
     default(spec(Command::NewShell, "New shell tab", Some("mod+t"))),
     default(CommandSpec {
-        enabled: |_, config| config.git_command().is_some(),
+        enabled: |_, config, _| config.git_command().is_some(),
         ..spec(Command::ToggleGit, "Toggle git", Some("mod+g"))
     }),
     default(spec(Command::OpenProject, "Open project…", Some("mod+n"))),
     default(CommandSpec {
-        enabled: |workspace, _| workspace.project().is_some(),
+        enabled: |workspace, _, _| workspace.project().is_some(),
         ..spec(Command::ChangeFolder, "Change project folder…", None)
     }),
     default(CommandSpec {
-        enabled: |workspace, _| workspace.projects.len() > 1,
+        enabled: |workspace, _, _| workspace.projects.len() > 1,
         ..spec(Command::MoveToNewWindow, "Move project to new window", None)
     }),
+    default(CommandSpec {
+        enabled: |workspace, _, torn_off| torn_off && workspace.project().is_some(),
+        ..spec(
+            Command::MoveToMainWindow,
+            "Move project to main window",
+            None,
+        )
+    }),
+    default(CommandSpec {
+        enabled: |_, _, torn_off| torn_off,
+        ..spec(Command::MergeIntoMain, "Merge window into main", None)
+    }),
     CommandSpec {
-        enabled: |_, _| false,
+        enabled: |_, _, _| false,
         ..spec(Command::Palette, "Command palette", Some("mod+p"))
     },
     spec(Command::Find, "Find in scrollback", Some("mod+f")),
