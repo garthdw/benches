@@ -2,26 +2,20 @@ pub mod constraint;
 mod nerd_font_table;
 pub mod sprite;
 
+#[cfg(target_os = "macos")]
+mod coretext;
+#[cfg(target_os = "macos")]
+use coretext::CoreText as Os;
+
+#[cfg(not(target_os = "macos"))]
+compile_error!("benches-font has a CoreText backend only");
+
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::hash::{BuildHasherDefault, Hash, Hasher};
-use std::ptr::NonNull;
 use std::rc::Rc;
 
-use anyhow::{Context, Result, ensure};
-use objc2_core_foundation::{
-    CFArray, CFAttributedString, CFData, CFDictionary, CFNumber, CFRange, CFRetained, CFString,
-    CFType, CGPoint, CGRect, kCFBooleanTrue,
-};
-use objc2_core_graphics::{
-    CGBitmapContextCreate, CGColorSpace, CGContext, CGImageAlphaInfo, CGImageByteOrderInfo,
-};
-use objc2_core_text::{
-    CTFont, CTFontDescriptor, CTFontManagerCreateFontDescriptorFromData, CTFontOrientation,
-    CTFontSymbolicTraits, CTLine, CTRun, kCTFontAttributeName, kCTFontFeatureSettingsAttribute,
-    kCTFontOpenTypeFeatureTag, kCTFontOpenTypeFeatureValue,
-    kCTForegroundColorFromContextAttributeName,
-};
+use anyhow::{Context, Result};
 
 use crate::constraint::{Bounds, Constraint, Metrics, Modifier, Size, is_private_use};
 use crate::sprite::TiledUnderline;
@@ -81,44 +75,89 @@ pub fn parse_features(specs: &[String]) -> Vec<FontFeature> {
         .collect()
 }
 
-fn feature_dictionary(feature: FontFeature) -> CFRetained<CFDictionary<CFString, CFType>> {
-    let tag = CFString::from_str(&String::from_utf8_lossy(&feature.tag));
-    let value = CFNumber::new_i32(feature.value);
-    let values: [&CFType; 2] = [tag.as_ref(), value.as_ref()];
-    // SAFETY: the extern statics are immutable CoreFoundation constants.
-    let keys = unsafe { [kCTFontOpenTypeFeatureTag, kCTFontOpenTypeFeatureValue] };
-    CFDictionary::from_slices(&keys, &values)
+/// A face's measurements in device pixels.
+struct FaceMetrics {
+    ascent: f64,
+    descent: f64,
+    leading: f64,
+    underline_position: f64,
+    underline_thickness: f64,
+    x_height: f64,
+    cap_height: f64,
 }
 
-/// `font` with `features` on top of CoreText's defaults, which already enable `calt` and `liga`.
-fn with_features(font: CFRetained<CTFont>, features: &[FontFeature]) -> CFRetained<CTFont> {
-    if features.is_empty() {
-        return font;
-    }
-    let settings = CFArray::from_retained_objects(
-        &features
-            .iter()
-            .map(|feature| feature_dictionary(*feature))
-            .collect::<Vec<_>>(),
-    );
-    let values: [&CFType; 1] = [settings.as_ref()];
-    // SAFETY: the extern static is an immutable CoreFoundation constant.
-    let key = unsafe { kCTFontFeatureSettingsAttribute };
-    let attributes = CFDictionary::<CFString, CFType>::from_slices(&[key], &values);
-    // SAFETY: the dictionary holds the settings array CoreText documents for this key, a zero
-    // size keeps the font's size and a null matrix means identity.
-    unsafe {
-        let descriptor = CTFontDescriptor::with_attributes(attributes.as_opaque());
-        font.copy_with_attributes(0.0, std::ptr::null(), Some(&descriptor))
-    }
+/// A glyph id and its origin, in pixels from the start of the run and up from the baseline.
+#[derive(Clone, Copy)]
+struct Glyph {
+    id: u16,
+    x: f64,
+    y: f64,
 }
+
+/// Where a glyph's ink starts and ends horizontally, if it has any.
+type InkExtent = Option<(f64, f64)>;
+
+/// Maps a point `p` of the drawing to `offset + scale * (p - origin)` on the canvas.
+struct Placement {
+    offset: (f64, f64),
+    scale: (f64, f64),
+    origin: (f64, f64),
+}
+
+/// The system font services a `Font` is built on. Canvases are premultiplied RGBA with the top
+/// row first, and draw white with font smoothing off, so that `rgb != alpha` means colour.
+trait Backend {
+    type Face: Clone;
+    /// Text shaped with the system's fallback cascade for characters the face lacks.
+    type Line;
+    type Canvas<'a>;
+
+    fn new() -> Self;
+
+    /// `None` when `family` isn't installed, rather than whatever the system substitutes.
+    fn installed_face(&self, family: &str, pixels: f64) -> Option<Self::Face>;
+    /// `None` when the family has no such style.
+    fn styled(&self, face: &Self::Face, style: FontStyle) -> Option<Self::Face>;
+    fn embedded_face(&self, bytes: &'static [u8], pixels: f64) -> Result<Self::Face>;
+    /// The face shaping with `features` on top of the font's defaults. A shaper that takes features
+    /// per call keeps them with the face.
+    fn with_features(face: Self::Face, features: &[FontFeature]) -> Self::Face;
+    /// The face's own glyph for `character`, without fallback.
+    fn glyph(face: &Self::Face, character: char) -> Option<u16>;
+    fn advance(face: &Self::Face, glyph: u16) -> f64;
+    fn metrics(face: &Self::Face) -> FaceMetrics;
+
+    /// The glyphs of `text` as `line` shapes it. Only glyphs from the face itself draw correctly
+    /// through `draw_glyphs`, so callers shape only characters the face has.
+    fn shape(face: &Self::Face, text: &str) -> Option<Vec<Glyph>>;
+    fn glyph_ink(face: &Self::Face, glyph: u16) -> InkExtent;
+    fn line(face: &Self::Face, text: &str) -> Option<Self::Line>;
+    fn line_width(line: &Self::Line) -> f64;
+
+    /// A canvas drawing over `out`, which callers clear first, or `None` if `out` is smaller than `width` by `height` pixels.
+    fn canvas<'a>(&self, out: &'a mut [u8], width: u32, height: u32) -> Option<Self::Canvas<'a>>;
+    /// The line's ink, with `y` measured up from its baseline.
+    fn line_ink(canvas: &Self::Canvas<'_>, line: &Self::Line) -> Bounds;
+    fn draw_line(canvas: &mut Self::Canvas<'_>, line: &Self::Line, placement: Placement);
+    /// Each glyph at its origin, in pixels up from the bottom of the canvas.
+    fn draw_glyphs(
+        canvas: &mut Self::Canvas<'_>,
+        face: &Self::Face,
+        glyphs: impl IntoIterator<Item = Glyph>,
+    );
+
+    #[cfg(test)]
+    fn postscript_name(face: &Self::Face) -> String;
+}
+
+type Face = <Os as Backend>::Face;
 
 /// A monospaced face rasterised into whole-cell RGBA bitmaps, in device pixels.
 pub struct Font {
+    backend: Os,
     /// Indexed by `bold + 2 * italic`.
-    faces: [CFRetained<CTFont>; 4],
-    symbols: CFRetained<CTFont>,
-    color_space: Option<CFRetained<CGColorSpace>>,
+    faces: [Face; 4],
+    symbols: Face,
     pub cell_width: u32,
     pub cell_height: u32,
     pub line_thickness: u32,
@@ -138,9 +177,6 @@ pub struct Font {
     /// The horizontal extent of a glyph's ink from its origin, per style index and glyph.
     ink: RefCell<FnvMap<(usize, u16), InkExtent>>,
 }
-
-/// Where a glyph's ink starts and ends horizontally, if it has any.
-type InkExtent = Option<(f64, f64)>;
 
 type RunCache = FnvMap<Rc<str>, Rc<ShapedRun>>;
 
@@ -191,55 +227,23 @@ const RUN_CACHE_LIMIT: usize = 4096;
 
 const SYMBOLS_FONT: &[u8] = include_bytes!("../assets/SymbolsNerdFont-Regular.ttf");
 
-fn symbols_face(pixels: f64) -> Result<CFRetained<CTFont>> {
-    // SAFETY: the data is live for the call, and a null matrix means identity.
-    unsafe {
-        let descriptor =
-            CTFontManagerCreateFontDescriptorFromData(&CFData::from_static_bytes(SYMBOLS_FONT))
-                .context("the bundled symbols font couldn't be loaded")?;
-        Ok(CTFont::with_font_descriptor(
-            &descriptor,
-            pixels,
-            std::ptr::null(),
-        ))
-    }
-}
-
-fn face(name: &str, pixels: f64) -> CFRetained<CTFont> {
-    // SAFETY: a null matrix means identity.
-    unsafe { CTFont::with_name(&CFString::from_str(name), pixels, std::ptr::null()) }
-}
-
-fn installed_face(family: &str, pixels: f64) -> Option<CFRetained<CTFont>> {
-    let regular = face(family, pixels);
-    // CoreText silently substitutes another family when a name isn't installed.
-    // SAFETY: a plain getter on a live font.
-    (unsafe { regular.family_name() }.to_string() == family).then_some(regular)
-}
-
-fn has_icons(font: &CTFont) -> bool {
+fn has_icons(face: &Face) -> bool {
     // A Powerline separator and a Font Awesome icon.
-    let mut characters = [0xE0B0u16, 0xF432];
-    let mut glyphs = [0u16; 2];
-    // SAFETY: both arrays hold the two elements the count names.
-    unsafe {
-        font.glyphs_for_characters(
-            NonNull::from(&mut characters).cast(),
-            NonNull::from(&mut glyphs).cast(),
-            2,
-        )
-    }
+    ['\u{E0B0}', '\u{F432}']
+        .into_iter()
+        .all(|character| Os::glyph(face, character).is_some())
 }
 
 /// The face for private-use icons: the configured family, else the first Ghostty fallback, else the
 /// main font, each only when it has the icons, else the bundled Symbols Nerd Font.
 fn icon_face(
-    main: &CFRetained<CTFont>,
+    backend: &Os,
+    main: &Face,
     pixels: f64,
     configured: Option<&str>,
     fallbacks: &[String],
-) -> Result<CFRetained<CTFont>> {
-    let with_icons = |family: &str| installed_face(family, pixels).filter(|font| has_icons(font));
+) -> Result<Face> {
+    let with_icons = |family: &str| backend.installed_face(family, pixels).filter(has_icons);
     if let Some(family) = configured {
         if let Some(font) = with_icons(family) {
             return Ok(font);
@@ -254,89 +258,28 @@ fn icon_face(
     if has_icons(main) {
         return Ok(main.clone());
     }
-    symbols_face(pixels)
+    backend
+        .embedded_face(SYMBOLS_FONT, pixels)
+        .context("the bundled symbols font couldn't be loaded")
 }
 
 /// Regular, bold, italic and bold italic faces of `family`, or `None` if it isn't installed.
 /// A style the family lacks reuses the regular face.
-fn family_faces(family: &str, pixels: f64) -> Option<[CFRetained<CTFont>; 4]> {
-    let regular = installed_face(family, pixels)?;
-    let styled = |traits: CTFontSymbolicTraits| {
-        // SAFETY: a zero size keeps the font's size and a null matrix means identity.
-        unsafe { regular.copy_with_symbolic_traits(0.0, std::ptr::null(), traits, traits) }
-            .unwrap_or_else(|| regular.clone())
-    };
-    let bold = styled(CTFontSymbolicTraits::TraitBold);
-    let italic = styled(CTFontSymbolicTraits::TraitItalic);
-    let bold_italic = styled(CTFontSymbolicTraits::TraitBold | CTFontSymbolicTraits::TraitItalic);
+fn family_faces(backend: &Os, family: &str, pixels: f64) -> Option<[Face; 4]> {
+    let regular = backend.installed_face(family, pixels)?;
+    let [bold, italic, bold_italic] =
+        [(true, false), (false, true), (true, true)].map(|(bold, italic)| {
+            backend
+                .styled(&regular, FontStyle { bold, italic })
+                .unwrap_or_else(|| regular.clone())
+        });
     Some([regular, bold, italic, bold_italic])
 }
 
-fn shaped_line(font: &CTFont, text: &str) -> Option<CFRetained<CTLine>> {
-    // SAFETY: the extern statics are immutable CoreFoundation constants.
-    let (font_key, color_key, enabled) = unsafe {
-        (
-            kCTFontAttributeName,
-            kCTForegroundColorFromContextAttributeName,
-            kCFBooleanTrue?,
-        )
-    };
-    let values: [&CFType; 2] = [font.as_ref(), enabled.as_ref()];
-    let attributes = CFDictionary::<CFString, CFType>::from_slices(&[font_key, color_key], &values);
-    // SAFETY: the dictionary maps CFString attribute names to values of the types CoreText expects.
-    let string = unsafe {
-        CFAttributedString::new(
-            None,
-            Some(&CFString::from_str(text)),
-            Some(attributes.as_opaque()),
-        )
-    }?;
-    // SAFETY: `string` is a valid attributed string.
-    Some(unsafe { CTLine::with_attributed_string(&string) })
-}
-
+/// A placed glyph and where its ink starts and ends horizontally, if it has any.
 struct Placed {
-    glyph: u16,
-    x: f64,
-    y: f64,
-    /// Where the glyph's ink starts and ends horizontally, if it has any.
-    ink: Option<(f64, f64)>,
-}
-
-struct Shaped {
-    glyphs: Vec<u16>,
-    positions: Vec<CGPoint>,
-}
-
-fn shape(font: &CTFont, text: &str) -> Option<Shaped> {
-    let line = shaped_line(font, text)?;
-    // SAFETY: a plain getter on a live line.
-    let runs = unsafe { line.glyph_runs() };
-    // SAFETY: a line's glyph runs are `CTRun`s.
-    let runs = unsafe { runs.cast_unchecked::<CTRun>() };
-    let mut shaped = Shaped {
-        glyphs: Vec::new(),
-        positions: Vec::new(),
-    };
-    for run in runs.iter() {
-        // SAFETY: plain getter.
-        let count = unsafe { run.glyph_count() };
-        let length = usize::try_from(count).ok()?;
-        let range = CFRange {
-            location: 0,
-            length: count,
-        };
-        let (mut glyphs, mut positions) =
-            (vec![0u16; length], vec![CGPoint { x: 0.0, y: 0.0 }; length]);
-        // SAFETY: each buffer holds the `count` elements the range names.
-        unsafe {
-            run.glyphs(range, NonNull::new(glyphs.as_mut_ptr())?);
-            run.positions(range, NonNull::new(positions.as_mut_ptr())?);
-        }
-        shaped.glyphs.append(&mut glyphs);
-        shaped.positions.append(&mut positions);
-    }
-    Some(shaped)
+    glyph: Glyph,
+    ink: InkExtent,
 }
 
 /// A glyph with any `rgb != alpha` pixel is colour, such as an emoji drawn through a constraint.
@@ -368,41 +311,23 @@ impl Font {
         features: &[String],
     ) -> Result<Self> {
         let pixels = points * f64::from(scale);
-        let faces = family_faces(family, pixels)
+        let backend = Os::new();
+        let faces = family_faces(&backend, family, pixels)
             .or_else(|| {
                 eprintln!(
                     "benches: font family {family} isn't installed; using {DEFAULT_FONT_FAMILY}"
                 );
-                family_faces(DEFAULT_FONT_FAMILY, pixels)
+                family_faces(&backend, DEFAULT_FONT_FAMILY, pixels)
             })
             .with_context(|| format!("neither {family} nor {DEFAULT_FONT_FAMILY} is installed"))?;
         let features = parse_features(features);
-        let faces = faces.map(|face| with_features(face, &features));
+        let faces = faces.map(|face| Os::with_features(face, &features));
         let regular = &faces[0];
-        let mut character = u16::from(b'M');
-        let mut glyph = 0u16;
-        // SAFETY: both pointers are to one element, matching the count.
-        let found = unsafe {
-            regular.glyphs_for_characters(
-                NonNull::from(&mut character),
-                NonNull::from(&mut glyph),
-                1,
-            )
-        };
-        ensure!(found, "the terminal font has no glyph for M");
-        // SAFETY: one glyph, and a null advances buffer is allowed when only the total is needed.
-        let advance = unsafe {
-            regular.advances_for_glyphs(
-                CTFontOrientation::Horizontal,
-                NonNull::from(&mut glyph),
-                std::ptr::null_mut(),
-                1,
-            )
-        };
-        // Cell and icon metrics follow Ghostty's `Metrics.calc` in `src/font/Metrics.zig`
-        // (MIT, © Mitchell Hashimoto, Ghostty contributors).
-        // SAFETY: plain metric getters.
-        let (
+        let advance = Os::advance(
+            regular,
+            Os::glyph(regular, 'M').context("the terminal font has no glyph for M")?,
+        );
+        let FaceMetrics {
             ascent,
             descent,
             leading,
@@ -410,17 +335,9 @@ impl Font {
             underline_thickness,
             x_height,
             cap_height,
-        ) = unsafe {
-            (
-                regular.ascent(),
-                regular.descent(),
-                regular.leading(),
-                regular.underline_position(),
-                regular.underline_thickness(),
-                regular.x_height(),
-                regular.cap_height(),
-            )
-        };
+        } = Os::metrics(regular);
+        // Cell and icon metrics follow Ghostty's `Metrics.calc` in `src/font/Metrics.zig`
+        // (MIT, © Mitchell Hashimoto, Ghostty contributors).
         let face_height = ascent + descent + leading;
         let cell_height = face_height.ceil() as u32;
         let cell_width = advance.ceil() as u32;
@@ -430,7 +347,7 @@ impl Font {
         let half_line = f64::from(line_thickness) / 2.0;
         // Room for the second line of a double underline.
         let lowest_underline = cell_height.saturating_sub(3 * line_thickness);
-        let symbols = icon_face(regular, pixels, symbols_family, fallback_families)?;
+        let symbols = icon_face(&backend, regular, pixels, symbols_family, fallback_families)?;
         Ok(Self {
             cell_width,
             cell_height,
@@ -456,32 +373,12 @@ impl Font {
             ink: RefCell::default(),
             faces,
             symbols,
-            color_space: CGColorSpace::new_device_rgb(),
+            backend,
         })
     }
 
     fn face_index(style: FontStyle) -> usize {
         usize::from(style.bold) + 2 * usize::from(style.italic)
-    }
-
-    /// A white-on-clear context over `out`, which must hold `4 * width * cell_height` bytes.
-    fn bitmap_context(&self, out: &mut [u8], width: u32) -> Option<CFRetained<CGContext>> {
-        // SAFETY: `out` holds that many bytes and outlives the context.
-        let context = unsafe {
-            CGBitmapContextCreate(
-                out.as_mut_ptr().cast(),
-                width as usize,
-                self.cell_height as usize,
-                8,
-                width as usize * 4,
-                self.color_space.as_deref(),
-                CGImageAlphaInfo::PremultipliedLast.0 | CGImageByteOrderInfo::Order32Big.0,
-            )
-        }?;
-        // LCD smoothing would give coverage glyphs unequal channels and read as colour.
-        CGContext::set_should_smooth_fonts(Some(&context), false);
-        CGContext::set_rgb_fill_color(Some(&context), 1.0, 1.0, 1.0, 1.0);
-        Some(context)
     }
 
     /// Ghostty's `adjust-icon-height`, applied to the icon heights the constraints size against.
@@ -498,7 +395,8 @@ impl Font {
         cells: u32,
         out: &mut Vec<u8>,
     ) -> Option<GlyphKind> {
-        // CoreText's cascade never picks an installed font for private-use codepoints.
+        // Constraints are sized for the chosen symbols face, and a system cascade needn't pick an
+        // installed icon font for private-use codepoints (CoreText never does).
         let font = if text.chars().any(is_private_use) {
             &self.symbols
         } else {
@@ -515,53 +413,51 @@ impl Font {
         {
             return Some(GlyphKind::Coverage);
         }
-        let line = shaped_line(font, text)?;
-        let context = self.bitmap_context(out, width)?;
-        if let Some(constraint) = single.and_then(Constraint::of) {
-            // SAFETY: `line` and `context` are live.
-            let ink = unsafe { line.image_bounds(Some(&context)) };
-            if ink.size.width > 0.0 && ink.size.height > 0.0 {
-                let glyph = Bounds {
-                    x: ink.origin.x,
-                    y: ink.origin.y + self.baseline,
-                    width: ink.size.width,
-                    height: ink.size.height,
-                };
-                let mut target = constraint.constrain(glyph, self.metrics, cells);
-                if constraint.size != Size::Stretch {
-                    // Centre the face in a pixel cell wider than its advance.
-                    target.x += (self.metrics.cell_width - self.metrics.face_width) / 2.0;
-                }
-                let (scale_x, scale_y) = (target.width / glyph.width, target.height / glyph.height);
-                CGContext::translate_ctm(Some(&context), target.x, target.y);
-                CGContext::scale_ctm(Some(&context), scale_x, scale_y);
-                CGContext::translate_ctm(Some(&context), -glyph.x, -ink.origin.y);
-                CGContext::set_text_position(Some(&context), 0.0, 0.0);
-                // SAFETY: `line` and `context` are live, and `out` outlives the context.
-                unsafe { line.draw(&context) };
-                return Some(glyph_kind(out));
-            }
+        let line = Os::line(font, text)?;
+        let mut canvas = self.backend.canvas(out, width, self.cell_height)?;
+        let placement = single
+            .and_then(Constraint::of)
+            .and_then(|constraint| {
+                self.constrained(constraint, Os::line_ink(&canvas, &line), cells)
+            })
+            .unwrap_or_else(|| self.centred(Os::line_width(&line), width));
+        Os::draw_line(&mut canvas, &line, placement);
+        drop(canvas);
+        Some(glyph_kind(out))
+    }
+
+    /// Fits a constrained glyph's ink to the box its constraint gives it, or `None` for no ink.
+    fn constrained(&self, constraint: Constraint, ink: Bounds, cells: u32) -> Option<Placement> {
+        if ink.width <= 0.0 || ink.height <= 0.0 {
+            return None;
         }
-        // SAFETY: null out-parameters are allowed when only the width is needed.
-        let line_width = unsafe {
-            line.typographic_bounds(
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-            )
+        let glyph = Bounds {
+            y: ink.y + self.baseline,
+            ..ink
         };
+        let mut target = constraint.constrain(glyph, self.metrics, cells);
+        if constraint.size != Size::Stretch {
+            // Centre the face in a pixel cell wider than its advance.
+            target.x += (self.metrics.cell_width - self.metrics.face_width) / 2.0;
+        }
+        Some(Placement {
+            offset: (target.x, target.y),
+            scale: (target.width / glyph.width, target.height / glyph.height),
+            origin: (glyph.x, ink.y),
+        })
+    }
+
+    /// Centres a line in `width` pixels on the baseline, shrinking it to fit if it's wider.
+    fn centred(&self, line_width: f64, width: u32) -> Placement {
         let available = f64::from(width);
         // Fallback faces such as CJK are narrower than two terminal cells.
         let centred = ((available - line_width) / 2.0).max(0.0);
-        CGContext::translate_ctm(Some(&context), centred, self.baseline);
-        if line_width > available {
-            let shrink = available / line_width;
-            CGContext::scale_ctm(Some(&context), shrink, shrink);
+        let shrink = (available / line_width).min(1.0);
+        Placement {
+            offset: (centred, self.baseline),
+            scale: (shrink, shrink),
+            origin: (0.0, 0.0),
         }
-        CGContext::set_text_position(Some(&context), 0.0, 0.0);
-        // SAFETY: `line` and `context` are live, and `out` outlives the context.
-        unsafe { line.draw(&context) };
-        Some(glyph_kind(out))
     }
 
     /// Whether `character` may be shaped with its neighbours. Only characters the main face draws
@@ -579,24 +475,17 @@ impl Font {
 
     fn joins_non_ascii(&self, character: char) -> bool {
         *self.joins.borrow_mut().entry(character).or_insert_with(|| {
-            let mut unit = [u16::try_from(u32::from(character)).unwrap_or(0)];
-            let mut glyph = 0u16;
-            let mut scratch = vec![0; (self.cell_width * self.cell_height * 4) as usize];
             !character.is_whitespace()
                 && !character.is_control()
                 && !is_private_use(character)
                 && character.len_utf16() == 1
-                // SAFETY: both pointers are to one element, matching the count.
-                && unsafe {
-                    self.faces[0]
-                        .glyphs_for_characters(NonNull::from(&mut unit[0]), NonNull::from(&mut glyph), 1)
-                }
+                && Os::glyph(&self.faces[0], character).is_some()
                 && !sprite::draw(
                     character,
                     self.cell_width,
                     self.cell_height,
                     self.line_thickness,
-                    &mut scratch,
+                    &mut vec![0; (self.cell_width * self.cell_height * 4) as usize],
                 )
         })
     }
@@ -607,8 +496,10 @@ impl Font {
             .borrow_mut()
             .entry((face, character))
             .or_insert_with(|| {
-                let shaped = shape(&self.faces[face], &character.to_string())?;
-                (shaped.glyphs.len() == 1).then(|| shaped.glyphs[0])
+                match Os::shape(&self.faces[face], character.encode_utf8(&mut [0; 4]))?[..] {
+                    [glyph] => Some(glyph.id),
+                    _ => None,
+                }
             })
     }
 
@@ -617,40 +508,27 @@ impl Font {
             .ink
             .borrow_mut()
             .entry((face, glyph))
-            .or_insert_with(|| {
-                let mut glyph = glyph;
-                let mut rect = CGRect::ZERO;
-                // SAFETY: one glyph and one rect, matching the count of 1.
-                unsafe {
-                    self.faces[face].bounding_rects_for_glyphs(
-                        CTFontOrientation::Horizontal,
-                        NonNull::from(&mut glyph),
-                        &mut rect,
-                        1,
-                    );
-                }
-                (rect.size.width > 0.0).then_some((rect.origin.x, rect.origin.x + rect.size.width))
-            })
+            .or_insert_with(|| Os::glyph_ink(&self.faces[face], glyph))
     }
 
     /// The glyphs of `shaped` placed in the cell grid, each with its ink's horizontal extent.
-    /// A cell's glyph is centred in it and CoreText advances by the unrounded width.
-    fn placed(&self, face: usize, shaped: &Shaped) -> Vec<Placed> {
+    /// A cell's glyph is centred in it and the shaper advances by the unrounded width.
+    fn placed(&self, face: usize, shaped: &[Glyph]) -> Vec<Placed> {
         let ratio = f64::from(self.cell_width) / self.advance;
         let centred = (f64::from(self.cell_width) - self.advance) / 2.0;
         shaped
-            .glyphs
             .iter()
-            .zip(&shaped.positions)
-            .map(|(glyph, position)| {
-                let x = position.x * ratio + centred;
+            .map(|glyph| {
+                let x = glyph.x * ratio + centred;
                 let ink = self
-                    .glyph_ink(face, *glyph)
+                    .glyph_ink(face, glyph.id)
                     .map(|(low, high)| (x + low * ratio, x + high * ratio));
                 Placed {
-                    glyph: *glyph,
-                    x,
-                    y: position.y + self.baseline,
+                    glyph: Glyph {
+                        id: glyph.id,
+                        x,
+                        y: glyph.y + self.baseline,
+                    },
                     ink,
                 }
             })
@@ -665,8 +543,8 @@ impl Font {
     ) -> impl Iterator<Item = &'a Placed> + use<'a> {
         let left = index as f64 * f64::from(self.cell_width);
         let right = left + f64::from(self.cell_width);
-        placed.iter().filter(move |glyph| {
-            glyph
+        placed.iter().filter(move |placed| {
+            placed
                 .ink
                 .is_some_and(|(low, high)| low < right - 0.5 && high > left + 0.5)
         })
@@ -691,24 +569,23 @@ impl Font {
     fn shape_run(&self, run: &str, face: usize) -> ShapedRun {
         let length = run.chars().count();
         let text: Rc<str> = run.into();
-        let Some(shaped) = shape(&self.faces[face], run) else {
+        let Some(shaped) = Os::shape(&self.faces[face], run) else {
             return ShapedRun {
                 text,
                 signatures: vec![0; length].into(),
             };
         };
-        // A monospaced font gives a ligature one glyph per character, though CoreText clusters
-        // them under the first. Fewer glyphs than characters is a true ligature, so no cell
-        // stands alone.
-        let in_order = shaped.glyphs.len() == length;
+        // A monospaced font gives a ligature one glyph per character, though the shaper may
+        // cluster them under the first. Fewer glyphs than characters is a true ligature, so no
+        // cell stands alone.
+        let in_order = shaped.len() == length;
         let differs: Vec<bool> = if in_order {
             run.chars()
-                .zip(&shaped.glyphs)
-                .zip(&shaped.positions)
+                .zip(&shaped)
                 .zip(0..)
-                .map(|(((character, glyph), position), cell): (_, u32)| {
-                    self.glyph_alone(face, character) != Some(*glyph)
-                        || (position.x - f64::from(cell) * self.advance).abs() > 0.5
+                .map(|((character, glyph), cell): (_, u32)| {
+                    self.glyph_alone(face, character) != Some(glyph.id)
+                        || (glyph.x - f64::from(cell) * self.advance).abs() > 0.5
                 })
                 .collect()
         } else {
@@ -733,8 +610,8 @@ impl Font {
                 let mut hasher = Fnv::default();
                 face.hash(&mut hasher);
                 let origin = index as f64 * f64::from(self.cell_width);
-                for glyph in self.painting(&placed, index) {
-                    (glyph.glyph, ((glyph.x - origin) * 8.0).round() as i32).hash(&mut hasher);
+                for Placed { glyph, .. } in self.painting(&placed, index) {
+                    (glyph.id, ((glyph.x - origin) * 8.0).round() as i32).hash(&mut hasher);
                 }
                 hasher.finish() | 1
             })
@@ -753,32 +630,18 @@ impl Font {
     ) -> Option<GlyphKind> {
         let face = Self::face_index(style);
         let font = &self.faces[face];
-        let placed = self.placed(face, &shape(font, run)?);
+        let placed = self.placed(face, &Os::shape(font, run)?);
         out.clear();
         out.resize((self.cell_width * self.cell_height * 4) as usize, 0);
-        let context = self.bitmap_context(out, self.cell_width)?;
+        let mut canvas = self
+            .backend
+            .canvas(out, self.cell_width, self.cell_height)?;
         let origin = index as f64 * f64::from(self.cell_width);
-        let (mut glyphs, mut positions): (Vec<u16>, Vec<CGPoint>) = self
-            .painting(&placed, index)
-            .map(|glyph| {
-                (
-                    glyph.glyph,
-                    CGPoint {
-                        x: glyph.x - origin,
-                        y: glyph.y,
-                    },
-                )
-            })
-            .unzip();
-        // SAFETY: both buffers hold `glyphs.len()` elements and `context` is live.
-        unsafe {
-            font.draw_glyphs(
-                NonNull::new(glyphs.as_mut_ptr())?,
-                NonNull::new(positions.as_mut_ptr())?,
-                glyphs.len(),
-                &context,
-            );
-        }
+        let glyphs = self.painting(&placed, index).map(|placed| Glyph {
+            x: placed.glyph.x - origin,
+            ..placed.glyph
+        });
+        Os::draw_glyphs(&mut canvas, font, glyphs);
         Some(GlyphKind::Coverage)
     }
 
@@ -884,17 +747,8 @@ mod tests {
     }
 
     fn icon_height_single(font: &Font) -> f64 {
-        // SAFETY: plain metric getters on a live font.
-        let (cap, ascent, descent, leading) = unsafe {
-            let face = &font.faces[0];
-            (
-                face.cap_height(),
-                face.ascent(),
-                face.descent(),
-                face.leading(),
-            )
-        };
-        (2.0 * cap + ascent + descent + leading) / 3.0
+        let metrics = Os::metrics(&font.faces[0]);
+        (2.0 * metrics.cap_height + metrics.ascent + metrics.descent + metrics.leading) / 3.0
     }
 
     #[test]
@@ -980,11 +834,7 @@ mod tests {
     }
 
     fn face_names(font: &Font) -> Vec<String> {
-        font.faces
-            .iter()
-            // SAFETY: a plain getter on a live font.
-            .map(|face| unsafe { face.post_script_name() }.to_string())
-            .collect()
+        font.faces.iter().map(Os::postscript_name).collect()
     }
 
     #[test]
@@ -1023,19 +873,16 @@ mod tests {
         font.rasterize("\u{F432}", REGULAR, 1, &mut icon);
         // Every missing private-use character draws the same placeholder.
         assert_ne!(separator, icon);
-        // SAFETY: a plain getter on a live font.
-        let name = unsafe { font.symbols.post_script_name() }.to_string();
-        assert_eq!(name, "SymbolsNF");
+        assert_eq!(symbols_name(&font), "SymbolsNF");
     }
 
     fn symbols_name(font: &Font) -> String {
-        // SAFETY: a plain getter on a live font.
-        unsafe { font.symbols.post_script_name() }.to_string()
+        Os::postscript_name(&font.symbols)
     }
 
     /// CI doesn't have Caskaydia; tests that need it skip.
     fn nerd_family_installed() -> bool {
-        family_faces(NERD_FAMILY, 26.0).is_some()
+        family_faces(&Os::new(), NERD_FAMILY, 26.0).is_some()
     }
 
     const NERD_FAMILY: &str = "CaskaydiaMono Nerd Font Mono";
@@ -1154,17 +1001,6 @@ mod tests {
         assert!(parsed("ss01=x").is_empty());
         assert!(parsed("").is_empty());
         assert_eq!(parsed("nopes, -liga"), [feature(b"liga", 0)]);
-    }
-
-    #[test]
-    fn a_feature_becomes_a_coretext_tag_and_value_dictionary() {
-        let dictionary = feature_dictionary(feature(b"liga", 0));
-        // SAFETY: the extern statics are immutable CoreFoundation constants.
-        let (tag, value) = unsafe { (kCTFontOpenTypeFeatureTag, kCTFontOpenTypeFeatureValue) };
-        let tag = dictionary.get(tag).unwrap();
-        let value = dictionary.get(value).unwrap();
-        assert_eq!(tag.downcast_ref::<CFString>().unwrap().to_string(), "liga");
-        assert_eq!(value.downcast_ref::<CFNumber>().unwrap().as_i32(), Some(0));
     }
 
     fn cells(font: &Font, text: &str) -> Vec<Vec<u8>> {

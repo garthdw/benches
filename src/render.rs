@@ -199,8 +199,8 @@ fn load_font(
     Ok(font)
 }
 
-/// Rasterises glyphs off the UI thread, each worker with its own `Font`, as CoreText objects and
-/// the font's caches stay on one thread. Dropping it stops the workers.
+/// Rasterises glyphs off the UI thread, each worker with its own `Font`, as the backend's faces
+/// and the font's caches stay on one thread. Dropping it stops the workers.
 struct Rasterizer {
     jobs: Sender<Job>,
     done: Receiver<Rasterized>,

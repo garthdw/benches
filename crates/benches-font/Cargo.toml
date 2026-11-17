@@ -10,6 +10,8 @@ path = "src/font.rs"
 
 [dependencies]
 anyhow.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
 objc2-core-foundation.workspace = true
 objc2-core-graphics = "0.3"
 objc2-core-text = "0.3"
