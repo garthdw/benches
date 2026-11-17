@@ -1,5 +1,3 @@
-use libghostty_vt::style::Underline;
-
 const NONE: u8 = 0;
 const HEAVY: u8 = 2;
 const DOUBLE: u8 = 3;
@@ -338,8 +336,15 @@ pub fn draw(character: char, width: u32, height: u32, light: u32, out: &mut [u8]
 }
 
 /// An underline that tiles across cells. Straight underlines are plain quads instead.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum TiledUnderline {
+    Curly,
+    Dotted,
+    Dashed,
+}
+
 pub fn underline(
-    kind: Underline,
+    kind: TiledUnderline,
     width: u32,
     height: u32,
     top: u32,
@@ -353,7 +358,7 @@ pub fn underline(
     };
     let (full_width, half) = (width as f32, thickness as f32 / 2.0);
     match kind {
-        Underline::Curly => {
+        TiledUnderline::Curly => {
             let amplitude = thickness as f32;
             let center = (top as f32 + half).min(height as f32 - amplitude - half);
             canvas.shape(|x, y| {
@@ -361,7 +366,7 @@ pub fn underline(
                 (y - (center + amplitude * wave)).abs() <= half
             });
         }
-        Underline::Dotted => {
+        TiledUnderline::Dotted => {
             let center = top as f32 + half;
             let period = full_width / 2.0;
             canvas.shape(|x, y| {
@@ -369,8 +374,7 @@ pub fn underline(
                 (x - dot).hypot(y - center) <= half
             });
         }
-        Underline::Dashed => canvas.fill((0, width * 5 / 8), (top, top + thickness), 255),
-        _ => {}
+        TiledUnderline::Dashed => canvas.fill((0, width * 5 / 8), (top, top + thickness), 255),
     }
 }
 
@@ -498,7 +502,7 @@ mod tests {
     fn a_curly_underline_stays_inside_the_cell_and_tiles() {
         let mut pixels = vec![0; (WIDTH * HEIGHT * 4) as usize];
         underline(
-            Underline::Curly,
+            TiledUnderline::Curly,
             WIDTH,
             HEIGHT,
             HEIGHT - 3,

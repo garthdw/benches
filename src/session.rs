@@ -498,11 +498,13 @@ fn set_cloexec(fd: &OwnedFd) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::app::default_config;
     use crate::config::Theme;
     use crate::grid::{FRAME, GridBuilder, Presentation, Scrollbar, new_terminal};
     use crate::protocol::{Progress, ProgressKind};
     use crate::terminal_input::TerminalInput;
-    use crate::test_support::{TEST_SURFACE, pointer_at, wait_until, wheel_by};
+    use crate::test_support::wait_until;
+    use crate::test_support::{TEST_SURFACE, pointer_at, wheel_by};
     use libghostty_vt::color::Rgb;
     use libghostty_vt::render::CursorVisualStyle;
     use libghostty_vt::style::Underline;
@@ -512,7 +514,7 @@ mod tests {
     use std::time::Duration;
 
     fn spawn_shell() -> Session {
-        Session::spawn(None, Path::new("/tmp"), &Config::default(), Arc::new(|| {})).unwrap()
+        Session::spawn(None, Path::new("/tmp"), &default_config(), Arc::new(|| {})).unwrap()
     }
 
     #[test]
@@ -638,7 +640,7 @@ mod tests {
         let session = Session::spawn(
             Some(r#"sh -c 'printf "\\033]52;c;?\\007"; cat'"#),
             Path::new("/tmp"),
-            &Config::default(),
+            &default_config(),
             Arc::new(|| {}),
         )
         .unwrap();
@@ -701,7 +703,7 @@ mod tests {
         let session = Session::spawn(
             Some("cat"),
             Path::new("/tmp"),
-            &Config::default(),
+            &default_config(),
             Arc::new(|| {}),
         )
         .unwrap();
@@ -741,21 +743,6 @@ mod tests {
         builder.build(&terminal, 1, shown).unwrap();
         builder.selection_changed();
         assert!(builder.build(&terminal, 2, shown).unwrap().is_some());
-    }
-
-    #[test]
-    fn a_presentation_change_alone_publishes_a_new_grid() {
-        let shown = Presentation::default();
-        let mut builder = GridBuilder::new().unwrap();
-        let terminal = new_terminal(10, 2).unwrap();
-        builder.build(&terminal, 1, shown).unwrap();
-        assert!(builder.build(&terminal, 2, shown).unwrap().is_none());
-        let blurred = Presentation {
-            focused: false,
-            ..shown
-        };
-        let grid = builder.build(&terminal, 3, blurred).unwrap().unwrap();
-        assert_eq!(grid.cursor_style, CursorVisualStyle::BlockHollow);
     }
 
     #[test]
@@ -1036,7 +1023,7 @@ mod tests {
         let session = Session::spawn(
             Some("sh -c 'exit 3'"),
             Path::new("/tmp"),
-            &Config::default(),
+            &default_config(),
             Arc::new(|| {}),
         )
         .unwrap();
@@ -1048,7 +1035,7 @@ mod tests {
         let session = Session::spawn(
             Some("cd /usr && echo a | tr a b; exit 4"),
             Path::new("/tmp"),
-            &Config::default(),
+            &default_config(),
             Arc::new(|| {}),
         )
         .unwrap();
@@ -1062,7 +1049,7 @@ mod tests {
         let exited = Session::spawn(
             Some("sh -c 'exit 0'"),
             Path::new("/tmp"),
-            &Config::default(),
+            &default_config(),
             Arc::new(|| {}),
         )
         .unwrap();
@@ -1072,7 +1059,7 @@ mod tests {
         let stopped = Session::spawn(
             Some("sleep 100"),
             Path::new("/tmp"),
-            &Config::default(),
+            &default_config(),
             Arc::new(|| {}),
         )
         .unwrap();
@@ -1103,7 +1090,7 @@ mod tests {
         }
         let config = Config {
             shell: fish.into(),
-            ..Config::default()
+            ..default_config()
         };
         let session = Session::spawn(None, Path::new("/tmp"), &config, Arc::new(|| {})).unwrap();
         // Fish reports the symlink `/tmp`, where the process's directory reads `/private/tmp`.
@@ -1120,7 +1107,7 @@ mod tests {
         let session = Session::spawn(
             Some("sleep 100"),
             Path::new("/tmp"),
-            &Config::default(),
+            &default_config(),
             Arc::new(|| {}),
         )
         .unwrap();
@@ -1173,7 +1160,7 @@ mod tests {
     fn spawn_with_threshold(threshold: Duration) -> Session {
         let config = Config {
             command_finish_after: Some(threshold),
-            ..Config::default()
+            ..default_config()
         };
         Session::spawn(None, Path::new("/tmp"), &config, Arc::new(|| {})).unwrap()
     }
@@ -1197,7 +1184,7 @@ mod tests {
         let session = spawn_with_threshold(Duration::from_secs(3600));
         session.configure(&Config {
             command_finish_after: Some(Duration::from_millis(200)),
-            ..Config::default()
+            ..default_config()
         });
         session.set_visibility(Visibility::Hidden);
         type_line(&session, SLOW_FAILURE);
@@ -1215,7 +1202,7 @@ mod tests {
                 background,
                 ..Theme::default()
             },
-            ..Config::default()
+            ..default_config()
         });
         wait_until(
             Duration::from_secs(15),
@@ -1447,7 +1434,7 @@ mod tests {
         let session = Session::spawn(
             Some("sleep 100"),
             Path::new("/tmp"),
-            &Config::default(),
+            &default_config(),
             Arc::new(|| {}),
         )
         .unwrap();
@@ -1474,7 +1461,7 @@ mod tests {
         let session = Session::spawn(
             Some("sleep 4243"),
             Path::new("/tmp"),
-            &Config::default(),
+            &default_config(),
             Arc::new(|| {}),
         )
         .unwrap();
@@ -1530,7 +1517,7 @@ mod tests {
     fn child_programs_see_the_launch_shell() {
         let session = spawn_shell();
         type_line(&session, "echo $SHELL");
-        wait_for_line(&session, &Config::default().shell.to_string_lossy());
+        wait_for_line(&session, &default_config().shell.to_string_lossy());
     }
 
     #[test]

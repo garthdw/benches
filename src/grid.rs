@@ -1643,4 +1643,19 @@ mod tests {
             second.images[0].image.generation
         );
     }
+
+    #[test]
+    fn a_presentation_change_alone_publishes_a_new_grid() {
+        let shown = Presentation::default();
+        let mut builder = GridBuilder::new().unwrap();
+        let terminal = new_terminal(10, 2).unwrap();
+        builder.build(&terminal, 1, shown).unwrap();
+        assert!(builder.build(&terminal, 2, shown).unwrap().is_none());
+        let blurred = Presentation {
+            focused: false,
+            ..shown
+        };
+        let grid = builder.build(&terminal, 3, blurred).unwrap().unwrap();
+        assert_eq!(grid.cursor_style, CursorVisualStyle::BlockHollow);
+    }
 }

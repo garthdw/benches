@@ -5,7 +5,6 @@ use std::ptr::NonNull;
 use std::rc::Rc;
 
 use anyhow::{Context, Result, ensure};
-use libghostty_vt::style::Underline;
 use objc2_core_foundation::{
     CFArray, CFAttributedString, CFData, CFDictionary, CFNumber, CFRange, CFRetained, CFString,
     CFType, CGPoint, CGRect, kCFBooleanTrue,
@@ -20,9 +19,10 @@ use objc2_core_text::{
     kCTForegroundColorFromContextAttributeName,
 };
 
-use crate::config::DEFAULT_FONT_FAMILY;
 use crate::constraint::{Bounds, Constraint, Metrics, Modifier, Size, is_private_use};
-use crate::sprite;
+use crate::sprite::{self, TiledUnderline};
+
+pub const DEFAULT_FONT_FAMILY: &str = "Monaspace Neon";
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct FontStyle {
@@ -779,7 +779,7 @@ impl Font {
     }
 
     /// One cell of a tiling underline, in the same format as `rasterize`.
-    pub fn rasterize_underline(&self, kind: Underline, out: &mut Vec<u8>) {
+    pub fn rasterize_underline(&self, kind: TiledUnderline, out: &mut Vec<u8>) {
         out.clear();
         out.resize((self.cell_width * self.cell_height * 4) as usize, 0);
         sprite::underline(

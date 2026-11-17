@@ -40,8 +40,6 @@ use crate::terminal_input::{TerminalInput, open_link, paste_text, selection_text
 const RESIZE_SETTLE: Duration = Duration::from_millis(100);
 /// Later than `RESIZE_SETTLE`, so background tabs' programs reprint after the shown one has.
 const BACKGROUND_RESIZE_SETTLE: Duration = Duration::from_millis(400);
-/// Ghostty's: a program that dies mid-task never removes its progress. Short in tests.
-const PROGRESS_TIMEOUT: Duration = Duration::from_millis(if cfg!(test) { 1000 } else { 15_000 });
 const HOLD_TIMEOUT: Duration = Duration::from_secs(1);
 const BLINK: Duration = Duration::from_millis(530);
 /// Ghostty's interval for watching the terminal modes that mark a password prompt.
@@ -427,7 +425,7 @@ impl Actor {
                             self.emit(Event::Notify { title, body });
                         }
                         if let Some(progress) = reported.take() {
-                            progress_due = progress.map(|_| Instant::now() + PROGRESS_TIMEOUT);
+                            progress_due = progress.map(|_| Instant::now() + self.settings.progress_timeout);
                             self.emit(Event::Progress(progress));
                         }
                         for command in finished {

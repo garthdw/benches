@@ -1,6 +1,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 use libghostty_vt::effect::ClipboardLocation;
 use rune::{
@@ -58,7 +59,6 @@ impl Repaint {
     }
 }
 
-#[derive(Default)]
 pub(crate) struct State {
     pub(crate) waker: Option<Waker>,
     pub(crate) repaint: Repaint,
@@ -93,6 +93,51 @@ pub(crate) struct State {
     pub(crate) secure_input: SecureInput,
     /// Whether ⌘ is held, as the window last reported, which turns `!` rows into tray runs.
     pub(crate) command_held: bool,
+}
+
+impl Default for State {
+    fn default() -> Self {
+        Self {
+            waker: Default::default(),
+            repaint: Default::default(),
+            fleet: Default::default(),
+            window: Default::default(),
+            workspace: Default::default(),
+            started: Default::default(),
+            drawn: Default::default(),
+            alerting: Default::default(),
+            titled: Default::default(),
+            confirms: Default::default(),
+            hovered_project: Default::default(),
+            dragged_project: Default::default(),
+            preedit: Default::default(),
+            caret: Default::default(),
+            palette: Default::default(),
+            find: Default::default(),
+            sidebar_hidden: Default::default(),
+            config: default_config(),
+            config_error: Default::default(),
+            font_zoom: Default::default(),
+            paths: Default::default(),
+            secure_input: Default::default(),
+            command_held: Default::default(),
+        }
+    }
+}
+
+/// `Config::default`, except that tests must not start the developer's own shell and rc files,
+/// and needn't wait for stale progress to drop.
+pub(crate) fn default_config() -> config::Config {
+    let config = config::Config::default();
+    if cfg!(test) {
+        config::Config {
+            shell: PathBuf::from("/bin/sh"),
+            progress_timeout: Duration::from_secs(1),
+            ..config
+        }
+    } else {
+        config
+    }
 }
 
 impl State {

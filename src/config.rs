@@ -11,13 +11,15 @@ use serde::de::value::Error as ValueError;
 
 use crate::LogErr;
 use crate::constraint::Modifier;
+use crate::font::DEFAULT_FONT_FAMILY;
 use crate::grid::{DEFAULT_BG, DEFAULT_FG};
 
 const FALLBACK_SHELL: &str = "/bin/zsh";
-pub const DEFAULT_FONT_FAMILY: &str = "Monaspace Neon";
 const DEFAULT_FONT_SIZE: f64 = 18.0;
 /// Ghostty's default for `notify-on-command-finish-after`.
 const DEFAULT_COMMAND_FINISH_AFTER: Duration = Duration::from_secs(5);
+/// Ghostty's: a program that dies mid-task never removes its progress.
+const PROGRESS_TIMEOUT: Duration = Duration::from_secs(15);
 const GHOSTTY_THEMES: &str = "/Applications/Ghostty.app/Contents/Resources/ghostty/themes";
 
 #[derive(Clone, Debug, PartialEq)]
@@ -41,6 +43,8 @@ pub struct Config {
     pub command_finish_after: Option<Duration>,
     pub clipboard_read: ClipboardAccess,
     pub clipboard_write: ClipboardAccess,
+    /// How long a progress report lasts without an update; not read from `config.toml`.
+    pub progress_timeout: Duration,
 }
 
 /// Ghostty's `clipboard-read` and `clipboard-write` values.
@@ -103,19 +107,14 @@ impl Default for Theme {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            // Tests must not start the developer's own shell and rc files.
-            shell: if cfg!(test) {
-                PathBuf::from("/bin/sh")
-            } else {
-                default_shell(
-                    std::env::var_os("SHELL"),
-                    nix::unistd::User::from_uid(nix::unistd::getuid())
-                        .ok()
-                        .flatten()
-                        .map(|user| user.shell),
-                    is_executable_file,
-                )
-            },
+            shell: default_shell(
+                std::env::var_os("SHELL"),
+                nix::unistd::User::from_uid(nix::unistd::getuid())
+                    .ok()
+                    .flatten()
+                    .map(|user| user.shell),
+                is_executable_file,
+            ),
             font: FontConfig {
                 family: DEFAULT_FONT_FAMILY.to_owned(),
                 size: DEFAULT_FONT_SIZE,
@@ -138,6 +137,7 @@ impl Default for Config {
             command_finish_after: None,
             clipboard_read: ClipboardAccess::Ask,
             clipboard_write: ClipboardAccess::Allow,
+            progress_timeout: PROGRESS_TIMEOUT,
         }
     }
 }
@@ -366,6 +366,8 @@ pub struct TerminalSettings {
     pub command_finish_after: Option<Duration>,
     pub clipboard_read: ClipboardAccess,
     pub clipboard_write: ClipboardAccess,
+    /// How long a progress report lasts without an update.
+    pub progress_timeout: Duration,
 }
 
 fn read_file(paths: &Paths) -> Result<File> {
@@ -381,18 +383,18 @@ impl Config {
         (!command.is_empty()).then_some(command)
     }
 
-    /// `config.toml`, then Ghostty's config for the font and theme it leaves out, then the defaults.
+    /// `config.toml`, then Ghostty's config for the font and theme it leaves out, then `defaults`.
     /// Problems fall back, so the app always starts; the error is why `config.toml` was skipped.
-    pub fn load(paths: &Paths) -> (Self, Option<anyhow::Error>) {
+    pub fn load(paths: &Paths, defaults: Self) -> (Self, Option<anyhow::Error>) {
         match read_file(paths) {
-            Ok(file) => (Self::resolve(file, paths), None),
-            Err(error) => (Self::resolve(File::default(), paths), Some(error)),
+            Ok(file) => (Self::resolve(file, paths, defaults), None),
+            Err(error) => (Self::resolve(File::default(), paths, defaults), Some(error)),
         }
     }
 
     /// As `load`, but a `config.toml` that can't be read is an error, so the running config stays.
-    pub fn reload(paths: &Paths) -> Result<Self> {
-        Ok(Self::resolve(read_file(paths)?, paths))
+    pub fn reload(paths: &Paths, defaults: Self) -> Result<Self> {
+        Ok(Self::resolve(read_file(paths)?, paths, defaults))
     }
 
     pub fn terminal(&self) -> TerminalSettings {
@@ -401,10 +403,11 @@ impl Config {
             command_finish_after: self.command_finish_after,
             clipboard_read: self.clipboard_read,
             clipboard_write: self.clipboard_write,
+            progress_timeout: self.progress_timeout,
         }
     }
 
-    fn resolve(file: File, paths: &Paths) -> Self {
+    fn resolve(file: File, paths: &Paths, defaults: Self) -> Self {
         let ghostty = read_optional(&paths.ghostty_dir.join("config"))
             .log_err("ghostty config")
             .flatten()
@@ -415,7 +418,6 @@ impl Config {
                 .map(|value| (*value).to_owned())
         };
         let ghostty_families = ghostty_values(&ghostty, "font-family");
-        let defaults = Config::default();
         let ghostty_size = ghostty_value("font-size")
             .and_then(|size| size.parse::<f64>().log_err("ghostty font-size"));
         let clipboard = |setting: Option<ClipboardAccess>, key: &str, default| {
@@ -509,6 +511,7 @@ impl Config {
                 "clipboard-write",
                 defaults.clipboard_write,
             ),
+            progress_timeout: defaults.progress_timeout,
         }
     }
 }
@@ -814,7 +817,7 @@ mod tests {
         );
         let load = |config: Option<&str>, ghostty: Option<&str>| {
             let (_root, paths) = paths(config, ghostty);
-            Config::load(&paths).0.working_directory
+            Config::load(&paths, Config::default()).0.working_directory
         };
         assert_eq!(load(Some(&toml), Some(&ghostty)), folder.path());
         assert_eq!(load(None, Some(&ghostty)), other.path());
@@ -825,7 +828,7 @@ mod tests {
     fn ghostty_empty_value_resets_a_list() {
         let ghostty = "font-family = Old\nfont-family = \"\"\nfont-family = JetBrains Mono\nfont-family = Symbols\nfont-feature = -calt\nfont-feature =\n";
         let (_root, paths) = paths(None, Some(ghostty));
-        let font = Config::load(&paths).0.font;
+        let font = Config::load(&paths, Config::default()).0.font;
         assert_eq!(font.family, "JetBrains Mono");
         assert_eq!(font.fallback_families, ["Symbols"]);
         assert!(font.features.is_empty());
@@ -885,14 +888,14 @@ mod tests {
     #[test]
     fn missing_files_give_the_defaults() {
         let (_root, paths) = paths(None, None);
-        assert_eq!(Config::load(&paths).0, Config::default());
+        assert_eq!(Config::load(&paths, Config::default()).0, Config::default());
     }
 
     #[test]
     fn ghostty_fills_the_font_and_theme_with_the_last_theme_winning() {
         let ghostty = "# comment\nfont-size = 14\nfont-family = Iosevka\nfont-family = Symbols\ntheme = nope\ntheme = dusk\n";
         let (_root, paths) = paths(None, Some(ghostty));
-        let config = Config::load(&paths).0;
+        let config = Config::load(&paths, Config::default()).0;
         assert_eq!(
             config.font,
             FontConfig {
@@ -930,7 +933,10 @@ mod tests {
     fn adjust_icon_height_comes_from_config_toml_then_ghostty() {
         let adjust = |config: Option<&str>, ghostty: Option<&str>| {
             let (_root, paths) = paths(config, ghostty);
-            Config::load(&paths).0.font.adjust_icon_height
+            Config::load(&paths, Config::default())
+                .0
+                .font
+                .adjust_icon_height
         };
         assert_eq!(adjust(None, None), None);
         assert_eq!(
@@ -953,7 +959,7 @@ mod tests {
     #[test]
     fn clipboard_access_defaults_to_asking_for_reads_and_allowing_writes() {
         let (_root, paths) = paths(None, None);
-        let config = Config::load(&paths).0;
+        let config = Config::load(&paths, Config::default()).0;
         assert_eq!(config.clipboard_read, ClipboardAccess::Ask);
         assert_eq!(config.clipboard_write, ClipboardAccess::Allow);
     }
@@ -964,7 +970,7 @@ mod tests {
             Some("clipboard-read = \"allow\"\n"),
             Some("clipboard-read = deny\nclipboard-write = ask\n"),
         );
-        let config = Config::load(&paths).0;
+        let config = Config::load(&paths, Config::default()).0;
         assert_eq!(config.clipboard_read, ClipboardAccess::Allow);
         assert_eq!(config.clipboard_write, ClipboardAccess::Ask);
     }
@@ -972,14 +978,20 @@ mod tests {
     #[test]
     fn an_unknown_ghostty_clipboard_value_falls_back_to_the_default() {
         let (_root, paths) = paths(None, Some("clipboard-read = sometimes\n"));
-        assert_eq!(Config::load(&paths).0.clipboard_read, ClipboardAccess::Ask);
+        assert_eq!(
+            Config::load(&paths, Config::default()).0.clipboard_read,
+            ClipboardAccess::Ask
+        );
     }
 
     #[test]
     fn git_command_defaults_to_lazygit_and_blank_disables_it() {
         let git_command = |config: Option<&str>| {
             let (_root, paths) = paths(config, None);
-            Config::load(&paths).0.git_command().map(str::to_owned)
+            Config::load(&paths, Config::default())
+                .0
+                .git_command()
+                .map(str::to_owned)
         };
         assert_eq!(git_command(None).as_deref(), Some("lazygit"));
         assert_eq!(
@@ -997,7 +1009,7 @@ mod tests {
             Some(config),
             Some("font-size = 14\nfont-family = Iosevka\n"),
         );
-        let config = Config::load(&paths).0;
+        let config = Config::load(&paths, Config::default()).0;
         assert_eq!(config.shell, PathBuf::from("/bin/zsh"));
         assert_eq!(config.jump_command.as_deref(), Some("j"));
         assert_eq!(
@@ -1026,7 +1038,7 @@ mod tests {
         let ghostty = "font-feature = -calt\nfont-feature = ss01\n";
         let features = |config: Option<&str>| {
             let (_root, paths) = paths(config, Some(ghostty));
-            Config::load(&paths).0.font.features
+            Config::load(&paths, Config::default()).0.font.features
         };
         assert_eq!(features(None), ["-calt", "ss01"]);
         assert_eq!(
@@ -1040,7 +1052,7 @@ mod tests {
     fn auto_secure_input_reads_ghostty_and_config_toml_replaces_it() {
         let auto = |config: Option<&str>, ghostty: Option<&str>| {
             let (_root, paths) = paths(config, ghostty);
-            Config::load(&paths).0.auto_secure_input
+            Config::load(&paths, Config::default()).0.auto_secure_input
         };
         assert!(auto(None, None));
         assert!(!auto(None, Some("macos-auto-secure-input = false\n")));
@@ -1055,7 +1067,9 @@ mod tests {
     fn command_finish_reads_ghostty_and_config_toml_replaces_it() {
         let after = |config: Option<&str>, ghostty: Option<&str>| {
             let (_root, paths) = paths(config, ghostty);
-            Config::load(&paths).0.command_finish_after
+            Config::load(&paths, Config::default())
+                .0
+                .command_finish_after
         };
         let seconds = |seconds| Some(Duration::from_secs(seconds));
         assert_eq!(after(None, None), None);
@@ -1102,7 +1116,10 @@ mod tests {
     fn shaping_break_reads_ghostty_and_config_toml_replaces_it() {
         let breaks = |config: Option<&str>, ghostty: Option<&str>| {
             let (_root, paths) = paths(config, ghostty);
-            Config::load(&paths).0.font.shaping_breaks_at_cursor
+            Config::load(&paths, Config::default())
+                .0
+                .font
+                .shaping_breaks_at_cursor
         };
         assert!(breaks(None, None));
         assert!(!breaks(None, Some("font-shaping-break = no-cursor\n")));
@@ -1127,7 +1144,7 @@ mod tests {
     fn a_light_and_dark_theme_picks_the_dark_one() {
         let (_root, paths) = paths(Some("theme = \"light:nope,dark:dusk\"\n"), None);
         assert_eq!(
-            Config::load(&paths).0.theme.foreground,
+            Config::load(&paths, Config::default()).0.theme.foreground,
             Rgb {
                 r: 0xee,
                 g: 0xee,
@@ -1139,16 +1156,16 @@ mod tests {
     #[test]
     fn a_broken_config_falls_back_to_the_defaults() {
         let (_root, paths) = paths(Some("shel = 1"), None);
-        assert_eq!(Config::load(&paths).0, Config::default());
+        assert_eq!(Config::load(&paths, Config::default()).0, Config::default());
     }
 
     #[test]
     fn reload_refuses_a_broken_config_rather_than_fall_back() {
         let (_root, broken) = paths(Some("shel = 1"), None);
-        assert!(Config::reload(&broken).is_err());
+        assert!(Config::reload(&broken, Config::default()).is_err());
         let (_root, good) = paths(Some("shell = \"/bin/zsh\"\n"), None);
         assert_eq!(
-            Config::reload(&good).unwrap().shell,
+            Config::reload(&good, Config::default()).unwrap().shell,
             PathBuf::from("/bin/zsh")
         );
     }
@@ -1226,7 +1243,7 @@ mod schema_tests {
         let (_root, paths) = dir_paths();
         run(&paths, &["init"]).unwrap();
         toml::from_str::<File>(&read(&paths, "config.toml")).unwrap();
-        assert_eq!(Config::load(&paths).0, Config::default());
+        assert_eq!(Config::load(&paths, Config::default()).0, Config::default());
     }
 
     #[test]
@@ -1238,9 +1255,9 @@ mod schema_tests {
             "font-family = Iosevka\nfont-size = 14\n",
         )
         .unwrap();
-        let without_config = Config::load(&paths).0;
+        let without_config = Config::load(&paths, Config::default()).0;
         run(&paths, &["init"]).unwrap();
-        assert_eq!(Config::load(&paths).0, without_config);
+        assert_eq!(Config::load(&paths, Config::default()).0, without_config);
         assert_eq!(without_config.font.family, "Iosevka");
     }
 

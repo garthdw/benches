@@ -14,6 +14,7 @@ mod link;
 mod nerd_font_table;
 mod notify;
 mod palette;
+mod platform;
 mod protocol;
 mod render;
 mod scenes;

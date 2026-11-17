@@ -1,5 +1,4 @@
 use std::io::Write;
-use std::process::Command;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -78,9 +77,8 @@ fn whole_lines(remainder: &mut f32, delta: f32) -> i32 {
 }
 
 pub(crate) fn open_link(url: &str) {
-    let mut open = Command::new("/usr/bin/open");
-    open.args(link::open_args(url));
-    thread::spawn(move || open.status().log_err("open link"));
+    let link = link::target(url);
+    thread::spawn(move || crate::platform::open(&link).log_err("open link"));
 }
 
 /// False if libghostty refused the text because it could run commands.
@@ -1068,7 +1066,13 @@ mod tests {
         let mut input = input_for_test();
         input.wheel(&mut terminal, wheel_by(60.0)).unwrap();
         assert_ne!(top_line(&terminal), bottom);
-        let typed = crate::input::map_text("a", rune::Mods::default(), None, None);
+        let typed = KeyInput {
+            key: Vt::Unidentified,
+            mods: VtMods::empty(),
+            consumed: VtMods::empty(),
+            text: Some("a".to_owned()),
+            unshifted: '\0',
+        };
         input.key(&mut terminal, typed).unwrap();
         assert_eq!(top_line(&terminal), bottom);
     }
@@ -1098,53 +1102,6 @@ mod tests {
         assert!(written.borrow().is_empty());
         assert!(paste_text(&mut terminal, "rm -rf x\n", true).unwrap());
         assert_eq!(written.borrow().as_slice(), b"rm -rf x\r");
-    }
-
-    #[test]
-    fn option_b_is_escape_b() {
-        let mut terminal = new_terminal(20, 5).unwrap();
-        let option = rune::Mods {
-            alt: true,
-            ..rune::Mods::default()
-        };
-        let typed =
-            crate::input::map_text("∫", option, Some(rune::PhysicalKeyCode::KeyB), Some('b'));
-        assert_eq!(
-            input_for_test().key(&mut terminal, typed).unwrap(),
-            b"\x1bb"
-        );
-    }
-
-    fn command_k() -> KeyInput {
-        let command = rune::Mods {
-            cmd: true,
-            logo: true,
-            ..rune::Mods::default()
-        };
-        crate::input::map_key(
-            &rune::KeyEvent {
-                key: rune::Key::Command('k'),
-                mods: command,
-            },
-            Some(rune::PhysicalKeyCode::KeyK),
-            Some('k'),
-        )
-        .unwrap()
-    }
-
-    #[test]
-    fn an_unbound_command_chord_types_nothing_in_legacy_mode() {
-        let mut terminal = new_terminal(20, 5).unwrap();
-        let bytes = input_for_test().key(&mut terminal, command_k()).unwrap();
-        assert_eq!(bytes, b"");
-    }
-
-    #[test]
-    fn an_unbound_command_chord_reports_super_under_the_kitty_protocol() {
-        let mut terminal = new_terminal(20, 5).unwrap();
-        terminal.vt_write(b"\x1b[>1u");
-        let bytes = input_for_test().key(&mut terminal, command_k()).unwrap();
-        assert_eq!(bytes, b"\x1b[107;9u");
     }
 
     #[test]
