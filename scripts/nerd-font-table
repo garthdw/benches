@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Regenerate src/nerd_font_table.rs from Ghostty's generated src/font/nerd_font_tables.zig.
+"""Regenerate crates/benches-font/src/nerd_font_table.rs from Ghostty's generated
+src/font/nerd_font_tables.zig.
 
 Usage: scripts/nerd-font-table PATH/TO/ghostty/src/font/nerd_font_tables.zig
 
@@ -84,7 +85,7 @@ def main(path):
         "];",
         "",
     ]
-    target = Path(__file__).resolve().parent.parent / "src" / "nerd_font_table.rs"
+    target = Path(__file__).resolve().parent.parent / "crates/benches-font/src/nerd_font_table.rs"
     target.write_text("\n".join(out))
 
 

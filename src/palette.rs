@@ -7,13 +7,13 @@ use rune::color::Color;
 use rune::tok;
 use rune::{El, Key, KeyEvent, Mods, Span, TextEdit, Tx, Waker, col, el, text, text_input};
 
-use crate::LogErr;
 use crate::app::{State, open_project, open_tab, open_tray, run_command, tray_action};
-use crate::config::Config;
-use crate::history;
 use crate::jump;
 use crate::keymap::{COMMANDS, Command, CommandSpec, chord_hint};
 use crate::workspace::{Status, Workspace};
+use benches_core::LogErr;
+use benches_core::config::Config;
+use benches_core::history;
 
 const PALETTE_WIDTH: f32 = 520.0;
 const PALETTE_TOP: f32 = 96.0;

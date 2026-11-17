@@ -4,9 +4,9 @@ use std::process::ExitStatus;
 
 use serde::{Deserialize, Serialize};
 
-use crate::grid::Grid;
-use crate::protocol::{Progress, Visibility};
 use crate::session::{Attention, Retarget, Session};
+use benches_core::grid::Grid;
+use benches_core::protocol::{Progress, Visibility};
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Status {
@@ -679,7 +679,7 @@ impl Workspace {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::grid::Grid;
+    use benches_core::grid::Grid;
 
     fn tab(title: &str) -> Tab {
         Tab::new(title, Session::fixture(Grid::default()))

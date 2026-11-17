@@ -7,7 +7,7 @@ cd "$(dirname "$0")/.."
 
 cargo build --release --locked
 version=${BENCHES_VERSION:-$(cargo metadata --no-deps --format-version 1 --locked |
-  python3 -c 'import json, sys; print(json.load(sys.stdin)["packages"][0]["version"])')}
+  python3 -c 'import json, sys; print(next(p["version"] for p in json.load(sys.stdin)["packages"] if p["name"] == "benches"))')}
 
 app=target/release/Benches.app
 rm -rf "$app"

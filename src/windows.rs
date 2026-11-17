@@ -4,10 +4,10 @@ use std::rc::Rc;
 
 use rune::{Tx, Waker, WindowSpec};
 
-use crate::LogErr;
-use crate::app::{State, dismiss_confirms, save_layout, window_app};
-use crate::config::Config;
+use crate::app::{State, default_config, dismiss_confirms, save_layout, window_app};
 use crate::workspace::{Project, SavedWorkspace};
+use benches_core::LogErr;
+use benches_core::config::Config;
 
 pub(crate) type WindowId = u32;
 
@@ -221,7 +221,7 @@ pub(crate) fn torn_off([x, y]: [f32; 2], sidebar_width: f32) -> bool {
 /// The config at launch. A config.toml that fails falls back to the defaults, and the window says why.
 pub(crate) fn load_config(state: &mut State) {
     let Some(paths) = &state.paths else { return };
-    let (config, error) = Config::load(paths);
+    let (config, error) = Config::load(paths, default_config());
     state.config = config;
     report_config_error(state, error);
 }
@@ -230,7 +230,7 @@ pub(crate) fn load_config(state: &mut State) {
 /// this window says why.
 pub(crate) fn reload_config(state: &mut State) {
     let Some(paths) = &state.paths else { return };
-    match Config::reload(paths) {
+    match Config::reload(paths, default_config()) {
         Ok(config) => {
             report_config_error(state, None);
             state.fleet.share_config(state.window, &config);
@@ -283,12 +283,12 @@ pub(crate) fn adopt_projects(state: &mut State) -> bool {
 mod tests {
     use super::*;
     use crate::app::{Confirm, open_tab};
-    use crate::config::Paths;
-    use crate::protocol::Visibility;
     use crate::scenes::fixture_tab;
     use crate::session::Session;
     use crate::test_support::*;
     use crate::view::SIDEBAR_WIDTH;
+    use benches_core::config::Paths;
+    use benches_core::protocol::Visibility;
     use libghostty_vt::effect::ClipboardLocation;
     use rune::Runtime;
     use std::cell::Cell;
@@ -357,7 +357,7 @@ mod tests {
             ..State::default()
         };
         load_config(&mut state);
-        assert_eq!(state.config, Config::default());
+        assert_eq!(state.config, default_config());
         assert!(
             state
                 .config_error
@@ -384,7 +384,7 @@ mod tests {
         write("shel = 1\n");
         reload(&mut runtime);
         assert!(runtime.find("config-error").is_some());
-        assert_eq!(runtime.state.config, Config::default());
+        assert_eq!(runtime.state.config, default_config());
         write("shell = \"/bin/zsh\"\n");
         reload(&mut runtime);
         assert!(runtime.find("config-error").is_none());

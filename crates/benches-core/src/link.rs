@@ -1,3 +1,5 @@
+use benches_platform::Link;
+
 const SCHEMES: [&str; 4] = ["https://", "http://", "file://", "mailto:"];
 
 /// Only schemes whose handler is a browser, Finder or a mail client. Anything else, such as
@@ -11,10 +13,9 @@ pub fn openable(uri: &str) -> bool {
     })
 }
 
-/// Arguments for `/usr/bin/open`. A file is revealed in Finder rather than opened, because
-/// opening would launch an `.app` or `.command` that program output merely named.
-pub fn open_args(uri: &str) -> Vec<String> {
-    file_path(uri).map_or_else(|| vec![uri.to_owned()], |path| vec!["-R".to_owned(), path])
+/// What opening `uri` does; see `Link`.
+pub fn target(uri: &str) -> Link {
+    file_path(uri).map_or_else(|| Link::Url(uri.to_owned()), |path| Link::File(path.into()))
 }
 
 /// The host and path of a `file://` URI.
@@ -226,14 +227,26 @@ mod tests {
 
     #[test]
     fn web_and_mail_links_open_plainly() {
-        assert_eq!(open_args("https://a.test/x"), ["https://a.test/x"]);
-        assert_eq!(open_args("mailto:a@b.test"), ["mailto:a@b.test"]);
+        assert_eq!(
+            target("https://a.test/x"),
+            Link::Url("https://a.test/x".to_owned())
+        );
+        assert_eq!(
+            target("mailto:a@b.test"),
+            Link::Url("mailto:a@b.test".to_owned())
+        );
     }
 
     #[test]
     fn file_links_are_revealed_not_opened() {
-        assert_eq!(open_args("file:///tmp/a%20b.app"), ["-R", "/tmp/a b.app"]);
-        assert_eq!(open_args("FILE://localhost/tmp/x"), ["-R", "/tmp/x"]);
+        assert_eq!(
+            target("file:///tmp/a%20b.app"),
+            Link::File("/tmp/a b.app".into())
+        );
+        assert_eq!(
+            target("FILE://localhost/tmp/x"),
+            Link::File("/tmp/x".into())
+        );
     }
 
     #[test]

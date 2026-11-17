@@ -7,13 +7,13 @@ use libghostty_vt::effect::ClipboardLocation;
 use crate::app::{Confirm, State};
 use anyhow::Context;
 
-use crate::grid::{Grid, GridBuilder, Presentation, new_terminal};
 use crate::jump;
 use crate::palette::WorktreeChoice;
-use crate::protocol::{Progress, ProgressKind};
-use crate::search::Searcher;
 use crate::session::Session;
 use crate::workspace::{Project, Status, Tab};
+use benches_core::grid::{Grid, GridBuilder, Presentation, new_terminal};
+use benches_core::protocol::{Progress, ProgressKind};
+use benches_core::search::Searcher;
 
 pub(crate) const SCENE_FIXTURE: &[u8] = b"\x1b[1;32mbenches\x1b[0m fixture\r\n\x1b[31mred\x1b[0m \x1b[42;30m on green \x1b[0m \x1b[7minverse\x1b[0m\r\na != b // c == d ... \x1b[1m!=\x1b[0m \x1b[3m!=\x1b[0m\r\n$ ";
 const SCENE_UNICODE: &str = concat!(
@@ -302,7 +302,7 @@ pub(crate) const SCENES: &[Scene] = &[
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config;
+    use benches_core::config;
 
     #[test]
     fn scenes_read_and_write_no_files() {

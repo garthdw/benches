@@ -1,55 +1,27 @@
-mod actor;
 mod app;
-mod config;
-mod constraint;
 mod find;
-mod font;
-mod grid;
-mod history;
-mod images;
 mod input;
 mod jump;
 mod keymap;
-mod link;
-mod nerd_font_table;
 mod notify;
 mod palette;
-mod protocol;
 mod render;
 mod scenes;
-mod search;
 mod secure_input;
 mod session;
-mod sprite;
-mod terminal_input;
 #[cfg(test)]
 mod test_support;
 mod view;
 mod windows;
 mod workspace;
 
-use std::fmt::Display;
 use std::path::PathBuf;
 
 use anyhow::Context;
 use app::window_app;
+use benches_core::{LogErr, config};
 use windows::{Fleet, MAIN_WINDOW};
 
-pub trait LogErr<T> {
-    fn log_err(self, context: &str) -> Option<T>;
-}
-
-impl<T, E: Display> LogErr<T> for std::result::Result<T, E> {
-    fn log_err(self, context: &str) -> Option<T> {
-        match self {
-            Ok(value) => Some(value),
-            Err(error) => {
-                eprintln!("benches: {context}: {error:#}");
-                None
-            }
-        }
-    }
-}
 /// A bundle launched from Finder has its stderr discarded, so send it to a file instead.
 fn log_to_file_in_bundle() -> anyhow::Result<()> {
     use std::os::fd::AsRawFd;

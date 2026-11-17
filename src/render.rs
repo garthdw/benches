@@ -16,12 +16,13 @@ use rune::color::srgb_decode;
 use rune::compose::{Compositor, DeviceKey, Frame};
 use rune::render::EffectSite;
 
-use crate::LogErr;
-use crate::constraint::{Constraint, is_graphics_element, is_symbol};
-use crate::font::{FnvMap, Font, FontStyle, GlyphKind, ShapedRun};
-use crate::grid::{Cell, Grid, Metrics, Scrollbar, Surface};
-use crate::images::{Image, Placement};
 use crate::session::Session;
+use benches_core::LogErr;
+use benches_core::grid::{Cell, Grid, Metrics, Scrollbar, Surface};
+use benches_core::images::{Image, Placement};
+use benches_font::constraint::{Constraint, is_graphics_element, is_symbol};
+use benches_font::sprite::TiledUnderline;
+use benches_font::{FnvMap, Font, FontStyle, GlyphKind, ShapedRun};
 
 /// Also the width of the scrollbar's strip, which takes the right padding.
 pub const PADDING_POINTS: f32 = 6.0;
@@ -90,7 +91,7 @@ enum GlyphText {
     Character(char),
     Cluster(Arc<str>),
     Shaped(ShapedCell),
-    Underline(Underline),
+    Underline(TiledUnderline),
 }
 
 #[derive(Clone, PartialEq, Eq, Hash)]
@@ -121,7 +122,7 @@ enum JobText {
     Character(char),
     Cluster(String),
     Shaped { run: String, index: u16 },
-    Underline(Underline),
+    Underline(TiledUnderline),
 }
 
 impl From<&GlyphText> for JobText {
@@ -178,7 +179,11 @@ fn rasterize(
     }
 }
 
-fn load_font(config: &crate::config::FontConfig, size: f64, scale: f32) -> anyhow::Result<Font> {
+fn load_font(
+    config: &benches_core::config::FontConfig,
+    size: f64,
+    scale: f32,
+) -> anyhow::Result<Font> {
     let mut font = Font::with_symbols(
         &config.family,
         size,
@@ -206,7 +211,7 @@ struct Rasterizer {
 }
 
 impl Rasterizer {
-    fn new(config: &crate::config::FontConfig, size: f64, scale: f32, wake: Waker) -> Self {
+    fn new(config: &benches_core::config::FontConfig, size: f64, scale: f32, wake: Waker) -> Self {
         let (jobs, queued) = unbounded::<Job>();
         let (finished, done) = unbounded();
         let woken = Arc::new(AtomicBool::new(false));
@@ -927,23 +932,30 @@ fn build_quads(
             };
             let underline_fill = cell.underline_color.unwrap_or(fg);
             let line = |y: f32, fill| solid([left, top + y, width, thickness], fill);
-            match cell.underline {
-                Underline::Single => quads.push(line(underline_top, underline_fill)),
+            let tiled = match cell.underline {
+                Underline::Single => {
+                    quads.push(line(underline_top, underline_fill));
+                    None
+                }
                 Underline::Double => {
                     quads.push(line(underline_top, underline_fill));
                     quads.push(line(underline_top + 2.0 * thickness, underline_fill));
+                    None
                 }
-                kind @ (Underline::Curly | Underline::Dotted | Underline::Dashed) => {
-                    let key = GlyphKey {
-                        text: GlyphText::Underline(kind),
-                        style: FontStyle::default(),
-                        cells: 1,
-                    };
-                    if let Some(found) = lookup(key) {
-                        quads.push(textured(found, left, top, 1.0, underline_fill));
-                    }
+                Underline::Curly => Some(TiledUnderline::Curly),
+                Underline::Dotted => Some(TiledUnderline::Dotted),
+                Underline::Dashed => Some(TiledUnderline::Dashed),
+                _ => None,
+            };
+            if let Some(kind) = tiled {
+                let key = GlyphKey {
+                    text: GlyphText::Underline(kind),
+                    style: FontStyle::default(),
+                    cells: 1,
+                };
+                if let Some(found) = lookup(key) {
+                    quads.push(textured(found, left, top, 1.0, underline_fill));
                 }
-                _ => {}
             }
             if cell.strikethrough {
                 quads.push(line(font.strike_top as f32, fg));
@@ -1373,7 +1385,7 @@ fn quad_buffer(device: &wgpu::Device, size: u64) -> wgpu::Buffer {
 /// What the compositor reads from the app.
 pub trait TerminalSource: 'static {
     /// The configured font and the size to draw it at, which zoom changes.
-    fn font(&self) -> (&crate::config::FontConfig, f64);
+    fn font(&self) -> (&benches_core::config::FontConfig, f64);
     /// Resizes every session sharing the area of effect `mark` to `surface`.
     fn resize(&self, mark: u32, surface: Surface);
     /// The session to draw in the area of effect `mark`.
@@ -1385,7 +1397,7 @@ pub trait TerminalSource: 'static {
 struct LoadedFont {
     scale: f32,
     size: f64,
-    config: crate::config::FontConfig,
+    config: benches_core::config::FontConfig,
     font: Font,
     rasterizer: Rasterizer,
 }
@@ -1807,7 +1819,7 @@ mod tests {
 
     #[test]
     fn a_worker_rasterises_as_the_ui_thread_would() {
-        let config = crate::config::Config::default().font;
+        let config = benches_core::config::Config::default().font;
         let rasterizer = Rasterizer::new(&config, 18.0, 2.0, Arc::new(|| {}));
         let font = load_font(&config, 18.0, 2.0).unwrap();
         for (id, text, cells) in [
@@ -1834,7 +1846,7 @@ mod tests {
 
     #[test]
     fn a_worker_skips_a_job_no_recent_build_wants() {
-        let config = crate::config::Config::default().font;
+        let config = benches_core::config::Config::default().font;
         let rasterizer = Rasterizer::new(&config, 18.0, 2.0, Arc::new(|| {}));
         rasterizer
             .latest_frame
@@ -1862,7 +1874,7 @@ mod tests {
 
     #[test]
     fn a_pending_glyph_a_recent_build_asked_for_again_is_not_skipped() {
-        let config = crate::config::Config::default().font;
+        let config = benches_core::config::Config::default().font;
         let rasterizer = Rasterizer::new(&config, 18.0, 2.0, Arc::new(|| {}));
         let mut atlas = Atlas::new(0);
         let key = GlyphKey {
@@ -1914,7 +1926,7 @@ mod tests {
     }
 
     fn quads_for(grid: &Grid, scale: f32) -> (Vec<Quad>, Font) {
-        let font = Font::new(crate::config::DEFAULT_FONT_FAMILY, 18.0, scale).unwrap();
+        let font = Font::new(benches_font::DEFAULT_FONT_FAMILY, 18.0, scale).unwrap();
         let mut quads = Vec::new();
         build_quads(
             grid,
@@ -1949,7 +1961,7 @@ mod tests {
             bytes.extend_from_slice(line.as_bytes());
         }
         let grid = Grid::from_vt(&bytes, cols, rows).unwrap();
-        let font = Font::new(crate::config::DEFAULT_FONT_FAMILY, 18.0, 2.0).unwrap();
+        let font = Font::new(benches_font::DEFAULT_FONT_FAMILY, 18.0, 2.0).unwrap();
         let metrics = metrics(&font, 0.0, 2.0);
         let mut atlas = HashMap::new();
         let mut quads = Vec::new();
@@ -1985,7 +1997,7 @@ mod tests {
     #[test]
     #[ignore]
     fn atlas_waste() {
-        let font = Font::new(crate::config::DEFAULT_FONT_FAMILY, 18.0, 2.0).unwrap();
+        let font = Font::new(benches_font::DEFAULT_FONT_FAMILY, 18.0, 2.0).unwrap();
         let range = |from: u32, to: u32| {
             (from..to)
                 .filter_map(char::from_u32)
@@ -2107,7 +2119,7 @@ mod tests {
             .map(|feature| (*feature).to_owned())
             .collect();
         let mut font = Font::with_symbols(
-            crate::config::DEFAULT_FONT_FAMILY,
+            benches_font::DEFAULT_FONT_FAMILY,
             18.0,
             2.0,
             None,
@@ -2179,7 +2191,7 @@ mod tests {
 
     #[test]
     fn fl_fi_and_st_are_never_shaped_together() {
-        let font = Font::new(crate::config::DEFAULT_FONT_FAMILY, 18.0, 2.0).unwrap();
+        let font = Font::new(benches_font::DEFAULT_FONT_FAMILY, 18.0, 2.0).unwrap();
         let grid = Grid::from_vt(b"flfist", 8, 1).unwrap();
         let mut text = String::new();
         let ends: Vec<usize> = (0..6)
@@ -2235,7 +2247,7 @@ mod tests {
     }
 
     fn run_end(bytes: &[u8], start: usize) -> usize {
-        let font = Font::new(crate::config::DEFAULT_FONT_FAMILY, 18.0, 2.0).unwrap();
+        let font = Font::new(benches_font::DEFAULT_FONT_FAMILY, 18.0, 2.0).unwrap();
         let grid = Grid::from_vt(bytes, 10, 1).unwrap();
         find_run(
             &grid,
@@ -2263,7 +2275,7 @@ mod tests {
 
     #[test]
     fn a_selection_edge_breaks_a_ligature() {
-        let font = Font::new(crate::config::DEFAULT_FONT_FAMILY, 18.0, 2.0).unwrap();
+        let font = Font::new(benches_font::DEFAULT_FONT_FAMILY, 18.0, 2.0).unwrap();
         let mut grid = Grid::from_vt(b"a != b\x1b[2;1H", 8, 2).unwrap();
         let mut cells = grid.cells.to_vec();
         cells[2].selected = true;
@@ -2458,7 +2470,7 @@ mod tests {
             );
         }
         let grid = Grid::from_vt(&bytes, 200, 60).unwrap();
-        let font = Font::new(crate::config::DEFAULT_FONT_FAMILY, 18.0, 2.0).unwrap();
+        let font = Font::new(benches_font::DEFAULT_FONT_FAMILY, 18.0, 2.0).unwrap();
         let (jobs, _queued) = crossbeam_channel::unbounded();
         let mut atlas = Atlas::new(0);
         let mut quads = Vec::new();
@@ -2523,7 +2535,7 @@ mod tests {
                 Grid::from_vt(&bytes, cols, rows).unwrap()
             })
             .collect();
-        let font = Font::new(crate::config::DEFAULT_FONT_FAMILY, 8.0, 2.0).unwrap();
+        let font = Font::new(benches_font::DEFAULT_FONT_FAMILY, 8.0, 2.0).unwrap();
         let mut quads = Vec::new();
         let start = std::time::Instant::now();
         for grid in &grids {
@@ -2606,7 +2618,7 @@ mod tests {
     #[test]
     fn a_reset_during_a_build_leaves_no_quad_on_a_wiped_slot() {
         let grid = Grid::message("abc");
-        let font = Font::new(crate::config::DEFAULT_FONT_FAMILY, 18.0, 1.0).unwrap();
+        let font = Font::new(benches_font::DEFAULT_FONT_FAMILY, 18.0, 1.0).unwrap();
         let mut slots: HashMap<GlyphKey, [u32; 2]> = HashMap::new();
         let mut epoch = 0;
         let mut quads = Vec::new();

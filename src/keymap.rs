@@ -1,8 +1,8 @@
 use rune::{Chord, Key, KeyEvent, Tx};
 
 use crate::app::{State, run_command};
-use crate::config::Config;
 use crate::workspace::Workspace;
+use benches_core::config::Config;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Command {

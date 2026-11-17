@@ -3,9 +3,9 @@ use libghostty_vt::mouse;
 use rune::{Key, KeyEvent, Mods, Phase, PhysicalKeyCode as Code, Tx};
 
 use crate::app::State;
-use crate::grid::Grid;
 use crate::session::Session;
-use crate::terminal_input::{KeyInput, PointerInput, PointerPhase};
+use benches_core::grid::Grid;
+use benches_core::terminal_input::{KeyInput, PointerInput, PointerPhase};
 
 pub fn vt_mods(mods: Mods) -> VtMods {
     let mut out = VtMods::empty();
@@ -224,6 +224,8 @@ pub(crate) fn focus_on_press(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use benches_core::grid::new_terminal;
+    use benches_core::terminal_input::TerminalInput;
 
     #[test]
     fn ctrl_c_is_the_physical_c_key_without_text() {
@@ -352,5 +354,43 @@ mod tests {
         assert_eq!(chord_text(Key::Left, alt).as_deref(), Some("\x1bb"));
         assert_eq!(chord_text(Key::Right, alt).as_deref(), Some("\x1bf"));
         assert_eq!(chord_text(Key::Left, Mods::default()), None);
+    }
+
+    #[test]
+    fn option_b_is_escape_b() {
+        let mut terminal = new_terminal(20, 5).unwrap();
+        let option = Mods {
+            alt: true,
+            ..Mods::default()
+        };
+        let typed = map_text("∫", option, Some(Code::KeyB), Some('b'));
+        assert_eq!(
+            TerminalInput::new()
+                .unwrap()
+                .key(&mut terminal, typed)
+                .unwrap(),
+            b"\x1bb"
+        );
+    }
+
+    #[test]
+    fn an_unbound_command_chord_types_nothing_in_legacy_mode() {
+        let mut terminal = new_terminal(20, 5).unwrap();
+        let bytes = TerminalInput::new()
+            .unwrap()
+            .key(&mut terminal, command_key(Key::Command('k'), false))
+            .unwrap();
+        assert_eq!(bytes, b"");
+    }
+
+    #[test]
+    fn an_unbound_command_chord_reports_super_under_the_kitty_protocol() {
+        let mut terminal = new_terminal(20, 5).unwrap();
+        terminal.vt_write(b"\x1b[>1u");
+        let bytes = TerminalInput::new()
+            .unwrap()
+            .key(&mut terminal, command_key(Key::Command('k'), false))
+            .unwrap();
+        assert_eq!(bytes, b"\x1b[107;9u");
     }
 }

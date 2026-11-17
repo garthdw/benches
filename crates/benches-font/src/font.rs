@@ -1,3 +1,7 @@
+pub mod constraint;
+mod nerd_font_table;
+pub mod sprite;
+
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::hash::{BuildHasherDefault, Hash, Hasher};
@@ -5,7 +9,6 @@ use std::ptr::NonNull;
 use std::rc::Rc;
 
 use anyhow::{Context, Result, ensure};
-use libghostty_vt::style::Underline;
 use objc2_core_foundation::{
     CFArray, CFAttributedString, CFData, CFDictionary, CFNumber, CFRange, CFRetained, CFString,
     CFType, CGPoint, CGRect, kCFBooleanTrue,
@@ -20,9 +23,10 @@ use objc2_core_text::{
     kCTForegroundColorFromContextAttributeName,
 };
 
-use crate::config::DEFAULT_FONT_FAMILY;
 use crate::constraint::{Bounds, Constraint, Metrics, Modifier, Size, is_private_use};
-use crate::sprite;
+use crate::sprite::TiledUnderline;
+
+pub const DEFAULT_FONT_FAMILY: &str = "Monaspace Neon";
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct FontStyle {
@@ -160,9 +164,9 @@ impl ShapedRun {
 /// FNV-1a, because the shaping caches and glyph atlas hash every word or cell of every rebuild and
 /// their keys are short.
 #[derive(Default)]
-pub(crate) struct Fnv(u64);
+pub struct Fnv(u64);
 
-pub(crate) type FnvMap<K, V> = HashMap<K, V, BuildHasherDefault<Fnv>>;
+pub type FnvMap<K, V> = HashMap<K, V, BuildHasherDefault<Fnv>>;
 
 impl Hasher for Fnv {
     fn finish(&self) -> u64 {
@@ -350,7 +354,7 @@ fn glyph_kind(pixels: &[u8]) -> GlyphKind {
 }
 
 impl Font {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn new(family: &str, points: f64, scale: f32) -> Result<Self> {
         Self::with_symbols(family, points, scale, None, &[], &[])
     }
@@ -779,7 +783,7 @@ impl Font {
     }
 
     /// One cell of a tiling underline, in the same format as `rasterize`.
-    pub fn rasterize_underline(&self, kind: Underline, out: &mut Vec<u8>) {
+    pub fn rasterize_underline(&self, kind: TiledUnderline, out: &mut Vec<u8>) {
         out.clear();
         out.resize((self.cell_width * self.cell_height * 4) as usize, 0);
         sprite::underline(

@@ -1,6 +1,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 use libghostty_vt::effect::ClipboardLocation;
 use rune::{
@@ -8,17 +9,13 @@ use rune::{
     Tx, Waker,
 };
 
-use crate::LogErr;
-use crate::config;
 use crate::find::{Find, open_find, poll_find};
-use crate::grid::{Grid, Surface};
 use crate::input::caret_rect;
 use crate::keymap::{Command, pressed, shortcut};
 use crate::palette::{
     Action, Palette, open_palette, poll_creation, poll_history, poll_jump, poll_selection,
     poll_worktrees, run_action,
 };
-use crate::protocol::{Event, Visibility};
 use crate::render::TerminalSource;
 use crate::secure_input::SecureInput;
 use crate::session::{Attention, Retarget, Session};
@@ -29,6 +26,10 @@ use crate::windows::{
 };
 use crate::workspace::{Project, SavedWorkspace, Slot, Status, Tab, Workspace};
 use anyhow::Context;
+use benches_core::LogErr;
+use benches_core::config;
+use benches_core::grid::{Grid, Surface};
+use benches_core::protocol::{Event, Visibility};
 
 /// Asks for a frame without a new view: terminal output only changes the effect slot's pixels.
 #[derive(Clone)]
@@ -58,7 +59,6 @@ impl Repaint {
     }
 }
 
-#[derive(Default)]
 pub(crate) struct State {
     pub(crate) waker: Option<Waker>,
     pub(crate) repaint: Repaint,
@@ -93,6 +93,51 @@ pub(crate) struct State {
     pub(crate) secure_input: SecureInput,
     /// Whether ⌘ is held, as the window last reported, which turns `!` rows into tray runs.
     pub(crate) command_held: bool,
+}
+
+impl Default for State {
+    fn default() -> Self {
+        Self {
+            waker: Default::default(),
+            repaint: Default::default(),
+            fleet: Default::default(),
+            window: Default::default(),
+            workspace: Default::default(),
+            started: Default::default(),
+            drawn: Default::default(),
+            alerting: Default::default(),
+            titled: Default::default(),
+            confirms: Default::default(),
+            hovered_project: Default::default(),
+            dragged_project: Default::default(),
+            preedit: Default::default(),
+            caret: Default::default(),
+            palette: Default::default(),
+            find: Default::default(),
+            sidebar_hidden: Default::default(),
+            config: default_config(),
+            config_error: Default::default(),
+            font_zoom: Default::default(),
+            paths: Default::default(),
+            secure_input: Default::default(),
+            command_held: Default::default(),
+        }
+    }
+}
+
+/// `Config::default`, except that tests must not start the developer's own shell and rc files,
+/// and needn't wait for stale progress to drop.
+pub(crate) fn default_config() -> config::Config {
+    let config = config::Config::default();
+    if cfg!(test) {
+        config::Config {
+            shell: PathBuf::from("/bin/sh"),
+            progress_timeout: Duration::from_secs(1),
+            ..config
+        }
+    } else {
+        config
+    }
 }
 
 impl State {
@@ -210,7 +255,11 @@ pub(crate) fn open_tab(state: &mut State, title: &str, command: Option<&str>) {
 pub(crate) fn open_tray(state: &mut State, command: &str) {
     let cwd = state.session().and_then(Session::cwd);
     if let Some(cwd) = cwd.or_else(|| state.active_root()) {
-        let tab = state.spawn_tab(&crate::history::flattened(command), Some(command), &cwd);
+        let tab = state.spawn_tab(
+            &benches_core::history::flattened(command),
+            Some(command),
+            &cwd,
+        );
         state.workspace.add_tray(tab);
     }
 }
@@ -897,13 +946,13 @@ pub(crate) fn window_app(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::grid::Metrics;
-    use crate::protocol::{Progress, ProgressKind};
     use crate::scenes::*;
-    use crate::terminal_input::Hover;
     use crate::test_support::*;
     use crate::view::{DRAWER_HEIGHT, RAIL_WIDTH, SIDEBAR_WIDTH};
     use crate::workspace;
+    use benches_core::grid::Metrics;
+    use benches_core::protocol::{Progress, ProgressKind};
+    use benches_core::terminal_input::Hover;
     use rune::{Cursor, Runtime};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;

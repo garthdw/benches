@@ -13,12 +13,12 @@ use crate::app::{
 use crate::find;
 use crate::input::{self, focus_on_press, pointer_phase, send_pointer};
 use crate::palette::{self, open_palette};
-use crate::protocol::{Progress, ProgressKind};
 use crate::render;
 use crate::session::{Attention, Session};
-use crate::terminal_input::{Hover, PointerPhase, WheelInput};
 use crate::windows::{move_to_main_window, move_to_new_window, torn_off};
 use crate::workspace::{Project, Status, Tab, Workspace};
+use benches_core::protocol::{Progress, ProgressKind};
+use benches_core::terminal_input::{Hover, PointerPhase, WheelInput};
 
 pub(crate) const TERMINAL_MARK: u32 = 1;
 pub(crate) const DRAWER_MARK: u32 = 2;
