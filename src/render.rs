@@ -226,15 +226,10 @@ impl Rasterizer {
                 latest_frame.clone(),
             );
             thread::spawn(move || {
-                // Utility QoS leaves the performance cores to the PTY readers and actors, which a
-                // flood keeps busy; a glyph that lands a frame later costs less than slower output.
-                // SAFETY: changes only the calling thread's QoS class.
-                if unsafe {
-                    libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_UTILITY, 0)
-                } != 0
-                {
-                    eprintln!("benches: lower the glyph rasteriser's priority failed");
-                }
+                // Leaves the cores to the PTY readers and actors, which a flood keeps busy; a
+                // glyph that lands a frame later costs less than slower output.
+                benches_platform::lower_thread_priority()
+                    .log_err("lower the glyph rasteriser's priority");
                 let Some(font) = load_font(&config, size, scale).log_err("load font to rasterise")
                 else {
                     return;

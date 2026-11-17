@@ -30,6 +30,7 @@ use benches_core::LogErr;
 use benches_core::config;
 use benches_core::grid::{Grid, Surface};
 use benches_core::protocol::{Event, Visibility};
+use benches_platform::notify::{self, Notification};
 
 /// Asks for a frame without a new view: terminal output only changes the effect slot's pixels.
 #[derive(Clone)]
@@ -739,9 +740,8 @@ pub(crate) fn poll(state: &mut State, now: f64, tx: &mut Tx) -> bool {
             && let Some(project) = state.workspace.projects.get(project)
             && let Some(tab) = project.tab(slot)
         {
-            let notification =
-                crate::notify::Notification::new(&project.name, tab.label(), title, body);
-            crate::notify::post(session, &notification);
+            let notification = Notification::new(&project.name, tab.label(), title, body);
+            notify::post(session, &notification);
         }
     }
     for session in exits {

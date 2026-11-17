@@ -8,6 +8,7 @@ publish.workspace = true
 [dependencies]
 benches-core.workspace = true
 benches-font.workspace = true
+benches-platform.workspace = true
 rune = { git = "https://github.com/anomalyco/rune", rev = "958743308f36fdf1c568c513badc96ddb0c7f040", features = [
   "native-file-dialog",
 ] }
@@ -17,30 +18,10 @@ bytemuck = { version = "1", features = ["derive"] }
 crossbeam-channel.workspace = true
 libc.workspace = true
 nix.workspace = true
-objc2-core-foundation.workspace = true
 anyhow.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 toml.workspace = true
-objc2 = "0.6"
-block2 = "0.6"
-objc2-foundation = { version = "0.3", default-features = false, features = [
-  "std",
-  "NSBundle",
-  "NSError",
-  "NSString",
-] }
-objc2-user-notifications = { version = "0.3", default-features = false, features = [
-  "std",
-  "block2",
-  "UNNotification",
-  "UNNotificationContent",
-  "UNNotificationRequest",
-  "UNNotificationResponse",
-  "UNNotificationSound",
-  "UNNotificationTrigger",
-  "UNUserNotificationCenter",
-] }
 
 [features]
 # Rune's headless flags (`--snap`, `--scene`) in a release build.

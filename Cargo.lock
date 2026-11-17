@@ -392,16 +392,12 @@ dependencies = [
  "anyhow",
  "benches-core",
  "benches-font",
- "block2 0.6.2",
+ "benches-platform",
  "bytemuck",
  "crossbeam-channel",
  "libc",
  "libghostty-vt",
  "nix",
- "objc2 0.6.5",
- "objc2-core-foundation",
- "objc2-foundation 0.3.2",
- "objc2-user-notifications 0.3.2",
  "rune",
  "serde",
  "serde_json",
@@ -443,6 +439,14 @@ dependencies = [
 [[package]]
 name = "benches-platform"
 version = "0.1.0"
+dependencies = [
+ "block2 0.6.2",
+ "libc",
+ "objc2 0.6.5",
+ "objc2-core-foundation",
+ "objc2-foundation 0.3.2",
+ "objc2-user-notifications 0.3.2",
+]
 
 [[package]]
 name = "bit-set"
