@@ -90,11 +90,14 @@ pub const COMMANDS: &[CommandSpec] = &[
     spec(Command::Find, "Find in scrollback", Some("mod+f")),
     spec(Command::ToggleSidebar, "Toggle sidebar", Some("mod+b")),
     spec(Command::ToggleDrawer, "Toggle drawer", Some("mod+j")),
-    spec(
-        Command::ToggleSecureInput,
-        "Toggle secure keyboard entry",
-        None,
-    ),
+    CommandSpec {
+        enabled: |_, _, _| benches_platform::SECURE_INPUT_SUPPORTED,
+        ..spec(
+            Command::ToggleSecureInput,
+            "Toggle secure keyboard entry",
+            None,
+        )
+    },
     spec(Command::CloseTab, "Close tab", Some("mod+w")),
     spec(Command::ZoomIn, "Zoom in", Some("mod+=")),
     spec(Command::ZoomOut, "Zoom out", Some("mod+-")),

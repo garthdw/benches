@@ -1,10 +1,6 @@
 //! Secure keyboard entry: while on, other processes can't read keystrokes through event taps.
 
-#[link(name = "Carbon", kind = "framework")]
-unsafe extern "C" {
-    fn EnableSecureEventInput() -> i32;
-    fn DisableSecureEventInput() -> i32;
-}
+use benches_platform::{SECURE_INPUT_SUPPORTED, set_secure_input};
 
 /// The enable and disable calls are reference-counted for the whole process, so each window
 /// keeps them balanced by only calling on a change and disabling on drop.
@@ -18,19 +14,11 @@ pub(crate) struct SecureInput {
 impl SecureInput {
     /// Returns whether `enabled` changed.
     pub(crate) fn set(&mut self, wanted: bool) -> bool {
-        if self.enabled == wanted {
+        if !SECURE_INPUT_SUPPORTED || self.enabled == wanted {
             return false;
         }
-        // SAFETY: plain Carbon calls with no arguments, balanced by `enabled`.
-        let status = unsafe {
-            if wanted {
-                EnableSecureEventInput()
-            } else {
-                DisableSecureEventInput()
-            }
-        };
-        if status != 0 {
-            eprintln!("benches: secure event input: status {status}");
+        if let Err(error) = set_secure_input(wanted) {
+            eprintln!("benches: secure event input: {error}");
             return false;
         }
         self.enabled = wanted;

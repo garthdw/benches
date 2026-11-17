@@ -3,7 +3,6 @@ mod find;
 mod input;
 mod jump;
 mod keymap;
-mod notify;
 mod palette;
 mod render;
 mod scenes;
@@ -70,8 +69,8 @@ fn main() {
         windows::load_config(state);
     });
     let handle = app.handle();
-    notify::start(move |session| match session {
-        Some(session) => fleet.reveal(session),
+    benches_platform::notify::start(move |session| match session {
+        Some(session) => handle.update(move |state, _| state.fleet.reveal(session)),
         None => handle.open(),
     });
     app.run();

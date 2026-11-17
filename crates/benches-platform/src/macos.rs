@@ -1,3 +1,6 @@
+use std::io;
+use std::path::PathBuf;
+use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use block2::RcBlock;
@@ -11,10 +14,90 @@ use objc2_user_notifications::{
     UNUserNotificationCenterDelegate,
 };
 
-/// Set once the notification centre is usable, which needs the app bundle.
-static ENABLED: AtomicBool = AtomicBool::new(false);
+use crate::Link;
+use crate::notify::Notification;
 
-type OnClick = Box<dyn Fn(Option<u64>)>;
+pub fn open(link: &Link) -> io::Result<()> {
+    crate::run(open_command(link))
+}
+
+fn open_command(link: &Link) -> Command {
+    let mut open = Command::new("/usr/bin/open");
+    match link {
+        Link::Url(url) => open.arg(url),
+        Link::File(path) => open.arg("-R").arg(path),
+    };
+    open
+}
+
+/// The process's `proc_pidinfo` of `flavor`, which must fill a `T`.
+fn pid_info<T>(pid: i32, flavor: libc::c_int) -> Option<T> {
+    let mut info = std::mem::MaybeUninit::<T>::zeroed();
+    let size = std::mem::size_of::<T>() as i32;
+    // SAFETY: `info` is a writable buffer of `size` bytes.
+    let written = unsafe { libc::proc_pidinfo(pid, flavor, 0, info.as_mut_ptr().cast(), size) };
+    // SAFETY: the kernel filled the whole struct, and zeroed bytes are valid for it anyway.
+    (written == size).then(|| unsafe { info.assume_init() })
+}
+
+pub fn process_cwd(pid: i32) -> Option<PathBuf> {
+    use std::os::unix::ffi::OsStrExt;
+    let info = pid_info::<libc::proc_vnodepathinfo>(pid, libc::PROC_PIDVNODEPATHINFO)?;
+    let path = info.pvi_cdir.vip_path;
+    // SAFETY: `vip_path` is a flat 1024-byte buffer split into rows by libc.
+    let bytes: &[u8; 1024] = unsafe { &*path.as_ptr().cast() };
+    let path = std::ffi::CStr::from_bytes_until_nul(bytes).ok()?;
+    Some(PathBuf::from(std::ffi::OsStr::from_bytes(path.to_bytes())))
+}
+
+pub fn foreground_process_group(pid: i32) -> Option<i32> {
+    let info = pid_info::<libc::proc_bsdinfo>(pid, libc::PROC_PIDTBSDINFO)?;
+    i32::try_from(info.e_tpgid).ok()
+}
+
+pub fn system_locale() -> Option<String> {
+    let identifier = objc2_core_foundation::CFLocale::current()?.identifier()?;
+    Some(identifier.to_string())
+}
+
+pub const FALLBACK_LOCALE: &str = "en_US.UTF-8";
+
+/// Utility QoS, which keeps the thread off the performance cores while others need them.
+pub fn lower_thread_priority() -> io::Result<()> {
+    // SAFETY: changes only the calling thread's QoS class.
+    match unsafe { libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_UTILITY, 0) } {
+        0 => Ok(()),
+        error => Err(io::Error::from_raw_os_error(error)),
+    }
+}
+
+pub const SECURE_INPUT_SUPPORTED: bool = true;
+
+#[link(name = "Carbon", kind = "framework")]
+unsafe extern "C" {
+    fn EnableSecureEventInput() -> i32;
+    fn DisableSecureEventInput() -> i32;
+}
+
+pub fn set_secure_input(enabled: bool) -> io::Result<()> {
+    // SAFETY: plain Carbon calls with no arguments.
+    let status = unsafe {
+        if enabled {
+            EnableSecureEventInput()
+        } else {
+            DisableSecureEventInput()
+        }
+    };
+    if status != 0 {
+        return Err(io::Error::other(format!("status {status}")));
+    }
+    Ok(())
+}
+
+/// Set once the notification centre is usable, which needs the app bundle.
+static NOTIFICATIONS_ENABLED: AtomicBool = AtomicBool::new(false);
+
+type OnClick = Box<dyn Fn(Option<u64>) + Send>;
 
 define_class!(
     #[unsafe(super(NSObject))]
@@ -39,10 +122,8 @@ define_class!(
     }
 );
 
-/// Starts listening for clicks, which `on_click` gets with the session the notification was
-/// for, or `None` when it came from an earlier run. Does nothing outside the app bundle, where
-/// the notification centre raises an exception.
-pub fn start(on_click: impl Fn(Option<u64>) + 'static) {
+/// Does nothing outside the app bundle, where the notification centre raises an exception.
+pub fn start_notifications(on_click: impl Fn(Option<u64>) + Send + 'static) {
     if NSBundle::mainBundle().bundleIdentifier().is_none() {
         eprintln!("benches: notifications need the app bundle; not posting any");
         return;
@@ -61,12 +142,11 @@ pub fn start(on_click: impl Fn(Option<u64>) + 'static) {
         UNAuthorizationOptions::Alert | UNAuthorizationOptions::Sound,
         &handler,
     );
-    ENABLED.store(true, Ordering::Relaxed);
+    NOTIFICATIONS_ENABLED.store(true, Ordering::Relaxed);
 }
 
-/// Replaces the notification already shown for `session`, so a session has at most one.
-pub fn post(session: u64, notification: &Notification) {
-    if !ENABLED.load(Ordering::Relaxed) {
+pub fn post_notification(session: u64, notification: &Notification) {
+    if !NOTIFICATIONS_ENABLED.load(Ordering::Relaxed) {
         return;
     }
     let content = UNMutableNotificationContent::new();
@@ -91,28 +171,6 @@ fn log_error(context: &str, error: *mut NSError) {
     }
 }
 
-#[derive(Debug, PartialEq)]
-pub struct Notification {
-    pub title: String,
-    pub subtitle: String,
-    pub body: String,
-}
-
-impl Notification {
-    /// The program's own title and body when it sent them (OSC 9 or 777), otherwise the tab's name.
-    pub fn new(project: &str, tab: &str, title: String, body: String) -> Self {
-        Self {
-            title: if title.is_empty() {
-                tab.to_owned()
-            } else {
-                title
-            },
-            subtitle: project.to_owned(),
-            body,
-        }
-    }
-}
-
 /// Session ids restart with each run, so the process id keeps an old notification from
 /// revealing whichever session now has its id.
 fn identifier(session: u64) -> String {
@@ -130,23 +188,26 @@ fn session_for(identifier: &str) -> Option<u64> {
 mod tests {
     use super::*;
 
+    fn args(link: Link) -> Vec<String> {
+        open_command(&link)
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect()
+    }
+
     #[test]
-    fn a_notification_names_the_tab_unless_the_program_gave_a_title() {
+    fn a_url_opens_plainly() {
         assert_eq!(
-            Notification::new("benches", "claude", String::new(), String::new()),
-            Notification {
-                title: "claude".into(),
-                subtitle: "benches".into(),
-                body: String::new(),
-            }
+            args(Link::Url("https://a.test/x".to_owned())),
+            ["https://a.test/x"]
         );
+    }
+
+    #[test]
+    fn a_file_is_revealed_not_opened() {
         assert_eq!(
-            Notification::new("benches", "claude", "Done".into(), "Built".into()),
-            Notification {
-                title: "Done".into(),
-                subtitle: "benches".into(),
-                body: "Built".into(),
-            }
+            args(Link::File("/tmp/a b.app".into())),
+            ["-R", "/tmp/a b.app"]
         );
     }
 
@@ -155,5 +216,13 @@ mod tests {
         assert_eq!(session_for(&identifier(42)), Some(42));
         assert_eq!(session_for(&format!("{}.42", std::process::id() + 1)), None);
         assert_eq!(session_for("42"), None);
+    }
+
+    #[test]
+    fn a_process_s_cwd_and_terminal_are_read() {
+        let pid = std::process::id() as i32;
+        assert_eq!(process_cwd(pid), std::env::current_dir().ok());
+        assert_eq!(process_cwd(-1), None);
+        assert_eq!(foreground_process_group(-1), None);
     }
 }

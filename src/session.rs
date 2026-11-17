@@ -24,6 +24,7 @@ use benches_core::config::Config;
 use benches_core::grid::{Grid, Surface, bundled_terminfo, terminfo_name};
 use benches_core::protocol::{Event, Msg, Visibility};
 use benches_core::terminal_input::{Hover, KeyInput, PointerInput, PointerPhase, WheelInput};
+use benches_platform::{FALLBACK_LOCALE, foreground_process_group, process_cwd, system_locale};
 
 const BATCH_GAP: Duration = Duration::from_micros(50);
 const BATCH_LIMIT: Duration = Duration::from_millis(1);
@@ -111,7 +112,7 @@ fn missing_locale(
         .and_then(|identifier| identifier.split('@').next())
         .map(|language| format!("{language}.UTF-8"))
         .filter(|candidate| locale_exists(candidate));
-    Some(candidate.unwrap_or_else(|| "en_US.UTF-8".to_owned()))
+    Some(candidate.unwrap_or_else(|| FALLBACK_LOCALE.to_owned()))
 }
 
 fn locale_exists(name: &str) -> bool {
@@ -127,11 +128,6 @@ fn locale_exists(name: &str) -> bool {
         libc::freelocale(locale);
     }
     true
-}
-
-fn system_locale() -> Option<String> {
-    let identifier = objc2_core_foundation::CFLocale::current()?.identifier()?;
-    Some(identifier.to_string())
 }
 
 /// A process on a PTY. Its `Terminal` lives on an actor thread, as libghostty types are `!Send`.
@@ -304,16 +300,11 @@ impl Session {
         self.hover.store(hover as u8, Ordering::Release);
     }
 
-    /// The process's pid and its `proc_pidinfo` of `flavor`, which must fill a `T`.
-    fn pid_info<T>(&self, flavor: libc::c_int) -> Option<(i32, T)> {
+    /// Looks up the running process by pid.
+    fn inspect<T>(&self, lookup: impl FnOnce(i32) -> Option<T>) -> Option<T> {
         // Held through the lookup so the actor can't reap the process, freeing its pid, meanwhile.
-        let pid = (*self.pid.lock().unwrap_or_else(PoisonError::into_inner))?;
-        let mut info = std::mem::MaybeUninit::<T>::zeroed();
-        let size = std::mem::size_of::<T>() as i32;
-        // SAFETY: `info` is a writable buffer of `size` bytes.
-        let written = unsafe { libc::proc_pidinfo(pid, flavor, 0, info.as_mut_ptr().cast(), size) };
-        // SAFETY: the kernel filled the whole struct, and zeroed bytes are valid for it anyway.
-        (written == size).then(|| (pid, unsafe { info.assume_init() }))
+        let pid = self.pid.lock().unwrap_or_else(PoisonError::into_inner);
+        lookup((*pid)?)
     }
 
     /// The shell's current directory, as it reports it, else the process's, which follows the
@@ -324,23 +315,13 @@ impl Session {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .clone();
-        reported.or_else(|| self.process_cwd())
-    }
-
-    fn process_cwd(&self) -> Option<PathBuf> {
-        use std::os::unix::ffi::OsStrExt;
-        let (_, info) = self.pid_info::<libc::proc_vnodepathinfo>(libc::PROC_PIDVNODEPATHINFO)?;
-        let path = info.pvi_cdir.vip_path;
-        // SAFETY: `vip_path` is a flat 1024-byte buffer split into rows by libc.
-        let bytes: &[u8; 1024] = unsafe { &*path.as_ptr().cast() };
-        let path = std::ffi::CStr::from_bytes_until_nul(bytes).ok()?;
-        Some(PathBuf::from(std::ffi::OsStr::from_bytes(path.to_bytes())))
+        reported.or_else(|| self.inspect(process_cwd))
     }
 
     /// True while a program other than the shell holds the terminal's foreground.
     pub fn busy(&self) -> bool {
-        self.pid_info::<libc::proc_bsdinfo>(libc::PROC_PIDTBSDINFO)
-            .is_some_and(|(pid, info)| info.e_tpgid != pid as u32)
+        self.inspect(|pid| foreground_process_group(pid).map(|group| group != pid))
+            .unwrap_or(false)
     }
 
     pub fn finished(&self) -> Receiver<()> {
@@ -1504,8 +1485,8 @@ mod tests {
             locale(Some("en_GB@rg=zazzzz")).as_deref(),
             Some("en_GB.UTF-8")
         );
-        assert_eq!(locale(Some("xx_YY")).as_deref(), Some("en_US.UTF-8"));
-        assert_eq!(locale(None).as_deref(), Some("en_US.UTF-8"));
+        assert_eq!(locale(Some("xx_YY")).as_deref(), Some(FALLBACK_LOCALE));
+        assert_eq!(locale(None).as_deref(), Some(FALLBACK_LOCALE));
         for set in ["LANG", "LC_ALL", "LC_CTYPE"] {
             let lookup = |name: &str| (name == set).then(|| "de_DE.UTF-8".into());
             let system = || unreachable!("the system locale is read with {set} set");
