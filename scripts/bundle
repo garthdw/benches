@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Builds a release and assembles a signed target/release/benches.app without installing it.
+# Builds a release and assembles a signed target/release/Benches.app without installing it.
 # BENCHES_VERSION overrides the bundle version, which defaults to Cargo.toml's.
 # Set MAC_APP_SIGN to a codesigning identity; without it the bundle is signed ad hoc.
 set -euo pipefail
@@ -9,11 +9,13 @@ cargo build --release --locked
 version=${BENCHES_VERSION:-$(cargo metadata --no-deps --format-version 1 --locked |
   python3 -c 'import json, sys; print(json.load(sys.stdin)["packages"][0]["version"])')}
 
-app=target/release/benches.app
+app=target/release/Benches.app
 rm -rf "$app"
 mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
-cp target/release/benches "$app/Contents/MacOS/benches"
+cp target/release/benches "$app/Contents/MacOS/Benches"
 cp assets/benches.icns "$app/Contents/Resources/icon.icns"
+# The standard About panel shows Credits.html, which carries the third-party notices.
+cargo about generate --locked --fail about.hbs -o "$app/Contents/Resources/Credits.html"
 # macOS looks entries up in a hashed directory, so compile rather than copy a source file.
 tic -x -o "$app/Contents/Resources/terminfo" assets/xterm-ghostty.terminfo
 cat >"$app/Contents/Info.plist" <<EOF
@@ -24,7 +26,7 @@ cat >"$app/Contents/Info.plist" <<EOF
   <key>CFBundleName</key><string>Benches</string>
   <key>CFBundleDisplayName</key><string>Benches</string>
   <key>CFBundleIdentifier</key><string>dev.dewet.benches</string>
-  <key>CFBundleExecutable</key><string>benches</string>
+  <key>CFBundleExecutable</key><string>Benches</string>
   <key>CFBundleIconFile</key><string>icon</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>CFBundleShortVersionString</key><string>$version</string>

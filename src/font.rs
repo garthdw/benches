@@ -395,6 +395,8 @@ impl Font {
                 1,
             )
         };
+        // Cell and icon metrics follow Ghostty's `Metrics.calc` in `src/font/Metrics.zig`
+        // (MIT, © Mitchell Hashimoto, Ghostty contributors).
         // SAFETY: plain metric getters.
         let (
             ascent,

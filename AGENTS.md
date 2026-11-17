@@ -18,10 +18,12 @@ cargo run -- config init                    # write a commented config.toml and 
 cargo run -- config migrate                 # refresh the schema file and the `#:schema` line of an existing config.toml
 cargo run -- config schema > schema/config.schema.json   # regenerate the committed schema
 scripts/nerd-font-table PATH/nerd_font_tables.zig   # regenerate src/nerd_font_table.rs from Ghostty's generated table, then cargo fmt
-scripts/bundle                              # release build into a signed target/release/benches.app, without installing
-scripts/install                             # scripts/bundle, then into ~/Applications/benches.app, relaunching a running copy
+scripts/bundle                              # release build into a signed target/release/Benches.app, without installing
+scripts/install                             # scripts/bundle, then into ~/Applications/Benches.app, relaunching a running copy
 scripts/icon                                # regenerate assets/benches.icns from scripts/icon.swift
 ```
+
+`scripts/bundle` needs `cargo-about` (`cargo install cargo-about --features cli`): it writes the About panel's third-party notices from `about.toml` and `about.hbs`, whose non-Cargo entries (Ghostty, the Zig and C libraries linked into libghostty-vt, the Symbols Nerd Font) are kept by hand. Code ported from Ghostty says so in a header comment.
 
 `--snap`, `--scene` and the other headless flags come from Rune. Scenes are registered in `AppSpec::scenes` in `window_app` in `src/app.rs`.
 
