@@ -228,7 +228,7 @@ impl Rasterizer {
                     libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_UTILITY, 0)
                 } != 0
                 {
-                    eprintln!("agentd: lower the glyph rasteriser's priority failed");
+                    eprintln!("benches: lower the glyph rasteriser's priority failed");
                 }
                 let Some(font) = load_font(&config, size, scale).log_err("load font to rasterise")
                 else {
@@ -654,7 +654,7 @@ fn glyph_key(grid: &Grid, index: usize, cell: &Cell) -> Option<GlyphKey> {
 /// Ghostty's `constraintWidth`: a symbol may use the next cell when that is blank, unless the row
 /// ends there or a symbol other than a graphics element precedes, so that a run of icons stays
 /// aligned. A rule capped at one cell, as Powerline's is, keeps its one-cell key: Ghostty clamps
-/// the width there, and agentd draws its sprites only in a single cell.
+/// the width there, and Benches draws its sprites only in a single cell.
 fn spills_into_next(grid: &Grid, index: usize, cell: &Cell) -> bool {
     let cols = usize::from(grid.cols).max(1);
     cell.cluster.is_none()
@@ -1064,7 +1064,7 @@ impl ImageTextures {
         }
         if image.width.max(image.height) > device.limits().max_texture_dimension_2d {
             eprintln!(
-                "agentd: image {}x{} is too large to draw",
+                "benches: image {}x{} is too large to draw",
                 image.width, image.height
             );
             return None;
@@ -1425,7 +1425,7 @@ impl TerminalCompositor {
                     });
                 }
                 Err(error) => {
-                    eprintln!("agentd: load font: {error:#}");
+                    eprintln!("benches: load font: {error:#}");
                     return;
                 }
             }

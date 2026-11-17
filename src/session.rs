@@ -183,7 +183,7 @@ impl Session {
             .current_dir(cwd)
             .env("TERM", terminfo_name(terminfo.as_deref()))
             .env("COLORTERM", "truecolor")
-            .env("TERM_PROGRAM", "agentd")
+            .env("TERM_PROGRAM", "benches")
             .env("SHELL", &config.shell)
             .stdin(Stdio::from(pty.slave));
         if let Some(locale) = missing_locale(|name| std::env::var_os(name), system_locale) {
@@ -965,12 +965,12 @@ mod tests {
     #[test]
     fn a_program_title_comes_back_to_the_ui() {
         let session = spawn_shell();
-        type_line(&session, "printf '\\033]2;agentd-title\\007'; sleep 5");
+        type_line(&session, "printf '\\033]2;benches-title\\007'; sleep 5");
         wait_until(
             Duration::from_secs(15),
             || "the title never arrived".to_owned(),
             || match session.next_event() {
-                Some(Event::Title(title)) if title == "agentd-title" => Some(()),
+                Some(Event::Title(title)) if title == "benches-title" => Some(()),
                 _ => None,
             },
         );
@@ -1536,8 +1536,8 @@ mod tests {
     #[test]
     fn a_real_process_reaches_the_grid_and_takes_keys() {
         let session = spawn_shell();
-        type_line(&session, "echo agentd-42");
-        wait_for_line(&session, "agentd-42");
+        type_line(&session, "echo benches-42");
+        wait_for_line(&session, "benches-42");
     }
 
     #[test]

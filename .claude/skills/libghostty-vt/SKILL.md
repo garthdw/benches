@@ -1,6 +1,6 @@
 ---
 name: libghostty-vt
-description: libghostty-vt Rust bindings as used by agentd - threading, render state, cells and graphemes, key and mouse encoders, selection gestures, formatting, paste, scrollback, callbacks. Use when changing session.rs or anything that talks to Terminal, instead of reading the bindings source.
+description: libghostty-vt Rust bindings as used by Benches - threading, render state, cells and graphemes, key and mouse encoders, selection gestures, formatting, paste, scrollback, callbacks. Use when changing session.rs or anything that talks to Terminal, instead of reading the bindings source.
 ---
 
 # libghostty-vt
@@ -10,7 +10,7 @@ Source: `~/.cargo/git/checkouts/libghostty-rs-28fee7453bdb2b25/cd4d497/crates/li
 
 ## Threading
 
-Every type is `!Send` and `!Sync`. agentd keeps `Terminal` and everything tied to it on one actor thread per session and talks to it over channels. Callbacks run on the thread that called `vt_write`, `reset` or `resize`, so they need no locking.
+Every type is `!Send` and `!Sync`. Benches keeps `Terminal` and everything tied to it on one actor thread per session and talks to it over channels. Callbacks run on the thread that called `vt_write`, `reset` or `resize`, so they need no locking.
 
 ## References
 

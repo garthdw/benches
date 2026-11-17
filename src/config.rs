@@ -165,7 +165,7 @@ struct File {
     #[serde(rename = "git-command")]
     git_command: Option<String>,
     /// The folder new projects start in: an absolute path, `~/...`, `home`, or `inherit` (the
-    /// folder agentd was launched from, which is home unless that was a terminal). Falls back to
+    /// folder Benches was launched from, which is home unless that was a terminal). Falls back to
     /// Ghostty's `working-directory`, then home.
     #[serde(rename = "working-directory")]
     working_directory: Option<String>,
@@ -228,7 +228,7 @@ impl Paths {
     pub fn from_home() -> Option<Self> {
         let home = PathBuf::from(std::env::var_os("HOME")?);
         Some(Self {
-            dir: home.join(".config/agentd"),
+            dir: home.join(".config/benches"),
             ghostty_dir: home.join(".config/ghostty"),
         })
     }
@@ -252,13 +252,13 @@ pub fn schema() -> String {
     format!("{:#}\n", schemars::schema_for!(File).as_value())
 }
 
-/// `agentd config init|migrate|schema`, run before the app starts.
+/// `benches config init|migrate|schema`, run before the app starts.
 pub fn command(args: &[String], paths: &Paths, out: &mut impl std::io::Write) -> Result<()> {
     match args {
         [name] if name == "init" => init(paths),
         [name] if name == "migrate" => migrate(paths),
         [name] if name == "schema" => write!(out, "{}", schema()).context("print schema"),
-        _ => bail!("usage: agentd config init|migrate|schema"),
+        _ => bail!("usage: benches config init|migrate|schema"),
     }
 }
 
@@ -272,7 +272,7 @@ fn write_schema(paths: &Paths) -> Result<()> {
 fn init(paths: &Paths) -> Result<()> {
     if paths.config().exists() {
         bail!(
-            "{} already exists; run `agentd config migrate` to update it",
+            "{} already exists; run `benches config migrate` to update it",
             paths.config().display()
         );
     }
@@ -284,7 +284,7 @@ fn init(paths: &Paths) -> Result<()> {
 /// Edits the first line as text, which keeps every comment and the key order as written.
 fn migrate(paths: &Paths) -> Result<()> {
     let text = read_optional(&paths.config())?
-        .with_context(|| format!("no {}; run `agentd config init`", paths.config().display()))?;
+        .with_context(|| format!("no {}; run `benches config init`", paths.config().display()))?;
     text.parse::<toml_edit::DocumentMut>()
         .context("parse config.toml")?;
     write_schema(paths)?;
@@ -572,7 +572,7 @@ fn home_dir() -> PathBuf {
 }
 
 /// Ghostty's `working-directory` values. A bundled app launches in `/`, so `inherit` only differs
-/// from home when agentd was started from a terminal. A bad folder is logged and becomes home.
+/// from home when Benches was started from a terminal. A bad folder is logged and becomes home.
 fn resolve_working_directory(
     value: Option<&str>,
     home: &Path,
@@ -595,7 +595,7 @@ fn resolve_working_directory(
         return directory;
     }
     eprintln!(
-        "agentd: working-directory: {} is not an existing folder",
+        "benches: working-directory: {} is not an existing folder",
         directory.display()
     );
     home.to_owned()
@@ -635,7 +635,7 @@ fn command_finish_after(mode: Option<String>, after: Option<String>) -> Option<D
         ),
         Some("never") | None => None,
         Some(other) => {
-            eprintln!("agentd: notify-on-command-finish: unknown value {other}");
+            eprintln!("benches: notify-on-command-finish: unknown value {other}");
             None
         }
     }
@@ -683,7 +683,7 @@ fn shaping_breaks_at_cursor(values: &[String]) -> bool {
         })
 }
 
-/// A theme name as Ghostty takes it; `light:X,dark:Y` picks the dark one, as agentd is dark.
+/// A theme name as Ghostty takes it; `light:X,dark:Y` picks the dark one, as Benches is dark.
 fn load_theme(name: &str, paths: &Paths) -> Result<Theme> {
     let name = name
         .split(',')
@@ -761,7 +761,7 @@ mod tests {
     fn paths(config: Option<&str>, ghostty: Option<&str>) -> (tempfile::TempDir, Paths) {
         let root = tempfile::tempdir().unwrap();
         let paths = Paths {
-            dir: root.path().join("agentd"),
+            dir: root.path().join("benches"),
             ghostty_dir: root.path().join("ghostty"),
         };
         for (dir, text) in [(&paths.dir, config), (&paths.ghostty_dir, ghostty)] {
@@ -1161,7 +1161,7 @@ mod schema_tests {
     fn dir_paths() -> (tempfile::TempDir, Paths) {
         let root = tempfile::tempdir().unwrap();
         let paths = Paths {
-            dir: root.path().join("agentd"),
+            dir: root.path().join("benches"),
             ghostty_dir: root.path().join("ghostty"),
         };
         (root, paths)

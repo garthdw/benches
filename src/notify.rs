@@ -18,7 +18,7 @@ type OnClick = Box<dyn Fn(Option<u64>)>;
 
 define_class!(
     #[unsafe(super(NSObject))]
-    #[name = "AgentdNotificationDelegate"]
+    #[name = "BenchesNotificationDelegate"]
     #[ivars = OnClick]
     struct Delegate;
 
@@ -44,7 +44,7 @@ define_class!(
 /// the notification centre raises an exception.
 pub fn start(on_click: impl Fn(Option<u64>) + 'static) {
     if NSBundle::mainBundle().bundleIdentifier().is_none() {
-        eprintln!("agentd: notifications need the app bundle; not posting any");
+        eprintln!("benches: notifications need the app bundle; not posting any");
         return;
     }
     let center = UNUserNotificationCenter::currentNotificationCenter();
@@ -87,7 +87,7 @@ pub fn post(session: u64, notification: &Notification) {
 fn log_error(context: &str, error: *mut NSError) {
     // SAFETY: the completion handler's error is null or a live NSError for its duration.
     if let Some(error) = unsafe { error.as_ref() } {
-        eprintln!("agentd: {context}: {}", error.localizedDescription());
+        eprintln!("benches: {context}: {}", error.localizedDescription());
     }
 }
 
@@ -133,18 +133,18 @@ mod tests {
     #[test]
     fn a_notification_names_the_tab_unless_the_program_gave_a_title() {
         assert_eq!(
-            Notification::new("agentd", "claude", String::new(), String::new()),
+            Notification::new("benches", "claude", String::new(), String::new()),
             Notification {
                 title: "claude".into(),
-                subtitle: "agentd".into(),
+                subtitle: "benches".into(),
                 body: String::new(),
             }
         );
         assert_eq!(
-            Notification::new("agentd", "claude", "Done".into(), "Built".into()),
+            Notification::new("benches", "claude", "Done".into(), "Built".into()),
             Notification {
                 title: "Done".into(),
-                subtitle: "agentd".into(),
+                subtitle: "benches".into(),
                 body: "Built".into(),
             }
         );

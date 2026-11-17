@@ -858,7 +858,7 @@ pub(crate) fn answer_queries(
             tertiary: TertiaryDeviceAttributes::default(),
         })
     })?;
-    terminal.on_xtversion(|_| Some(concat!("agentd ", env!("CARGO_PKG_VERSION"))))?;
+    terminal.on_xtversion(|_| Some(concat!("benches ", env!("CARGO_PKG_VERSION"))))?;
     terminal.on_enquiry(|_| None)?;
     terminal.on_color_scheme(move |_| Some(scheme))?;
     terminal.on_size(|terminal| {
@@ -917,8 +917,8 @@ mod tests {
     }
 
     #[test]
-    fn xtversion_names_agentd_and_its_version() {
-        let expected = format!("\x1bP>|agentd {}\x1b\\", env!("CARGO_PKG_VERSION"));
+    fn xtversion_names_benches_and_its_version() {
+        let expected = format!("\x1bP>|benches {}\x1b\\", env!("CARGO_PKG_VERSION"));
         assert_eq!(reply_to(&Theme::default(), b"\x1b[>q"), expected.as_bytes());
     }
 
@@ -970,7 +970,7 @@ mod tests {
     #[test]
     fn terminfo_is_bundled_only_when_the_entry_exists() {
         let root = tempfile::tempdir().unwrap();
-        let exe = root.path().join("Contents/MacOS/agentd");
+        let exe = root.path().join("Contents/MacOS/benches");
         assert_eq!(bundled_terminfo(&exe), None);
         assert_eq!(terminfo_name(None), "xterm-256color");
 

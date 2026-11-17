@@ -224,7 +224,7 @@ impl Actor {
         };
         // SAFETY: `master` is an open PTY and `size` outlives the call.
         if unsafe { libc::ioctl(self.master.as_raw_fd(), libc::TIOCSWINSZ as _, &size) } < 0 {
-            eprintln!("agentd: set PTY size: {}", std::io::Error::last_os_error());
+            eprintln!("benches: set PTY size: {}", std::io::Error::last_os_error());
         }
     }
 
@@ -820,7 +820,7 @@ impl Publisher {
             Ok(()) => self.note_publish(false),
             Err(error) => {
                 if self.note_publish(true) {
-                    eprintln!("agentd: publish: {error:#}");
+                    eprintln!("benches: publish: {error:#}");
                 }
                 false
             }
@@ -859,7 +859,7 @@ fn signal_group(group: Pid, signal: Signal) {
     if let Err(error) = killpg(group, signal)
         && error != Errno::ESRCH
     {
-        eprintln!("agentd: signal process group: {error}");
+        eprintln!("benches: signal process group: {error}");
     }
 }
 

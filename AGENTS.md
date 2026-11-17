@@ -2,7 +2,7 @@
 
 This file provides guidance to AI coding agents when working with code in this repository.
 
-agentd is a native macOS workspace where each project is a group of terminals, built on [Rune](https://github.com/anomalyco/rune) (UI) and `libghostty-vt` (terminal emulation). macOS only. `docs/ROADMAP.md` lists the delivery stages (M0–M6); a stage is done when every exit criterion is met in the real app.
+Benches is a native macOS workspace where each project is a group of terminals, built on [Rune](https://github.com/anomalyco/rune) (UI) and `libghostty-vt` (terminal emulation). macOS only.
 
 ## Commands
 
@@ -18,14 +18,16 @@ cargo run -- config init                    # write a commented config.toml and 
 cargo run -- config migrate                 # refresh the schema file and the `#:schema` line of an existing config.toml
 cargo run -- config schema > schema/config.schema.json   # regenerate the committed schema
 scripts/nerd-font-table PATH/nerd_font_tables.zig   # regenerate src/nerd_font_table.rs from Ghostty's generated table, then cargo fmt
-scripts/bundle                              # release build into a signed target/release/agentd.app, without installing
-scripts/install                             # scripts/bundle, then into ~/Applications/agentd.app, relaunching a running copy
-scripts/icon                                # regenerate assets/agentd.icns from scripts/icon.swift
+scripts/bundle                              # release build into a signed target/release/Benches.app, without installing
+scripts/install                             # scripts/bundle, then into ~/Applications/Benches.app, relaunching a running copy
+scripts/icon                                # regenerate assets/benches.icns from scripts/icon.swift
 ```
+
+`scripts/bundle` needs `cargo-about` (`cargo install cargo-about --features cli`): it writes the About panel's third-party notices from `about.toml` and `about.hbs`, whose non-Cargo entries (Ghostty, the Zig and C libraries linked into libghostty-vt, the Symbols Nerd Font) are kept by hand. Code ported from Ghostty says so in a header comment.
 
 `--snap`, `--scene` and the other headless flags come from Rune. Scenes are registered in `AppSpec::scenes` in `window_app` in `src/app.rs`.
 
-`scripts/install` uses the pinned Rune checkout's installer and launches the app with a Finder-like environment, so nothing from the calling terminal leaks into tabs. It signs with the identity in `MAC_APP_SIGN` (create an Apple Development certificate in Xcode → Settings → Accounts → Manage Certificates; `security find-identity -v -p codesigning` lists it), or ad hoc without one, in which case macOS may ask again for folder access after each install. A bundled app logs to `~/Library/Logs/agentd.log`.
+`scripts/install` uses the pinned Rune checkout's installer and launches the app with a Finder-like environment, so nothing from the calling terminal leaks into tabs. It signs with the identity in `MAC_APP_SIGN` (create an Apple Development certificate in Xcode → Settings → Accounts → Manage Certificates; `security find-identity -v -p codesigning` lists it), or ad hoc without one, in which case macOS may ask again for folder access after each install. A bundled app logs to `~/Library/Logs/benches.log`.
 
 Publishing a GitHub release for a `vX.Y.Z` tag runs `.github/workflows/release.yml`, which bundles an ad hoc signed Apple Silicon build versioned from the tag and attaches it to the release as a zip.
 
@@ -89,4 +91,4 @@ Dependencies run one way, UI down to core: `app`/`view`/`input`/`render` -> `ses
 
 ## Verifying changes
 
-A roadmap exit criterion means working in the real app, not just passing tests. Use `--snap --scene fixture` to inspect rendering. Rune's headless runs go through the same compositor, but a snapshot can't prove physical keyboard behaviour.
+A change is done when it works in the real app, not just when tests pass. Use `--snap --scene fixture` to inspect rendering. Rune's headless runs go through the same compositor, but a snapshot can't prove physical keyboard behaviour.

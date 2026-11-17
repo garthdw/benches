@@ -1,3 +1,7 @@
+//! Ported from Ghostty (MIT, © Mitchell Hashimoto, Ghostty contributors):
+//! `Glyph.RenderOptions.Constraint` from `src/font/Glyph.zig`, `isSymbol` and `isGraphicsElement`
+//! from `src/renderer/cell.zig`, and `Modifier` from `src/font/Metrics.zig`.
+
 use crate::nerd_font_table::{CONSTRAINTS, RANGES};
 
 #[derive(Clone, Copy, PartialEq, Debug)]

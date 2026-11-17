@@ -1024,7 +1024,7 @@ mod tests {
             ]
         );
         let actions = main_window_actions("lazy", None, &state.workspace, &Config::default());
-        assert!(actions.contains(&Action::SwitchTab(0, 2, "lazygit (agentd)".to_owned())));
+        assert!(actions.contains(&Action::SwitchTab(0, 2, "lazygit (benches)".to_owned())));
         assert!(
             !main_window_actions("", None, &state.workspace, &Config::default())
                 .iter()
@@ -1128,7 +1128,7 @@ mod tests {
         enter_on_switch_row(
             &mut runtime,
             "lazygit",
-            Action::SwitchTab(0, 2, "lazygit (agentd)".to_owned()),
+            Action::SwitchTab(0, 2, "lazygit (benches)".to_owned()),
         );
         assert_eq!(runtime.state.workspace.active, 0);
         assert_eq!(runtime.state.workspace.projects[0].active_tab, 2);
@@ -1420,7 +1420,7 @@ mod tests {
             args.contains("wt switch --create --no-cd --format=json \"$@\""),
             "{args}"
         );
-        assert!(args.contains("agentd\nfeature-x\n"));
+        assert!(args.contains("benches\nfeature-x\n"));
     }
 
     #[test]

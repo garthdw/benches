@@ -24,13 +24,16 @@ jobs:
         with:
           version: 0.17.1
 
+      # scripts/bundle writes the third-party notices with cargo-about.
+      - run: cargo install cargo-about --version 0.9.3 --locked --features cli
+
       # The tag's `v` is stripped so the bundle version reads like Cargo's.
-      - run: AGENTD_VERSION="${GITHUB_REF_NAME#v}" scripts/bundle
+      - run: BENCHES_VERSION="${GITHUB_REF_NAME#v}" scripts/bundle
 
       # ditto keeps the bundle's signature and symlinks intact, which zip does not.
       - run: |
-          archive="agentd-${GITHUB_REF_NAME}-aarch64-apple-darwin.zip"
-          ditto -c -k --keepParent target/release/agentd.app "$archive"
+          archive="benches-${GITHUB_REF_NAME}-aarch64-apple-darwin.zip"
+          ditto -c -k --keepParent target/release/Benches.app "$archive"
           gh release upload --clobber "$GITHUB_REF_NAME" "$archive"
 
       # The app is not notarized, so Gatekeeper blocks a downloaded copy until it is allowed.
@@ -43,8 +46,8 @@ jobs:
           <!-- install -->
           ## Install
 
-          Unzip and move \`agentd.app\` to \`~/Applications\` or \`/Applications\`. The app is not notarized, so macOS blocks the first launch: open it once, then choose **Open Anyway** in System Settings → Privacy & Security, or run:
+          Unzip and move \`Benches.app\` to \`~/Applications\` or \`/Applications\`. The app is not notarized, so macOS blocks the first launch: open it once, then choose **Open Anyway** in System Settings → Privacy & Security, or run:
 
           \`\`\`sh
-          xattr -dr com.apple.quarantine /Applications/agentd.app
+          xattr -dr com.apple.quarantine /Applications/Benches.app
           \`\`\`"

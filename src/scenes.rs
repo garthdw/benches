@@ -15,7 +15,7 @@ use crate::search::Searcher;
 use crate::session::Session;
 use crate::workspace::{Project, Status, Tab};
 
-pub(crate) const SCENE_FIXTURE: &[u8] = b"\x1b[1;32magentd\x1b[0m fixture\r\n\x1b[31mred\x1b[0m \x1b[42;30m on green \x1b[0m \x1b[7minverse\x1b[0m\r\na != b // c == d ... \x1b[1m!=\x1b[0m \x1b[3m!=\x1b[0m\r\n$ ";
+pub(crate) const SCENE_FIXTURE: &[u8] = b"\x1b[1;32mbenches\x1b[0m fixture\r\n\x1b[31mred\x1b[0m \x1b[42;30m on green \x1b[0m \x1b[7minverse\x1b[0m\r\na != b // c == d ... \x1b[1m!=\x1b[0m \x1b[3m!=\x1b[0m\r\n$ ";
 const SCENE_UNICODE: &str = concat!(
     "wide \u{4e16}\u{754c} kana \u{30ab}\u{30bf}\u{30ab}\u{30ca}|\r\n",
     "emoji \u{1F600}\u{1F680} zwj \u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467} vs16 \u{2764}\u{FE0F}|\r\n",
@@ -120,7 +120,7 @@ pub(crate) fn scrollback_tab(hovered: bool) -> Tab {
 pub(crate) fn show_workspace_scene(state: &mut State) {
     isolate_scene(state);
     let mut titled = fixture_tab("shell", b"$ ");
-    titled.program_title = Some("vim ~/dev/agentd/src/workspace.rs and a long tail".to_owned());
+    titled.program_title = Some("vim ~/dev/benches/src/workspace.rs and a long tail".to_owned());
     let tabs = vec![
         fixture_tab("claude", SCENE_FIXTURE),
         titled,
@@ -128,7 +128,7 @@ pub(crate) fn show_workspace_scene(state: &mut State) {
     ];
     state
         .workspace
-        .add_project(Project::new("/dev/agentd".into(), tabs));
+        .add_project(Project::new("/dev/benches".into(), tabs));
     let tabs = vec![fixture_tab("claude", b""), fixture_tab("shell", b"$ ")];
     state
         .workspace
@@ -169,7 +169,7 @@ fn show_progress_scene(state: &mut State) {
     project.tabs[1].session.alert();
 }
 
-const SCENE_LAZYGIT: &[u8] = b"\x1b[1mStatus\x1b[0m\r\n\x1b[32m\xe2\x9c\x93\x1b[0m agentd -> lazygit-overlay\r\n\r\n\x1b[1mFiles\x1b[0m\r\n\x1b[32m M\x1b[0m src/main.rs\r\n\x1b[32m M\x1b[0m src/workspace.rs\r\n\x1b[31m??\x1b[0m notes.txt\r\n";
+const SCENE_LAZYGIT: &[u8] = b"\x1b[1mStatus\x1b[0m\r\n\x1b[32m\xe2\x9c\x93\x1b[0m benches -> lazygit-overlay\r\n\r\n\x1b[1mFiles\x1b[0m\r\n\x1b[32m M\x1b[0m src/main.rs\r\n\x1b[32m M\x1b[0m src/workspace.rs\r\n\x1b[31m??\x1b[0m notes.txt\r\n";
 
 fn show_lazygit_scene(state: &mut State) {
     show_workspace_scene(state);

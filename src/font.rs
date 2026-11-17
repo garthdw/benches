@@ -70,7 +70,7 @@ pub fn parse_features(specs: &[String]) -> Vec<FontFeature> {
         .filter_map(|spec| {
             let feature = FontFeature::parse(spec);
             if feature.is_none() {
-                eprintln!("agentd: ignoring invalid font feature {spec:?}");
+                eprintln!("benches: ignoring invalid font feature {spec:?}");
             }
             feature
         })
@@ -241,7 +241,7 @@ fn icon_face(
             return Ok(font);
         }
         eprintln!(
-            "agentd: symbols family {family} isn't installed or lacks icons; using the next choice"
+            "benches: symbols family {family} isn't installed or lacks icons; using the next choice"
         );
     }
     if let Some(font) = fallbacks.iter().find_map(|family| with_icons(family)) {
@@ -367,7 +367,7 @@ impl Font {
         let faces = family_faces(family, pixels)
             .or_else(|| {
                 eprintln!(
-                    "agentd: font family {family} isn't installed; using {DEFAULT_FONT_FAMILY}"
+                    "benches: font family {family} isn't installed; using {DEFAULT_FONT_FAMILY}"
                 );
                 family_faces(DEFAULT_FONT_FAMILY, pixels)
             })
@@ -395,6 +395,8 @@ impl Font {
                 1,
             )
         };
+        // Cell and icon metrics follow Ghostty's `Metrics.calc` in `src/font/Metrics.zig`
+        // (MIT, © Mitchell Hashimoto, Ghostty contributors).
         // SAFETY: plain metric getters.
         let (
             ascent,

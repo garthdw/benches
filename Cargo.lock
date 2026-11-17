@@ -87,34 +87,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
 
 [[package]]
-name = "agentd"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "base64 0.23.1",
- "block2 0.6.2",
- "bytemuck",
- "crossbeam-channel",
- "libc",
- "libghostty-vt",
- "nix",
- "objc2 0.6.5",
- "objc2-core-foundation",
- "objc2-core-graphics",
- "objc2-core-text",
- "objc2-foundation 0.3.2",
- "objc2-user-notifications 0.3.2",
- "rune",
- "schemars",
- "serde",
- "serde_json",
- "tempfile",
- "toml",
- "toml_edit",
- "wgpu",
-]
-
-[[package]]
 name = "ahash"
 version = "0.8.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -412,6 +384,34 @@ name = "base64"
 version = "0.23.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ac07cdecf99051d9a5238b80f35af32cdeba5b336e55d957b318b50137e18da5"
+
+[[package]]
+name = "benches"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "base64 0.23.1",
+ "block2 0.6.2",
+ "bytemuck",
+ "crossbeam-channel",
+ "libc",
+ "libghostty-vt",
+ "nix",
+ "objc2 0.6.5",
+ "objc2-core-foundation",
+ "objc2-core-graphics",
+ "objc2-core-text",
+ "objc2-foundation 0.3.2",
+ "objc2-user-notifications 0.3.2",
+ "rune",
+ "schemars",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "toml",
+ "toml_edit",
+ "wgpu",
+]
 
 [[package]]
 name = "bit-set"

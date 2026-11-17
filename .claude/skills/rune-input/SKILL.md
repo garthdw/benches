@@ -1,6 +1,6 @@
 ---
 name: rune-input
-description: Rune input behaviour as used by agentd - key routing, physical keys, IME, Option as Alt, pointer drag, wheel, clipboard. Use when changing input.rs, on_key, mouse reporting, selection gestures, scrolling, paste/copy or IME, instead of reading the Rune source.
+description: Rune input behaviour as used by Benches - key routing, physical keys, IME, Option as Alt, pointer drag, wheel, clipboard. Use when changing input.rs, on_key, mouse reporting, selection gestures, scrolling, paste/copy or IME, instead of reading the Rune source.
 ---
 
 # Rune input
@@ -13,7 +13,7 @@ Global shortcuts and native menu key equivalents are handled before the window s
 
 1. Return and Escape during an IME composition go to the composition.
 2. Unmodified Return presses the window's `default_button()`.
-3. **Nothing focused: `AppSpec::on_key`**, with `tx.focused() == None`. agentd lives here.
+3. **Nothing focused: `AppSpec::on_key`**, with `tx.focused() == None`. Benches lives here.
 4. Focused field's `on_input_key`.
 5. Focus navigation (Escape, Tab, arrows and so on).
 6. Focused text field's editor.
@@ -21,7 +21,7 @@ Global shortcuts and native menu key equivalents are handled before the window s
 8. Selected text's Cmd+A and Cmd+C.
 9. Page Up, Page Down, Home and End scroll the nearest scroll view.
 
-Making the terminal `.focusable(true)` moves it out of step 3 and exposes Tab and Escape to step 5. Don't do that casually: M1's exit criterion is that clicks don't leave Rune focus holding keys.
+Making the terminal `.focusable(true)` moves it out of step 3 and exposes Tab and Escape to step 5. Don't do that casually: clicks must not leave Rune focus holding keys.
 
 ## References
 

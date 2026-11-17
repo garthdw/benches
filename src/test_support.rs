@@ -146,7 +146,7 @@ pub(crate) fn wait_until<T>(
 
 pub(crate) fn one_project() -> Workspace {
     let mut workspace = Workspace::default();
-    workspace.add_project(Project::new("/dev/agentd".into(), Vec::new()));
+    workspace.add_project(Project::new("/dev/benches".into(), Vec::new()));
     workspace
 }
 

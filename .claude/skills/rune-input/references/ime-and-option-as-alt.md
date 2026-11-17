@@ -10,4 +10,4 @@
 
 ## Option as Alt
 
-`.ime_option_as_alt(true)` beside `.ime_cursor()` sets winit's `OptionAsAlt::Both` while that caret has the input method (off again when a field takes it). Option and a key, dead keys such as ⌥E and ⌥U included, then arrive as that key with `mods.alt` and `tx.key_base()` its character, instead of the composed character or marked text. agentd always sets it on the terminal caret, so keep `.ime_cursor()` stable rather than toggling it on Option.
+`.ime_option_as_alt(true)` beside `.ime_cursor()` sets winit's `OptionAsAlt::Both` while that caret has the input method (off again when a field takes it). Option and a key, dead keys such as ⌥E and ⌥U included, then arrive as that key with `mods.alt` and `tx.key_base()` its character, instead of the composed character or marked text. Benches always sets it on the terminal caret, so keep `.ime_cursor()` stable rather than toggling it on Option.

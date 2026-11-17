@@ -528,7 +528,7 @@ fn pick_folder(tx: &mut Tx, directory: Option<PathBuf>, replace_active: bool) {
         Ok(Some(root)) if replace_active => state.workspace.change_root(root),
         Ok(Some(root)) => open_project(state, root),
         Ok(None) => {}
-        Err(error) => eprintln!("agentd: open folder: {error}"),
+        Err(error) => eprintln!("benches: open folder: {error}"),
     });
 }
 
@@ -847,7 +847,7 @@ pub(crate) fn window_app(
         }),
         poll: Some(poll),
         on_key: Some(on_key),
-        ..AppSpec::new("agentd", (960.0, 640.0), State::default, view)
+        ..AppSpec::new("Benches", (960.0, 640.0), State::default, view)
     };
     let init_fleet = fleet.clone();
     let app = App::new(spec)
@@ -1371,7 +1371,7 @@ mod tests {
         press(&mut runtime, Key::Enter, Mods::default());
         let workspace = &runtime.state.workspace;
         assert_eq!(workspace.projects.len(), 1);
-        assert_eq!(workspace.projects[0].name, "agentd");
+        assert_eq!(workspace.projects[0].name, "benches");
     }
 
     fn command_tab_runtime() -> Runtime<State> {
@@ -2126,7 +2126,7 @@ mod tests {
     fn the_layout_saves_and_loads_back() {
         let directory = tempfile::tempdir().unwrap();
         let paths = || config::Paths {
-            dir: directory.path().join("agentd"),
+            dir: directory.path().join("benches"),
             ghostty_dir: directory.path().join("ghostty"),
         };
         let mut state = State::default();
@@ -2195,7 +2195,7 @@ mod tests {
         assert_eq!(workspace.projects.len(), 1);
         assert_eq!(
             workspace.project().map(|project| project.name.as_str()),
-            Some("agentd")
+            Some("benches")
         );
 
         let mut second = second_window(&runtime.state.fleet, 1);
@@ -2324,7 +2324,7 @@ mod tests {
     fn the_last_window_to_quit_saves_every_windows_projects() {
         let directory = tempfile::tempdir().unwrap();
         let paths = config::Paths {
-            dir: directory.path().join("agentd"),
+            dir: directory.path().join("benches"),
             ghostty_dir: directory.path().join("ghostty"),
         };
         let fleet = Fleet::default();
