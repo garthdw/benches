@@ -14,7 +14,7 @@
 
 - `f.device_key()`: the device can change between frames. Rebuild GPU resources when the key changes. Never compare `wgpu::Device`s, whose ids repeat across instances.
 - `f.srgb_blend()`.
-- `f.write_buffer(buffer, offset, data)`: `queue.write_buffer` via reused staging. Offset and length must be multiples of 4. It needs the `Frame`, so it isn't usable from inside the `draw_with` closure, where agentd uses `queue.write_buffer`.
+- `f.write_buffer(buffer, offset, data)`: `queue.write_buffer` via reused staging. Offset and length must be multiples of 4. It needs the `Frame`, so it isn't usable from inside the `draw_with` closure, where Benches uses `queue.write_buffer`.
 - `f.draw_ui()`: the default frame with no slots handled.
 
 ## EffectSite (argument to the draw closure)

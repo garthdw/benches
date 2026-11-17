@@ -1,6 +1,6 @@
 ---
 name: rune-compositor
-description: Rune's custom GPU drawing contract as used by agentd - Compositor, Frame, effect slots, EffectSite, sRGB handling, device changes. Use when changing render.rs or cell.wgsl, or adding GPU-drawn surfaces, instead of reading the Rune source.
+description: Rune's custom GPU drawing contract as used by Benches - Compositor, Frame, effect slots, EffectSite, sRGB handling, device changes. Use when changing render.rs or cell.wgsl, or adding GPU-drawn surfaces, instead of reading the Rune source.
 ---
 
 # Rune compositor and effect slots
@@ -30,19 +30,19 @@ Register with `App::new(spec).compositor(..)`. It runs in the window and in head
 
 ## Rules
 
-- **Colour encoding:** use `site.srgb_blend`, never `format.is_srgb()`, because an isolated layer's `Rgba16Float` is neither. True: output sRGB-encoded values. False: output linear (`rune::color::srgb_decode`). Output is premultiplied; agentd uses `BlendState::PREMULTIPLIED_ALPHA_BLENDING`.
+- **Colour encoding:** use `site.srgb_blend`, never `format.is_srgb()`, because an isolated layer's `Rgba16Float` is neither. True: output sRGB-encoded values. False: output linear (`rune::color::srgb_decode`). Output is premultiplied; Benches uses `BlendState::PREMULTIPLIED_ALPHA_BLENDING`.
 - **Clipping:** Rune sets the scissor to the slot's clip rect before calling you, so overdraw stays inside the slot.
 - **Partial opacity** on the element puts the slot in its own layer, hence `format` and `origin` varying. Rotation draws upright inside a turned layer.
 - `.effect_bleed(pt)` lets a slot paint past its rect. `.effect_backdrop(true)` requests a backdrop copy.
 - `effect()` returns a normal `El`, so handlers, keys, sizing and children chain as usual.
-- `draw` receives only `&State`. Cell metrics known only in the compositor must travel by message or interior mutability; agentd sends them to the session actor.
+- `draw` receives only `&State`. Cell metrics known only in the compositor must travel by message or interior mutability; Benches sends them to the session actor.
 
 ## References
 
 | Task | Reference |
 |---|---|
 | `Compositor` trait methods, `Frame` fields, `EffectSite` fields | [references/api.md](references/api.md) |
-| Native Metal backend limits, wgpu fallback, WGSL, buffers, agentd's pipeline descriptor | [references/metal-backend.md](references/metal-backend.md) |
+| Native Metal backend limits, wgpu fallback, WGSL, buffers, Benches' pipeline descriptor | [references/metal-backend.md](references/metal-backend.md) |
 
 ## File map (under `crates/rune/`)
 

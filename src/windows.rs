@@ -179,7 +179,7 @@ pub(crate) fn move_to_new_window(state: &mut State, index: usize, position: Opti
         state.paths = paths;
         state.started = true;
     });
-    let mut spec = WindowSpec::from_app(format!("agentd-{window}"), app);
+    let mut spec = WindowSpec::from_app(format!("benches-{window}"), app);
     spec.options.position = position;
     rune::open_window(spec);
 }
@@ -243,7 +243,7 @@ pub(crate) fn reload_config(state: &mut State) {
 /// Logs why config.toml was skipped and shows it in the banner, or clears the banner.
 fn report_config_error(state: &mut State, error: Option<anyhow::Error>) {
     if let Some(error) = &error {
-        eprintln!("agentd: config: {error:#}");
+        eprintln!("benches: config: {error:#}");
     }
     state.config_error = error.map(|error| format!("{error:#}"));
 }
@@ -330,7 +330,7 @@ mod tests {
         let mut second = second_window(&runtime.state.fleet, 1);
         let root = tempfile::tempdir().unwrap();
         let paths = Paths {
-            dir: root.path().join("agentd"),
+            dir: root.path().join("benches"),
             ghostty_dir: root.path().join("ghostty"),
         };
         std::fs::create_dir_all(&paths.dir).unwrap();
@@ -347,7 +347,7 @@ mod tests {
     fn a_broken_config_at_launch_falls_back_and_shows_the_banner() {
         let root = tempfile::tempdir().unwrap();
         let paths = Paths {
-            dir: root.path().join("agentd"),
+            dir: root.path().join("benches"),
             ghostty_dir: root.path().join("ghostty"),
         };
         std::fs::create_dir_all(&paths.dir).unwrap();
@@ -371,7 +371,7 @@ mod tests {
         let mut runtime = workspace_runtime();
         let root = tempfile::tempdir().unwrap();
         let paths = Paths {
-            dir: root.path().join("agentd"),
+            dir: root.path().join("benches"),
             ghostty_dir: root.path().join("ghostty"),
         };
         std::fs::create_dir_all(&paths.dir).unwrap();

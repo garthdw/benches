@@ -19,7 +19,7 @@ snapshot.clean()?;
 - `CursorViewport { x, y, at_wide_tail }`, `None` when off-viewport. `CursorVisualStyle::{Bar, Block, Underline, BlockHollow}`.
 - Row: `dirty() id() viewport_y() raw_row() selection() next_dirty()`.
 - Cell: `fg_color() -> Option`, `bg_color() -> Option`, `style()`, `has_styling()`, `is_selected()`, `raw_cell()`.
-- Graphemes: `graphemes_len()`, `graphemes() -> Vec<char>`, `graphemes_utf8(&mut String)`, `graphemes_buf(&mut [char])` (M1 relies on it filling the base codepoint in a one-element buffer even for longer clusters).
+- Graphemes: `graphemes_len()`, `graphemes() -> Vec<char>`, `graphemes_utf8(&mut String)`, `graphemes_buf(&mut [char])` (`read_cell` in `grid.rs` relies on it filling the base codepoint in a one-element buffer even for longer clusters).
 - Width: `cell.raw_cell()?.wide()?` gives `CellWide::{Narrow, Wide, SpacerTail, SpacerHead}`. Don't render spacers.
 - `Style { fg_color, bg_color, underline_color, bold, italic, faint, blink, inverse, invisible, strikethrough, overline, underline }`, `Underline::{None, Single, Double, Curly, Dotted, Dashed}`.
 - Inverse and selection are left to the renderer: `session.rs` swaps colours itself.

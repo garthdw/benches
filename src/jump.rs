@@ -209,7 +209,7 @@ fn login_args<'a>(
     };
     let mut args = vec!["-l".to_owned(), "-i".to_owned(), "-c".to_owned(), script];
     if !fish {
-        args.push("agentd".to_owned());
+        args.push("benches".to_owned());
     }
     args.extend(words.map(str::to_owned));
     args
@@ -335,7 +335,7 @@ mod tests {
     fn the_query_goes_in_as_arguments() {
         assert_eq!(
             shell_args(Path::new("/bin/zsh"), "j", " a  $(b) "),
-            ["-l", "-i", "-c", "j \"$@\" && pwd", "agentd", "a", "$(b)"]
+            ["-l", "-i", "-c", "j \"$@\" && pwd", "benches", "a", "$(b)"]
         );
         assert_eq!(
             shell_args(Path::new("/opt/homebrew/bin/fish"), "zoxide query", "a"),
@@ -430,7 +430,7 @@ mod tests {
         assert_eq!(path, Path::new("/dev/site.new-branch"));
         assert_eq!(
             std::fs::read_to_string(record).unwrap(),
-            "-l\n-i\n-c\nwt switch --create --no-cd --format=json \"$@\"\nagentd\nnew-branch\n"
+            "-l\n-i\n-c\nwt switch --create --no-cd --format=json \"$@\"\nbenches\nnew-branch\n"
         );
     }
 

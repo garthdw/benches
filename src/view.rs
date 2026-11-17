@@ -806,8 +806,8 @@ pub(crate) fn view(state: &State, cx: &mut Cx<State>) -> El {
 
 pub(crate) fn window_title(workspace: &Workspace) -> String {
     workspace.project().map_or_else(
-        || "agentd".to_owned(),
-        |project| format!("{} — agentd", project.name),
+        || "Benches".to_owned(),
+        |project| format!("{} — Benches", project.name),
     )
 }
 
@@ -818,10 +818,10 @@ mod tests {
 
     #[test]
     fn the_window_title_names_the_active_project() {
-        assert_eq!(window_title(&Workspace::default()), "agentd");
+        assert_eq!(window_title(&Workspace::default()), "Benches");
         let mut workspace = workspace_state().workspace;
-        assert_eq!(window_title(&workspace), "agentd — agentd");
+        assert_eq!(window_title(&workspace), "benches — Benches");
         workspace.select_project(1);
-        assert_eq!(window_title(&workspace), "site — agentd");
+        assert_eq!(window_title(&workspace), "site — Benches");
     }
 }

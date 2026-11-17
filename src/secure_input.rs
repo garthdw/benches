@@ -30,7 +30,7 @@ impl SecureInput {
             }
         };
         if status != 0 {
-            eprintln!("agentd: secure event input: status {status}");
+            eprintln!("benches: secure event input: status {status}");
             return false;
         }
         self.enabled = wanted;

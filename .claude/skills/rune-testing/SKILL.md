@@ -1,13 +1,13 @@
 ---
 name: rune-testing
-description: Testing and verifying Rune apps in agentd - the headless Runtime harness, --snap/--tree/--script flags, named scenes, and what headless runs cannot prove. Use when writing UI tests or checking a rendering or input change, instead of reading the Rune source.
+description: Testing and verifying Rune apps in Benches - the headless Runtime harness, --snap/--tree/--script flags, named scenes, and what headless runs cannot prove. Use when writing UI tests or checking a rendering or input change, instead of reading the Rune source.
 ---
 
 # Testing Rune apps
 
 Verified against Rune rev `7dfaa8f`. If the pin has moved, check anything you rely on.
 
-## agentd specifics
+## Benches specifics
 
 - Rendering is checked by adding a scene that builds `Session::fixture(Grid::from_vt(bytes, cols, rows))`, then `--snap` and viewing the PNG. Fixture sessions have no process, and input goes nowhere.
 - Real-process behaviour is tested through `Session::spawn` with a polling `wait_for_line`.

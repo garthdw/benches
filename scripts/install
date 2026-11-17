@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Bundles a release with scripts/bundle and installs it to ~/Applications/agentd.app with the
+# Bundles a release with scripts/bundle and installs it to ~/Applications/benches.app with the
 # pinned Rune's installer, which quits a running copy, swaps the bundle atomically and rolls
 # back if the new one fails.
 set -euo pipefail
@@ -19,5 +19,5 @@ python=$(python3 -c 'import sys; print(sys.executable)')
 exec env -i HOME="$HOME" USER="$USER" LOGNAME="${LOGNAME:-$USER}" TMPDIR="$TMPDIR" \
   ${SSH_AUTH_SOCK:+SSH_AUTH_SOCK="$SSH_AUTH_SOCK"} \
   PATH=/usr/bin:/bin:/usr/sbin:/sbin PYTHONCOERCECLOCALE=0 \
-  "$python" "$rune/scripts/mac_app_install.py" --name agentd --id dev.dewet.agentd --exe agentd \
+  "$python" "$rune/scripts/mac_app_install.py" --name benches --id dev.dewet.benches --exe benches \
   --bundle "$app" "$@"

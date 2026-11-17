@@ -6,7 +6,7 @@ let spec = AppSpec::<State> {
     setup: Some(|s, waker| s.waker = Some(waker)),
     poll: Some(poll),
     on_key: Some(on_key),
-    ..AppSpec::new("agentd", (960.0, 640.0), State::default, view)
+    ..AppSpec::new("Benches", (960.0, 640.0), State::default, view)
 };
 App::new(spec).compositor(render::TerminalCompositor::default()).run();
 ```

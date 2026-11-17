@@ -44,7 +44,7 @@ impl<T, E: Display> LogErr<T> for std::result::Result<T, E> {
         match self {
             Ok(value) => Some(value),
             Err(error) => {
-                eprintln!("agentd: {context}: {error:#}");
+                eprintln!("benches: {context}: {error:#}");
                 None
             }
         }
@@ -59,7 +59,7 @@ fn log_to_file_in_bundle() -> anyhow::Result<()> {
         return Ok(());
     }
     let home = std::env::var_os("HOME").context("HOME is unset")?;
-    let path = PathBuf::from(home).join("Library/Logs/agentd.log");
+    let path = PathBuf::from(home).join("Library/Logs/benches.log");
     let file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -71,7 +71,7 @@ fn log_to_file_in_bundle() -> anyhow::Result<()> {
     }
     let started = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?;
     eprintln!(
-        "agentd {} started at unix time {}, pid {}",
+        "benches {} started at unix time {}, pid {}",
         env!("CARGO_PKG_VERSION"),
         started.as_secs(),
         std::process::id()
@@ -86,7 +86,7 @@ fn main() {
             .context("HOME is not set")
             .and_then(|paths| config::command(config_args, &paths, &mut std::io::stdout()));
         if let Err(error) = result {
-            eprintln!("agentd: {error:#}");
+            eprintln!("benches: {error:#}");
             std::process::exit(1);
         }
         return;

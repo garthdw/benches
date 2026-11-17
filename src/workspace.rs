@@ -523,7 +523,7 @@ impl Workspace {
                 .recv_deadline(deadline)
                 .is_err_and(|error| error.is_timeout())
             {
-                eprintln!("agentd: processes still running at quit");
+                eprintln!("benches: processes still running at quit");
                 return;
             }
         }

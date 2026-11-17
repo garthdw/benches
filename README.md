@@ -1,4 +1,4 @@
-# agentd
+# Benches
 
 A native macOS workspace where each project is a group of terminals. See `AGENTS.md` for development.
 
