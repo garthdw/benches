@@ -3,9 +3,9 @@ use libghostty_vt::mouse;
 use rune::{Key, KeyEvent, Mods, Phase, PhysicalKeyCode as Code, Tx};
 
 use crate::app::State;
-use crate::grid::Grid;
 use crate::session::Session;
-use crate::terminal_input::{KeyInput, PointerInput, PointerPhase};
+use benches_core::grid::Grid;
+use benches_core::terminal_input::{KeyInput, PointerInput, PointerPhase};
 
 pub fn vt_mods(mods: Mods) -> VtMods {
     let mut out = VtMods::empty();
@@ -224,8 +224,8 @@ pub(crate) fn focus_on_press(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::grid::new_terminal;
-    use crate::terminal_input::TerminalInput;
+    use benches_core::grid::new_terminal;
+    use benches_core::terminal_input::TerminalInput;
 
     #[test]
     fn ctrl_c_is_the_physical_c_key_without_text() {

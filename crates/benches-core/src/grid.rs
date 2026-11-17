@@ -21,7 +21,7 @@ use crate::LogErr;
 use crate::config::{ClipboardAccess, Theme};
 use crate::images::{ImageReader, Placement};
 
-pub(crate) const FRAME: Duration = Duration::from_millis(8);
+pub const FRAME: Duration = Duration::from_millis(8);
 
 const SCROLLBAR_HOLD: Duration = Duration::from_secs(1);
 const SCROLLBAR_FADE: Duration = Duration::from_millis(200);
@@ -181,7 +181,7 @@ pub struct Found {
 
 /// Matched cells in one viewport row, as inclusive columns.
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub(crate) struct Highlight {
+pub struct Highlight {
     pub(crate) row: u16,
     pub(crate) first: u16,
     pub(crate) last: u16,
@@ -269,7 +269,7 @@ impl Grid {
         self.clusters.get(index)
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn lines(&self) -> Vec<String> {
         self.cells
             .chunks(usize::from(self.cols).max(1))
@@ -293,7 +293,7 @@ const MIN_THUMB_POINTS: f32 = 24.0;
 /// Where the viewport sits in the scrollback, in rows, and how the thumb looks.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Scrollbar {
-    pub(crate) total: u64,
+    pub total: u64,
     offset: u64,
     len: u64,
     /// Zero while hidden; the thumb fades out after scrolling stops.
@@ -419,7 +419,7 @@ fn faint(color: [u8; 3], background: [u8; 3]) -> [u8; 3] {
 
 /// What the actor knows that the terminal doesn't.
 #[derive(Clone, Copy, PartialEq)]
-pub(crate) struct Presentation {
+pub struct Presentation {
     pub(crate) focused: bool,
     /// The PTY is in the mode programs use to read a password, which libghostty can't see.
     pub(crate) password_input: bool,
@@ -526,7 +526,7 @@ type Shown = (
     Option<(u16, u16)>,
 );
 
-pub(crate) struct GridBuilder {
+pub struct GridBuilder {
     state: RenderState<'static>,
     rows: RowIterator<'static>,
     cells: CellIterator<'static>,
@@ -544,7 +544,7 @@ pub(crate) struct GridBuilder {
 }
 
 impl GridBuilder {
-    pub(crate) fn new() -> Result<Self> {
+    pub fn new() -> Result<Self> {
         Ok(Self {
             state: RenderState::new()?,
             rows: RowIterator::new()?,
@@ -561,7 +561,7 @@ impl GridBuilder {
     }
 
     /// libghostty isn't known to mark the render state dirty when only the selection moves.
-    pub(crate) fn selection_changed(&mut self) {
+    pub fn selection_changed(&mut self) {
         self.last_shown = None;
         self.content = None;
     }
@@ -574,7 +574,7 @@ impl GridBuilder {
     }
 
     /// Matches are painted over the cells at build time, so the cached cells stay plain.
-    pub(crate) fn set_search(&mut self, highlights: Vec<Highlight>, found: Option<Found>) {
+    pub fn set_search(&mut self, highlights: Vec<Highlight>, found: Option<Found>) {
         if (&self.highlights, self.found) != (&highlights, found) {
             self.highlights = highlights;
             self.found = found;
@@ -582,7 +582,7 @@ impl GridBuilder {
         }
     }
 
-    pub(crate) fn build(
+    pub fn build(
         &mut self,
         terminal: &Terminal<'static, '_>,
         generation: u64,
@@ -761,12 +761,12 @@ impl GridBuilder {
 }
 
 /// The bundled compiled terminfo directory, found relative to `exe` inside a `.app`.
-pub(crate) fn bundled_terminfo(exe: &Path) -> Option<PathBuf> {
+pub fn bundled_terminfo(exe: &Path) -> Option<PathBuf> {
     let dir = exe.parent()?.parent()?.join("Resources/terminfo");
     dir.join("78/xterm-ghostty").is_file().then_some(dir)
 }
 
-pub(crate) fn terminfo_name(bundled: Option<&Path>) -> &'static str {
+pub fn terminfo_name(bundled: Option<&Path>) -> &'static str {
     if bundled.is_some() {
         "xterm-ghostty"
     } else {
@@ -793,7 +793,7 @@ fn enable_png_images() {
     });
 }
 
-pub(crate) fn new_terminal<'cb>(cols: u16, rows: u16) -> Result<Terminal<'static, 'cb>> {
+pub fn new_terminal<'cb>(cols: u16, rows: u16) -> Result<Terminal<'static, 'cb>> {
     enable_png_images();
     let mut terminal = Terminal::new(cols, rows)?;
     terminal

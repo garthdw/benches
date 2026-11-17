@@ -18,12 +18,12 @@ use nix::sys::select::{FdSet, select};
 use nix::sys::time::{TimeVal, TimeValLike};
 use rune::Waker;
 
-use crate::LogErr;
-use crate::actor::{Actor, store, terminate};
-use crate::config::Config;
-use crate::grid::{Grid, Surface, bundled_terminfo, terminfo_name};
-use crate::protocol::{Event, Msg, Visibility};
-use crate::terminal_input::{Hover, KeyInput, PointerInput, PointerPhase, WheelInput};
+use benches_core::LogErr;
+use benches_core::actor::{Actor, store, terminate};
+use benches_core::config::Config;
+use benches_core::grid::{Grid, Surface, bundled_terminfo, terminfo_name};
+use benches_core::protocol::{Event, Msg, Visibility};
+use benches_core::terminal_input::{Hover, KeyInput, PointerInput, PointerPhase, WheelInput};
 
 const BATCH_GAP: Duration = Duration::from_micros(50);
 const BATCH_LIMIT: Duration = Duration::from_millis(1);
@@ -499,12 +499,12 @@ fn set_cloexec(fd: &OwnedFd) -> Result<()> {
 mod tests {
     use super::*;
     use crate::app::default_config;
-    use crate::config::Theme;
-    use crate::grid::{FRAME, GridBuilder, Presentation, Scrollbar, new_terminal};
-    use crate::protocol::{Progress, ProgressKind};
-    use crate::terminal_input::TerminalInput;
     use crate::test_support::wait_until;
-    use crate::test_support::{TEST_SURFACE, pointer_at, wheel_by};
+    use benches_core::config::Theme;
+    use benches_core::grid::{FRAME, GridBuilder, Presentation, Scrollbar, new_terminal};
+    use benches_core::protocol::{Progress, ProgressKind};
+    use benches_core::terminal_input::TerminalInput;
+    use benches_core::test_support::{TEST_SURFACE, pointer_at, wheel_by};
     use libghostty_vt::color::Rgb;
     use libghostty_vt::render::CursorVisualStyle;
     use libghostty_vt::style::Underline;

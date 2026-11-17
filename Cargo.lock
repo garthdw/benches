@@ -390,7 +390,8 @@ name = "benches"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "base64 0.23.1",
+ "benches-core",
+ "benches-font",
  "block2 0.6.2",
  "bytemuck",
  "crossbeam-channel",
@@ -399,19 +400,49 @@ dependencies = [
  "nix",
  "objc2 0.6.5",
  "objc2-core-foundation",
- "objc2-core-graphics",
- "objc2-core-text",
  "objc2-foundation 0.3.2",
  "objc2-user-notifications 0.3.2",
  "rune",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "toml",
+ "wgpu",
+]
+
+[[package]]
+name = "benches-core"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "base64 0.23.1",
+ "benches-font",
+ "benches-platform",
+ "crossbeam-channel",
+ "libc",
+ "libghostty-vt",
+ "nix",
  "schemars",
  "serde",
  "serde_json",
  "tempfile",
  "toml",
  "toml_edit",
- "wgpu",
 ]
+
+[[package]]
+name = "benches-font"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "objc2-core-foundation",
+ "objc2-core-graphics",
+ "objc2-core-text",
+]
+
+[[package]]
+name = "benches-platform"
+version = "0.1.0"
 
 [[package]]
 name = "bit-set"

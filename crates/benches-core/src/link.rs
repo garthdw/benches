@@ -1,4 +1,4 @@
-use crate::platform::Link;
+use benches_platform::Link;
 
 const SCHEMES: [&str; 4] = ["https://", "http://", "file://", "mailto:"];
 

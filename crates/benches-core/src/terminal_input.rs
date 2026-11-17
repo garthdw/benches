@@ -78,7 +78,7 @@ fn whole_lines(remainder: &mut f32, delta: f32) -> i32 {
 
 pub(crate) fn open_link(url: &str) {
     let link = link::target(url);
-    thread::spawn(move || crate::platform::open(&link).log_err("open link"));
+    thread::spawn(move || benches_platform::open(&link).log_err("open link"));
 }
 
 /// False if libghostty refused the text because it could run commands.
@@ -111,7 +111,7 @@ pub(crate) fn selection_text(terminal: &Terminal<'static, '_>) -> Result<Option<
 }
 
 /// Turns raw input into terminal bytes or selection changes. Lives with the `Terminal` on its actor.
-pub(crate) struct TerminalInput {
+pub struct TerminalInput {
     key_encoder: key::Encoder<'static>,
     key_event: key::Event<'static>,
     mouse_encoder: mouse::Encoder<'static>,
@@ -131,14 +131,14 @@ pub(crate) struct TerminalInput {
     /// How far below the thumb's top the pointer holds it, while dragging the scrollbar.
     pub(crate) scrollbar_grab: Option<f32>,
     /// Set by `select` for the actor to take, as libghostty doesn't mark the render state dirty.
-    pub(crate) selection_changed: bool,
+    pub selection_changed: bool,
     hover: Hover,
     /// The viewport cells, `start..end` counted row by row, of the link ⌘ is over.
     pub(crate) link: Option<(usize, usize)>,
 }
 
 impl TerminalInput {
-    pub(crate) fn new() -> Result<Self> {
+    pub fn new() -> Result<Self> {
         let mut press = PressEvent::new()?;
         press.set_repeat_interval(MULTI_CLICK)?;
         Ok(Self {
@@ -222,7 +222,7 @@ impl TerminalInput {
         Ok(encoded)
     }
 
-    pub(crate) fn key(
+    pub fn key(
         &mut self,
         terminal: &mut Terminal<'static, '_>,
         input: KeyInput,
@@ -483,7 +483,7 @@ impl TerminalInput {
         }))
     }
 
-    pub(crate) fn pointer(
+    pub fn pointer(
         &mut self,
         terminal: &Terminal<'static, '_>,
         input: PointerInput,

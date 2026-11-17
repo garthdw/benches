@@ -10,9 +10,9 @@ use serde::de::IntoDeserializer;
 use serde::de::value::Error as ValueError;
 
 use crate::LogErr;
-use crate::constraint::Modifier;
-use crate::font::DEFAULT_FONT_FAMILY;
 use crate::grid::{DEFAULT_BG, DEFAULT_FG};
+use benches_font::DEFAULT_FONT_FAMILY;
+use benches_font::constraint::Modifier;
 
 const FALLBACK_SHELL: &str = "/bin/zsh";
 const DEFAULT_FONT_SIZE: f64 = 18.0;
@@ -1202,7 +1202,7 @@ mod schema_tests {
     fn committed_schema_is_up_to_date() {
         let committed = std::fs::read_to_string(concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/schema/config.schema.json"
+            "/../../schema/config.schema.json"
         ))
         .unwrap_or_default();
         assert!(

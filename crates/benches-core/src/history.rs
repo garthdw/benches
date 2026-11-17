@@ -21,17 +21,17 @@ const ZSH_META: u8 = 0x83;
 
 /// Which history file was read and when it was last written, so an unchanged one isn't reread.
 #[derive(Clone, Debug, Default, PartialEq)]
-pub(crate) struct Stamp {
+pub struct Stamp {
     path: Option<PathBuf>,
     modified: Option<SystemTime>,
 }
 
 /// A history file's stamp and its commands, newest first.
-pub(crate) type Loaded = (Stamp, Vec<String>);
+pub type Loaded = (Stamp, Vec<String>);
 
 /// The login shell's history, newest command first with repeats dropped, unless `known` is
 /// still current. A missing file is an empty history.
-pub(crate) fn load(shell: &Path, known: &Stamp) -> anyhow::Result<Option<Loaded>> {
+pub fn load(shell: &Path, known: &Stamp) -> anyhow::Result<Option<Loaded>> {
     load_file(history_file(shell, |name| std::env::var_os(name)), known)
 }
 
@@ -179,7 +179,7 @@ fn is_bash_timestamp(line: &str) -> bool {
 }
 
 /// `command` shown on one line, each newline marked.
-pub(crate) fn flattened(command: &str) -> Cow<'_, str> {
+pub fn flattened(command: &str) -> Cow<'_, str> {
     match command.contains('\n') {
         true => Cow::Owned(command.replace('\n', " ⏎ ")),
         false => Cow::Borrowed(command),
@@ -189,7 +189,7 @@ pub(crate) fn flattened(command: &str) -> Cow<'_, str> {
 /// `command` as one line that runs the same, for the command centre's single-line input: a
 /// newline ends a command unless the line already leads into the next. None when a newline is
 /// inside quotes or a here-document, which no join keeps.
-pub(crate) fn single_line(command: &str) -> Option<Cow<'_, str>> {
+pub fn single_line(command: &str) -> Option<Cow<'_, str>> {
     if !command.contains('\n') {
         return Some(Cow::Borrowed(command));
     }

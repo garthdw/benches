@@ -8,7 +8,7 @@ use crate::grid::{Found, Highlight};
 
 /// A find bar's search over the terminal's scrollback; idle until a query is set.
 #[derive(Default)]
-pub(crate) struct Searcher {
+pub struct Searcher {
     search: Option<Search<'static, 'static>>,
     buffer: MatchBuffer,
 }
@@ -48,7 +48,7 @@ fn rows(
 
 impl Searcher {
     /// An empty query ends the search. A new one selects the first match, scrolling to it.
-    pub(crate) fn set(&mut self, terminal: &mut Terminal<'static, '_>, query: &str) -> Result<()> {
+    pub fn set(&mut self, terminal: &mut Terminal<'static, '_>, query: &str) -> Result<()> {
         if query.is_empty() {
             self.search = None;
             return Ok(());
@@ -76,7 +76,7 @@ impl Searcher {
     }
 
     /// The matches in view and the count, after catching up with output since the last call.
-    pub(crate) fn highlights(
+    pub fn highlights(
         &mut self,
         terminal: &mut Terminal<'static, '_>,
         cols: u16,

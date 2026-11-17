@@ -9,17 +9,13 @@ use rune::{
     Tx, Waker,
 };
 
-use crate::LogErr;
-use crate::config;
 use crate::find::{Find, open_find, poll_find};
-use crate::grid::{Grid, Surface};
 use crate::input::caret_rect;
 use crate::keymap::{Command, pressed, shortcut};
 use crate::palette::{
     Action, Palette, open_palette, poll_creation, poll_history, poll_jump, poll_selection,
     poll_worktrees, run_action,
 };
-use crate::protocol::{Event, Visibility};
 use crate::render::TerminalSource;
 use crate::secure_input::SecureInput;
 use crate::session::{Attention, Retarget, Session};
@@ -30,6 +26,10 @@ use crate::windows::{
 };
 use crate::workspace::{Project, SavedWorkspace, Slot, Status, Tab, Workspace};
 use anyhow::Context;
+use benches_core::LogErr;
+use benches_core::config;
+use benches_core::grid::{Grid, Surface};
+use benches_core::protocol::{Event, Visibility};
 
 /// Asks for a frame without a new view: terminal output only changes the effect slot's pixels.
 #[derive(Clone)]
@@ -255,7 +255,11 @@ pub(crate) fn open_tab(state: &mut State, title: &str, command: Option<&str>) {
 pub(crate) fn open_tray(state: &mut State, command: &str) {
     let cwd = state.session().and_then(Session::cwd);
     if let Some(cwd) = cwd.or_else(|| state.active_root()) {
-        let tab = state.spawn_tab(&crate::history::flattened(command), Some(command), &cwd);
+        let tab = state.spawn_tab(
+            &benches_core::history::flattened(command),
+            Some(command),
+            &cwd,
+        );
         state.workspace.add_tray(tab);
     }
 }
@@ -942,13 +946,13 @@ pub(crate) fn window_app(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::grid::Metrics;
-    use crate::protocol::{Progress, ProgressKind};
     use crate::scenes::*;
-    use crate::terminal_input::Hover;
     use crate::test_support::*;
     use crate::view::{DRAWER_HEIGHT, RAIL_WIDTH, SIDEBAR_WIDTH};
     use crate::workspace;
+    use benches_core::grid::Metrics;
+    use benches_core::protocol::{Progress, ProgressKind};
+    use benches_core::terminal_input::Hover;
     use rune::{Cursor, Runtime};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;

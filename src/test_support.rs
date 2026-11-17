@@ -3,15 +3,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
-use libghostty_vt::color::Rgb;
-use libghostty_vt::{Terminal, key, mouse};
 use rune::{Env, Key, KeyEvent, Mods, Runtime, Waker};
 
 use crate::app::{State, on_key, poll};
-use crate::grid::new_terminal;
-use crate::grid::{Metrics, Surface};
 use crate::scenes::show_workspace_scene;
-use crate::terminal_input::{PointerInput, PointerPhase, WheelInput};
 use crate::view::view;
 use crate::windows::{Fleet, WindowId};
 use crate::workspace::{Project, Workspace};
@@ -148,62 +143,4 @@ pub(crate) fn one_project() -> Workspace {
     let mut workspace = Workspace::default();
     workspace.add_project(Project::new("/dev/benches".into(), Vec::new()));
     workspace
-}
-
-pub(crate) fn scrolled_terminal<'cb>() -> Terminal<'static, 'cb> {
-    let mut terminal = new_terminal(20, 5).unwrap();
-    for line in 0..30 {
-        terminal.vt_write(format!("line{line}\r\n").as_bytes());
-    }
-    terminal
-}
-
-pub(crate) fn fractional_metrics(scale: f32) -> Metrics {
-    Metrics {
-        cell_width: 9,
-        cell_height: 19,
-        padding: 12.0 * scale,
-        scale,
-    }
-}
-
-pub(crate) const THEME_RED: Rgb = Rgb {
-    r: 0xff,
-    g: 0,
-    b: 0,
-};
-pub(crate) const THEME_BLUE: Rgb = Rgb {
-    r: 0,
-    g: 0,
-    b: 0xff,
-};
-
-pub(crate) const TEST_SURFACE: Surface = Surface {
-    cols: 20,
-    rows: 5,
-    metrics: Metrics {
-        cell_width: 10,
-        cell_height: 20,
-        padding: 0.0,
-        scale: 1.0,
-    },
-};
-
-pub(crate) fn pointer_at(phase: PointerPhase, column: u16, row: u16) -> PointerInput {
-    PointerInput {
-        phase,
-        button: Some(mouse::Button::Left),
-        x: f32::from(column) * 10.0 + 5.0,
-        y: f32::from(row) * 20.0 + 10.0,
-        mods: key::Mods::empty(),
-    }
-}
-
-pub(crate) fn wheel_by(dy: f32) -> WheelInput {
-    WheelInput {
-        dy,
-        x: 5.0,
-        y: 10.0,
-        mods: key::Mods::empty(),
-    }
 }

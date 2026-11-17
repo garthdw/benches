@@ -23,9 +23,7 @@ use nix::pty::Winsize;
 use nix::sys::signal::{Signal, killpg};
 use nix::sys::termios::{LocalFlags, tcgetattr};
 use nix::unistd::Pid;
-use rune::Waker;
 
-use crate::LogErr;
 use crate::config::{ClipboardAccess, TerminalSettings};
 use crate::grid::{
     FRAME, Grid, GridBuilder, Presentation, ScrollbarFade, Surface, answer_queries, apply_theme,
@@ -35,6 +33,7 @@ use crate::link::reported_directory;
 use crate::protocol::{Event, Msg, Progress, ProgressKind, Visibility};
 use crate::search::Searcher;
 use crate::terminal_input::{TerminalInput, open_link, paste_text, selection_text};
+use crate::{LogErr, Waker};
 
 /// How long the size must hold before the program sees it, as each SIGWINCH makes inline TUIs reprint.
 const RESIZE_SETTLE: Duration = Duration::from_millis(100);
@@ -122,7 +121,7 @@ fn watch_commands(
     Ok(finished)
 }
 
-pub(crate) fn store(slot: &Mutex<Arc<Grid>>, grid: Grid) {
+pub fn store(slot: &Mutex<Arc<Grid>>, grid: Grid) {
     *slot.lock().unwrap_or_else(PoisonError::into_inner) = Arc::new(grid);
 }
 
@@ -164,22 +163,22 @@ impl ResizeDebounce {
     }
 }
 
-pub(crate) struct Actor {
-    pub(crate) cols: u16,
-    pub(crate) rows: u16,
-    pub(crate) output: Receiver<Vec<u8>>,
-    pub(crate) commands: Receiver<Msg>,
-    pub(crate) input: Sender<Vec<u8>>,
-    pub(crate) child: Child,
-    pub(crate) pid: Arc<Mutex<Option<i32>>>,
-    pub(crate) master: OwnedFd,
-    pub(crate) slot: Arc<Mutex<Arc<Grid>>>,
-    pub(crate) alerted: Arc<AtomicBool>,
-    pub(crate) hover: Arc<AtomicU8>,
-    pub(crate) reported_cwd: Arc<Mutex<Option<PathBuf>>>,
-    pub(crate) events: Sender<Event>,
-    pub(crate) waker: Waker,
-    pub(crate) settings: TerminalSettings,
+pub struct Actor {
+    pub cols: u16,
+    pub rows: u16,
+    pub output: Receiver<Vec<u8>>,
+    pub commands: Receiver<Msg>,
+    pub input: Sender<Vec<u8>>,
+    pub child: Child,
+    pub pid: Arc<Mutex<Option<i32>>>,
+    pub master: OwnedFd,
+    pub slot: Arc<Mutex<Arc<Grid>>>,
+    pub alerted: Arc<AtomicBool>,
+    pub hover: Arc<AtomicU8>,
+    pub reported_cwd: Arc<Mutex<Option<PathBuf>>>,
+    pub events: Sender<Event>,
+    pub waker: Waker,
+    pub settings: TerminalSettings,
 }
 
 impl Actor {
@@ -249,7 +248,7 @@ impl Actor {
         )
     }
 
-    pub(crate) fn run(&mut self) -> Result<()> {
+    pub fn run(&mut self) -> Result<()> {
         let mut terminal = new_terminal(self.cols, self.rows)?;
         let reply_muted = Rc::new(Cell::new(false));
         self.apply_settings(&mut terminal, &reply_muted)?;
@@ -866,7 +865,7 @@ pub(crate) fn forget(pid: &Mutex<Option<i32>>) {
     *pid.lock().unwrap_or_else(PoisonError::into_inner) = None;
 }
 
-pub(crate) fn terminate(child: &mut Child, pid: &Mutex<Option<i32>>) {
+pub fn terminate(child: &mut Child, pid: &Mutex<Option<i32>>) {
     forget(pid);
     // Also true once the actor has reaped the process, whose pid may have been reused.
     if matches!(child.try_wait(), Ok(Some(_))) {

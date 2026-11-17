@@ -10,14 +10,14 @@ The toolchain is pinned in `rust-toolchain.toml`. Building `libghostty-vt` needs
 
 ```sh
 cargo run                                   # open the app with a live shell
-cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test
+cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test   # every crate, via default-members
 cargo test ctrl_c_interrupts                # single test, by name substring; some tests spawn real shells
 cargo run -- --snap out.png --scene fixture --size 620x300   # headless render of fixture VT content
 cargo run --release --features tooling -- --snap out.png --scene fixture   # release builds need `tooling` for headless flags
 cargo run -- config init                    # write a commented config.toml and its schema file; refuses to overwrite
 cargo run -- config migrate                 # refresh the schema file and the `#:schema` line of an existing config.toml
 cargo run -- config schema > schema/config.schema.json   # regenerate the committed schema
-scripts/nerd-font-table PATH/nerd_font_tables.zig   # regenerate src/nerd_font_table.rs from Ghostty's generated table, then cargo fmt
+scripts/nerd-font-table PATH/nerd_font_tables.zig   # regenerate crates/benches-font/src/nerd_font_table.rs from Ghostty's generated table, then cargo fmt
 scripts/bundle                              # release build into a signed target/release/Benches.app, without installing
 scripts/install                             # scripts/bundle, then into ~/Applications/Benches.app, relaunching a running copy
 scripts/icon                                # regenerate assets/benches.icns from scripts/icon.swift
@@ -32,6 +32,13 @@ scripts/icon                                # regenerate assets/benches.icns fro
 Publishing a GitHub release for a `vX.Y.Z` tag runs `.github/workflows/release.yml`, which bundles an ad hoc signed Apple Silicon build versioned from the tag and attaches it to the release as a zip.
 
 ## Architecture
+
+The repository is a Cargo workspace:
+
+- `crates/benches-platform` (`platform.rs`): OS services, so far opening a URL and revealing a file. `notify.rs`, `secure_input.rs` and the `session.rs` process queries move here next.
+- `crates/benches-font` (`font.rs` is the crate root): `font`, `constraint`, `sprite` and `nerd_font_table`, with `DEFAULT_FONT_FAMILY` and the `Fnv` hasher.
+- `crates/benches-core` (`core.rs`, which also holds `LogErr`): `actor`, `protocol`, `grid`, `terminal_input`, `link`, `search`, `images`, `config` and `history`.
+- The root `benches` package: `app`, `view`, `input`, `render`, `session`, `workspace`, `windows`, `palette`, `keymap`, `find`, `jump`, `scenes`, `notify`, `secure_input` and `main`.
 
 Data flows one way from the PTY to the screen, and each `Session` owns its own threads:
 
@@ -48,16 +55,18 @@ shell <-> PTY --reader thread--> bounded channel --> actor thread (owns Terminal
 - **Spawning**: `openpty` plus `login_tty` in `pre_exec`. Only async-signal-safe calls may run between fork and exec, because the app is multi-threaded.
 - **`render.rs`**: a Rune `Compositor` that draws into the `effect(TERMINAL_MARK)` slot declared in `view` with a custom wgpu pass (`cell.wgsl`). Glyphs live in a shared atlas and quads are instanced; a `Slot` per effect mark rebuilds only when generation, rect, atlas epoch or blend mode changes. The compositor also derives cols and rows from the slot size and sends `Session::resize`. The actor applies a new grid size, and so sends SIGWINCH, only once it has held for `RESIZE_SETTLE`, because inline TUIs such as Claude Code reprint on every SIGWINCH.
 - **`font.rs`**: CoreText shaping and fallback through `CTLine`, rasterised into whole-cell premultiplied RGBA bitmaps in device pixels. A glyph with any `rgb != alpha` pixel is treated as colour, so font smoothing must stay off. The atlas resets when the scale changes.
-- **`constraint.rs`** and **`nerd_font_table.rs`**: Ghostty's `Constraint`/`constrain` (size modes, scale groups, padding, `icon_height`) over `font.rs` metrics (`adjust-icon-height` scales its icon heights), with Ghostty's `isSymbol` rule fitting non-Nerd-Font symbols (arrows, dingbats, pictographs) and the per-codepoint table generated from Ghostty's `nerd_font_tables.zig` (libghostty-vt's build leaves it under `target/*/build/libghostty-vt-sys-*/out/ghostty-src/src/font/`). The bundled `SymbolsNerdFont-Regular.ttf` must be the non-Mono font Ghostty embeds, as the scale groups were measured from its glyph bounds.
+- **`constraint.rs`** and **`nerd_font_table.rs`**: Ghostty's `Constraint`/`constrain` (size modes, scale groups, padding, `icon_height`) over `font.rs` metrics (`adjust-icon-height` scales its icon heights), with Ghostty's `isSymbol` rule fitting non-Nerd-Font symbols (arrows, dingbats, pictographs) and the per-codepoint table generated from Ghostty's `nerd_font_tables.zig` (libghostty-vt's build leaves it under `target/*/build/libghostty-vt-sys-*/out/ghostty-src/src/font/`). The bundled `crates/benches-font/assets/SymbolsNerdFont-Regular.ttf` must be the non-Mono font Ghostty embeds, as the scale groups were measured from its glyph bounds.
 - **`sprite.rs`**: procedural box drawing, blocks, Powerline glyphs and tiling underlines, so they meet their neighbours with no seams.
 - **`workspace.rs`**: projects (folders) holding tabs and a tray, each with its own `Session`. Selection hides the outgoing session and shows the incoming one: a hidden session keeps reading its PTY but doesn't publish grids or wake the UI, so a flood in a background tab costs nothing on the UI thread. The compositor resizes every session to the terminal area, so hidden tabs are already the right size when shown, and keys its quad cache by session id because generations restart per session.
 - **Windows**: each window has its own `State` and `Workspace`, so selection, hidden sessions and sizing stay per window. `Fleet` (in `windows.rs`) hands a `Project` to another window's inbox, which takes it in `poll` and retargets each tab's `Retarget` waker. Closing a torn-off window merges its projects back into the main window; closing the main window quits. Torn-off windows aren't restored: the layout saved at quit lists their projects after the main window's.
 - **Reported directory**: the actor stores the local pwd from `on_pwd_changed` (OSC 7/9;9/1337, parsed in `link.rs`, ignoring other hosts), and `Session::cwd` prefers it over `proc_pidinfo`.
-- **`app.rs`**: `State`, `window_app` (the `AppSpec` and hooks), `poll`, `on_key` and the tab, layout and close-confirm logic. `main.rs` is only the entry point, `config` CLI dispatch and the crate-wide `LogErr`.
+- **`app.rs`**: `State`, `window_app` (the `AppSpec` and hooks), `poll`, `on_key` and the tab, layout and close-confirm logic. `main.rs` is only the entry point and `config` CLI dispatch.
 - **`input.rs`**: maps Rune key events to `KeyInput`; the actor encodes them with libghostty's encoder using the terminal's current modes. Returning `None` from `map_key` keeps a key (such as a ⌘ chord) away from the terminal.
 - **Pointer input** (`terminal_input.rs`): the UI sends raw `Msg::Pointer` and `Msg::Wheel`, and `TerminalInput` on the actor decides between mouse reports, selection, alt-screen arrows and scrollback, because only the actor knows the terminal's modes.
 
-Dependencies run one way, UI down to core: `app`/`view`/`input`/`render` -> `session` -> `actor` -> `protocol` -> `grid`/`terminal_input`. Core modules (`actor`, `protocol`, `grid`, `terminal_input`, `config`, `font`, `constraint`, `sprite`, `link`, `notify`) must not import `app`, `view`, `input`, `render`, `workspace` or `session`, and use Rune only for `Waker` (and in tests), so they can move into their own crate once a second frontend needs them.
+Dependencies run one way, UI down to core: `app`/`view`/`input`/`render` -> `session` -> `actor` -> `protocol` -> `grid`/`terminal_input`. Across crates, `benches` -> `benches-core` -> `benches-font` and `benches-platform`; the font and platform crates depend on neither core nor each other, and the font crate stays free of libghostty. Core doesn't depend on Rune (its `Waker` is the same type as Rune's), so a second frontend can reuse it.
+
+Core and font helpers that the app's tests share (`test_support`, `Font::new`, `Grid::lines`) sit behind each crate's `test-support` feature, which the root enables as a dev-dependency. The feature only exposes helpers: Cargo unifies features across one build, so `--all-targets` would hand it to the dev binary too. Test-only behaviour, such as `app::default_config`'s `/bin/sh` shell, belongs in the app under `cfg!(test)`.
 
 `Grid::from_vt` (`grid.rs`) and `Session::fixture` give a process-free grid for tests and scenes.
 

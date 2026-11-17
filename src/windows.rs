@@ -4,10 +4,10 @@ use std::rc::Rc;
 
 use rune::{Tx, Waker, WindowSpec};
 
-use crate::LogErr;
 use crate::app::{State, default_config, dismiss_confirms, save_layout, window_app};
-use crate::config::Config;
 use crate::workspace::{Project, SavedWorkspace};
+use benches_core::LogErr;
+use benches_core::config::Config;
 
 pub(crate) type WindowId = u32;
 
@@ -283,12 +283,12 @@ pub(crate) fn adopt_projects(state: &mut State) -> bool {
 mod tests {
     use super::*;
     use crate::app::{Confirm, open_tab};
-    use crate::config::Paths;
-    use crate::protocol::Visibility;
     use crate::scenes::fixture_tab;
     use crate::session::Session;
     use crate::test_support::*;
     use crate::view::SIDEBAR_WIDTH;
+    use benches_core::config::Paths;
+    use benches_core::protocol::Visibility;
     use libghostty_vt::effect::ClipboardLocation;
     use rune::Runtime;
     use std::cell::Cell;

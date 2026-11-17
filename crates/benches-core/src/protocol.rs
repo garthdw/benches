@@ -7,7 +7,7 @@ use crate::config::TerminalSettings;
 use crate::grid::Surface;
 use crate::terminal_input::{KeyInput, PointerInput, PointerPhase, WheelInput};
 
-pub(crate) enum Msg {
+pub enum Msg {
     Key(KeyInput),
     Focus(bool),
     Pointer(PointerInput),
