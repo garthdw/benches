@@ -1,6 +1,8 @@
 targets = ["aarch64-apple-darwin", "x86_64-apple-darwin"]
 ignore-build-dependencies = true
 ignore-dev-dependencies = true
+# Unpublished crates: the workspace's own, and Rune internals that the `rune` entry covers.
+private = { ignore = true }
 accepted = [
     "0BSD",
     "Apache-2.0",
