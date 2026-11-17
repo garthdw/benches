@@ -18,11 +18,7 @@ use crate::Link;
 use crate::notify::Notification;
 
 pub fn open(link: &Link) -> io::Result<()> {
-    let status = open_command(link).status()?;
-    if !status.success() {
-        return Err(io::Error::other(format!("open {status}")));
-    }
-    Ok(())
+    crate::run(open_command(link))
 }
 
 fn open_command(link: &Link) -> Command {

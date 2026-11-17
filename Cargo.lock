@@ -441,11 +441,14 @@ name = "benches-platform"
 version = "0.1.0"
 dependencies = [
  "block2 0.6.2",
+ "futures-util",
  "libc",
  "objc2 0.6.5",
  "objc2-core-foundation",
  "objc2-foundation 0.3.2",
  "objc2-user-notifications 0.3.2",
+ "tokio",
+ "zbus 6.3.0",
 ]
 
 [[package]]

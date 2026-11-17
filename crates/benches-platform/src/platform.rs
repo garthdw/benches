@@ -2,14 +2,19 @@
 
 use std::io;
 use std::path::PathBuf;
+use std::process::Command;
 
+#[cfg(target_os = "linux")]
+mod linux;
+#[cfg(target_os = "linux")]
+use linux as os;
 #[cfg(target_os = "macos")]
 mod macos;
 #[cfg(target_os = "macos")]
 use macos as os;
 
-#[cfg(not(target_os = "macos"))]
-compile_error!("benches-platform supports macOS only");
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+compile_error!("benches-platform supports Linux and macOS only");
 
 /// What clicking a link opens. A file is shown in the file manager rather than opened, because
 /// opening would launch an `.app` or `.command` that program output merely named.
@@ -22,6 +27,15 @@ pub enum Link {
 /// Blocks until the opener has run, so call it off the UI thread.
 pub fn open(link: &Link) -> io::Result<()> {
     os::open(link)
+}
+
+fn run(mut command: Command) -> io::Result<()> {
+    let status = command.status()?;
+    if !status.success() {
+        let program = command.get_program().to_string_lossy().into_owned();
+        return Err(io::Error::other(format!("{program} {status}")));
+    }
+    Ok(())
 }
 
 /// A process's working directory, which follows the shell's `cd`.
@@ -59,7 +73,7 @@ pub fn set_secure_input(enabled: bool) -> io::Result<()> {
 pub mod notify {
     use crate::os;
 
-    #[derive(Debug, PartialEq)]
+    #[derive(Clone, Debug, PartialEq)]
     pub struct Notification {
         pub title: String,
         pub subtitle: String,
