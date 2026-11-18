@@ -116,6 +116,9 @@ trait Backend {
 
     /// `None` when `family` isn't installed, rather than whatever the system substitutes.
     fn installed_face(&self, family: &str, pixels: f64) -> Option<Self::Face>;
+    /// The system's generic monospace family, the last choice when neither the configured family
+    /// nor the default is installed.
+    fn monospace_family(&self) -> Option<String>;
     /// `None` when the family has no such style.
     fn styled(&self, face: &Self::Face, style: FontStyle) -> Option<Self::Face>;
     fn embedded_face(&self, bytes: &'static [u8], pixels: f64) -> Result<Self::Face>;
@@ -312,14 +315,28 @@ impl Font {
     ) -> Result<Self> {
         let pixels = points * f64::from(scale);
         let backend = Os::new();
-        let faces = family_faces(&backend, family, pixels)
-            .or_else(|| {
-                eprintln!(
-                    "benches: font family {family} isn't installed; using {DEFAULT_FONT_FAMILY}"
-                );
-                family_faces(&backend, DEFAULT_FONT_FAMILY, pixels)
+        let monospace = backend.monospace_family();
+        let mut tried = Vec::new();
+        let faces = [family, DEFAULT_FONT_FAMILY]
+            .into_iter()
+            .chain(monospace.as_deref())
+            .filter(|candidate| {
+                let new = !tried.contains(candidate);
+                tried.push(*candidate);
+                new
             })
-            .with_context(|| format!("neither {family} nor {DEFAULT_FONT_FAMILY} is installed"))?;
+            .find_map(|candidate| {
+                let faces = family_faces(&backend, candidate, pixels);
+                if faces.is_none() {
+                    eprintln!("benches: font family {candidate} isn't installed; trying the next");
+                }
+                faces
+            })
+            .with_context(|| {
+                format!(
+                    "none of {family}, {DEFAULT_FONT_FAMILY} or a monospace family is installed"
+                )
+            })?;
         let features = parse_features(features);
         let faces = faces.map(|face| Os::with_features(face, &features));
         let regular = &faces[0];
@@ -855,6 +872,16 @@ mod tests {
     fn an_unknown_family_falls_back_to_monaspace_neon() {
         let font = Font::new("No Such Family", 13.0, 2.0).unwrap();
         assert_eq!(face_names(&font)[0], "MonaspaceNeon-Regular");
+    }
+
+    #[test]
+    fn the_system_monospace_family_is_installed() {
+        let backend = Os::new();
+        let monospace = backend.monospace_family().unwrap();
+        assert!(
+            family_faces(&backend, &monospace, 26.0).is_some(),
+            "{monospace}"
+        );
     }
 
     #[test]
