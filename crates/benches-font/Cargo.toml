@@ -15,7 +15,27 @@ anyhow.workspace = true
 objc2-core-foundation.workspace = true
 objc2-core-graphics = "0.3"
 objc2-core-text = "0.3"
+fontique = { workspace = true, optional = true }
+harfrust = { workspace = true, optional = true }
+swash = { workspace = true, optional = true }
+icu_properties = { workspace = true, optional = true }
+unicode-segmentation = { workspace = true, optional = true }
+
+[target.'cfg(not(target_os = "macos"))'.dependencies]
+fontique.workspace = true
+harfrust.workspace = true
+swash.workspace = true
+icu_properties.workspace = true
+unicode-segmentation.workspace = true
 
 [features]
+# The backend other systems use, in place of CoreText on macOS.
+swash = [
+  "dep:fontique",
+  "dep:harfrust",
+  "dep:swash",
+  "dep:icu_properties",
+  "dep:unicode-segmentation",
+]
 # Test helpers shared with the app's tests.
 test-support = []
