@@ -128,30 +128,11 @@ pub const COMMANDS: &[CommandSpec] = &[
     spec(Command::ReloadConfig, "Reload config", Some("mod+shift+,")),
 ];
 
-/// A chord such as `mod+shift+]` the way macOS menus show it: `⇧⌘]`.
+/// A chord as this platform draws it: `⇧⌘]` on macOS, `Ctrl+Shift+]` on Linux.
 pub fn chord_hint(chord: &str) -> String {
-    let mut modifiers = ['⌃', '⌥', '⇧', '⌘'].map(|symbol| (symbol, false));
-    let mut key = String::new();
-    for part in chord.split('+') {
-        let symbol = match part {
-            "ctrl" => '⌃',
-            "alt" => '⌥',
-            "shift" => '⇧',
-            "mod" => '⌘',
-            _ => {
-                key = part.to_uppercase();
-                continue;
-            }
-        };
-        for (candidate, held) in &mut modifiers {
-            *held |= *candidate == symbol;
-        }
-    }
-    let held = modifiers
-        .iter()
-        .filter(|(_, held)| *held)
-        .map(|(symbol, _)| symbol);
-    held.copied().chain(key.chars()).collect()
+    Chord::parse(chord)
+        .map(|chord| chord.label())
+        .unwrap_or_default()
 }
 
 impl Command {
@@ -165,6 +146,10 @@ impl Command {
 
     pub fn chord(self) -> Option<&'static str> {
         self.find_spec().and_then(|spec| spec.chord)
+    }
+
+    pub fn hint(self) -> Option<String> {
+        self.chord().map(chord_hint)
     }
 }
 
@@ -198,14 +183,20 @@ pub fn pressed(binding: &str, event: &KeyEvent, tx: &Tx) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rune::KeyPlatform;
 
     #[test]
-    fn chords_read_like_macos_menus() {
-        assert_eq!(chord_hint("mod+t"), "⌘T");
-        assert_eq!(chord_hint("mod+shift+]"), "⇧⌘]");
-        assert_eq!(chord_hint("mod+="), "⌘=");
-        assert_eq!(chord_hint("ctrl+c"), "⌃C");
-        assert_eq!(chord_hint("alt+shift+mod+x"), "⌥⇧⌘X");
+    fn hints_use_the_platforms_glyphs_or_words() {
+        let hint = |chord, platform| Chord::parse(chord).unwrap().label_on(platform);
+        assert_eq!(hint("mod+t", KeyPlatform::Mac), "⌘T");
+        assert_eq!(hint("mod+shift+]", KeyPlatform::Mac), "⇧⌘]");
+        assert_eq!(hint("alt+shift+mod+x", KeyPlatform::Mac), "⌥⇧⌘X");
+        assert_eq!(hint("ctrl+shift+t", KeyPlatform::Linux), "Ctrl+Shift+T");
+        assert_eq!(hint("ctrl+pageup", KeyPlatform::Linux), "Ctrl+Page Up");
+        assert_eq!(
+            chord_hint(Command::NewShell.chord().unwrap()),
+            hint(Command::NewShell.chord().unwrap(), KeyPlatform::current())
+        );
     }
 
     #[test]

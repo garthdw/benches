@@ -770,6 +770,7 @@ pub(crate) fn view(
 ) -> Option<El> {
     state.palette.open.then(|| {
         let rows = state.palette_rows(state.command_held);
+        let (return_key, command_return) = (chord_hint("enter"), chord_hint("mod+enter"));
         let elements: Vec<El> = if state.palette.creation.is_some() {
             vec![pill("palette-0".to_owned(), "Creating worktree…", false, None).w_full()]
         } else if let Some(choice) = &state.palette.worktrees {
@@ -783,7 +784,10 @@ pub(crate) fn view(
                 let branch = worktree.branch.as_deref().unwrap_or("(detached)");
                 let label = format!("{branch}  {}", jump::abbreviate_home(&worktree.path));
                 pill(format!("palette-{index}"), &label, index == selected, None)
-                    .children(enter_hint(theme, (index == selected).then_some("↵")))
+                    .children(enter_hint(
+                        theme,
+                        (index == selected).then_some(return_key.as_str()),
+                    ))
                     .justify_between()
                     .w_full()
                     .on_pointer_move(select_on_pointer_move(index))
@@ -800,28 +804,27 @@ pub(crate) fn view(
                 .enumerate()
                 .map(|(index, action)| {
                     let is_selected = index == selected;
-                    let chord = match action {
-                        Action::Command(command) => COMMANDS
-                            .iter()
-                            .find(|spec| spec.command == *command)
-                            .and_then(|spec| spec.chord),
+                    let hint = match action {
+                        Action::Command(command) => command.hint(),
                         _ => None,
                     };
                     let alternative = match action {
-                        Action::Run(_) => Some("⌘↵ in the tray"),
-                        Action::Jump(_) => Some("⌘↵ worktrees"),
+                        Action::Run(_) => Some(format!("{command_return} in the tray")),
+                        Action::Jump(_) => Some(format!("{command_return} worktrees")),
                         _ => None,
                     }
                     .filter(|_| is_selected && !state.command_held);
                     let enter = match (is_selected, state.command_held) {
                         (false, _) => None,
-                        (true, false) => Some("↵"),
-                        (true, true) => action.takes_command_enter().then_some("⌘↵"),
+                        (true, false) => Some(return_key.as_str()),
+                        (true, true) => action
+                            .takes_command_enter()
+                            .then_some(command_return.as_str()),
                     };
                     let shortcuts = row()
                         .gap(8.0)
-                        .children(chord.map(|chord| {
-                            text(chord_hint(chord))
+                        .children(hint.map(|hint| {
+                            text(hint)
                                 .key("palette-shortcut")
                                 .color(theme.text_secondary)
                         }))
