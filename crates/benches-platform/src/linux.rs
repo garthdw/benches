@@ -94,6 +94,9 @@ pub fn system_locale() -> Option<String> {
 
 pub const FALLBACK_LOCALE: &str = "C.UTF-8";
 
+/// Every POSIX system has it, unlike zsh.
+pub const FALLBACK_SHELL: &str = "/bin/sh";
+
 /// Linux keeps a nice value per thread, so this lowers only the calling one.
 pub fn lower_thread_priority() -> io::Result<()> {
     // SAFETY: changes only the calling thread's nice value.

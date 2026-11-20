@@ -361,8 +361,8 @@ pub(crate) fn save_layout(state: &State) -> anyhow::Result<()> {
         return Ok(());
     };
     let json = serde_json::to_string_pretty(&layout)?;
-    std::fs::create_dir_all(&paths.dir)
-        .with_context(|| format!("create {}", paths.dir.display()))?;
+    std::fs::create_dir_all(&paths.state_dir)
+        .with_context(|| format!("create {}", paths.state_dir.display()))?;
     let temporary = path.with_extension("json.tmp");
     std::fs::write(&temporary, json).with_context(|| format!("write {}", temporary.display()))?;
     std::fs::rename(&temporary, &path).with_context(|| format!("replace {}", path.display()))?;

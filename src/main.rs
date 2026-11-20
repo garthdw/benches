@@ -14,22 +14,31 @@ mod view;
 mod windows;
 mod workspace;
 
-use std::path::PathBuf;
+use std::io::IsTerminal;
 
 use anyhow::Context;
 use app::window_app;
 use benches_core::{LogErr, config};
 use windows::{Fleet, MAIN_WINDOW};
 
-/// A bundle launched from Finder has its stderr discarded, so send it to a file instead.
-fn log_to_file_in_bundle() -> anyhow::Result<()> {
+/// An app launched from Finder or a desktop launcher has its stderr discarded or buried in the
+/// system log, so send it to a file instead.
+fn log_to_file_without_terminal() -> anyhow::Result<()> {
     use std::os::fd::AsRawFd;
 
-    if !app::in_bundle() {
+    let launched_without_terminal = if cfg!(target_os = "macos") {
+        app::in_bundle()
+    } else {
+        !std::io::stderr().is_terminal()
+    };
+    if !launched_without_terminal {
         return Ok(());
     }
-    let home = std::env::var_os("HOME").context("HOME is unset")?;
-    let path = PathBuf::from(home).join("Library/Logs/benches.log");
+    let path = benches_platform::dirs::log_file(&|name| std::env::var_os(name))
+        .context("HOME is unset")?;
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
+    }
     let file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -52,7 +61,7 @@ fn log_to_file_in_bundle() -> anyhow::Result<()> {
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if let Some((_, config_args)) = args.split_first().filter(|(name, _)| *name == "config") {
-        let result = config::Paths::from_home()
+        let result = config::Paths::from_env()
             .context("HOME is not set")
             .and_then(|paths| config::command(config_args, &paths, &mut std::io::stdout()));
         if let Err(error) = result {
@@ -61,10 +70,10 @@ fn main() {
         }
         return;
     }
-    log_to_file_in_bundle().log_err("log file");
+    log_to_file_without_terminal().log_err("log file");
     let fleet = Fleet::default();
     let app = window_app(&fleet, MAIN_WINDOW, |state| {
-        state.paths = config::Paths::from_home();
+        state.paths = config::Paths::from_env();
         windows::load_config(state);
     });
     let handle = app.handle();

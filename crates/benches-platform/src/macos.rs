@@ -62,6 +62,8 @@ pub fn system_locale() -> Option<String> {
 
 pub const FALLBACK_LOCALE: &str = "en_US.UTF-8";
 
+pub const FALLBACK_SHELL: &str = "/bin/zsh";
+
 pub fn full_disk_access_settings() -> Option<Link> {
     let home = std::env::var_os("HOME")?;
     // Every Mac has this file, and only Full Disk Access lets a process read it.

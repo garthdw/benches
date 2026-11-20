@@ -760,10 +760,15 @@ impl GridBuilder {
     }
 }
 
-/// The bundled compiled terminfo directory, found relative to `exe` inside a `.app`.
+/// The compiled terminfo directory installed with `exe`, if it holds `xterm-ghostty`. ncurses
+/// on macOS files entries under the first letter's hex code (`78`), and on Linux under the
+/// letter itself.
 pub fn bundled_terminfo(exe: &Path) -> Option<PathBuf> {
-    let dir = exe.parent()?.parent()?.join("Resources/terminfo");
-    dir.join("78/xterm-ghostty").is_file().then_some(dir)
+    let dir = benches_platform::dirs::terminfo_dir(exe)?;
+    ["78", "x"]
+        .iter()
+        .any(|letter| dir.join(letter).join("xterm-ghostty").is_file())
+        .then_some(dir)
 }
 
 pub fn terminfo_name(bundled: Option<&Path>) -> &'static str {
@@ -968,18 +973,20 @@ mod tests {
     }
 
     #[test]
-    fn terminfo_is_bundled_only_when_the_entry_exists() {
-        let root = tempfile::tempdir().unwrap();
-        let exe = root.path().join("Contents/MacOS/benches");
-        assert_eq!(bundled_terminfo(&exe), None);
-        assert_eq!(terminfo_name(None), "xterm-256color");
+    fn terminfo_is_bundled_only_when_the_entry_exists_in_either_layout() {
+        for layout in ["78", "x"] {
+            let root = tempfile::tempdir().unwrap();
+            let exe = root.path().join("bin/benches");
+            assert_eq!(bundled_terminfo(&exe), None);
+            assert_eq!(terminfo_name(None), "xterm-256color");
 
-        let entry = root.path().join("Contents/Resources/terminfo/78");
-        std::fs::create_dir_all(&entry).unwrap();
-        std::fs::write(entry.join("xterm-ghostty"), "").unwrap();
-        let dir = bundled_terminfo(&exe);
-        assert_eq!(dir, Some(root.path().join("Contents/Resources/terminfo")));
-        assert_eq!(terminfo_name(dir.as_deref()), "xterm-ghostty");
+            let installed = benches_platform::dirs::terminfo_dir(&exe).unwrap();
+            std::fs::create_dir_all(installed.join(layout)).unwrap();
+            std::fs::write(installed.join(layout).join("xterm-ghostty"), "").unwrap();
+            let dir = bundled_terminfo(&exe);
+            assert_eq!(dir.as_ref(), Some(&installed), "{layout}");
+            assert_eq!(terminfo_name(dir.as_deref()), "xterm-ghostty");
+        }
     }
 
     #[test]

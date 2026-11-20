@@ -4,6 +4,7 @@ use std::io;
 use std::path::PathBuf;
 use std::process::Command;
 
+pub mod dirs;
 #[cfg(target_os = "linux")]
 mod linux;
 #[cfg(target_os = "linux")]
@@ -55,6 +56,9 @@ pub fn system_locale() -> Option<String> {
 
 /// The locale children get when the user's own isn't installed.
 pub const FALLBACK_LOCALE: &str = os::FALLBACK_LOCALE;
+
+/// The shell when neither `$SHELL` nor the password database names one that runs.
+pub const FALLBACK_SHELL: &str = os::FALLBACK_SHELL;
 
 /// Lowers the calling thread's priority, for background work that mustn't slow the UI.
 pub fn lower_thread_priority() -> io::Result<()> {

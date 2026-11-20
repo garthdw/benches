@@ -36,7 +36,7 @@ Publishing a GitHub release for a `vX.Y.Z` tag runs `.github/workflows/release.y
 
 The repository is a Cargo workspace:
 
-- `crates/benches-platform` (`platform.rs`): OS services, so far opening a URL and revealing a file. `notify.rs`, `secure_input.rs` and the `session.rs` process queries move here next.
+- `crates/benches-platform` (`platform.rs`): OS services, so far opening a URL and revealing a file, and `dirs.rs`, the XDG-aware folders for config, state, logs, Ghostty's themes and the installed terminfo. `notify.rs`, `secure_input.rs` and the `session.rs` process queries move here next.
 - `crates/benches-font` (`font.rs` is the crate root): `font`, `coretext`, `swash`, `constraint`, `sprite` and `nerd_font_table`, with `DEFAULT_FONT_FAMILY` and the `Fnv` hasher.
 - `crates/benches-core` (`core.rs`, which also holds `LogErr`): `actor`, `protocol`, `grid`, `terminal_input`, `link`, `search`, `images`, `config` and `history`.
 - The root `benches` package: `app`, `view`, `input`, `render`, `session`, `workspace`, `windows`, `palette`, `keymap`, `find`, `jump`, `scenes`, `notify`, `secure_input` and `main`.

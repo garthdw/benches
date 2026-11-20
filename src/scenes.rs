@@ -332,7 +332,7 @@ mod tests {
     fn scenes_read_and_write_no_files() {
         for (name, scene) in SCENES {
             let mut state = State {
-                paths: config::Paths::from_home(),
+                paths: config::Paths::from_env(),
                 ..State::default()
             };
             scene(&mut state);
