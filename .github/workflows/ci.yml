@@ -28,3 +28,49 @@ jobs:
       - run: cargo fmt --check
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test
+
+  # Rune has no Linux CI, so this is also the first to catch its Linux regressions. rustfmt checks
+  # every file whatever the cfg, so `cargo fmt --check` only runs on macOS.
+  linux:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+
+      # libghostty-vt builds with zig.
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: 0.17.1
+
+      # Winit and fontique's headers; the fonts the tests expect (the `monospace` family, emoji,
+      # and Unifont as a single-face family); zsh, which tests otherwise skip; and lavapipe's
+      # software Vulkan for `--snap`.
+      - run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config libxkbcommon-dev libwayland-dev libfontconfig-dev \
+            fontconfig fonts-dejavu-core fonts-noto-color-emoji fonts-unifont \
+            zsh \
+            mesa-vulkan-drivers libvulkan1
+
+      # The default font. The static build, as earlier releases put icons in its private use area.
+      - run: |
+          curl -fsSL -o "$RUNNER_TEMP/monaspace.zip" \
+            https://github.com/githubnext/monaspace/releases/download/v1.400/monaspace-static-v1.400.zip
+          unzip -q "$RUNNER_TEMP/monaspace.zip" -d "$RUNNER_TEMP/monaspace"
+          mkdir -p ~/.local/share/fonts
+          find "$RUNNER_TEMP/monaspace" -name 'MonaspaceNeon-*.otf' -exec cp {} ~/.local/share/fonts/ \;
+          fc-cache -f
+          fc-list | grep MonaspaceNeon-Regular
+
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test
+
+      - run: cargo run -- --snap fixture.png --scene fixture --size 620x300
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: linux-fixture
+          path: fixture.png
+          if-no-files-found: error
