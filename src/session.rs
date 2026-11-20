@@ -484,7 +484,7 @@ mod tests {
     use benches_core::config::Theme;
     use benches_core::grid::{FRAME, GridBuilder, Presentation, Scrollbar, new_terminal};
     use benches_core::protocol::{Progress, ProgressKind};
-    use benches_core::terminal_input::TerminalInput;
+    use benches_core::terminal_input::{LINK_MODS, TerminalInput};
     use benches_core::test_support::{TEST_SURFACE, pointer_at, wheel_by};
     use libghostty_vt::color::Rgb;
     use libghostty_vt::render::CursorVisualStyle;
@@ -818,7 +818,7 @@ mod tests {
                 .all(|cell| cell.underline == Underline::Single)
         };
         session.pointer(PointerInput {
-            mods: key::Mods::SUPER,
+            mods: LINK_MODS,
             ..pointer_at(PointerPhase::Move, 3, u16::try_from(row).unwrap())
         });
         wait_until(
@@ -847,7 +847,7 @@ mod tests {
             .position(|line| line.trim_end() == "https://a.te/x")
             .unwrap();
         session.pointer(PointerInput {
-            mods: key::Mods::SUPER,
+            mods: LINK_MODS,
             ..pointer_at(PointerPhase::Move, 3, u16::try_from(row).unwrap())
         });
         let wait_for_hover = |want: Hover| {
