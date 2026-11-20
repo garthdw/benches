@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use rune::color::Color;
 use rune::tok;
-use rune::{El, Key, KeyEvent, Mods, Span, TextEdit, Tx, Waker, col, el, text, text_input};
+use rune::{El, Key, KeyEvent, Mods, Span, TextEdit, Tx, Waker, col, el, row, text, text_input};
 
 use crate::app::{State, open_project, open_tab, open_tray, run_command, tray_action};
 use crate::jump;
@@ -751,6 +751,18 @@ pub(crate) fn poll_jump(state: &mut State, now: f64, tx: &mut Tx) -> bool {
     changed
 }
 
+fn enter_hint(theme: &tok::Theme, selected: bool) -> Option<El> {
+    selected.then(|| text("↵").key("palette-enter").color(theme.text_secondary))
+}
+
+fn select_on_hover(index: usize) -> impl Fn(&mut State, bool, &mut Tx) {
+    move |state, hovered, _| {
+        if hovered {
+            state.palette.selected = index;
+        }
+    }
+}
+
 pub(crate) fn view(
     state: &State,
     theme: &tok::Theme,
@@ -771,7 +783,10 @@ pub(crate) fn view(
                 let branch = worktree.branch.as_deref().unwrap_or("(detached)");
                 let label = format!("{branch}  {}", jump::abbreviate_home(&worktree.path));
                 pill(format!("palette-{index}"), &label, index == selected, None)
+                    .children(enter_hint(theme, index == selected))
+                    .justify_between()
                     .w_full()
+                    .on_hover_change(select_on_hover(index))
                     .on_press(move |state: &mut State| open_worktree(state, index))
             });
             placeholder.into_iter().chain(worktrees).collect()
@@ -784,33 +799,56 @@ pub(crate) fn view(
                 .iter()
                 .enumerate()
                 .map(|(index, action)| {
-                    let shortcut = match action {
-                        Action::Run(_) => Some("⌘↵ tray".to_owned()),
-                        Action::Jump(_) => Some("⌘↵ worktrees".to_owned()),
+                    let is_selected = index == selected;
+                    let chord = match action {
                         Action::Command(command) => COMMANDS
                             .iter()
                             .find(|spec| spec.command == *command)
-                            .and_then(|spec| spec.chord)
-                            .map(chord_hint),
+                            .and_then(|spec| spec.chord),
+                        _ => None,
+                    };
+                    let alternative = match action {
+                        Action::Run(_) => Some("⌘↵ in the tray"),
+                        Action::Jump(_) => Some("⌘↵ worktrees"),
                         _ => None,
                     }
-                    .map(|hint| {
-                        text(&hint)
-                            .key("palette-shortcut")
-                            .color(theme.text_secondary)
-                    });
-                    pill(
-                        format!("palette-{index}"),
-                        &action.label(&state.config.working_directory),
-                        index == selected,
-                        None,
-                    )
-                    .children(shortcut)
-                    .justify_between()
-                    .w_full()
-                    .on_press_tx(move |state: &mut State, tx: &mut Tx| {
-                        run_palette(state, index, state.command_held, tx)
-                    })
+                    .filter(|_| is_selected);
+                    let shortcuts = row()
+                        .gap(8.0)
+                        .children(chord.map(|chord| {
+                            text(chord_hint(chord))
+                                .key("palette-shortcut")
+                                .color(theme.text_secondary)
+                        }))
+                        .children(enter_hint(theme, is_selected));
+                    let label = action.label(&state.config.working_directory);
+                    col()
+                        .key(format!("palette-{index}"))
+                        .w_full()
+                        .radius(6.0)
+                        .fill(if is_selected {
+                            theme.control_off
+                        } else {
+                            Color::TRANSPARENT
+                        })
+                        .child(
+                            pill(format!("palette-{index}-label"), &label, false, None)
+                                .child(shortcuts)
+                                .justify_between()
+                                .w_full(),
+                        )
+                        .children(alternative.map(|alternative| {
+                            text(alternative)
+                                .key("palette-alternative")
+                                .font(tok::type_::LABEL)
+                                .color(theme.text_secondary)
+                                .px(10.0)
+                                .pb(4.0)
+                        }))
+                        .on_hover_change(select_on_hover(index))
+                        .on_press_tx(move |state: &mut State, tx: &mut Tx| {
+                            run_palette(state, index, state.command_held, tx)
+                        })
                 })
                 .collect()
         };
@@ -923,11 +961,40 @@ mod tests {
     }
 
     #[test]
-    fn the_tray_row_shows_its_shortcut() {
+    fn the_run_row_hints_at_the_tray_until_command_is_held() {
         let mut runtime = palette_runtime();
         press(&mut runtime, Key::Text("x".into()), Mods::default());
         runtime.frame(0.0);
-        assert!(runtime.find("palette-shortcut").is_some());
+        assert!(runtime.find("palette-alternative").is_some());
+        runtime.state.command_held = true;
+        runtime.invalidate();
+        runtime.frame(1.0 / 60.0);
+        assert!(runtime.find("palette-alternative").is_none());
+    }
+
+    #[test]
+    fn only_the_selected_row_shows_enter() {
+        let mut runtime = palette_runtime();
+        runtime.frame(0.0);
+        let row_y = |runtime: &Runtime<State>, key: &str| runtime.find(key).map(|(_, y)| y);
+        assert_eq!(
+            row_y(&runtime, "palette-enter"),
+            row_y(&runtime, "palette-0")
+        );
+        press(&mut runtime, Key::Down, Mods::default());
+        runtime.frame(1.0 / 60.0);
+        assert_eq!(
+            row_y(&runtime, "palette-enter"),
+            row_y(&runtime, "palette-1")
+        );
+    }
+
+    #[test]
+    fn hovering_a_row_selects_it() {
+        let mut runtime = palette_runtime();
+        runtime.frame(0.0);
+        hover(&mut runtime, "palette-2");
+        assert_eq!(runtime.state.palette.selected, 2);
     }
 
     #[test]
@@ -1244,7 +1311,7 @@ mod tests {
     fn the_jump_row_hints_at_worktrees() {
         let mut runtime = jump_runtime();
         runtime.frame(0.0);
-        assert!(runtime.find("palette-shortcut").is_some());
+        assert!(runtime.find("palette-alternative").is_some());
     }
 
     #[test]
@@ -1978,11 +2045,11 @@ mod tests {
     }
 
     #[test]
-    fn bang_rows_always_show_the_tray_shortcut() {
+    fn bang_rows_hint_at_the_tray() {
         let mut runtime = history_runtime();
         press(&mut runtime, Key::Text("!ls".into()), Mods::default());
         runtime.frame(0.0);
-        assert!(runtime.find("palette-shortcut").is_some());
+        assert!(runtime.find("palette-alternative").is_some());
     }
 
     #[test]
