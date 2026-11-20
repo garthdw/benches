@@ -1509,7 +1509,7 @@ mod tests {
         press(&mut runtime, Key::Enter, command());
         press(&mut runtime, Key::Escape, Mods::default());
         assert!(!runtime.state.palette.open);
-        press(&mut runtime, Key::Command('p'), command());
+        press_command(&mut runtime, Command::Palette);
         assert!(runtime.state.palette.worktrees.is_none());
     }
 
@@ -1720,7 +1720,7 @@ mod tests {
         state.config.shell = shell;
         state.workspace.projects[0].root = std::env::temp_dir();
         let mut runtime = runtime_with(state);
-        press(&mut runtime, Key::Command('p'), command());
+        press_command(&mut runtime, Command::Palette);
         press(
             &mut runtime,
             Key::Text(format!("wt {branch}")),
@@ -1827,7 +1827,7 @@ mod tests {
         state.config.shell = shell;
         state.config.jump_command = Some("j".to_owned());
         let mut runtime = runtime_with(state);
-        press(&mut runtime, Key::Command('p'), command());
+        press_command(&mut runtime, Command::Palette);
         press(&mut runtime, Key::Text("site".into()), Mods::default());
         runtime.frame(0.0);
         runtime.frame(1000.0);
@@ -2144,7 +2144,7 @@ mod tests {
         let mut state = workspace_state();
         state.config.jump_command = Some("j".to_owned());
         let mut runtime = runtime_with(state);
-        press(&mut runtime, Key::Command('p'), command());
+        press_command(&mut runtime, Command::Palette);
         press(&mut runtime, Key::Text("!site".into()), Mods::default());
         runtime.frame(0.5);
         assert!(runtime.state.palette.jump.due.is_none());

@@ -3,9 +3,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
-use rune::{Env, Key, KeyEvent, Mods, Runtime, Waker};
+use rune::{Chord, ChordKey, ChordMod, Env, Key, KeyEvent, KeyPlatform, Mods, Runtime, Waker};
 
 use crate::app::{State, on_key, poll};
+use crate::keymap::Command;
 use crate::scenes::show_workspace_scene;
 use crate::view::view;
 use crate::windows::{Fleet, WindowId};
@@ -37,7 +38,7 @@ pub(crate) fn workspace_runtime() -> Runtime<State> {
 
 pub(crate) fn palette_runtime() -> Runtime<State> {
     let mut runtime = workspace_runtime();
-    press(&mut runtime, Key::Command('p'), command());
+    press_command(&mut runtime, Command::Palette);
     runtime.frame(2.0 / 60.0);
     runtime
 }
@@ -66,26 +67,62 @@ pub(crate) fn settle(runtime: &mut Runtime<State>) {
     }
 }
 
+/// The modifiers the keyboard reports for these keys here: Rune sets `cmd` with ⌘ on macOS and
+/// with Ctrl elsewhere.
+fn held(ctrl: bool, alt: bool, shift: bool, logo: bool) -> Mods {
+    let cmd = if cfg!(target_os = "macos") {
+        logo
+    } else {
+        ctrl
+    };
+    Mods {
+        shift,
+        cmd,
+        alt,
+        ctrl,
+        logo,
+    }
+}
+
+/// The primary modifier held alone: ⌘ on macOS, Ctrl elsewhere.
 pub(crate) fn command() -> Mods {
-    Mods {
-        cmd: true,
-        logo: true,
-        ..Mods::default()
-    }
+    let mac = cfg!(target_os = "macos");
+    held(!mac, false, false, mac)
 }
 
-pub(crate) fn command_shift() -> Mods {
-    Mods {
-        shift: true,
-        ..command()
-    }
+/// The key event the keyboard sends for `chord` here, such as `mod+shift+]`.
+pub(crate) fn chord_event(chord: &str) -> KeyEvent {
+    let chord = Chord::parse(chord).unwrap();
+    let platform = KeyPlatform::current();
+    let has = |modifier| chord.mods_on(platform).contains(&modifier);
+    let primary = has(ChordMod::Primary);
+    let mac = platform == KeyPlatform::Mac;
+    let mods = held(
+        has(ChordMod::Ctrl) || (primary && !mac),
+        has(ChordMod::Alt),
+        has(ChordMod::Shift),
+        has(ChordMod::Super) || (primary && mac),
+    );
+    let key = match chord.key() {
+        ChordKey::Char(character) => Key::Command(character),
+        ChordKey::Enter => Key::Enter,
+        ChordKey::Up => Key::Up,
+        ChordKey::Down => Key::Down,
+        ChordKey::PageUp => Key::PageUp,
+        ChordKey::PageDown => Key::PageDown,
+        key => panic!("no test key for {key:?}"),
+    };
+    KeyEvent { key, mods }
 }
 
-pub(crate) fn control() -> Mods {
-    Mods {
-        ctrl: true,
-        ..Mods::default()
-    }
+pub(crate) fn press_chord(runtime: &mut Runtime<State>, chord: &str) {
+    runtime.key(chord_event(chord));
+    runtime.frame(1.0 / 60.0);
+}
+
+/// Presses `command`'s shortcut on this platform.
+pub(crate) fn press_command(runtime: &mut Runtime<State>, command: Command) {
+    press_chord(runtime, command.chord().unwrap());
 }
 
 pub(crate) fn counting_waker() -> (Waker, Arc<AtomicUsize>) {

@@ -61,8 +61,8 @@ impl Keys {
 pub const COPY: Keys = keys("mod+c", "ctrl+shift+c");
 pub const PASTE: Keys = keys("mod+v", "ctrl+shift+v");
 /// Followed by a digit. Tabs follow GNOME Terminal and Ghostty on Linux.
-const TAB_DIGIT: Keys = keys("mod+", "alt+");
-const PROJECT_DIGIT: Keys = keys("ctrl+", "ctrl+shift+");
+pub(crate) const TAB_DIGIT: Keys = keys("mod+", "alt+");
+pub(crate) const PROJECT_DIGIT: Keys = keys("ctrl+", "ctrl+shift+");
 
 pub struct CommandSpec {
     pub command: Command,

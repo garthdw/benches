@@ -494,8 +494,23 @@ mod tests {
     use std::process::ExitStatus;
     use std::time::Duration;
 
+    /// Waits for the prompt, so what a test types follows it as a user's would: a shell without
+    /// line editing, such as dash, prints its prompt after the type-ahead the terminal echoed.
     fn spawn_shell() -> Session {
-        Session::spawn(None, Path::new("/tmp"), &default_config(), Arc::new(|| {})).unwrap()
+        let session =
+            Session::spawn(None, Path::new("/tmp"), &default_config(), Arc::new(|| {})).unwrap();
+        wait_until(
+            Duration::from_secs(15),
+            || "the shell never prompted".to_owned(),
+            || {
+                let lines = session.grid().lines();
+                lines
+                    .iter()
+                    .any(|line| !line.trim().is_empty())
+                    .then_some(())
+            },
+        );
+        session
     }
 
     #[test]
@@ -1053,7 +1068,7 @@ mod tests {
     #[test]
     fn the_working_directory_follows_the_shell() {
         let session = spawn_shell();
-        assert_eq!(session.cwd(), Some(PathBuf::from("/private/tmp")));
+        assert_eq!(session.cwd(), Path::new("/tmp").canonicalize().ok());
         type_line(&session, "cd /usr/bin");
         wait_until(
             Duration::from_secs(5),
@@ -1463,7 +1478,13 @@ mod tests {
 
     #[test]
     fn a_background_job_ends_with_its_dropped_shell() {
-        let session = spawn_shell();
+        // The job has its own process group, so it only hears the hangup when the shell passes
+        // it on, as bash and zsh do and dash, Ubuntu's `sh`, doesn't.
+        let config = Config {
+            shell: PathBuf::from("/bin/bash"),
+            ..default_config()
+        };
+        let session = Session::spawn(None, Path::new("/tmp"), &config, Arc::new(|| {})).unwrap();
         type_line(&session, "sleep 4242 & echo started");
         wait_for_line(&session, "started");
         let finished = session.finished();
@@ -1480,11 +1501,15 @@ mod tests {
     fn children_get_the_users_utf8_locale_only_when_the_app_has_none() {
         let unset = |_: &str| None;
         let locale = |system: Option<&str>| missing_locale(unset, || system.map(str::to_owned));
-        assert_eq!(locale(Some("en_GB")).as_deref(), Some("en_GB.UTF-8"));
-        assert_eq!(
-            locale(Some("en_GB@rg=zazzzz")).as_deref(),
-            Some("en_GB.UTF-8")
-        );
+        // A minimal Linux has no locale but C installed.
+        let installed = ["en_GB", "en_US"]
+            .into_iter()
+            .find(|language| locale_exists(&format!("{language}.UTF-8")));
+        if let Some(language) = installed {
+            let want = Some(format!("{language}.UTF-8"));
+            assert_eq!(locale(Some(language)), want);
+            assert_eq!(locale(Some(&format!("{language}@rg=zazzzz"))), want);
+        }
         assert_eq!(locale(Some("xx_YY")).as_deref(), Some(FALLBACK_LOCALE));
         assert_eq!(locale(None).as_deref(), Some(FALLBACK_LOCALE));
         for set in ["LANG", "LC_ALL", "LC_CTYPE"] {
@@ -1565,6 +1590,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(target_os = "macos"), ignore = "⌘⌫ line editing is macOS-only")]
     fn command_backspace_clears_the_line() {
         let session = spawn_shell();
         session.key(crate::input::map_text(

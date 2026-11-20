@@ -849,7 +849,7 @@ mod tests {
     }
 
     #[test]
-    fn the_default_shell_prefers_the_environment_then_the_login_shell_then_zsh() {
+    fn the_default_shell_prefers_the_environment_then_the_login_shell_then_the_fallback() {
         let exists = |path: &Path| path.starts_with("/usr/bin");
         let shell = |env: Option<&str>, login: Option<&str>| {
             default_shell(env.map(Into::into), login.map(PathBuf::from), exists)
@@ -866,10 +866,10 @@ mod tests {
             shell(Some(""), Some("/usr/bin/bash")),
             Path::new("/usr/bin/bash")
         );
-        assert_eq!(shell(None, None), Path::new("/bin/zsh"));
+        assert_eq!(shell(None, None), Path::new(FALLBACK_SHELL));
         assert_eq!(
             shell(Some("fish"), Some("/gone/bash")),
-            Path::new("/bin/zsh")
+            Path::new(FALLBACK_SHELL)
         );
     }
 

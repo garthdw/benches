@@ -123,13 +123,14 @@ pub(crate) fn view(state: &State, theme: &tok::Theme) -> Option<El> {
 
 #[cfg(test)]
 mod tests {
+    use crate::keymap::{Command, TAB_DIGIT};
     use crate::test_support::*;
     use rune::{Key, Mods};
 
     #[test]
     fn command_f_opens_the_find_bar_and_escape_closes_it() {
         let mut runtime = workspace_runtime();
-        press(&mut runtime, Key::Command('f'), command());
+        press_command(&mut runtime, Command::Find);
         runtime.frame(2.0 / 60.0);
         assert!(runtime.find("find").is_some());
         press(&mut runtime, Key::Escape, Mods::default());
@@ -141,7 +142,7 @@ mod tests {
     #[test]
     fn typing_goes_to_the_find_bar_not_the_terminal() {
         let mut runtime = workspace_runtime();
-        press(&mut runtime, Key::Command('f'), command());
+        press_command(&mut runtime, Command::Find);
         runtime.frame(2.0 / 60.0);
         press(&mut runtime, Key::Text("ab".into()), Mods::default());
         assert_eq!(runtime.state.find.edit.text, "ab");
@@ -151,9 +152,9 @@ mod tests {
     fn the_find_bar_closes_when_keys_move_to_another_tab() {
         let mut runtime = workspace_runtime();
         runtime.state.started = true;
-        press(&mut runtime, Key::Command('f'), command());
+        press_command(&mut runtime, Command::Find);
         runtime.frame(2.0 / 60.0);
-        press(&mut runtime, Key::Command('2'), command());
+        press_chord(&mut runtime, &format!("{}2", TAB_DIGIT.here()));
         runtime.frame(3.0 / 60.0);
         assert!(runtime.find("find").is_none());
     }
