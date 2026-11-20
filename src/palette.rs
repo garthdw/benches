@@ -121,20 +121,33 @@ impl State {
             .filter(|_| self.palette.jump.query == self.palette.edit.text.trim())
     }
 
-    /// `tray` makes `!` rows run in the tray.
+    /// `tray` makes run rows run in the tray, as ⌘↵ would.
     pub(crate) fn palette_rows(&self, tray: bool) -> Rows {
-        let Query::Shell(typed) = Query::of(&self.palette.edit.text) else {
-            return Rows {
+        let Rows { actions, ghost } = match Query::of(&self.palette.edit.text) {
+            Query::Shell(typed) => self.shell_rows(typed),
+            Query::Search(query) => Rows {
                 actions: palette_actions(
-                    &self.palette.edit.text,
+                    query,
                     self.jump_target(),
                     &self.workspace,
                     &self.config,
                     self.is_torn_off(),
                 ),
                 ghost: None,
-            };
+            },
         };
+        let actions = actions
+            .into_iter()
+            .map(|action| match action {
+                Action::Run(command) if tray => Action::Tray(command),
+                action => action,
+            })
+            .collect();
+        Rows { actions, ghost }
+    }
+
+    /// The typed `!` command, then the history entries containing it, as run rows.
+    fn shell_rows(&self, typed: &str) -> Rows {
         let command = typed.trim_end();
         let history = &self.palette.history;
         let prefixed = history.iter().filter(|entry| entry.starts_with(typed));
@@ -161,13 +174,7 @@ impl State {
             .then_some(command)
             .into_iter()
             .chain(suggested.take(HISTORY_ROWS))
-            .map(|command| {
-                if tray {
-                    Action::Tray(command.to_owned())
-                } else {
-                    Action::Run(command.to_owned())
-                }
-            })
+            .map(|command| Action::Run(command.to_owned()))
             .collect();
         Rows { actions, ghost }
     }
@@ -371,7 +378,6 @@ pub(crate) fn palette_actions(
     actions.extend(jump.map(|root| Action::Jump(root.to_owned())));
     actions.extend(strong.into_iter().map(command));
     actions.push(Action::Run(query.to_owned()));
-    actions.push(Action::Tray(query.to_owned()));
     actions.extend(weak.into_iter().map(command));
     actions.extend(
         exact_switches
@@ -770,7 +776,6 @@ pub(crate) fn view(
             });
             placeholder.into_iter().chain(worktrees).collect()
         } else {
-            let shell = matches!(Query::of(&state.palette.edit.text), Query::Shell(_));
             let selected = state
                 .palette
                 .selected
@@ -780,8 +785,7 @@ pub(crate) fn view(
                 .enumerate()
                 .map(|(index, action)| {
                     let shortcut = match action {
-                        Action::Tray(_) => Some("⌘↵".to_owned()),
-                        Action::Run(_) if shell => Some("⌘↵".to_owned()),
+                        Action::Run(_) => Some("⌘↵ tray".to_owned()),
                         Action::Jump(_) => Some("⌘↵ worktrees".to_owned()),
                         Action::Command(command) => COMMANDS
                             .iter()
@@ -948,7 +952,6 @@ mod tests {
             main_window_actions("tlgt", None, &one_project(), &Config::default()),
             [
                 Action::Run("tlgt".to_owned()),
-                Action::Tray("tlgt".to_owned()),
                 Action::Command(Command::ToggleGit),
             ]
         );
@@ -1017,11 +1020,11 @@ mod tests {
     }
 
     #[test]
-    fn loose_matches_follow_the_run_and_tray_rows() {
+    fn loose_matches_follow_the_run_row() {
         let actions = main_window_actions("ls", None, &one_project(), &Config::default());
-        assert_eq!(actions[2], Action::Command(Command::ToggleSidebar));
+        assert_eq!(actions[1], Action::Command(Command::ToggleSidebar));
         let actions = main_window_actions("zi", None, &one_project(), &Config::default());
-        assert_eq!(actions[2], Action::Command(Command::ZoomIn));
+        assert_eq!(actions[1], Action::Command(Command::ZoomIn));
     }
 
     #[test]
@@ -1051,7 +1054,6 @@ mod tests {
             [
                 Action::Jump(root.to_owned()),
                 Action::Run("site".to_owned()),
-                Action::Tray("site".to_owned()),
             ]
         );
     }
@@ -1074,10 +1076,9 @@ mod tests {
         let state = workspace_state();
         let actions = main_window_actions("sit", None, &state.workspace, &Config::default());
         assert_eq!(
-            actions[..3],
+            actions[..2],
             [
                 Action::Run("sit".to_owned()),
-                Action::Tray("sit".to_owned()),
                 Action::SwitchProject(1, "site".to_owned()),
             ]
         );
@@ -1096,9 +1097,8 @@ mod tests {
         let actions = main_window_actions("shell", None, &state.workspace, &Config::default());
         assert_eq!(actions[0], Action::Command(Command::NewShell));
         assert_eq!(actions[1], Action::Run("shell".to_owned()));
-        assert_eq!(actions[2], Action::Tray("shell".to_owned()));
         assert_eq!(
-            actions[3],
+            actions[2],
             Action::SwitchTab(1, 1, "shell (site)".to_owned())
         );
     }
@@ -1718,7 +1718,7 @@ mod tests {
         );
         let actions = main_window_actions("restart", None, &state.workspace, &Config::default());
         assert_eq!(
-            actions[2..4],
+            actions[1..3],
             [
                 Action::RestartTray(0, "pnpm dev".to_owned()),
                 Action::RestartTray(1, "storybook".to_owned()),
@@ -1726,7 +1726,7 @@ mod tests {
         );
         let actions =
             main_window_actions("restart sto", None, &state.workspace, &Config::default());
-        assert_eq!(actions[2], Action::RestartTray(1, "storybook".to_owned()));
+        assert_eq!(actions[1], Action::RestartTray(1, "storybook".to_owned()));
         assert!(
             main_window_actions("", None, &state.workspace, &Config::default())
                 .iter()
@@ -1885,10 +1885,17 @@ mod tests {
             [Action::Tray("ls".to_owned())]
         );
         runtime.state.palette.edit = TextEdit::new("ls");
-        assert_eq!(
-            runtime.state.palette_rows(true).actions[..2],
-            [Action::Run("ls".to_owned()), Action::Tray("ls".to_owned())]
-        );
+        let runs = |tray| -> Vec<Action> {
+            runtime
+                .state
+                .palette_rows(tray)
+                .actions
+                .into_iter()
+                .filter(|action| matches!(action, Action::Run(_) | Action::Tray(_)))
+                .collect()
+        };
+        assert_eq!(runs(true), [Action::Tray("ls".to_owned())]);
+        assert_eq!(runs(false), [Action::Run("ls".to_owned())]);
     }
 
     #[test]
