@@ -196,6 +196,11 @@ pub(crate) enum Action {
 }
 
 impl Action {
+    /// Whether ⌘↵ does something on this row, where `palette_rows` was asked for tray rows.
+    fn takes_command_enter(&self) -> bool {
+        matches!(self, Action::Tray(_) | Action::Jump(_))
+    }
+
     fn label(&self, working_directory: &Path) -> String {
         match self {
             Action::Command(command) => command.label().to_owned(),
@@ -525,8 +530,14 @@ fn run_palette(state: &mut State, index: usize, tray: bool, tx: &mut Tx) {
     let Some(action) = actions.get(index.min(actions.len().saturating_sub(1))) else {
         return;
     };
-    state.palette.open = false;
-    run_action(state, action, tx);
+    match action {
+        Action::Jump(root) if tray => list_worktrees(state, root.clone(), true, "", tx),
+        _ if tray && !action.takes_command_enter() => {}
+        _ => {
+            state.palette.open = false;
+            run_action(state, action, tx);
+        }
+    }
 }
 
 pub(crate) fn run_action(state: &mut State, action: &Action, tx: &mut Tx) {
@@ -666,20 +677,6 @@ fn palette_key(state: &mut State, event: &KeyEvent, tx: &mut Tx) -> bool {
                 .insert(&line[state.palette.edit.text.len()..]);
             state.palette.error = None;
         }
-        (Key::Enter, Query::Search(_))
-            if event.mods.cmd
-                && let Some(Action::Jump(root)) =
-                    rows.actions.get(state.palette.selected.min(last)) =>
-        {
-            list_worktrees(state, root.clone(), true, "", tx);
-        }
-        (Key::Enter, Query::Search(query)) if event.mods.cmd => {
-            if !query.is_empty() {
-                let query = query.to_owned();
-                state.palette.open = false;
-                open_tray(state, &query);
-            }
-        }
         (Key::Enter, _) => run_palette(state, state.palette.selected, event.mods.cmd, tx),
         _ => {
             // A poll after the edit lands starts the jump lookup's debounce.
@@ -751,8 +748,8 @@ pub(crate) fn poll_jump(state: &mut State, now: f64, tx: &mut Tx) -> bool {
     changed
 }
 
-fn enter_hint(theme: &tok::Theme, selected: bool) -> Option<El> {
-    selected.then(|| text("↵").key("palette-enter").color(theme.text_secondary))
+fn enter_hint(theme: &tok::Theme, hint: Option<&str>) -> Option<El> {
+    hint.map(|hint| text(hint).key("palette-enter").color(theme.text_secondary))
 }
 
 fn select_on_hover(index: usize) -> impl Fn(&mut State, bool, &mut Tx) {
@@ -783,7 +780,7 @@ pub(crate) fn view(
                 let branch = worktree.branch.as_deref().unwrap_or("(detached)");
                 let label = format!("{branch}  {}", jump::abbreviate_home(&worktree.path));
                 pill(format!("palette-{index}"), &label, index == selected, None)
-                    .children(enter_hint(theme, index == selected))
+                    .children(enter_hint(theme, (index == selected).then_some("↵")))
                     .justify_between()
                     .w_full()
                     .on_hover_change(select_on_hover(index))
@@ -812,7 +809,12 @@ pub(crate) fn view(
                         Action::Jump(_) => Some("⌘↵ worktrees"),
                         _ => None,
                     }
-                    .filter(|_| is_selected);
+                    .filter(|_| is_selected && !state.command_held);
+                    let enter = match (is_selected, state.command_held) {
+                        (false, _) => None,
+                        (true, false) => Some("↵"),
+                        (true, true) => action.takes_command_enter().then_some("⌘↵"),
+                    };
                     let shortcuts = row()
                         .gap(8.0)
                         .children(chord.map(|chord| {
@@ -820,7 +822,7 @@ pub(crate) fn view(
                                 .key("palette-shortcut")
                                 .color(theme.text_secondary)
                         }))
-                        .children(enter_hint(theme, is_selected));
+                        .children(enter_hint(theme, enter));
                     let label = action.label(&state.config.working_directory);
                     col()
                         .key(format!("palette-{index}"))
@@ -995,6 +997,28 @@ mod tests {
         runtime.frame(0.0);
         hover(&mut runtime, "palette-2");
         assert_eq!(runtime.state.palette.selected, 2);
+    }
+
+    #[test]
+    fn command_enter_on_a_command_row_does_nothing() {
+        let mut runtime = palette_runtime();
+        press(&mut runtime, Key::Text("sidebar".into()), Mods::default());
+        press(&mut runtime, Key::Enter, command());
+        assert!(!runtime.state.sidebar_hidden);
+        assert!(runtime.state.workspace.projects[0].tray.is_empty());
+        assert!(runtime.state.palette.open);
+    }
+
+    #[test]
+    fn holding_command_hints_enter_only_where_command_enter_applies() {
+        let mut runtime = palette_runtime();
+        runtime.state.command_held = true;
+        press(&mut runtime, Key::Text("sidebar".into()), Mods::default());
+        assert!(runtime.find("palette-enter").is_none());
+        runtime.state.palette.edit = TextEdit::new("x");
+        runtime.invalidate();
+        runtime.frame(3.0 / 60.0);
+        assert!(runtime.find("palette-enter").is_some());
     }
 
     #[test]
