@@ -651,6 +651,9 @@ fn open_worktree(state: &mut State, index: usize) {
 }
 
 fn palette_key(state: &mut State, event: &KeyEvent, tx: &mut Tx) -> bool {
+    // `on_modifiers` can miss the release of the ⌘ that opened the palette, which would
+    // leave every run row in the tray.
+    state.command_held = event.mods.cmd;
     if let Some(creation) = &state.palette.creation {
         if event.key == Key::Escape {
             creation.cancel.cancel().log_err("cancel wt switch");
@@ -849,7 +852,7 @@ pub(crate) fn view(
                         }))
                         .on_pointer_move(select_on_pointer_move(index))
                         .on_press_tx(move |state: &mut State, tx: &mut Tx| {
-                            run_palette(state, index, state.command_held, tx)
+                            run_palette(state, index, tx.mods().cmd, tx)
                         })
                 })
                 .collect()
@@ -1012,8 +1015,10 @@ mod tests {
     #[test]
     fn holding_command_hints_enter_only_where_command_enter_applies() {
         let mut runtime = palette_runtime();
-        runtime.state.command_held = true;
         press(&mut runtime, Key::Text("sidebar".into()), Mods::default());
+        runtime.state.command_held = true;
+        runtime.invalidate();
+        runtime.frame(2.0 / 60.0);
         assert!(runtime.find("palette-enter").is_none());
         runtime.state.palette.edit = TextEdit::new("x");
         runtime.invalidate();
@@ -1033,6 +1038,25 @@ mod tests {
         settle(&mut runtime);
         assert!(rows(&runtime).len() > 4);
         assert_eq!(runtime.state.palette.selected, 0);
+    }
+
+    #[test]
+    fn a_key_without_command_clears_a_command_release_that_went_unheard() {
+        let mut runtime = history_runtime();
+        runtime.state.command_held = true;
+        press(&mut runtime, Key::Text("!ls".into()), Mods::default());
+        assert!(!runtime.state.command_held);
+    }
+
+    #[test]
+    fn a_click_without_command_runs_the_row_despite_an_unheard_command_release() {
+        let mut runtime = palette_runtime();
+        press(&mut runtime, Key::Text("sidebar".into()), Mods::default());
+        runtime.state.command_held = true;
+        runtime.invalidate();
+        runtime.frame(2.0 / 60.0);
+        click(&mut runtime, "palette-0");
+        assert!(runtime.state.sidebar_hidden);
     }
 
     #[test]
