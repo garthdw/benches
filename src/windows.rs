@@ -329,10 +329,7 @@ mod tests {
         move_to_new_window(&mut runtime.state, 1, None);
         let mut second = second_window(&runtime.state.fleet, 1);
         let root = tempfile::tempdir().unwrap();
-        let paths = Paths {
-            dir: root.path().join("benches"),
-            ghostty_dir: root.path().join("ghostty"),
-        };
+        let paths = Paths::under(root.path());
         std::fs::create_dir_all(&paths.dir).unwrap();
         std::fs::write(paths.dir.join("config.toml"), "jump-command = \"j\"\n").unwrap();
         runtime.state.paths = Some(paths);
@@ -346,10 +343,7 @@ mod tests {
     #[test]
     fn a_broken_config_at_launch_falls_back_and_shows_the_banner() {
         let root = tempfile::tempdir().unwrap();
-        let paths = Paths {
-            dir: root.path().join("benches"),
-            ghostty_dir: root.path().join("ghostty"),
-        };
+        let paths = Paths::under(root.path());
         std::fs::create_dir_all(&paths.dir).unwrap();
         std::fs::write(paths.dir.join("config.toml"), "shel = 1\n").unwrap();
         let mut state = State {
@@ -370,10 +364,7 @@ mod tests {
     fn a_broken_config_shows_a_banner_until_a_reload_succeeds_or_it_is_dismissed() {
         let mut runtime = workspace_runtime();
         let root = tempfile::tempdir().unwrap();
-        let paths = Paths {
-            dir: root.path().join("benches"),
-            ghostty_dir: root.path().join("ghostty"),
-        };
+        let paths = Paths::under(root.path());
         std::fs::create_dir_all(&paths.dir).unwrap();
         let write = |text: &str| std::fs::write(paths.dir.join("config.toml"), text).unwrap();
         runtime.state.paths = Some(paths.clone());

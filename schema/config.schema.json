@@ -89,7 +89,7 @@
   "description": "The `config.toml` format. Every key is optional.",
   "properties": {
     "auto-secure-input": {
-      "description": "Whether to turn on secure keyboard entry while a program reads a password. Falls back to\nGhostty's `macos-auto-secure-input`, then on.",
+      "description": "Whether to turn on secure keyboard entry while a program reads a password. Falls back to\nGhostty's `macos-auto-secure-input` on macOS, then on.",
       "type": [
         "boolean",
         "null"

@@ -13,14 +13,14 @@ use crate::LogErr;
 use crate::grid::{DEFAULT_BG, DEFAULT_FG};
 use benches_font::DEFAULT_FONT_FAMILY;
 use benches_font::constraint::Modifier;
+use benches_platform::FALLBACK_SHELL;
+use benches_platform::dirs::{self, Env};
 
-const FALLBACK_SHELL: &str = "/bin/zsh";
 const DEFAULT_FONT_SIZE: f64 = 18.0;
 /// Ghostty's default for `notify-on-command-finish-after`.
 const DEFAULT_COMMAND_FINISH_AFTER: Duration = Duration::from_secs(5);
 /// Ghostty's: a program that dies mid-task never removes its progress.
 const PROGRESS_TIMEOUT: Duration = Duration::from_secs(15);
-const GHOSTTY_THEMES: &str = "/Applications/Ghostty.app/Contents/Resources/ghostty/themes";
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Config {
@@ -170,7 +170,7 @@ struct File {
     #[serde(rename = "working-directory")]
     working_directory: Option<String>,
     /// Whether to turn on secure keyboard entry while a program reads a password. Falls back to
-    /// Ghostty's `macos-auto-secure-input`, then on.
+    /// Ghostty's `macos-auto-secure-input` on macOS, then on.
     #[serde(rename = "auto-secure-input")]
     auto_secure_input: Option<bool>,
     /// Whether a command finishing out of sight marks its tab: `never`, or `unfocused` or
@@ -219,22 +219,41 @@ struct FontFile {
 /// Where to look for the files the config names.
 #[derive(Clone)]
 pub struct Paths {
-    /// Holds `config.toml`, `state.json` and a `themes` folder.
+    /// Holds `config.toml` and a `themes` folder.
     pub dir: PathBuf,
     pub ghostty_dir: PathBuf,
+    /// Holds `state.json`.
+    pub state_dir: PathBuf,
+    /// Ghostty's own themes, searched after the user's.
+    pub ghostty_themes: Vec<PathBuf>,
 }
 
 impl Paths {
-    pub fn from_home() -> Option<Self> {
-        let home = PathBuf::from(std::env::var_os("HOME")?);
+    /// The folders this OS and the environment name.
+    pub fn from_env() -> Option<Self> {
+        let env: Env = &|name| std::env::var_os(name);
+        let config = dirs::config_home(env)?;
         Some(Self {
-            dir: home.join(".config/benches"),
-            ghostty_dir: home.join(".config/ghostty"),
+            dir: config.join("benches"),
+            ghostty_dir: config.join("ghostty"),
+            state_dir: dirs::state_dir(env)?,
+            ghostty_themes: dirs::ghostty_theme_dirs(env),
         })
     }
 
+    /// Every folder under `root`, for tests.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn under(root: &Path) -> Self {
+        Self {
+            dir: root.join("benches"),
+            ghostty_dir: root.join("ghostty"),
+            state_dir: root.join("benches"),
+            ghostty_themes: Vec::new(),
+        }
+    }
+
     pub fn state(&self) -> PathBuf {
-        self.dir.join("state.json")
+        self.state_dir.join("state.json")
     }
 
     fn config(&self) -> PathBuf {
@@ -330,7 +349,7 @@ fn default_config_text() -> String {
          # Ghostty's `working-directory`, then home.\n\
          # working-directory = \"~/dev\"\n\
          # Turn on secure keyboard entry while a program reads a password; unset uses Ghostty's\n\
-         # `macos-auto-secure-input`, then true.\n\
+         # `macos-auto-secure-input` on macOS, then true.\n\
          # auto-secure-input = false\n\
          # Mark a tab when a command finishes out of sight (`unfocused`, or `never`) and how long\n\
          # it must have run, as in Ghostty; unset uses Ghostty's, then `never` and 5s.\n\
@@ -492,6 +511,7 @@ impl Config {
                 .auto_secure_input
                 .or_else(|| {
                     ghostty_value("macos-auto-secure-input")
+                        .filter(|_| cfg!(target_os = "macos"))
                         .and_then(|value| value.parse().log_err("macos-auto-secure-input"))
                 })
                 .unwrap_or(defaults.auto_secure_input),
@@ -516,8 +536,8 @@ impl Config {
     }
 }
 
-/// `$SHELL`, else the login shell from the password database, else `/bin/zsh`; the first that
-/// is an executable file. Unlike the environment, the password database is right when Finder
+/// `$SHELL`, else the login shell from the password database, else `FALLBACK_SHELL`; the first
+/// that is an executable file. Unlike the environment, the password database is right when Finder
 /// launches the app.
 fn default_shell(
     env_shell: Option<std::ffi::OsString>,
@@ -696,15 +716,12 @@ fn load_theme(name: &str, paths: &Paths) -> Result<Theme> {
     let path = if Path::new(name).is_absolute() {
         PathBuf::from(name)
     } else {
-        [
-            paths.dir.join("themes"),
-            paths.ghostty_dir.join("themes"),
-            PathBuf::from(GHOSTTY_THEMES),
-        ]
-        .into_iter()
-        .map(|dir| dir.join(name))
-        .find(|path| path.is_file())
-        .with_context(|| format!("no theme named {name}"))?
+        [paths.dir.join("themes"), paths.ghostty_dir.join("themes")]
+            .into_iter()
+            .chain(paths.ghostty_themes.iter().cloned())
+            .map(|dir| dir.join(name))
+            .find(|path| path.is_file())
+            .with_context(|| format!("no theme named {name}"))?
     };
     let text =
         std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
@@ -763,10 +780,7 @@ mod tests {
 
     fn paths(config: Option<&str>, ghostty: Option<&str>) -> (tempfile::TempDir, Paths) {
         let root = tempfile::tempdir().unwrap();
-        let paths = Paths {
-            dir: root.path().join("benches"),
-            ghostty_dir: root.path().join("ghostty"),
-        };
+        let paths = Paths::under(root.path());
         for (dir, text) in [(&paths.dir, config), (&paths.ghostty_dir, ghostty)] {
             std::fs::create_dir_all(dir.join("themes")).unwrap();
             std::fs::write(
@@ -1055,7 +1069,10 @@ mod tests {
             Config::load(&paths, Config::default()).0.auto_secure_input
         };
         assert!(auto(None, None));
-        assert!(!auto(None, Some("macos-auto-secure-input = false\n")));
+        assert_eq!(
+            auto(None, Some("macos-auto-secure-input = false\n")),
+            !cfg!(target_os = "macos")
+        );
         assert!(auto(
             Some("auto-secure-input = true\n"),
             Some("macos-auto-secure-input = false\n")
@@ -1177,10 +1194,7 @@ mod schema_tests {
 
     fn dir_paths() -> (tempfile::TempDir, Paths) {
         let root = tempfile::tempdir().unwrap();
-        let paths = Paths {
-            dir: root.path().join("benches"),
-            ghostty_dir: root.path().join("ghostty"),
-        };
+        let paths = Paths::under(root.path());
         (root, paths)
     }
 
