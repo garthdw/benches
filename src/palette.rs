@@ -5,7 +5,10 @@ use std::time::Duration;
 
 use rune::color::Color;
 use rune::tok;
-use rune::{El, Key, KeyEvent, Mods, Span, TextEdit, Tx, Waker, col, el, row, text, text_input};
+use rune::{
+    El, Key, KeyEvent, Mods, PointerPress, Span, TextEdit, Tx, Waker, col, el, row, text,
+    text_input,
+};
 
 use crate::app::{State, open_project, open_tab, open_tray, run_command, tray_action};
 use crate::jump;
@@ -752,12 +755,9 @@ fn enter_hint(theme: &tok::Theme, hint: Option<&str>) -> Option<El> {
     hint.map(|hint| text(hint).key("palette-enter").color(theme.text_secondary))
 }
 
-fn select_on_hover(index: usize) -> impl Fn(&mut State, bool, &mut Tx) {
-    move |state, hovered, _| {
-        if hovered {
-            state.palette.selected = index;
-        }
-    }
+/// Selects on moving, not on entering, so rows that arrive under a still pointer don't take it.
+fn select_on_pointer_move(index: usize) -> impl Fn(&mut State, PointerPress) {
+    move |state, _| state.palette.selected = index
 }
 
 pub(crate) fn view(
@@ -783,7 +783,7 @@ pub(crate) fn view(
                     .children(enter_hint(theme, (index == selected).then_some("↵")))
                     .justify_between()
                     .w_full()
-                    .on_hover_change(select_on_hover(index))
+                    .on_pointer_move(select_on_pointer_move(index))
                     .on_press(move |state: &mut State| open_worktree(state, index))
             });
             placeholder.into_iter().chain(worktrees).collect()
@@ -847,7 +847,7 @@ pub(crate) fn view(
                                 .px(10.0)
                                 .pb(4.0)
                         }))
-                        .on_hover_change(select_on_hover(index))
+                        .on_pointer_move(select_on_pointer_move(index))
                         .on_press_tx(move |state: &mut State, tx: &mut Tx| {
                             run_palette(state, index, state.command_held, tx)
                         })
@@ -1019,6 +1019,20 @@ mod tests {
         runtime.invalidate();
         runtime.frame(3.0 / 60.0);
         assert!(runtime.find("palette-enter").is_some());
+    }
+
+    #[test]
+    fn rows_arriving_under_a_still_pointer_keep_the_selection() {
+        let mut runtime = palette_runtime();
+        press(&mut runtime, Key::Text("x".into()), Mods::default());
+        assert!(rows(&runtime).len() < 4);
+        let (x, y) = runtime.find("palette-0").unwrap();
+        runtime.pointer_move(x, y + 85.0);
+        runtime.frame(3.0 / 60.0);
+        press(&mut runtime, Key::Backspace, Mods::default());
+        settle(&mut runtime);
+        assert!(rows(&runtime).len() > 4);
+        assert_eq!(runtime.state.palette.selected, 0);
     }
 
     #[test]
