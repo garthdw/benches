@@ -651,10 +651,8 @@ fn open_worktree(state: &mut State, index: usize) {
 }
 
 fn palette_key(state: &mut State, event: &KeyEvent, tx: &mut Tx) -> bool {
-    if let Key::Modifier { .. } = event.key {
-        return false;
-    }
-    // A fallback should a modifier key go unheard, as every run row would stay in the tray.
+    // A key's own modifiers win should `on_modifiers` miss a change, which would leave every
+    // run row in the tray.
     state.command_held = event.mods.cmd;
     if let Some(creation) = &state.palette.creation {
         if event.key == Key::Escape {
@@ -1065,17 +1063,11 @@ mod tests {
     fn holding_command_alone_swaps_the_run_row_for_the_tray() {
         let mut runtime = palette_runtime();
         press(&mut runtime, Key::Text("x".into()), Mods::default());
-        let command_key = |pressed, mods| rune::PhysicalInput::Key {
-            key: rune::PhysicalKeyCode::SuperLeft,
-            mods,
-            pressed,
-            repeat: false,
-        };
-        runtime.physical_input(command_key(true, command()));
+        runtime.update(|state, _| crate::app::modifiers_changed(state, command()));
         runtime.frame(3.0 / 60.0);
         assert!(runtime.state.command_held);
         assert!(runtime.find("palette-alternative").is_none());
-        runtime.physical_input(command_key(false, Mods::default()));
+        runtime.update(|state, _| crate::app::modifiers_changed(state, Mods::default()));
         runtime.frame(4.0 / 60.0);
         assert!(!runtime.state.command_held);
         assert!(runtime.find("palette-alternative").is_some());
