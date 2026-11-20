@@ -373,7 +373,10 @@ mod tests {
     fn a_command_that_cds_finds_the_folder_in_sh_style_shells() {
         let (_root, folder) = awkward_folder();
         let query = folder.to_str().unwrap();
-        for shell in ["/bin/sh", "/bin/zsh"] {
+        let installed = ["/bin/sh", "/bin/zsh"]
+            .into_iter()
+            .filter(|shell| Path::new(shell).exists());
+        for shell in installed {
             assert_eq!(
                 lookup(Path::new(shell), "cd", query, TIMEOUT, &Cancel::default()).unwrap(),
                 Some(folder.clone()),

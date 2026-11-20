@@ -892,8 +892,14 @@ mod tests {
 
     #[test]
     fn a_family_without_a_style_draws_it_from_its_one_font() {
-        // Andale Mono has one face, which CoreText reuses and swash synthesises from.
-        let font = Font::new("Andale Mono", 13.0, 2.0).unwrap();
+        // Each has one face, which CoreText reuses and swash synthesises from. macOS ships Andale
+        // Mono; on Linux, Unifont comes from `fonts-unifont`.
+        let family = if cfg!(target_os = "macos") {
+            "Andale Mono"
+        } else {
+            "Unifont"
+        };
+        let font = Font::new(family, 13.0, 2.0).unwrap();
         let names = face_names(&font);
         assert!(names.iter().all(|name| name == &names[0]), "{names:?}");
     }

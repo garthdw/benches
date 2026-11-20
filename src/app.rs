@@ -987,6 +987,7 @@ pub(crate) fn window_app(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::keymap::{PROJECT_DIGIT, TAB_DIGIT};
     use crate::scenes::*;
     use crate::test_support::*;
     use crate::view::{DRAWER_HEIGHT, RAIL_WIDTH, SIDEBAR_WIDTH};
@@ -1155,6 +1156,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        not(target_os = "macos"),
+        ignore = "only macOS has secure keyboard entry"
+    )]
     fn a_password_prompt_turns_secure_input_on_until_it_ends() {
         let mut state = secure_input_state();
         let password = Grid {
@@ -1170,6 +1175,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        not(target_os = "macos"),
+        ignore = "only macOS has secure keyboard entry"
+    )]
     fn auto_secure_input_can_be_turned_off() {
         let mut state = secure_input_state();
         state.config.auto_secure_input = false;
@@ -1183,6 +1192,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        not(target_os = "macos"),
+        ignore = "only macOS has secure keyboard entry"
+    )]
     fn the_manual_toggle_survives_tabs_but_not_losing_focus() {
         let mut state = secure_input_state();
         let mut tx = Tx::default();
@@ -1197,6 +1210,20 @@ mod tests {
         state.workspace.set_window_focused(true);
         assert!(state.sync_secure_input());
         run_command(&mut state, Command::ToggleSecureInput, &mut tx);
+        assert!(!state.secure_input.enabled);
+    }
+
+    #[test]
+    #[cfg_attr(target_os = "macos", ignore = "macOS has secure keyboard entry")]
+    fn secure_input_stays_off_where_the_os_has_none() {
+        let mut state = secure_input_state();
+        let password = Grid {
+            password_input: true,
+            ..Grid::default()
+        };
+        state.session().unwrap().publish_fixture(password);
+        run_command(&mut state, Command::ToggleSecureInput, &mut Tx::default());
+        assert!(!state.sync_secure_input());
         assert!(!state.secure_input.enabled);
     }
 
@@ -1280,8 +1307,8 @@ mod tests {
     #[test]
     fn control_digits_pick_projects_and_command_digits_pick_tabs() {
         let mut runtime = workspace_runtime();
-        press(&mut runtime, Key::Text("2".into()), control());
-        press(&mut runtime, Key::Command('2'), command());
+        press_chord(&mut runtime, &format!("{}2", PROJECT_DIGIT.here()));
+        press_chord(&mut runtime, &format!("{}2", TAB_DIGIT.here()));
         let workspace = &runtime.state.workspace;
         assert_eq!(workspace.active, 1);
         assert_eq!(workspace.projects[1].active_tab, 1);
@@ -1290,22 +1317,23 @@ mod tests {
     #[test]
     fn a_command_digit_past_the_last_tab_selects_the_last_tab() {
         let mut runtime = workspace_runtime();
-        press(&mut runtime, Key::Command('9'), command());
+        press_chord(&mut runtime, &format!("{}9", TAB_DIGIT.here()));
         assert_eq!(runtime.state.workspace.projects[0].active_tab, 2);
     }
 
     #[test]
     fn a_control_digit_past_the_last_project_selects_the_last_project() {
         let mut runtime = workspace_runtime();
-        press(&mut runtime, Key::Text("9".into()), control());
+        press_chord(&mut runtime, &format!("{}9", PROJECT_DIGIT.here()));
         assert_eq!(runtime.state.workspace.active, 1);
     }
 
     #[test]
-    fn command_shift_digits_do_not_switch_tabs() {
+    fn shifted_tab_digits_do_not_switch_tabs() {
         let mut runtime = workspace_runtime();
-        press(&mut runtime, Key::Command('2'), command_shift());
-        press(&mut runtime, Key::Command('@'), command_shift());
+        let shifted = chord_event(&format!("shift+{}2", TAB_DIGIT.here()));
+        press(&mut runtime, shifted.key.clone(), shifted.mods);
+        press(&mut runtime, Key::Command('@'), shifted.mods);
         let workspace = &runtime.state.workspace;
         assert_eq!((workspace.active, workspace.projects[0].active_tab), (0, 0));
     }
@@ -1316,12 +1344,12 @@ mod tests {
             .map_or(-1.0, |(rect, _)| rect[2])
     }
 
-    fn zoomed(chords: &[char]) -> Runtime<State> {
+    fn zoomed(commands: &[Command]) -> Runtime<State> {
         let mut state = State::default();
         show_scene(&mut state, SCENE_FIXTURE);
         let mut runtime = runtime_with(state);
-        for chord in chords {
-            press(&mut runtime, Key::Command(*chord), command());
+        for command in commands {
+            press_command(&mut runtime, *command);
         }
         runtime
     }
@@ -1329,37 +1357,58 @@ mod tests {
     #[test]
     fn command_equals_and_minus_zoom_the_font_by_one_point() {
         let base = State::default().font_size();
-        assert_eq!(zoomed(&['=']).state.font_size(), base + 1.0);
-        assert_eq!(zoomed(&['=', '=', '-']).state.font_size(), base + 1.0);
-        assert_eq!(zoomed(&['-']).state.font_size(), base - 1.0);
+        assert_eq!(zoomed(&[Command::ZoomIn]).state.font_size(), base + 1.0);
+        assert_eq!(
+            zoomed(&[Command::ZoomIn, Command::ZoomIn, Command::ZoomOut])
+                .state
+                .font_size(),
+            base + 1.0
+        );
+        assert_eq!(zoomed(&[Command::ZoomOut]).state.font_size(), base - 1.0);
     }
 
     #[test]
     fn command_zero_restores_the_configured_size() {
         let base = State::default().font_size();
-        assert_eq!(zoomed(&['=', '=', '0']).state.font_size(), base);
-        assert_eq!(zoomed(&['-', '0']).state.font_size(), base);
+        assert_eq!(
+            zoomed(&[Command::ZoomIn, Command::ZoomIn, Command::ZoomReset])
+                .state
+                .font_size(),
+            base
+        );
+        assert_eq!(
+            zoomed(&[Command::ZoomOut, Command::ZoomReset])
+                .state
+                .font_size(),
+            base
+        );
     }
 
     #[test]
     fn zoom_stops_at_the_limits() {
-        assert_eq!(zoomed(&['='; 80]).state.font_size(), MAX_FONT_SIZE);
-        assert_eq!(zoomed(&['-'; 80]).state.font_size(), MIN_FONT_SIZE);
-        let mut runtime = zoomed(&['-'; 80]);
-        press(&mut runtime, Key::Command('='), command());
+        assert_eq!(
+            zoomed(&[Command::ZoomIn; 80]).state.font_size(),
+            MAX_FONT_SIZE
+        );
+        assert_eq!(
+            zoomed(&[Command::ZoomOut; 80]).state.font_size(),
+            MIN_FONT_SIZE
+        );
+        let mut runtime = zoomed(&[Command::ZoomOut; 80]);
+        press_command(&mut runtime, Command::ZoomIn);
         assert_eq!(runtime.state.font_size(), MIN_FONT_SIZE + 1.0);
     }
 
     #[test]
     fn zoom_leaves_the_configured_size_alone() {
         let base = State::default().config.font.size;
-        assert_eq!(zoomed(&['=']).state.config.font.size, base);
+        assert_eq!(zoomed(&[Command::ZoomIn]).state.config.font.size, base);
     }
 
     #[test]
     fn collapsing_with_several_projects_leaves_a_rail_of_project_tabs() {
         let mut runtime = workspace_runtime();
-        press(&mut runtime, Key::Command('b'), command());
+        press_command(&mut runtime, Command::ToggleSidebar);
         settle(&mut runtime);
         assert_eq!(sidebar_width(&runtime), RAIL_WIDTH);
         click(&mut runtime, "project-1");
@@ -1371,7 +1420,7 @@ mod tests {
         let mut state = State::default();
         show_scene(&mut state, SCENE_FIXTURE);
         let mut runtime = runtime_with(state);
-        press(&mut runtime, Key::Command('b'), command());
+        press_command(&mut runtime, Command::ToggleSidebar);
         runtime.frame(2.0 / 60.0);
         let sliding = sidebar_width(&runtime);
         assert!(0.0 < sliding && sliding < SIDEBAR_WIDTH, "{sliding}");
@@ -1386,16 +1435,16 @@ mod tests {
     #[test]
     fn command_shift_brackets_cycle_tabs() {
         let mut runtime = workspace_runtime();
-        press(&mut runtime, Key::Command('{'), command_shift());
+        press_command(&mut runtime, Command::PrevTab);
         assert_eq!(runtime.state.workspace.projects[0].active_tab, 2);
-        press(&mut runtime, Key::Command(']'), command_shift());
+        press_command(&mut runtime, Command::NextTab);
         assert_eq!(runtime.state.workspace.projects[0].active_tab, 0);
     }
 
     #[test]
     fn command_w_closes_the_active_tab() {
         let mut runtime = workspace_runtime();
-        press(&mut runtime, Key::Command('w'), command());
+        press_command(&mut runtime, Command::CloseTab);
         let titles: Vec<_> = runtime.state.workspace.projects[0]
             .tabs
             .iter()
@@ -1478,7 +1527,7 @@ mod tests {
     #[test]
     fn command_w_on_a_running_command_asks_and_escape_keeps_it() {
         let mut runtime = command_tab_runtime();
-        press(&mut runtime, Key::Command('w'), command());
+        press_command(&mut runtime, Command::CloseTab);
         assert!(runtime.find("close-confirm").is_some());
         press(&mut runtime, Key::Escape, Mods::default());
         assert!(runtime.find("close-confirm").is_none());
@@ -1497,7 +1546,7 @@ mod tests {
     fn enter_answers_the_newest_confirmation_first() {
         let mut runtime = command_tab_runtime();
         reject_paste(&mut runtime);
-        press(&mut runtime, Key::Command('w'), command());
+        press_command(&mut runtime, Command::CloseTab);
         press(&mut runtime, Key::Enter, Mods::default());
         assert_eq!(tab_titles(&runtime), ["shell", "lazygit"]);
         assert!(matches!(
@@ -1509,7 +1558,7 @@ mod tests {
     #[test]
     fn escape_dismisses_a_newer_paste_before_the_older_close() {
         let mut runtime = command_tab_runtime();
-        press(&mut runtime, Key::Command('w'), command());
+        press_command(&mut runtime, Command::CloseTab);
         reject_paste(&mut runtime);
         press(&mut runtime, Key::Escape, Mods::default());
         assert!(matches!(
@@ -1523,7 +1572,7 @@ mod tests {
     #[test]
     fn enter_confirms_closing_a_running_command() {
         let mut runtime = command_tab_runtime();
-        press(&mut runtime, Key::Command('w'), command());
+        press_command(&mut runtime, Command::CloseTab);
         press(&mut runtime, Key::Enter, Mods::default());
         assert_eq!(tab_titles(&runtime), ["shell", "lazygit"]);
     }
@@ -1582,7 +1631,7 @@ mod tests {
     fn command_w_in_the_drawer_removes_its_process_and_keeps_the_tabs() {
         let mut runtime = tray_runtime();
         click(&mut runtime, "chip-1");
-        press(&mut runtime, Key::Command('w'), command());
+        press_command(&mut runtime, Command::CloseTab);
         let project = &runtime.state.workspace.projects[0];
         let tray: Vec<_> = project.tray.iter().map(|tab| tab.title.as_str()).collect();
         assert_eq!(tray, ["pnpm dev", "storybook"]);
@@ -1590,7 +1639,7 @@ mod tests {
         assert_eq!(drawer_id(&runtime), None);
         click(&mut runtime, "chip-0");
         click(&mut runtime, "terminal");
-        press(&mut runtime, Key::Command('w'), command());
+        press_command(&mut runtime, Command::CloseTab);
         let project = &runtime.state.workspace.projects[0];
         assert_eq!(project.tray.len(), 2);
         assert_eq!(project.tabs.len(), 2);
@@ -1599,7 +1648,7 @@ mod tests {
     #[test]
     fn command_n_opening_a_known_folder_selects_its_project() {
         let mut runtime = workspace_runtime();
-        press(&mut runtime, Key::Command('n'), command());
+        press_command(&mut runtime, Command::OpenProject);
         runtime
             .resolve_file_dialog(Some(PathBuf::from("/dev/site")))
             .unwrap();
@@ -1631,14 +1680,11 @@ mod tests {
     fn command_up_and_down_are_workspace_shortcuts_and_plain_arrows_are_not() {
         let mut state = workspace_state();
         let mut tx = Tx::default();
-        for key in [Key::Up, Key::Down] {
-            let event = KeyEvent {
-                key: key.clone(),
-                mods: command(),
-            };
+        for command in [Command::PrevPrompt, Command::NextPrompt] {
+            let event = chord_event(command.chord().unwrap());
             assert!(on_key(&mut state, &event, &mut tx));
             let plain = KeyEvent {
-                key,
+                key: event.key.clone(),
                 mods: Mods::default(),
             };
             assert!(!shortcut(&mut state, &plain, &mut tx));
@@ -1704,9 +1750,9 @@ mod tests {
         let mut runtime = tray_runtime();
         click(&mut runtime, "chip-2");
         click(&mut runtime, "chip-2");
-        press(&mut runtime, Key::Command('j'), command());
+        press_command(&mut runtime, Command::ToggleDrawer);
         assert_eq!(drawer_id(&runtime), tray_id(&runtime, 2));
-        press(&mut runtime, Key::Command('j'), command());
+        press_command(&mut runtime, Command::ToggleDrawer);
         assert_eq!(drawer_id(&runtime), None);
     }
 
@@ -1734,12 +1780,12 @@ mod tests {
             .overlay_sessions()
             .next()
             .map(Session::id);
-        press(&mut runtime, Key::Command('g'), command());
+        press_command(&mut runtime, Command::ToggleGit);
         assert_eq!(overlay_id(&runtime), kept);
         assert!(runtime.find("overlay-panel").is_some());
-        press(&mut runtime, Key::Command('g'), command());
+        press_command(&mut runtime, Command::ToggleGit);
         assert_eq!(overlay_id(&runtime), None);
-        press(&mut runtime, Key::Command('g'), command());
+        press_command(&mut runtime, Command::ToggleGit);
         assert_eq!(overlay_id(&runtime), kept);
     }
 
@@ -1748,7 +1794,7 @@ mod tests {
         let mut state = workspace_state();
         state.config.git_command = Some("sleep 5".to_owned());
         let mut runtime = runtime_with(state);
-        press(&mut runtime, Key::Command('g'), command());
+        press_command(&mut runtime, Command::ToggleGit);
         let tab = runtime.state.workspace.projects[0]
             .overlay
             .as_ref()
@@ -1762,7 +1808,7 @@ mod tests {
         let mut state = workspace_state();
         state.config.git_command = Some(String::new());
         let mut runtime = runtime_with(state);
-        press(&mut runtime, Key::Command('g'), command());
+        press_command(&mut runtime, Command::ToggleGit);
         assert!(runtime.state.workspace.projects[0].overlay.is_none());
         assert_eq!(overlay_id(&runtime), None);
     }
@@ -1770,7 +1816,7 @@ mod tests {
     #[test]
     fn the_first_command_g_starts_an_overlay_for_the_project() {
         let mut runtime = runtime_with(workspace_state());
-        press(&mut runtime, Key::Command('g'), command());
+        press_command(&mut runtime, Command::ToggleGit);
         assert!(overlay_id(&runtime).is_some());
         let titles: Vec<_> = runtime.state.workspace.projects[0]
             .tabs
@@ -1783,7 +1829,7 @@ mod tests {
     #[test]
     fn the_overlay_takes_keys_and_escape_reaches_it() {
         let mut runtime = overlay_runtime();
-        press(&mut runtime, Key::Command('g'), command());
+        press_command(&mut runtime, Command::ToggleGit);
         assert_eq!(
             runtime.state.session().map(Session::id),
             overlay_id(&runtime)
@@ -1799,7 +1845,7 @@ mod tests {
     #[test]
     fn clicking_outside_the_overlay_hides_it_and_inside_does_not() {
         let mut runtime = overlay_runtime();
-        press(&mut runtime, Key::Command('g'), command());
+        press_command(&mut runtime, Command::ToggleGit);
         click(&mut runtime, "overlay-terminal");
         assert!(overlay_id(&runtime).is_some());
         let (rect, _) = runtime.presented("overlay-layer").unwrap();
@@ -1985,7 +2031,7 @@ mod tests {
     }
 
     fn run_tray_action_from_palette(runtime: &mut Runtime<State>, query: &str) {
-        press(runtime, Key::Command('p'), command());
+        press_command(runtime, Command::Palette);
         press(runtime, Key::Text(query.into()), Mods::default());
         runtime.frame(0.0);
         runtime.state.palette.selected = 2;
@@ -2287,7 +2333,7 @@ mod tests {
     fn the_palette_hands_the_active_project_to_a_new_window() {
         let mut runtime = workspace_runtime();
         runtime.state.workspace.select_project(1);
-        press(&mut runtime, Key::Command('p'), command());
+        press_command(&mut runtime, Command::Palette);
         press(
             &mut runtime,
             Key::Text("move project".into()),
@@ -2393,7 +2439,7 @@ mod tests {
         }
         let mut second = second_window(&fleet, 1);
         assert_eq!(second.shell_request, None);
-        press(&mut second, Key::Command('p'), command());
+        press_command(&mut second, Command::Palette);
         press(
             &mut second,
             Key::Text("merge window".into()),

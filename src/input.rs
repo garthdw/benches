@@ -341,21 +341,18 @@ mod tests {
     }
 
     #[test]
-    fn command_chords_edit_the_line_like_ghostty() {
-        let cmd = Mods {
-            cmd: true,
-            logo: true,
-            ..Mods::default()
-        };
+    fn command_chords_edit_the_line_like_ghostty_on_macos() {
+        let cmd = crate::test_support::command();
         let alt = Mods {
             alt: true,
             ..Mods::default()
         };
-        assert_eq!(chord_text(Key::Backspace, cmd).as_deref(), Some("\x15"));
-        assert_eq!(chord_text(Key::Left, cmd).as_deref(), Some("\x01"));
-        assert_eq!(chord_text(Key::Right, cmd).as_deref(), Some("\x05"));
-        assert_eq!(chord_text(Key::Left, alt).as_deref(), Some("\x1bb"));
-        assert_eq!(chord_text(Key::Right, alt).as_deref(), Some("\x1bf"));
+        let on_macos = |text| cfg!(target_os = "macos").then_some(text);
+        assert_eq!(chord_text(Key::Backspace, cmd).as_deref(), on_macos("\x15"));
+        assert_eq!(chord_text(Key::Left, cmd).as_deref(), on_macos("\x01"));
+        assert_eq!(chord_text(Key::Right, cmd).as_deref(), on_macos("\x05"));
+        assert_eq!(chord_text(Key::Left, alt).as_deref(), on_macos("\x1bb"));
+        assert_eq!(chord_text(Key::Right, alt).as_deref(), on_macos("\x1bf"));
         assert_eq!(chord_text(Key::Left, Mods::default()), None);
     }
 
@@ -366,7 +363,13 @@ mod tests {
             alt: true,
             ..Mods::default()
         };
-        let typed = map_text("∫", option, Some(Code::KeyB), Some('b'));
+        // Option+B types "∫" on a Mac; Alt+B types "b" elsewhere.
+        let text = if cfg!(target_os = "macos") {
+            "∫"
+        } else {
+            "b"
+        };
+        let typed = map_text(text, option, Some(Code::KeyB), Some('b'));
         assert_eq!(
             TerminalInput::new()
                 .unwrap()

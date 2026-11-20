@@ -1113,8 +1113,8 @@ mod tests {
                 value: 1,
             }],
         );
-        face_for(&plain, "\u{4E16}").unwrap();
-        let fallback = face_for(&featured, "\u{4E16}").unwrap();
+        face_for(&plain, "\u{03A9}").unwrap();
+        let fallback = face_for(&featured, "\u{03A9}").unwrap();
         assert!(Rc::ptr_eq(&fallback.features, &featured.features));
     }
 
@@ -1123,8 +1123,8 @@ mod tests {
         let swash = Swash::new();
         let face = swash.embedded_face(SYMBOLS_FONT, PIXELS).unwrap();
         let (first, second) = (
-            face_for(&face, "\u{4E16}").unwrap(),
-            face_for(&face, "\u{754C}").unwrap(),
+            face_for(&face, "\u{03A9}").unwrap(),
+            face_for(&face, "\u{03C8}").unwrap(),
         );
         assert!(first.same(&second));
     }
@@ -1133,7 +1133,7 @@ mod tests {
     fn dropping_the_backend_frees_its_fallback_fonts() {
         let swash = Swash::new();
         let face = swash.embedded_face(SYMBOLS_FONT, PIXELS).unwrap();
-        face_for(&face, "\u{4E16}").unwrap();
+        face_for(&face, "\u{03A9}").unwrap();
         let shared = Rc::downgrade(&swash.shared);
         drop((face, swash));
         assert!(shared.upgrade().is_none());

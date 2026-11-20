@@ -283,6 +283,7 @@ pub(crate) fn adopt_projects(state: &mut State) -> bool {
 mod tests {
     use super::*;
     use crate::app::{Confirm, open_tab};
+    use crate::keymap::Command;
     use crate::scenes::fixture_tab;
     use crate::session::Session;
     use crate::test_support::*;
@@ -333,7 +334,7 @@ mod tests {
         std::fs::create_dir_all(&paths.dir).unwrap();
         std::fs::write(paths.dir.join("config.toml"), "jump-command = \"j\"\n").unwrap();
         runtime.state.paths = Some(paths);
-        press(&mut runtime, rune::Key::Command(','), command_shift());
+        press_command(&mut runtime, Command::ReloadConfig);
         second.frame(2.0 / 60.0);
         let jump = |state: &State| state.config.jump_command.clone();
         assert_eq!(jump(&runtime.state).as_deref(), Some("j"));
@@ -369,7 +370,7 @@ mod tests {
         let write = |text: &str| std::fs::write(paths.dir.join("config.toml"), text).unwrap();
         runtime.state.paths = Some(paths.clone());
         let reload = |runtime: &mut Runtime<State>| {
-            press(runtime, rune::Key::Command(','), command_shift());
+            press_command(runtime, Command::ReloadConfig);
         };
 
         write("shel = 1\n");
