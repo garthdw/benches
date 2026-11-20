@@ -8,7 +8,8 @@ use rune::{
 };
 
 use crate::app::{
-    Confirm, State, open_project, pick_new_tab, request_close_project, resolve_confirm, tray_action,
+    Confirm, State, answer_full_disk_access, open_project, pick_new_tab, request_close_project,
+    resolve_confirm, tray_action,
 };
 use crate::find;
 use crate::input::{self, focus_on_press, pointer_phase, send_pointer};
@@ -496,6 +497,28 @@ fn config_error_banner(state: &State, theme: &tok::Theme) -> Option<El> {
     ))
 }
 
+fn full_disk_access_banner(state: &State, theme: &tok::Theme) -> Option<El> {
+    state.full_disk_access.as_ref()?;
+    let detail = text(
+        "Programs started here share Benches' privacy permissions, so without Full Disk Access \
+         some can't read even their own data, such as a browser its profiles."
+            .to_owned(),
+    )
+    .color(theme.text_secondary)
+    .wrap();
+    let open = bar_button(theme, "full-disk-access-open", "Open Settings")
+        .on_press(|state: &mut State| answer_full_disk_access(state, true));
+    let dismiss = bar_button(theme, "full-disk-access-dismiss", "Dismiss")
+        .on_press(|state: &mut State| answer_full_disk_access(state, false));
+    Some(banner(
+        theme,
+        "full-disk-access",
+        "Benches doesn't have Full Disk Access",
+        detail,
+        vec![open, dismiss],
+    ))
+}
+
 /// The caret, composition and confirmations belong to whichever terminal takes keys.
 fn focus_overlays(state: &State, theme: &tok::Theme) -> Vec<El> {
     let mut overlays = Vec::new();
@@ -747,8 +770,21 @@ pub(crate) fn view(state: &State, cx: &mut Cx<State>) -> El {
                 .child(text("Open a folder with ⌘N, or drop one here").color(theme.text_secondary)),
         );
     }
-    if let Some(banner) = config_error_banner(state, &theme) {
-        overlays.push(banner.pin(Some(12.0), None, Some(12.0), Some(12.0)));
+    let banners: Vec<El> = [
+        config_error_banner(state, &theme),
+        full_disk_access_banner(state, &theme),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    if !banners.is_empty() {
+        overlays.push(
+            col()
+                .key("banners")
+                .pin(Some(12.0), None, Some(12.0), Some(12.0))
+                .gap(8.0)
+                .children(banners),
+        );
     }
     let focus_overlays = focus_overlays(state, &theme);
     let project = state.workspace.project();
