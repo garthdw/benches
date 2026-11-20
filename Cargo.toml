@@ -71,11 +71,13 @@ serde_json = "1.0.154"
 toml = "1.2.1"
 tempfile = "3.27.0"
 
-# Rune's vendored copies (its macOS IME calls need its winit); a dependency's `[patch]` doesn't
-# reach the app's workspace. The wgpu-hal and accesskit_windows patches are Windows-only.
+# Rune's vendored copies (its macOS IME calls need its winit, and its winit's Wayland frame needs
+# its sctk-adwaita); a dependency's `[patch]` doesn't reach the app's workspace. The wgpu-hal and
+# accesskit_windows patches are Windows-only.
 [patch.crates-io]
 accesskit_macos = { git = "https://github.com/anomalyco/rune", rev = "e6deb869c358471641e45a346034a3be1ac58da1" }
 winit = { git = "https://github.com/anomalyco/rune", rev = "e6deb869c358471641e45a346034a3be1ac58da1" }
+sctk-adwaita = { git = "https://github.com/anomalyco/rune", rev = "e6deb869c358471641e45a346034a3be1ac58da1" }
 parley_engine = { git = "https://github.com/anomalyco/rune", rev = "e6deb869c358471641e45a346034a3be1ac58da1" }
 
 [profile.release]
