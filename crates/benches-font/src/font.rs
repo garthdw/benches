@@ -2,13 +2,18 @@ pub mod constraint;
 mod nerd_font_table;
 pub mod sprite;
 
-#[cfg(target_os = "macos")]
+// With the `swash` feature on macOS, tests still build CoreText to compare the two.
+#[cfg(all(target_os = "macos", any(test, not(feature = "swash"))))]
 mod coretext;
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", not(feature = "swash")))]
 use coretext::CoreText as Os;
+#[cfg(any(not(target_os = "macos"), feature = "swash"))]
+mod swash;
+#[cfg(any(not(target_os = "macos"), feature = "swash"))]
+use self::swash::Swash as Os;
 
-#[cfg(not(target_os = "macos"))]
-compile_error!("benches-font has a CoreText backend only");
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+compile_error!("benches-font supports Linux and macOS only");
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -116,7 +121,10 @@ trait Backend {
 
     /// `None` when `family` isn't installed, rather than whatever the system substitutes.
     fn installed_face(&self, family: &str, pixels: f64) -> Option<Self::Face>;
-    /// `None` when the family has no such style.
+    /// The system's generic monospace family, the last choice when neither the configured family
+    /// nor the default is installed.
+    fn monospace_family(&self) -> Option<String>;
+    /// `None` when the family has no such style and the backend doesn't synthesise one.
     fn styled(&self, face: &Self::Face, style: FontStyle) -> Option<Self::Face>;
     fn embedded_face(&self, bytes: &'static [u8], pixels: f64) -> Result<Self::Face>;
     /// The face shaping with `features` on top of the font's defaults. A shaper that takes features
@@ -264,7 +272,7 @@ fn icon_face(
 }
 
 /// Regular, bold, italic and bold italic faces of `family`, or `None` if it isn't installed.
-/// A style the family lacks reuses the regular face.
+/// A style the family lacks is synthesised by the backend, or else reuses the regular face.
 fn family_faces(backend: &Os, family: &str, pixels: f64) -> Option<[Face; 4]> {
     let regular = backend.installed_face(family, pixels)?;
     let [bold, italic, bold_italic] =
@@ -312,14 +320,28 @@ impl Font {
     ) -> Result<Self> {
         let pixels = points * f64::from(scale);
         let backend = Os::new();
-        let faces = family_faces(&backend, family, pixels)
-            .or_else(|| {
-                eprintln!(
-                    "benches: font family {family} isn't installed; using {DEFAULT_FONT_FAMILY}"
-                );
-                family_faces(&backend, DEFAULT_FONT_FAMILY, pixels)
+        let monospace = backend.monospace_family();
+        let mut tried = Vec::new();
+        let faces = [family, DEFAULT_FONT_FAMILY]
+            .into_iter()
+            .chain(monospace.as_deref())
+            .filter(|candidate| {
+                let new = !tried.contains(candidate);
+                tried.push(*candidate);
+                new
             })
-            .with_context(|| format!("neither {family} nor {DEFAULT_FONT_FAMILY} is installed"))?;
+            .find_map(|candidate| {
+                let faces = family_faces(&backend, candidate, pixels);
+                if faces.is_none() {
+                    eprintln!("benches: font family {candidate} isn't installed; trying the next");
+                }
+                faces
+            })
+            .with_context(|| {
+                format!(
+                    "none of {family}, {DEFAULT_FONT_FAMILY} or a monospace family is installed"
+                )
+            })?;
         let features = parse_features(features);
         let faces = faces.map(|face| Os::with_features(face, &features));
         let regular = &faces[0];
@@ -414,15 +436,16 @@ impl Font {
             return Some(GlyphKind::Coverage);
         }
         let line = Os::line(font, text)?;
-        let mut canvas = self.backend.canvas(out, width, self.cell_height)?;
-        let placement = single
-            .and_then(Constraint::of)
-            .and_then(|constraint| {
-                self.constrained(constraint, Os::line_ink(&canvas, &line), cells)
-            })
-            .unwrap_or_else(|| self.centred(Os::line_width(&line), width));
-        Os::draw_line(&mut canvas, &line, placement);
-        drop(canvas);
+        {
+            let mut canvas = self.backend.canvas(out, width, self.cell_height)?;
+            let placement = single
+                .and_then(Constraint::of)
+                .and_then(|constraint| {
+                    self.constrained(constraint, Os::line_ink(&canvas, &line), cells)
+                })
+                .unwrap_or_else(|| self.centred(Os::line_width(&line), width));
+            Os::draw_line(&mut canvas, &line, placement);
+        }
         Some(glyph_kind(out))
     }
 
@@ -858,8 +881,18 @@ mod tests {
     }
 
     #[test]
-    fn a_family_without_a_style_reuses_the_regular_face() {
-        // Andale Mono has one face.
+    fn the_system_monospace_family_is_installed() {
+        let backend = Os::new();
+        let monospace = backend.monospace_family().unwrap();
+        assert!(
+            family_faces(&backend, &monospace, 26.0).is_some(),
+            "{monospace}"
+        );
+    }
+
+    #[test]
+    fn a_family_without_a_style_draws_it_from_its_one_font() {
+        // Andale Mono has one face, which CoreText reuses and swash synthesises from.
         let font = Font::new("Andale Mono", 13.0, 2.0).unwrap();
         let names = face_names(&font);
         assert!(names.iter().all(|name| name == &names[0]), "{names:?}");

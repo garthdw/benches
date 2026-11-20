@@ -66,6 +66,11 @@ impl Backend for CoreText {
         (unsafe { regular.family_name() }.to_string() == family).then_some(regular)
     }
 
+    /// CoreText has no generic families; Menlo ships with every macOS.
+    fn monospace_family(&self) -> Option<String> {
+        Some("Menlo".to_owned())
+    }
+
     fn styled(&self, face: &Self::Face, style: FontStyle) -> Option<Self::Face> {
         let mut traits = CTFontSymbolicTraits::empty();
         if style.bold {

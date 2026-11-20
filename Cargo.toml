@@ -26,6 +26,8 @@ toml.workspace = true
 [features]
 # Rune's headless flags (`--snap`, `--scene`) in a release build.
 tooling = ["rune/tooling"]
+# The fontique, harfrust and swash font backend on macOS, for comparing it against CoreText.
+swash = ["benches-font/swash"]
 
 [dev-dependencies]
 benches-core = { workspace = true, features = ["test-support"] }
@@ -54,6 +56,16 @@ crossbeam-channel = "0.5"
 libc = "0.2"
 nix = { version = "0.32", features = ["term", "fs", "signal", "poll", "hostname", "user"] }
 objc2-core-foundation = "0.3"
+# The swash font backend, matching Rune's text stack so no new crates enter the lockfile.
+fontique = { version = "0.12", default-features = false, features = [
+  "std",
+  "system",
+  "fontconfig-dlopen",
+] }
+harfrust = "0.12"
+swash = "0.2.10"
+icu_properties = { version = "2.3", default-features = false, features = ["compiled_data"] }
+unicode-segmentation = "1.13"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 toml = "1.2.1"

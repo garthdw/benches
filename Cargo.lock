@@ -431,9 +431,14 @@ name = "benches-font"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "fontique",
+ "harfrust",
+ "icu_properties",
  "objc2-core-foundation",
  "objc2-core-graphics",
  "objc2-core-text",
+ "swash",
+ "unicode-segmentation",
 ]
 
 [[package]]
