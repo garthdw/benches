@@ -21,7 +21,6 @@ pub(crate) fn runtime_with(mut state: State) -> Runtime<State> {
     let mut runtime = Runtime::new(state, view, (960.0, 640.0), env);
     runtime.poll = Some(poll);
     runtime.on_key = Some(on_key);
-    runtime.set_modifier_keys(true);
     runtime.frame(0.0);
     runtime
 }

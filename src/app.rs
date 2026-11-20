@@ -830,7 +830,7 @@ pub(crate) fn on_window_focus(state: &mut State, focused: bool, _: &mut Tx) {
     state.sync_secure_input();
 }
 
-fn modifiers_changed(state: &mut State, mods: Mods) {
+pub(crate) fn modifiers_changed(state: &mut State, mods: Mods) {
     state.command_held = mods.cmd;
     let shown = state
         .workspace
@@ -842,10 +842,6 @@ fn modifiers_changed(state: &mut State, mods: Mods) {
 }
 
 pub(crate) fn on_key(state: &mut State, event: &KeyEvent, tx: &mut Tx) -> bool {
-    if let Key::Modifier { .. } = event.key {
-        modifiers_changed(state, event.mods);
-        return true;
-    }
     if !state.confirms.is_empty() && matches!(event.key, Key::Enter | Key::Escape) {
         resolve_confirm(state, state.confirms.len() - 1, event.key == Key::Enter, tx);
         return true;
@@ -968,9 +964,6 @@ pub(crate) fn window_app(
         })
         .compositor(crate::render::TerminalCompositor::default())
         .on_ime(on_ime)
-        // The native window never calls `on_modifiers` in the pinned Rune, so `on_key` also hears
-        // modifier keys on their own.
-        .modifier_keys()
         .on_modifiers(|state, mods, _| modifiers_changed(state, mods))
         .menu_item(reload_menu_item())
         .on_quit(on_quit)

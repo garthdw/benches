@@ -1,6 +1,8 @@
 # Headless CLI
 
-Rune intercepts these flags on the app binary and renders with no window. The compositor still runs, on the same native Metal backend as the window; `RUNE_GPU_BACKEND=wgpu` forces wgpu-hal. At `7dfaa8f` the `fixture`, `unicode` and `tray` scenes snap byte-identical on both.
+Rune intercepts these flags on the app binary and renders with no window. The compositor still runs, on the same native Metal backend as the window; `RUNE_GPU_BACKEND=wgpu` forces wgpu-hal. At `e6deb86` the `fixture`, `unicode` and `tray` scenes snap byte-identical on both.
+
+Unlike a test `Runtime::new`, a headless run builds the runtime from the `App`, so `poll`, `on_key`, `setup` and the `App` hooks (`on_focus`, `on_modifiers`, `on_ime`, `on_visibility`, `modifier_keys`) all apply; a script's `{"focus": false}` reaches `on_window_focus`.
 
 ```sh
 cargo run -- --snap "$SCRATCH/out.png" --scene fixture --size 960x640 --scale 2

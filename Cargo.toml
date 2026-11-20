@@ -9,7 +9,7 @@ publish.workspace = true
 benches-core.workspace = true
 benches-font.workspace = true
 benches-platform.workspace = true
-rune = { git = "https://github.com/anomalyco/rune", rev = "958743308f36fdf1c568c513badc96ddb0c7f040", features = [
+rune = { git = "https://github.com/anomalyco/rune", rev = "e6deb869c358471641e45a346034a3be1ac58da1", features = [
   "native-file-dialog",
 ] }
 libghostty-vt.workspace = true
@@ -74,9 +74,9 @@ tempfile = "3.27.0"
 # Rune's vendored copies (its macOS IME calls need its winit); a dependency's `[patch]` doesn't
 # reach the app's workspace. The wgpu-hal and accesskit_windows patches are Windows-only.
 [patch.crates-io]
-accesskit_macos = { git = "https://github.com/anomalyco/rune", rev = "958743308f36fdf1c568c513badc96ddb0c7f040" }
-winit = { git = "https://github.com/anomalyco/rune", rev = "958743308f36fdf1c568c513badc96ddb0c7f040" }
-parley_engine = { git = "https://github.com/anomalyco/rune", rev = "958743308f36fdf1c568c513badc96ddb0c7f040" }
+accesskit_macos = { git = "https://github.com/anomalyco/rune", rev = "e6deb869c358471641e45a346034a3be1ac58da1" }
+winit = { git = "https://github.com/anomalyco/rune", rev = "e6deb869c358471641e45a346034a3be1ac58da1" }
+parley_engine = { git = "https://github.com/anomalyco/rune", rev = "e6deb869c358471641e45a346034a3be1ac58da1" }
 
 [profile.release]
 lto = "thin"

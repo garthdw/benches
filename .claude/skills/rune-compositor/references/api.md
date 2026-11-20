@@ -15,7 +15,7 @@
 - `f.device_key()`: the device can change between frames. Rebuild GPU resources when the key changes. Never compare `wgpu::Device`s, whose ids repeat across instances.
 - `f.srgb_blend()`.
 - `f.write_buffer(buffer, offset, data)`: `queue.write_buffer` via reused staging. Offset and length must be multiples of 4. It needs the `Frame`, so it isn't usable from inside the `draw_with` closure, where Benches uses `queue.write_buffer`.
-- `f.draw_ui()`: the default frame with no slots handled.
+- `f.draw_ui()`: the default frame with no slots handled. It uploads with the crate-private `prepare_ui`, which on an 8-bit sRGB-blended target rounds flat translucent fills and greyscale glyph ink to bytes before blending, as the CPU boot painter does. `f.ui.prepare` (Benches' path) leaves that off, so Rune's own chrome in a compositor frame can differ by 1 LSB at the CPU-to-GPU hand-over; nothing a compositor can switch.
 
 ## EffectSite (argument to the draw closure)
 
