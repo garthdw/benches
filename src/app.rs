@@ -13,8 +13,8 @@ use crate::find::{Find, open_find, poll_find};
 use crate::input::caret_rect;
 use crate::keymap::{Command, pressed, shortcut};
 use crate::palette::{
-    Action, Palette, open_palette, poll_creation, poll_history, poll_jump, poll_selection,
-    poll_worktrees, run_action,
+    Action, Palette, list_project_worktrees, open_palette, open_palette_with, poll_creation,
+    poll_history, poll_jump, poll_selection, poll_worktrees, run_action,
 };
 use crate::render::TerminalSource;
 use crate::secure_input::SecureInput;
@@ -627,6 +627,8 @@ pub(crate) fn run_command(state: &mut State, command: Command, tx: &mut Tx) {
             pick_folder(tx, Some(state.config.working_directory.clone()), false)
         }
         Command::ChangeFolder => pick_folder(tx, None, true),
+        Command::OpenWorktree => list_project_worktrees(state, "", tx),
+        Command::CreateWorktree => open_palette_with(state, "wt ", tx),
         Command::MoveToNewWindow => move_to_new_window(state, state.workspace.active, None),
         Command::MoveToMainWindow => move_to_main_window(state, state.workspace.active),
         Command::MergeIntoMain => tx.close_window(),

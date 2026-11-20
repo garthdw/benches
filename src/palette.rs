@@ -87,10 +87,13 @@ pub(crate) struct Creation {
     cancel: jump::Cancel,
 }
 
-/// The repository worktrees the command centre offers after ⌘↵ on the jump command's folder.
+/// The repository worktrees the command centre offers after ⌘↵ on the jump command's folder, or
+/// for the active project.
 #[derive(Default)]
 pub(crate) struct WorktreeChoice {
     pub(crate) root: PathBuf,
+    /// Opens `root` when it has no worktrees, as a jump folder needn't be a repository.
+    pub(crate) fallback_to_root: bool,
     pub(crate) pending: Option<mpsc::Receiver<Vec<jump::Worktree>>>,
     pub(crate) found: Vec<jump::Worktree>,
 }
@@ -179,6 +182,8 @@ pub(crate) enum Action {
     RestartTray(usize, String),
     StopTray(usize, String),
     CreateWorktree(String),
+    /// Lists the worktrees of the named active project, filtered.
+    ListWorktrees(String, String),
     Run(String),
     Tray(String),
 }
@@ -193,6 +198,12 @@ impl Action {
             Action::RestartTray(_, title) => format!("Restart {title}"),
             Action::StopTray(_, title) => format!("Stop {title}"),
             Action::CreateWorktree(branch) => format!("Create worktree “{branch}”"),
+            Action::ListWorktrees(project, filter) if filter.is_empty() => {
+                format!("Open a worktree of {project}")
+            }
+            Action::ListWorktrees(project, filter) => {
+                format!("Open a worktree of {project} matching “{filter}”")
+            }
             Action::Run(command) => format!("Run “{}” in a new tab", history::flattened(command)),
             Action::Tray(command) => {
                 format!("Run “{}” in the tray", history::flattened(command))
@@ -302,7 +313,8 @@ fn switch_actions(
 /// then running the query, so Enter on a typed command always runs it. Below those come the commands
 /// matching only loosely, then the open projects and tabs matching the query, exact names first, then the active project's
 /// tray restarts and stops. A query of `wt` and one branch name puts creating that worktree
-/// first. Everything but the fixed actions appears only once something is typed.
+/// first, and `wts` with an optional filter puts listing the active project's worktrees first.
+/// Everything but the fixed actions appears only once something is typed.
 pub(crate) fn palette_actions(
     query: &str,
     jump: Option<&Path>,
@@ -314,6 +326,7 @@ pub(crate) fn palette_actions(
     let needle = query.to_lowercase();
     let mut actions: Vec<Action> = create_worktree_action(query, workspace)
         .into_iter()
+        .chain(list_worktrees_action(query, workspace))
         .collect();
     if query.is_empty() {
         actions.extend(
@@ -386,8 +399,24 @@ fn create_worktree_action(query: &str, workspace: &Workspace) -> Option<Action> 
     (is_branch && workspace.project().is_some()).then(|| Action::CreateWorktree(branch.to_owned()))
 }
 
+fn list_worktrees_action(query: &str, workspace: &Workspace) -> Option<Action> {
+    let filter = match query.strip_prefix("wts")? {
+        "" => "",
+        rest => rest.strip_prefix(' ')?,
+    };
+    let project = workspace.project()?;
+    Some(Action::ListWorktrees(
+        project.name.clone(),
+        filter.trim().to_owned(),
+    ))
+}
+
 pub(crate) fn open_palette(state: &mut State, tx: &mut Tx) {
-    state.palette.edit = TextEdit::new("");
+    open_palette_with(state, "", tx);
+}
+
+pub(crate) fn open_palette_with(state: &mut State, text: &str, tx: &mut Tx) {
+    state.palette.edit = TextEdit::new(text);
     state.palette.open = true;
     state.palette.selected = 0;
     state.palette.worktrees = None;
@@ -501,12 +530,27 @@ pub(crate) fn run_action(state: &mut State, action: &Action, tx: &mut Tx) {
         Action::RestartTray(index, _) => tray_action(state, *index, Some("restart")),
         Action::StopTray(index, _) => tray_action(state, *index, Some("stop")),
         Action::CreateWorktree(branch) => create_worktree(state, branch),
+        Action::ListWorktrees(_, filter) => list_project_worktrees(state, filter, tx),
         Action::Run(command) => open_tab(state, &history::flattened(command), Some(command)),
         Action::Tray(command) => open_tray(state, command),
     }
 }
 
-fn list_worktrees(state: &mut State, root: PathBuf, tx: &mut Tx) {
+/// Opens the command centre on the active project's worktrees, filtered by `filter`.
+pub(crate) fn list_project_worktrees(state: &mut State, filter: &str, tx: &mut Tx) {
+    if let Some(root) = state.active_root() {
+        state.palette.open = true;
+        list_worktrees(state, root, false, filter, tx);
+    }
+}
+
+fn list_worktrees(
+    state: &mut State,
+    root: PathBuf,
+    fallback_to_root: bool,
+    filter: &str,
+    tx: &mut Tx,
+) {
     let pending = spawn_waking(state.waker.clone(), {
         let (shell, root) = (state.config.shell.clone(), root.clone());
         move || {
@@ -517,11 +561,13 @@ fn list_worktrees(state: &mut State, root: PathBuf, tx: &mut Tx) {
     });
     state.palette.worktrees = Some(WorktreeChoice {
         root,
+        fallback_to_root,
         pending: Some(pending),
         found: Vec::new(),
     });
-    state.palette.edit = TextEdit::new("");
+    state.palette.edit = TextEdit::new(filter);
     state.palette.selected = 0;
+    state.palette.error = None;
     tx.focus("palette-input", false);
 }
 
@@ -544,8 +590,15 @@ pub(crate) fn poll_worktrees(state: &mut State) -> bool {
     choice.found = found;
     if choice.found.is_empty() {
         let root = choice.root.clone();
-        state.palette.open = false;
-        open_project(state, root);
+        if choice.fallback_to_root {
+            state.palette.open = false;
+            open_project(state, root);
+        } else {
+            state.palette.error = Some(format!(
+                "No worktrees found in {}",
+                jump::abbreviate_home(&root)
+            ));
+        }
     }
     true
 }
@@ -607,7 +660,7 @@ fn palette_key(state: &mut State, event: &KeyEvent, tx: &mut Tx) -> bool {
                 && let Some(Action::Jump(root)) =
                     rows.actions.get(state.palette.selected.min(last)) =>
         {
-            list_worktrees(state, root.clone(), tx);
+            list_worktrees(state, root.clone(), true, "", tx);
         }
         (Key::Enter, Query::Search(query)) if event.mods.cmd => {
             if !query.is_empty() {
@@ -1161,6 +1214,7 @@ mod tests {
     fn loaded(found: Vec<jump::Worktree>) -> WorktreeChoice {
         WorktreeChoice {
             root: PathBuf::from("/dev/site"),
+            fallback_to_root: true,
             pending: None,
             found,
         }
@@ -1366,6 +1420,133 @@ mod tests {
             &Config::default(),
         );
         assert!(!none.contains(&create));
+    }
+
+    #[test]
+    fn the_wts_query_offers_listing_the_current_projects_worktrees_first() {
+        let workspace = one_project();
+        let list = |filter: &str| Action::ListWorktrees("benches".to_owned(), filter.to_owned());
+        for (query, filter) in [
+            ("wts", ""),
+            (" wts ", ""),
+            ("wts fea", "fea"),
+            ("wts  a b", "a b"),
+        ] {
+            let actions = main_window_actions(query, None, &workspace, &Config::default());
+            assert_eq!(actions[0], list(filter), "{query:?}");
+        }
+        for query in ["wt", "wtsx", "wtsx a", ""] {
+            assert!(
+                !main_window_actions(query, None, &workspace, &Config::default())
+                    .iter()
+                    .any(|action| matches!(action, Action::ListWorktrees(..))),
+                "{query:?}"
+            );
+        }
+        let none = main_window_actions("wts", None, &Workspace::default(), &Config::default());
+        assert!(!none.contains(&list("")));
+        assert_eq!(
+            list("fea").label(),
+            "Open a worktree of benches matching “fea”"
+        );
+    }
+
+    #[test]
+    fn enter_on_wts_lists_the_current_projects_worktrees_filtered_and_enter_opens_one() {
+        let mut runtime = palette_runtime();
+        let root = runtime.state.active_root().unwrap();
+        press(&mut runtime, Key::Text("wts feat".into()), Mods::default());
+        press(&mut runtime, Key::Enter, Mods::default());
+        assert!(runtime.state.palette.open);
+        assert_eq!(runtime.state.palette.edit.text, "feat");
+        let choice = runtime.state.palette.worktrees.as_ref().unwrap();
+        assert_eq!(choice.root, root);
+        assert!(!choice.fallback_to_root);
+        runtime.state.palette.worktrees = Some(loaded(vec![
+            worktree("main", "/dev/site"),
+            worktree("feature", "/dev/site.feature"),
+        ]));
+        let branches: Vec<_> = runtime
+            .state
+            .visible_worktrees()
+            .iter()
+            .map(|worktree| worktree.branch.clone().unwrap())
+            .collect();
+        assert_eq!(branches, ["feature"]);
+        press(&mut runtime, Key::Enter, Mods::default());
+        let workspace = &runtime.state.workspace;
+        assert_eq!(workspace.projects.len(), 3);
+        assert_eq!(workspace.projects[2].root, Path::new("/dev/site.feature"));
+        assert!(!runtime.state.palette.open);
+    }
+
+    #[test]
+    fn no_worktrees_for_the_current_project_says_so_instead_of_closing() {
+        let mut runtime = palette_runtime();
+        let (sender, receiver) = mpsc::channel();
+        press(&mut runtime, Key::Text("wts".into()), Mods::default());
+        press(&mut runtime, Key::Enter, Mods::default());
+        if let Some(choice) = &mut runtime.state.palette.worktrees {
+            choice.pending = Some(receiver);
+        }
+        sender.send(Vec::new()).unwrap();
+        assert!(poll_worktrees(&mut runtime.state));
+        runtime.frame(1.0);
+        assert!(runtime.state.palette.open);
+        assert_eq!(runtime.state.workspace.projects.len(), 2);
+        assert_eq!(runtime.state.workspace.active, 0);
+        let error = runtime.state.palette.error.as_deref().unwrap();
+        assert!(error.starts_with("No worktrees found in "), "{error}");
+        assert!(runtime.find("palette-error").is_some());
+    }
+
+    #[test]
+    fn worktree_commands_are_searchable_only_with_a_project() {
+        for (query, command) in [
+            ("open worktree", Command::OpenWorktree),
+            ("create worktree", Command::CreateWorktree),
+        ] {
+            let action = Action::Command(command);
+            let actions = main_window_actions(query, None, &one_project(), &Config::default());
+            assert!(actions.contains(&action), "{query}");
+            let none = main_window_actions(query, None, &Workspace::default(), &Config::default());
+            assert!(!none.contains(&action), "{query}");
+            assert!(
+                !main_window_actions("", None, &one_project(), &Config::default())
+                    .contains(&action)
+            );
+        }
+    }
+
+    #[test]
+    fn the_open_worktree_command_lists_the_current_projects_worktrees() {
+        let mut runtime = workspace_runtime();
+        let root = runtime.state.active_root().unwrap();
+        let mut tx = Tx::default();
+        run_command(&mut runtime.state, Command::OpenWorktree, &mut tx);
+        assert!(runtime.state.palette.open);
+        let choice = runtime.state.palette.worktrees.as_ref().unwrap();
+        assert_eq!(choice.root, root);
+        assert!(!choice.fallback_to_root);
+    }
+
+    #[test]
+    fn the_create_worktree_command_opens_the_command_centre_with_wt_typed() {
+        let mut runtime = palette_runtime();
+        press(
+            &mut runtime,
+            Key::Text("create worktree".into()),
+            Mods::default(),
+        );
+        press(&mut runtime, Key::Enter, Mods::default());
+        assert!(runtime.state.palette.open);
+        assert_eq!(runtime.state.palette.edit.text, "wt ");
+        assert_eq!(runtime.state.palette.edit.range(), (3, 3));
+        press(&mut runtime, Key::Text("feature-x".into()), Mods::default());
+        assert_eq!(
+            runtime.state.palette_rows(false).actions[0],
+            Action::CreateWorktree("feature-x".to_owned())
+        );
     }
 
     fn create_worktree_from_palette(shell: PathBuf, branch: &str) -> Runtime<State> {

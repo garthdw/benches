@@ -12,8 +12,9 @@ Ghostty config for its font and theme.
 - Projects in a sidebar, each with tabs and a drawer (`⌘J`) for a side process such as a dev server.
   Background tabs keep running but cost nothing to draw.
 - A command centre (`⌘P`) to switch tabs, open a folder found by a jump command such as `zoxide`, create
-  a git worktree with [Worktrunk](https://github.com/max-sixty/worktrunk), or run a `!command` in a
-  new tab, completed from your shell history.
+  a git worktree with [Worktrunk](https://github.com/max-sixty/worktrunk) (`wt <branch>`) or open
+  one of the current project's (`wts [filter]`), or run a `!command` in a new tab, completed from your
+  shell history.
 - A git overlay (`⌘G`, `lazygit` by default).
 - Find in scrollback (`⌘F`), jump between prompts (`⌘↑`/`⌘↓`), and select the last command's output.
 - A notification when a long command finishes in a tab you aren't looking at.
