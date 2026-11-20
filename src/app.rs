@@ -821,6 +821,11 @@ pub(crate) fn poll(state: &mut State, now: f64, tx: &mut Tx) -> bool {
     changed | state.sync_secure_input()
 }
 
+pub(crate) fn on_window_focus(state: &mut State, focused: bool, _: &mut Tx) {
+    state.workspace.set_window_focused(focused);
+    state.sync_secure_input();
+}
+
 fn modifiers_changed(state: &mut State, mods: Mods) {
     state.command_held = mods.cmd;
     let shown = state
@@ -959,10 +964,7 @@ pub(crate) fn window_app(
         .menu_item(reload_menu_item())
         .on_quit(on_quit)
         .on_close(on_close)
-        .on_focus(|state, focused, _| {
-            state.workspace.set_window_focused(focused);
-            state.sync_secure_input();
-        });
+        .on_focus(on_window_focus);
     let handle = app.handle();
     fleet.on_reveal(window, move |session| {
         let opener = handle.clone();
