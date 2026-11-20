@@ -62,6 +62,18 @@ pub fn system_locale() -> Option<String> {
 
 pub const FALLBACK_LOCALE: &str = "en_US.UTF-8";
 
+pub fn full_disk_access_settings() -> Option<Link> {
+    let home = std::env::var_os("HOME")?;
+    // Every Mac has this file, and only Full Disk Access lets a process read it.
+    let database = PathBuf::from(home).join("Library/Application Support/com.apple.TCC/TCC.db");
+    match std::fs::File::open(database) {
+        Err(error) if error.kind() == io::ErrorKind::PermissionDenied => Some(Link::Url(
+            "x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles".to_owned(),
+        )),
+        _ => None,
+    }
+}
+
 /// Utility QoS, which keeps the thread off the performance cores while others need them.
 pub fn lower_thread_priority() -> io::Result<()> {
     // SAFETY: changes only the calling thread's QoS class.

@@ -292,6 +292,12 @@ pub(crate) const SCENES: &[Scene] = &[
             .err()
             .map(|error| format!("parse config.toml: {error}"));
     }),
+    ("full-disk-access", |state| {
+        show_workspace_scene(state);
+        state.full_disk_access = Some(benches_platform::Link::Url(
+            "x-apple.systempreferences:".to_owned(),
+        ));
+    }),
     ("empty", isolate_scene),
     ("collapsed", |state| {
         show_workspace_scene(state);

@@ -61,6 +61,12 @@ pub fn lower_thread_priority() -> io::Result<()> {
     os::lower_thread_priority()
 }
 
+/// Where to grant Full Disk Access, while this process lacks it. Programs started from the app
+/// share its privacy permissions, so without it some can't read even their own data.
+pub fn full_disk_access_settings() -> Option<Link> {
+    os::full_disk_access_settings()
+}
+
 /// Whether `set_secure_input` can keep other processes from reading keystrokes.
 pub const SECURE_INPUT_SUPPORTED: bool = os::SECURE_INPUT_SUPPORTED;
 

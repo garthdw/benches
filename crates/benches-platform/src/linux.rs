@@ -103,6 +103,11 @@ pub fn lower_thread_priority() -> io::Result<()> {
     Ok(())
 }
 
+/// Linux has no per-app privacy permissions.
+pub fn full_disk_access_settings() -> Option<Link> {
+    None
+}
+
 /// X11 and Wayland have nothing like macOS's secure event input.
 pub const SECURE_INPUT_SUPPORTED: bool = false;
 
