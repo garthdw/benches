@@ -2210,10 +2210,7 @@ mod tests {
     #[test]
     fn the_layout_saves_and_loads_back() {
         let directory = tempfile::tempdir().unwrap();
-        let paths = || config::Paths {
-            dir: directory.path().join("benches"),
-            ghostty_dir: directory.path().join("ghostty"),
-        };
+        let paths = || config::Paths::under(directory.path());
         let mut state = State::default();
         for root in ["/", "/usr"] {
             let tabs = vec![fixture_tab("shell", b"$ "), fixture_tab("claude", b"")];
@@ -2239,10 +2236,7 @@ mod tests {
     #[test]
     fn the_full_disk_access_notice_ignores_keys_and_its_answer_is_saved() {
         let directory = tempfile::tempdir().unwrap();
-        let paths = || config::Paths {
-            dir: directory.path().join("benches"),
-            ghostty_dir: directory.path().join("ghostty"),
-        };
+        let paths = || config::Paths::under(directory.path());
         let mut runtime = workspace_runtime();
         runtime.state.paths = Some(paths());
         runtime.state.full_disk_access = Some(Link::Url("x-apple.systempreferences:".to_owned()));
@@ -2433,10 +2427,7 @@ mod tests {
     #[test]
     fn the_last_window_to_quit_saves_every_windows_projects() {
         let directory = tempfile::tempdir().unwrap();
-        let paths = config::Paths {
-            dir: directory.path().join("benches"),
-            ghostty_dir: directory.path().join("ghostty"),
-        };
+        let paths = config::Paths::under(directory.path());
         let fleet = Fleet::default();
         let window = |window, root: &str| {
             let mut state = State {

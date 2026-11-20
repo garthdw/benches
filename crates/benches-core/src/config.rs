@@ -233,6 +233,15 @@ impl Paths {
         })
     }
 
+    /// Every folder under `root`, for tests.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn under(root: &Path) -> Self {
+        Self {
+            dir: root.join("benches"),
+            ghostty_dir: root.join("ghostty"),
+        }
+    }
+
     pub fn state(&self) -> PathBuf {
         self.dir.join("state.json")
     }
@@ -763,10 +772,7 @@ mod tests {
 
     fn paths(config: Option<&str>, ghostty: Option<&str>) -> (tempfile::TempDir, Paths) {
         let root = tempfile::tempdir().unwrap();
-        let paths = Paths {
-            dir: root.path().join("benches"),
-            ghostty_dir: root.path().join("ghostty"),
-        };
+        let paths = Paths::under(root.path());
         for (dir, text) in [(&paths.dir, config), (&paths.ghostty_dir, ghostty)] {
             std::fs::create_dir_all(dir.join("themes")).unwrap();
             std::fs::write(
@@ -1177,10 +1183,7 @@ mod schema_tests {
 
     fn dir_paths() -> (tempfile::TempDir, Paths) {
         let root = tempfile::tempdir().unwrap();
-        let paths = Paths {
-            dir: root.path().join("benches"),
-            ghostty_dir: root.path().join("ghostty"),
-        };
+        let paths = Paths::under(root.path());
         (root, paths)
     }
 
