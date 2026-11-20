@@ -11,7 +11,7 @@ use rune::{
 
 use crate::find::{Find, open_find, poll_find};
 use crate::input::caret_rect;
-use crate::keymap::{Command, pressed, shortcut};
+use crate::keymap::{COPY, Command, PASTE, pressed, shortcut};
 use crate::palette::{
     Action, Palette, list_project_worktrees, open_palette, open_palette_with, poll_creation,
     poll_history, poll_jump, poll_selection, poll_worktrees, run_action,
@@ -862,13 +862,13 @@ pub(crate) fn on_key(state: &mut State, event: &KeyEvent, tx: &mut Tx) -> bool {
     if tx.focused().is_some() {
         return false;
     }
-    if pressed("mod+c", event, tx) {
+    if pressed(COPY.here(), event, tx) {
         if let Some(session) = state.session() {
             session.copy();
         }
         return true;
     }
-    if pressed("mod+v", event, tx) {
+    if pressed(PASTE.here(), event, tx) {
         tx.read_clipboard(
             |state: &mut State, content: &ClipboardContent, _: &mut Tx| {
                 if let Some(session) = state.session()
@@ -1643,13 +1643,7 @@ mod tests {
             };
             assert!(!shortcut(&mut state, &plain, &mut tx));
         }
-        assert_eq!(
-            crate::keymap::COMMANDS
-                .iter()
-                .find(|spec| spec.command == Command::SelectLastOutput)
-                .map(|spec| spec.chord),
-            Some(None)
-        );
+        assert_eq!(Command::SelectLastOutput.chord(), None);
     }
 
     fn tray_runtime() -> Runtime<State> {

@@ -48,13 +48,21 @@ pub struct PointerInput {
     pub mods: key::Mods,
 }
 
+/// Held to hover and open links: ⌘ on macOS, and Ctrl on Linux, where the window manager
+/// usually takes Super.
+pub const LINK_MODS: key::Mods = if cfg!(target_os = "macos") {
+    key::Mods::SUPER
+} else {
+    key::Mods::CTRL
+};
+
 /// What the pointer over the terminal would do, which picks its cursor.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[repr(u8)]
 pub enum Hover {
     #[default]
     Text,
-    /// ⌘ is held over a link, which a click opens.
+    /// `LINK_MODS` are held over a link, which a click opens.
     Link,
     /// The program tracks the mouse, so a click reaches it instead of selecting.
     Report,
@@ -133,7 +141,7 @@ pub struct TerminalInput {
     /// Set by `select` for the actor to take, as libghostty doesn't mark the render state dirty.
     pub selection_changed: bool,
     hover: Hover,
-    /// The viewport cells, `start..end` counted row by row, of the link ⌘ is over.
+    /// The viewport cells, `start..end` counted row by row, of the link `LINK_MODS` hover.
     pub(crate) link: Option<(usize, usize)>,
 }
 
@@ -365,7 +373,7 @@ impl TerminalInput {
         let Some(surface) = self.surface else {
             return Ok(None);
         };
-        self.link = if mods.contains(key::Mods::SUPER) {
+        self.link = if mods.contains(LINK_MODS) {
             let position = Self::viewport_point(surface, self.position);
             Self::link_at(terminal, surface, position)?.map(|(cells, _)| cells)
         } else {
@@ -384,8 +392,8 @@ impl TerminalInput {
         }))
     }
 
-    /// The link a ⌘-click starts on. The actor opens it instead of passing the press on, so it
-    /// neither selects nor reaches a mouse-tracking program.
+    /// The link a click with `LINK_MODS` starts on. The actor opens it instead of passing the
+    /// press on, so it neither selects nor reaches a mouse-tracking program.
     pub(crate) fn link_under(
         &self,
         terminal: &Terminal<'static, '_>,
@@ -396,7 +404,7 @@ impl TerminalInput {
         };
         if input.phase != PointerPhase::Press
             || input.button != Some(mouse::Button::Left)
-            || !input.mods.contains(key::Mods::SUPER)
+            || !input.mods.contains(LINK_MODS)
         {
             return Ok(None);
         }
@@ -675,7 +683,7 @@ mod tests {
 
     fn command_press(column: u16, row: u16) -> PointerInput {
         PointerInput {
-            mods: key::Mods::SUPER,
+            mods: LINK_MODS,
             ..pointer_at(PointerPhase::Press, column, row)
         }
     }
@@ -733,15 +741,15 @@ mod tests {
             input.pointer(&terminal, hover).unwrap();
         };
         let none = key::Mods::empty();
-        let command = key::Mods::SUPER;
+        let link = LINK_MODS;
         move_to(&mut input, 5);
         assert_eq!(input.hover(&terminal, none).unwrap(), None);
-        assert_eq!(input.hover(&terminal, command).unwrap(), Some(Hover::Link));
-        assert_eq!(input.hover(&terminal, command).unwrap(), None);
+        assert_eq!(input.hover(&terminal, link).unwrap(), Some(Hover::Link));
+        assert_eq!(input.hover(&terminal, link).unwrap(), None);
         move_to(&mut input, 0);
-        assert_eq!(input.hover(&terminal, command).unwrap(), Some(Hover::Text));
+        assert_eq!(input.hover(&terminal, link).unwrap(), Some(Hover::Text));
         move_to(&mut input, 5);
-        assert_eq!(input.hover(&terminal, command).unwrap(), Some(Hover::Link));
+        assert_eq!(input.hover(&terminal, link).unwrap(), Some(Hover::Link));
         assert_eq!(input.hover(&terminal, none).unwrap(), Some(Hover::Text));
     }
 
@@ -754,11 +762,11 @@ mod tests {
             input
                 .pointer(&terminal, pointer_at(PointerPhase::Move, column, row))
                 .unwrap();
-            input.hover(&terminal, key::Mods::SUPER).unwrap();
-            let command = input.link;
+            input.hover(&terminal, LINK_MODS).unwrap();
+            let hovered = input.link;
             input.hover(&terminal, key::Mods::empty()).unwrap();
             assert_eq!(input.link, None, "released");
-            command
+            hovered
         };
         assert_eq!(span_at(b"a https://a.te/x ok", 5, 0), Some((2, 16)));
         assert_eq!(span_at(b"a https://a.te/x ok", 0, 0), None);
@@ -782,8 +790,8 @@ mod tests {
         assert_eq!(input.hover(&terminal, none).unwrap(), Some(Hover::Report));
         let shift = key::Mods::SHIFT;
         assert_eq!(input.hover(&terminal, shift).unwrap(), Some(Hover::Text));
-        let command = key::Mods::SUPER;
-        assert_eq!(input.hover(&terminal, command).unwrap(), Some(Hover::Link));
+        let link = LINK_MODS;
+        assert_eq!(input.hover(&terminal, link).unwrap(), Some(Hover::Link));
         terminal.vt_write(b"\x1b[?1000l");
         assert_eq!(input.hover(&terminal, none).unwrap(), Some(Hover::Text));
     }

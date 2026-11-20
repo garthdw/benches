@@ -85,9 +85,12 @@ pub fn map_text(text: &str, mods: Mods, physical: Option<Code>, base: Option<cha
     }
 }
 
-/// Ghostty's default "natural text editing" keybinds, which send fixed bytes instead of
-/// an encoded key.
+/// Ghostty's default macOS "natural text editing" keybinds, which send fixed bytes instead
+/// of an encoded key.
 fn line_editing_text(event: &KeyEvent) -> Option<&'static str> {
+    if !cfg!(target_os = "macos") {
+        return None;
+    }
     let Mods {
         shift,
         cmd,
@@ -105,7 +108,7 @@ fn line_editing_text(event: &KeyEvent) -> Option<&'static str> {
     }
 }
 
-/// `None` for keys with no terminal meaning. The app's own ⌘ shortcuts are taken before this,
+/// `None` for keys with no terminal meaning. The app's own shortcuts are taken before this,
 /// so any ⌘ chord that gets here goes to the terminal with super set and the encoder decides.
 pub fn map_key(event: &KeyEvent, physical: Option<Code>, base: Option<char>) -> Option<KeyInput> {
     if let Some(text) = line_editing_text(event) {

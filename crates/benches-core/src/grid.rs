@@ -427,7 +427,7 @@ pub struct Presentation {
     pub(crate) metrics: Metrics,
     pub(crate) scrollbar_opacity: f32,
     pub(crate) scrollbar_wide: bool,
-    /// The viewport cells, `start..end` counted row by row, of the link ⌘ is over.
+    /// The viewport cells, `start..end` counted row by row, of the hovered link.
     pub(crate) link: Option<(usize, usize)>,
 }
 

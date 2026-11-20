@@ -1,4 +1,4 @@
-use rune::{Chord, Key, KeyEvent, Tx};
+use rune::{Chord, Key, KeyEvent, KeyPlatform, Tx};
 
 use crate::app::{State, run_command};
 use crate::workspace::Workspace;
@@ -32,21 +32,53 @@ pub enum Command {
     ReloadConfig,
 }
 
+/// A shortcut's chord on macOS and on Linux. Ctrl is `mod` on Linux and programs in the
+/// terminal need its plain chords, so app shortcuts there add Shift, as Ghostty's and GNOME
+/// Terminal's do.
+#[derive(Clone, Copy, Debug)]
+pub struct Keys {
+    mac: &'static str,
+    linux: &'static str,
+}
+
+const fn keys(mac: &'static str, linux: &'static str) -> Keys {
+    Keys { mac, linux }
+}
+
+impl Keys {
+    pub const fn on(self, platform: KeyPlatform) -> &'static str {
+        match platform {
+            KeyPlatform::Mac => self.mac,
+            KeyPlatform::Windows | KeyPlatform::Linux => self.linux,
+        }
+    }
+
+    pub const fn here(self) -> &'static str {
+        self.on(KeyPlatform::current())
+    }
+}
+
+pub const COPY: Keys = keys("mod+c", "ctrl+shift+c");
+pub const PASTE: Keys = keys("mod+v", "ctrl+shift+v");
+/// Followed by a digit. Tabs follow GNOME Terminal and Ghostty on Linux.
+const TAB_DIGIT: Keys = keys("mod+", "alt+");
+const PROJECT_DIGIT: Keys = keys("ctrl+", "ctrl+shift+");
+
 pub struct CommandSpec {
     pub command: Command,
     pub label: &'static str,
-    pub chord: Option<&'static str>,
+    pub keys: Option<Keys>,
     /// Listed in the palette before anything is typed.
     pub default: bool,
     /// Offered for this workspace and config, in a torn-off window or not.
     pub enabled: fn(&Workspace, &Config, bool) -> bool,
 }
 
-const fn spec(command: Command, label: &'static str, chord: Option<&'static str>) -> CommandSpec {
+const fn spec(command: Command, label: &'static str, keys: Option<Keys>) -> CommandSpec {
     CommandSpec {
         command,
         label,
-        chord,
+        keys,
         default: false,
         enabled: |_, _, _| true,
     }
@@ -59,12 +91,24 @@ const fn default(mut spec: CommandSpec) -> CommandSpec {
 
 /// Palette rows appear in this order, ahead of every dynamic action.
 pub const COMMANDS: &[CommandSpec] = &[
-    default(spec(Command::NewShell, "New shell tab", Some("mod+t"))),
+    default(spec(
+        Command::NewShell,
+        "New shell tab",
+        Some(keys("mod+t", "ctrl+shift+t")),
+    )),
     default(CommandSpec {
         enabled: |_, config, _| config.git_command().is_some(),
-        ..spec(Command::ToggleGit, "Toggle git", Some("mod+g"))
+        ..spec(
+            Command::ToggleGit,
+            "Toggle git",
+            Some(keys("mod+g", "ctrl+shift+g")),
+        )
     }),
-    default(spec(Command::OpenProject, "Open project…", Some("mod+n"))),
+    default(spec(
+        Command::OpenProject,
+        "Open project…",
+        Some(keys("mod+n", "ctrl+shift+n")),
+    )),
     default(CommandSpec {
         enabled: |workspace, _, _| workspace.project().is_some(),
         ..spec(Command::ChangeFolder, "Change project folder…", None)
@@ -95,11 +139,27 @@ pub const COMMANDS: &[CommandSpec] = &[
     }),
     CommandSpec {
         enabled: |_, _, _| false,
-        ..spec(Command::Palette, "Command palette", Some("mod+p"))
+        ..spec(
+            Command::Palette,
+            "Command palette",
+            Some(keys("mod+p", "ctrl+shift+p")),
+        )
     },
-    spec(Command::Find, "Find in scrollback", Some("mod+f")),
-    spec(Command::ToggleSidebar, "Toggle sidebar", Some("mod+b")),
-    spec(Command::ToggleDrawer, "Toggle drawer", Some("mod+j")),
+    spec(
+        Command::Find,
+        "Find in scrollback",
+        Some(keys("mod+f", "ctrl+shift+f")),
+    ),
+    spec(
+        Command::ToggleSidebar,
+        "Toggle sidebar",
+        Some(keys("mod+b", "ctrl+shift+b")),
+    ),
+    spec(
+        Command::ToggleDrawer,
+        "Toggle drawer",
+        Some(keys("mod+j", "ctrl+shift+j")),
+    ),
     CommandSpec {
         enabled: |_, _, _| benches_platform::SECURE_INPUT_SUPPORTED,
         ..spec(
@@ -108,50 +168,63 @@ pub const COMMANDS: &[CommandSpec] = &[
             None,
         )
     },
-    spec(Command::CloseTab, "Close tab", Some("mod+w")),
-    spec(Command::ZoomIn, "Zoom in", Some("mod+=")),
-    spec(Command::ZoomOut, "Zoom out", Some("mod+-")),
-    spec(Command::ZoomReset, "Reset zoom", Some("mod+0")),
-    spec(Command::PrevTab, "Previous tab", Some("mod+shift+[")),
-    spec(Command::NextTab, "Next tab", Some("mod+shift+]")),
+    spec(
+        Command::CloseTab,
+        "Close tab",
+        Some(keys("mod+w", "ctrl+shift+w")),
+    ),
+    spec(
+        Command::ZoomIn,
+        "Zoom in",
+        Some(keys("mod+=", "ctrl+shift+=")),
+    ),
+    spec(
+        Command::ZoomOut,
+        "Zoom out",
+        Some(keys("mod+-", "ctrl+shift+-")),
+    ),
+    spec(
+        Command::ZoomReset,
+        "Reset zoom",
+        Some(keys("mod+0", "ctrl+shift+0")),
+    ),
+    spec(
+        Command::PrevTab,
+        "Previous tab",
+        Some(keys("mod+shift+[", "ctrl+pageup")),
+    ),
+    spec(
+        Command::NextTab,
+        "Next tab",
+        Some(keys("mod+shift+]", "ctrl+pagedown")),
+    ),
     spec(
         Command::PrevPrompt,
         "Jump to previous prompt",
-        Some("mod+up"),
+        Some(keys("mod+up", "ctrl+shift+up")),
     ),
-    spec(Command::NextPrompt, "Jump to next prompt", Some("mod+down")),
+    spec(
+        Command::NextPrompt,
+        "Jump to next prompt",
+        Some(keys("mod+down", "ctrl+shift+down")),
+    ),
     spec(
         Command::SelectLastOutput,
         "Select last command output",
         None,
     ),
-    spec(Command::ReloadConfig, "Reload config", Some("mod+shift+,")),
+    spec(
+        Command::ReloadConfig,
+        "Reload config",
+        Some(keys("mod+shift+,", "ctrl+shift+,")),
+    ),
 ];
 
-/// A chord such as `mod+shift+]` the way macOS menus show it: `⇧⌘]`.
+/// A chord as this platform draws it: `⇧⌘]` on macOS, `Ctrl+Shift+]` on Linux.
 pub fn chord_hint(chord: &str) -> String {
-    let mut modifiers = ['⌃', '⌥', '⇧', '⌘'].map(|symbol| (symbol, false));
-    let mut key = String::new();
-    for part in chord.split('+') {
-        let symbol = match part {
-            "ctrl" => '⌃',
-            "alt" => '⌥',
-            "shift" => '⇧',
-            "mod" => '⌘',
-            _ => {
-                key = part.to_uppercase();
-                continue;
-            }
-        };
-        for (candidate, held) in &mut modifiers {
-            *held |= *candidate == symbol;
-        }
-    }
-    let held = modifiers
-        .iter()
-        .filter(|(_, held)| *held)
-        .map(|(symbol, _)| symbol);
-    held.copied().chain(key.chars()).collect()
+    Chord::parse(chord)
+        .map(|chord| chord.label())
+        .unwrap_or_default()
 }
 
 impl Command {
@@ -164,23 +237,32 @@ impl Command {
     }
 
     pub fn chord(self) -> Option<&'static str> {
-        self.find_spec().and_then(|spec| spec.chord)
+        self.find_spec().and_then(|spec| spec.keys).map(Keys::here)
+    }
+
+    pub fn hint(self) -> Option<String> {
+        self.chord().map(chord_hint)
     }
 }
 
 /// Workspace shortcuts. These keys never reach the terminal.
 pub fn shortcut(state: &mut State, event: &KeyEvent, tx: &mut Tx) -> bool {
-    if !matches!(event.key, Key::Command(_)) && !event.mods.ctrl && !event.mods.cmd {
+    let mods = event.mods;
+    if !matches!(event.key, Key::Command(_)) && !mods.ctrl && !mods.cmd && !mods.alt {
         return false;
     }
     let pressed = |binding: &str| pressed(binding, event, tx);
-    let digit = |prefix: &str| (1..=9usize).find(|digit| pressed(&format!("{prefix}{digit}")));
-    if let Some(spec) = COMMANDS.iter().find(|spec| spec.chord.is_some_and(pressed)) {
+    let digit =
+        |prefix: Keys| (1..=9usize).find(|digit| pressed(&format!("{}{digit}", prefix.here())));
+    if let Some(spec) = COMMANDS
+        .iter()
+        .find(|spec| spec.keys.map(Keys::here).is_some_and(pressed))
+    {
         run_command(state, spec.command, tx);
-    } else if let Some(digit) = digit("ctrl+") {
+    } else if let Some(digit) = digit(PROJECT_DIGIT) {
         let last = state.workspace.projects.len().saturating_sub(1);
         state.workspace.select_project((digit - 1).min(last));
-    } else if let Some(digit) = digit("mod+") {
+    } else if let Some(digit) = digit(TAB_DIGIT) {
         if let Some(project) = state.workspace.project() {
             let last = project.tabs.len().saturating_sub(1);
             state.workspace.select_tab((digit - 1).min(last));
@@ -199,22 +281,57 @@ pub fn pressed(binding: &str, event: &KeyEvent, tx: &Tx) -> bool {
 mod tests {
     use super::*;
 
-    #[test]
-    fn chords_read_like_macos_menus() {
-        assert_eq!(chord_hint("mod+t"), "⌘T");
-        assert_eq!(chord_hint("mod+shift+]"), "⇧⌘]");
-        assert_eq!(chord_hint("mod+="), "⌘=");
-        assert_eq!(chord_hint("ctrl+c"), "⌃C");
-        assert_eq!(chord_hint("alt+shift+mod+x"), "⌥⇧⌘X");
+    const PLATFORMS: [KeyPlatform; 2] = [KeyPlatform::Mac, KeyPlatform::Linux];
+
+    /// Every app chord on `platform`, digit chords included.
+    fn chords(platform: KeyPlatform) -> Vec<Chord> {
+        let digits = [TAB_DIGIT, PROJECT_DIGIT]
+            .into_iter()
+            .flat_map(|prefix| (1..=9).map(move |digit| format!("{}{digit}", prefix.on(platform))));
+        COMMANDS
+            .iter()
+            .filter_map(|spec| spec.keys)
+            .chain([COPY, PASTE])
+            .map(|keys| keys.on(platform).to_owned())
+            .chain(digits)
+            .map(|chord| Chord::parse(&chord).unwrap())
+            .collect()
     }
 
     #[test]
-    fn every_chord_parses_and_is_unique() {
-        let chords: Vec<_> = COMMANDS.iter().filter_map(|spec| spec.chord).collect();
-        assert!(chords.iter().all(|chord| Chord::parse(chord).is_ok()));
-        let mut unique = chords.clone();
-        unique.sort_unstable();
-        unique.dedup();
-        assert_eq!(unique.len(), chords.len());
+    fn hints_use_the_platforms_glyphs_or_words() {
+        let hint = |chord, platform| Chord::parse(chord).unwrap().label_on(platform);
+        assert_eq!(hint("mod+t", KeyPlatform::Mac), "⌘T");
+        assert_eq!(hint("mod+shift+]", KeyPlatform::Mac), "⇧⌘]");
+        assert_eq!(hint("alt+shift+mod+x", KeyPlatform::Mac), "⌥⇧⌘X");
+        assert_eq!(hint("ctrl+shift+t", KeyPlatform::Linux), "Ctrl+Shift+T");
+        assert_eq!(hint("ctrl+pageup", KeyPlatform::Linux), "Ctrl+Page Up");
+        assert_eq!(
+            chord_hint(Command::NewShell.chord().unwrap()),
+            hint(Command::NewShell.chord().unwrap(), KeyPlatform::current())
+        );
+    }
+
+    #[test]
+    fn chords_are_unique_on_each_platform() {
+        for platform in PLATFORMS {
+            let chords = chords(platform);
+            for (index, chord) in chords.iter().enumerate() {
+                let clash = chords[index + 1..]
+                    .iter()
+                    .find(|other| chord.same_keys(other, platform));
+                assert_eq!(clash, None, "{chord} on {platform:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn plain_ctrl_keys_reach_the_terminal_on_linux() {
+        let ctrl = Chord::parse("ctrl+c").unwrap();
+        for chord in chords(KeyPlatform::Linux) {
+            let typed_with_ctrl = matches!(chord.key(), rune::ChordKey::Char(_))
+                && chord.mods_on(KeyPlatform::Linux) == ctrl.mods_on(KeyPlatform::Linux);
+            assert!(!typed_with_ctrl, "{chord} takes a control key");
+        }
     }
 }

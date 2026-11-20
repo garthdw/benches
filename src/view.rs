@@ -13,6 +13,7 @@ use crate::app::{
 };
 use crate::find;
 use crate::input::{self, focus_on_press, pointer_phase, send_pointer};
+use crate::keymap::Command;
 use crate::palette::{self, open_palette};
 use crate::render;
 use crate::session::{Attention, Session};
@@ -767,7 +768,13 @@ pub(crate) fn view(state: &State, cx: &mut Cx<State>) -> El {
                 .key("empty-hint")
                 .pin(Some(0.0), Some(0.0), Some(0.0), Some(0.0))
                 .center()
-                .child(text("Open a folder with ⌘N, or drop one here").color(theme.text_secondary)),
+                .child(
+                    text(format!(
+                        "Open a folder with {}, or drop one here",
+                        Command::OpenProject.hint().unwrap_or_default()
+                    ))
+                    .color(theme.text_secondary),
+                ),
         );
     }
     let banners: Vec<El> = [
