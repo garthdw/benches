@@ -5,7 +5,10 @@ use std::time::Duration;
 
 use rune::color::Color;
 use rune::tok;
-use rune::{El, Key, KeyEvent, Mods, Span, TextEdit, Tx, Waker, col, el, text, text_input};
+use rune::{
+    El, Key, KeyEvent, Mods, PointerPress, Span, TextEdit, Tx, Waker, col, el, row, text,
+    text_input,
+};
 
 use crate::app::{State, open_project, open_tab, open_tray, run_command, tray_action};
 use crate::jump;
@@ -121,20 +124,33 @@ impl State {
             .filter(|_| self.palette.jump.query == self.palette.edit.text.trim())
     }
 
-    /// `tray` makes `!` rows run in the tray.
+    /// `tray` makes run rows run in the tray, as ⌘↵ would.
     pub(crate) fn palette_rows(&self, tray: bool) -> Rows {
-        let Query::Shell(typed) = Query::of(&self.palette.edit.text) else {
-            return Rows {
+        let Rows { actions, ghost } = match Query::of(&self.palette.edit.text) {
+            Query::Shell(typed) => self.shell_rows(typed),
+            Query::Search(query) => Rows {
                 actions: palette_actions(
-                    &self.palette.edit.text,
+                    query,
                     self.jump_target(),
                     &self.workspace,
                     &self.config,
                     self.is_torn_off(),
                 ),
                 ghost: None,
-            };
+            },
         };
+        let actions = actions
+            .into_iter()
+            .map(|action| match action {
+                Action::Run(command) if tray => Action::Tray(command),
+                action => action,
+            })
+            .collect();
+        Rows { actions, ghost }
+    }
+
+    /// The typed `!` command, then the history entries containing it, as run rows.
+    fn shell_rows(&self, typed: &str) -> Rows {
         let command = typed.trim_end();
         let history = &self.palette.history;
         let prefixed = history.iter().filter(|entry| entry.starts_with(typed));
@@ -161,13 +177,7 @@ impl State {
             .then_some(command)
             .into_iter()
             .chain(suggested.take(HISTORY_ROWS))
-            .map(|command| {
-                if tray {
-                    Action::Tray(command.to_owned())
-                } else {
-                    Action::Run(command.to_owned())
-                }
-            })
+            .map(|command| Action::Run(command.to_owned()))
             .collect();
         Rows { actions, ghost }
     }
@@ -189,6 +199,11 @@ pub(crate) enum Action {
 }
 
 impl Action {
+    /// Whether ⌘↵ does something on this row, where `palette_rows` was asked for tray rows.
+    fn takes_command_enter(&self) -> bool {
+        matches!(self, Action::Tray(_) | Action::Jump(_))
+    }
+
     fn label(&self, working_directory: &Path) -> String {
         match self {
             Action::Command(command) => command.label().to_owned(),
@@ -371,7 +386,6 @@ pub(crate) fn palette_actions(
     actions.extend(jump.map(|root| Action::Jump(root.to_owned())));
     actions.extend(strong.into_iter().map(command));
     actions.push(Action::Run(query.to_owned()));
-    actions.push(Action::Tray(query.to_owned()));
     actions.extend(weak.into_iter().map(command));
     actions.extend(
         exact_switches
@@ -519,8 +533,14 @@ fn run_palette(state: &mut State, index: usize, tray: bool, tx: &mut Tx) {
     let Some(action) = actions.get(index.min(actions.len().saturating_sub(1))) else {
         return;
     };
-    state.palette.open = false;
-    run_action(state, action, tx);
+    match action {
+        Action::Jump(root) if tray => list_worktrees(state, root.clone(), true, "", tx),
+        _ if tray && !action.takes_command_enter() => {}
+        _ => {
+            state.palette.open = false;
+            run_action(state, action, tx);
+        }
+    }
 }
 
 pub(crate) fn run_action(state: &mut State, action: &Action, tx: &mut Tx) {
@@ -631,6 +651,11 @@ fn open_worktree(state: &mut State, index: usize) {
 }
 
 fn palette_key(state: &mut State, event: &KeyEvent, tx: &mut Tx) -> bool {
+    if let Key::Modifier { .. } = event.key {
+        return false;
+    }
+    // A fallback should a modifier key go unheard, as every run row would stay in the tray.
+    state.command_held = event.mods.cmd;
     if let Some(creation) = &state.palette.creation {
         if event.key == Key::Escape {
             creation.cancel.cancel().log_err("cancel wt switch");
@@ -659,20 +684,6 @@ fn palette_key(state: &mut State, event: &KeyEvent, tx: &mut Tx) -> bool {
                 .edit
                 .insert(&line[state.palette.edit.text.len()..]);
             state.palette.error = None;
-        }
-        (Key::Enter, Query::Search(_))
-            if event.mods.cmd
-                && let Some(Action::Jump(root)) =
-                    rows.actions.get(state.palette.selected.min(last)) =>
-        {
-            list_worktrees(state, root.clone(), true, "", tx);
-        }
-        (Key::Enter, Query::Search(query)) if event.mods.cmd => {
-            if !query.is_empty() {
-                let query = query.to_owned();
-                state.palette.open = false;
-                open_tray(state, &query);
-            }
         }
         (Key::Enter, _) => run_palette(state, state.palette.selected, event.mods.cmd, tx),
         _ => {
@@ -745,6 +756,15 @@ pub(crate) fn poll_jump(state: &mut State, now: f64, tx: &mut Tx) -> bool {
     changed
 }
 
+fn enter_hint(theme: &tok::Theme, hint: Option<&str>) -> Option<El> {
+    hint.map(|hint| text(hint).key("palette-enter").color(theme.text_secondary))
+}
+
+/// Selects on moving, not on entering, so rows that arrive under a still pointer don't take it.
+fn select_on_pointer_move(index: usize) -> impl Fn(&mut State, PointerPress) {
+    move |state, _| state.palette.selected = index
+}
+
 pub(crate) fn view(
     state: &State,
     theme: &tok::Theme,
@@ -765,12 +785,14 @@ pub(crate) fn view(
                 let branch = worktree.branch.as_deref().unwrap_or("(detached)");
                 let label = format!("{branch}  {}", jump::abbreviate_home(&worktree.path));
                 pill(format!("palette-{index}"), &label, index == selected, None)
+                    .children(enter_hint(theme, (index == selected).then_some("↵")))
+                    .justify_between()
                     .w_full()
+                    .on_pointer_move(select_on_pointer_move(index))
                     .on_press(move |state: &mut State| open_worktree(state, index))
             });
             placeholder.into_iter().chain(worktrees).collect()
         } else {
-            let shell = matches!(Query::of(&state.palette.edit.text), Query::Shell(_));
             let selected = state
                 .palette
                 .selected
@@ -779,34 +801,61 @@ pub(crate) fn view(
                 .iter()
                 .enumerate()
                 .map(|(index, action)| {
-                    let shortcut = match action {
-                        Action::Tray(_) => Some("⌘↵".to_owned()),
-                        Action::Run(_) if shell => Some("⌘↵".to_owned()),
-                        Action::Jump(_) => Some("⌘↵ worktrees".to_owned()),
+                    let is_selected = index == selected;
+                    let chord = match action {
                         Action::Command(command) => COMMANDS
                             .iter()
                             .find(|spec| spec.command == *command)
-                            .and_then(|spec| spec.chord)
-                            .map(chord_hint),
+                            .and_then(|spec| spec.chord),
+                        _ => None,
+                    };
+                    let alternative = match action {
+                        Action::Run(_) => Some("⌘↵ in the tray"),
+                        Action::Jump(_) => Some("⌘↵ worktrees"),
                         _ => None,
                     }
-                    .map(|hint| {
-                        text(&hint)
-                            .key("palette-shortcut")
-                            .color(theme.text_secondary)
-                    });
-                    pill(
-                        format!("palette-{index}"),
-                        &action.label(&state.config.working_directory),
-                        index == selected,
-                        None,
-                    )
-                    .children(shortcut)
-                    .justify_between()
-                    .w_full()
-                    .on_press_tx(move |state: &mut State, tx: &mut Tx| {
-                        run_palette(state, index, state.command_held, tx)
-                    })
+                    .filter(|_| is_selected && !state.command_held);
+                    let enter = match (is_selected, state.command_held) {
+                        (false, _) => None,
+                        (true, false) => Some("↵"),
+                        (true, true) => action.takes_command_enter().then_some("⌘↵"),
+                    };
+                    let shortcuts = row()
+                        .gap(8.0)
+                        .children(chord.map(|chord| {
+                            text(chord_hint(chord))
+                                .key("palette-shortcut")
+                                .color(theme.text_secondary)
+                        }))
+                        .children(enter_hint(theme, enter));
+                    let label = action.label(&state.config.working_directory);
+                    col()
+                        .key(format!("palette-{index}"))
+                        .w_full()
+                        .radius(6.0)
+                        .fill(if is_selected {
+                            theme.control_off
+                        } else {
+                            Color::TRANSPARENT
+                        })
+                        .child(
+                            pill(format!("palette-{index}-label"), &label, false, None)
+                                .child(shortcuts)
+                                .justify_between()
+                                .w_full(),
+                        )
+                        .children(alternative.map(|alternative| {
+                            text(alternative)
+                                .key("palette-alternative")
+                                .font(tok::type_::LABEL)
+                                .color(theme.text_secondary)
+                                .px(10.0)
+                                .pb(4.0)
+                        }))
+                        .on_pointer_move(select_on_pointer_move(index))
+                        .on_press_tx(move |state: &mut State, tx: &mut Tx| {
+                            run_palette(state, index, tx.mods().cmd, tx)
+                        })
                 })
                 .collect()
         };
@@ -919,11 +968,125 @@ mod tests {
     }
 
     #[test]
-    fn the_tray_row_shows_its_shortcut() {
+    fn the_run_row_hints_at_the_tray_until_command_is_held() {
         let mut runtime = palette_runtime();
         press(&mut runtime, Key::Text("x".into()), Mods::default());
         runtime.frame(0.0);
-        assert!(runtime.find("palette-shortcut").is_some());
+        assert!(runtime.find("palette-alternative").is_some());
+        runtime.state.command_held = true;
+        runtime.invalidate();
+        runtime.frame(1.0 / 60.0);
+        assert!(runtime.find("palette-alternative").is_none());
+    }
+
+    #[test]
+    fn only_the_selected_row_shows_enter() {
+        let mut runtime = palette_runtime();
+        runtime.frame(0.0);
+        let row_y = |runtime: &Runtime<State>, key: &str| runtime.find(key).map(|(_, y)| y);
+        assert_eq!(
+            row_y(&runtime, "palette-enter"),
+            row_y(&runtime, "palette-0")
+        );
+        press(&mut runtime, Key::Down, Mods::default());
+        runtime.frame(1.0 / 60.0);
+        assert_eq!(
+            row_y(&runtime, "palette-enter"),
+            row_y(&runtime, "palette-1")
+        );
+    }
+
+    #[test]
+    fn hovering_a_row_selects_it() {
+        let mut runtime = palette_runtime();
+        runtime.frame(0.0);
+        hover(&mut runtime, "palette-2");
+        assert_eq!(runtime.state.palette.selected, 2);
+    }
+
+    #[test]
+    fn command_enter_on_a_command_row_does_nothing() {
+        let mut runtime = palette_runtime();
+        press(&mut runtime, Key::Text("sidebar".into()), Mods::default());
+        press(&mut runtime, Key::Enter, command());
+        assert!(!runtime.state.sidebar_hidden);
+        assert!(runtime.state.workspace.projects[0].tray.is_empty());
+        assert!(runtime.state.palette.open);
+    }
+
+    #[test]
+    fn holding_command_hints_enter_only_where_command_enter_applies() {
+        let mut runtime = palette_runtime();
+        press(&mut runtime, Key::Text("sidebar".into()), Mods::default());
+        runtime.state.command_held = true;
+        runtime.invalidate();
+        runtime.frame(2.0 / 60.0);
+        assert!(runtime.find("palette-enter").is_none());
+        runtime.state.palette.edit = TextEdit::new("x");
+        runtime.invalidate();
+        runtime.frame(3.0 / 60.0);
+        assert!(runtime.find("palette-enter").is_some());
+    }
+
+    #[test]
+    fn rows_arriving_under_a_still_pointer_keep_the_selection() {
+        let mut runtime = palette_runtime();
+        press(&mut runtime, Key::Text("x".into()), Mods::default());
+        assert!(rows(&runtime).len() < 4);
+        let (x, y) = runtime.find("palette-0").unwrap();
+        runtime.pointer_move(x, y + 85.0);
+        runtime.frame(3.0 / 60.0);
+        press(&mut runtime, Key::Backspace, Mods::default());
+        settle(&mut runtime);
+        assert!(rows(&runtime).len() > 4);
+        assert_eq!(runtime.state.palette.selected, 0);
+    }
+
+    #[test]
+    fn a_key_without_command_clears_a_command_release_that_went_unheard() {
+        let mut runtime = history_runtime();
+        runtime.state.command_held = true;
+        press(&mut runtime, Key::Text("!ls".into()), Mods::default());
+        assert!(!runtime.state.command_held);
+    }
+
+    #[test]
+    fn a_click_without_command_runs_the_row_despite_an_unheard_command_release() {
+        let mut runtime = palette_runtime();
+        press(&mut runtime, Key::Text("sidebar".into()), Mods::default());
+        runtime.state.command_held = true;
+        runtime.invalidate();
+        runtime.frame(2.0 / 60.0);
+        click(&mut runtime, "palette-0");
+        assert!(runtime.state.sidebar_hidden);
+    }
+
+    #[test]
+    fn holding_command_alone_swaps_the_run_row_for_the_tray() {
+        let mut runtime = palette_runtime();
+        press(&mut runtime, Key::Text("x".into()), Mods::default());
+        let command_key = |pressed, mods| rune::PhysicalInput::Key {
+            key: rune::PhysicalKeyCode::SuperLeft,
+            mods,
+            pressed,
+            repeat: false,
+        };
+        runtime.physical_input(command_key(true, command()));
+        runtime.frame(3.0 / 60.0);
+        assert!(runtime.state.command_held);
+        assert!(runtime.find("palette-alternative").is_none());
+        runtime.physical_input(command_key(false, Mods::default()));
+        runtime.frame(4.0 / 60.0);
+        assert!(!runtime.state.command_held);
+        assert!(runtime.find("palette-alternative").is_some());
+    }
+
+    #[test]
+    fn leaving_the_window_lets_go_of_command() {
+        let mut runtime = palette_runtime();
+        runtime.state.command_held = true;
+        runtime.update(|state, tx| crate::app::on_window_focus(state, false, tx));
+        assert!(!runtime.state.command_held);
     }
 
     #[test]
@@ -948,7 +1111,6 @@ mod tests {
             main_window_actions("tlgt", None, &one_project(), &Config::default()),
             [
                 Action::Run("tlgt".to_owned()),
-                Action::Tray("tlgt".to_owned()),
                 Action::Command(Command::ToggleGit),
             ]
         );
@@ -1017,11 +1179,11 @@ mod tests {
     }
 
     #[test]
-    fn loose_matches_follow_the_run_and_tray_rows() {
+    fn loose_matches_follow_the_run_row() {
         let actions = main_window_actions("ls", None, &one_project(), &Config::default());
-        assert_eq!(actions[2], Action::Command(Command::ToggleSidebar));
+        assert_eq!(actions[1], Action::Command(Command::ToggleSidebar));
         let actions = main_window_actions("zi", None, &one_project(), &Config::default());
-        assert_eq!(actions[2], Action::Command(Command::ZoomIn));
+        assert_eq!(actions[1], Action::Command(Command::ZoomIn));
     }
 
     #[test]
@@ -1051,7 +1213,6 @@ mod tests {
             [
                 Action::Jump(root.to_owned()),
                 Action::Run("site".to_owned()),
-                Action::Tray("site".to_owned()),
             ]
         );
     }
@@ -1074,10 +1235,9 @@ mod tests {
         let state = workspace_state();
         let actions = main_window_actions("sit", None, &state.workspace, &Config::default());
         assert_eq!(
-            actions[..3],
+            actions[..2],
             [
                 Action::Run("sit".to_owned()),
-                Action::Tray("sit".to_owned()),
                 Action::SwitchProject(1, "site".to_owned()),
             ]
         );
@@ -1096,9 +1256,8 @@ mod tests {
         let actions = main_window_actions("shell", None, &state.workspace, &Config::default());
         assert_eq!(actions[0], Action::Command(Command::NewShell));
         assert_eq!(actions[1], Action::Run("shell".to_owned()));
-        assert_eq!(actions[2], Action::Tray("shell".to_owned()));
         assert_eq!(
-            actions[3],
+            actions[2],
             Action::SwitchTab(1, 1, "shell (site)".to_owned())
         );
     }
@@ -1244,7 +1403,7 @@ mod tests {
     fn the_jump_row_hints_at_worktrees() {
         let mut runtime = jump_runtime();
         runtime.frame(0.0);
-        assert!(runtime.find("palette-shortcut").is_some());
+        assert!(runtime.find("palette-alternative").is_some());
     }
 
     #[test]
@@ -1718,7 +1877,7 @@ mod tests {
         );
         let actions = main_window_actions("restart", None, &state.workspace, &Config::default());
         assert_eq!(
-            actions[2..4],
+            actions[1..3],
             [
                 Action::RestartTray(0, "pnpm dev".to_owned()),
                 Action::RestartTray(1, "storybook".to_owned()),
@@ -1726,7 +1885,7 @@ mod tests {
         );
         let actions =
             main_window_actions("restart sto", None, &state.workspace, &Config::default());
-        assert_eq!(actions[2], Action::RestartTray(1, "storybook".to_owned()));
+        assert_eq!(actions[1], Action::RestartTray(1, "storybook".to_owned()));
         assert!(
             main_window_actions("", None, &state.workspace, &Config::default())
                 .iter()
@@ -1885,10 +2044,17 @@ mod tests {
             [Action::Tray("ls".to_owned())]
         );
         runtime.state.palette.edit = TextEdit::new("ls");
-        assert_eq!(
-            runtime.state.palette_rows(true).actions[..2],
-            [Action::Run("ls".to_owned()), Action::Tray("ls".to_owned())]
-        );
+        let runs = |tray| -> Vec<Action> {
+            runtime
+                .state
+                .palette_rows(tray)
+                .actions
+                .into_iter()
+                .filter(|action| matches!(action, Action::Run(_) | Action::Tray(_)))
+                .collect()
+        };
+        assert_eq!(runs(true), [Action::Tray("ls".to_owned())]);
+        assert_eq!(runs(false), [Action::Run("ls".to_owned())]);
     }
 
     #[test]
@@ -1971,11 +2137,11 @@ mod tests {
     }
 
     #[test]
-    fn bang_rows_always_show_the_tray_shortcut() {
+    fn bang_rows_hint_at_the_tray() {
         let mut runtime = history_runtime();
         press(&mut runtime, Key::Text("!ls".into()), Mods::default());
         runtime.frame(0.0);
-        assert!(runtime.find("palette-shortcut").is_some());
+        assert!(runtime.find("palette-alternative").is_some());
     }
 
     #[test]
