@@ -220,6 +220,14 @@ pub(crate) const SCENES: &[Scene] = &[
         state.palette.edit = TextEdit::new("zoom");
         state.palette.open = true;
     }),
+    ("palette-jump", |state| {
+        show_workspace_scene(state);
+        state.config.working_directory = PathBuf::from("/Users/me/dev");
+        state.palette.edit = TextEdit::new("site");
+        state.palette.jump.query = "site".to_owned();
+        state.palette.jump.found = Some(PathBuf::from("/Users/me/dev/own/site"));
+        state.palette.open = true;
+    }),
     ("palette-history", |state| {
         show_workspace_scene(state);
         state.palette.edit = TextEdit::new("!git");

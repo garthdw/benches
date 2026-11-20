@@ -246,6 +246,14 @@ pub fn abbreviate_home(path: &Path) -> String {
     }
 }
 
+/// `path` below `base`, or with home abbreviated when it's `base` itself or outside it.
+pub fn relative_to(path: &Path, base: &Path) -> String {
+    match path.strip_prefix(base) {
+        Ok(rest) if !rest.as_os_str().is_empty() => rest.display().to_string(),
+        _ => abbreviate_home(path),
+    }
+}
+
 /// Drops CSI sequences such as colours, which is all lookup commands print.
 fn strip_escapes(text: &str) -> String {
     let mut plain = String::with_capacity(text.len());
@@ -322,6 +330,16 @@ mod tests {
         assert_eq!(abbreviate_home(&home), "~");
         assert_eq!(abbreviate_home(&home.join("dev/site")), "~/dev/site");
         assert_eq!(abbreviate_home(Path::new("/dev/site")), "/dev/site");
+    }
+
+    #[test]
+    fn a_folder_inside_the_working_directory_is_shown_relative_to_it() {
+        let home = PathBuf::from(std::env::var_os("HOME").unwrap());
+        let base = home.join("dev");
+        assert_eq!(relative_to(&base.join("own/site"), &base), "own/site");
+        assert_eq!(relative_to(&base, &base), "~/dev");
+        assert_eq!(relative_to(&home.join("notes"), &base), "~/notes");
+        assert_eq!(relative_to(Path::new("/dev/site"), &base), "/dev/site");
     }
 
     #[test]

@@ -74,12 +74,12 @@ pub(crate) struct Rows {
 /// The jump command's folder for the command centre's query.
 #[derive(Default)]
 pub(crate) struct JumpLookup {
-    query: String,
+    pub(crate) query: String,
     /// When to start the lookup, once typing pauses.
     due: Option<f64>,
     pending: Option<mpsc::Receiver<Option<PathBuf>>>,
     cancel: jump::Cancel,
-    found: Option<PathBuf>,
+    pub(crate) found: Option<PathBuf>,
 }
 
 pub(crate) struct Creation {
@@ -189,10 +189,13 @@ pub(crate) enum Action {
 }
 
 impl Action {
-    fn label(&self) -> String {
+    fn label(&self, working_directory: &Path) -> String {
         match self {
             Action::Command(command) => command.label().to_owned(),
-            Action::Jump(root) => format!("Open project {}", root.display()),
+            Action::Jump(root) => format!(
+                "Open project {}",
+                jump::relative_to(root, working_directory)
+            ),
             Action::SwitchProject(_, name) => format!("Switch to project {name}"),
             Action::SwitchTab(_, _, name) => format!("Switch to tab {name}"),
             Action::RestartTray(_, title) => format!("Restart {title}"),
@@ -385,7 +388,9 @@ pub(crate) fn palette_actions(
             [Some(restart), stoppable.then_some(stop)]
                 .into_iter()
                 .flatten()
-                .filter(|action| letters_in_order(&action.label(), &needle)),
+                .filter(|action| {
+                    letters_in_order(&action.label(&config.working_directory), &needle)
+                }),
         );
     }
     actions
@@ -792,7 +797,7 @@ pub(crate) fn view(
                     });
                     pill(
                         format!("palette-{index}"),
-                        &action.label(),
+                        &action.label(&state.config.working_directory),
                         index == selected,
                         None,
                     )
@@ -1109,6 +1114,13 @@ mod tests {
                 .iter()
                 .any(|action| matches!(action, Action::SwitchProject(..)))
         );
+    }
+
+    #[test]
+    fn the_jump_folder_is_named_relative_to_the_working_directory() {
+        let jump = Action::Jump(PathBuf::from("/dev/own/site"));
+        assert_eq!(jump.label(Path::new("/dev")), "Open project own/site");
+        assert_eq!(jump.label(Path::new("/srv")), "Open project /dev/own/site");
     }
 
     #[test]
@@ -1446,7 +1458,7 @@ mod tests {
         let none = main_window_actions("wts", None, &Workspace::default(), &Config::default());
         assert!(!none.contains(&list("")));
         assert_eq!(
-            list("fea").label(),
+            list("fea").label(Path::new("/")),
             "Open a worktree of benches matching “fea”"
         );
     }
@@ -1927,7 +1939,7 @@ mod tests {
         let original = "for x in a b; do\necho $x\ndone";
         assert_eq!(rows(&runtime)[1], shell(original));
         assert_eq!(
-            rows(&runtime)[1].label(),
+            rows(&runtime)[1].label(Path::new("/")),
             "Run “for x in a b; do ⏎ echo $x ⏎ done” in a new tab"
         );
         press(&mut runtime, Key::Down, Mods::default());
@@ -1986,7 +1998,7 @@ mod tests {
         assert!(!moves(&one_project()));
         assert!(moves(&workspace_state().workspace));
         assert_eq!(
-            Action::Command(Command::MoveToNewWindow).label(),
+            Action::Command(Command::MoveToNewWindow).label(Path::new("/")),
             "Move project to new window"
         );
     }
