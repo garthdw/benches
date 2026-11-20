@@ -594,6 +594,9 @@ pub enum Slot {
 pub struct SavedWorkspace {
     pub active: usize,
     pub sidebar_hidden: bool,
+    /// Set once the Full Disk Access notice is answered, as it shows only once.
+    #[serde(default)]
+    pub full_disk_access_asked: bool,
     pub projects: Vec<SavedProject>,
 }
 
@@ -639,6 +642,7 @@ impl Workspace {
         SavedWorkspace {
             active: self.active,
             sidebar_hidden,
+            full_disk_access_asked: false,
             projects: self
                 .projects
                 .iter()
@@ -840,6 +844,7 @@ mod tests {
         let mut workspace = Workspace::restore(SavedWorkspace {
             active: 0,
             sidebar_hidden: false,
+            full_disk_access_asked: false,
             projects: vec![saved_project("/", 0)],
         });
         assert!(!workspace.projects[0].runs_program());
@@ -1160,6 +1165,7 @@ mod tests {
         let saved = SavedWorkspace {
             active: 1,
             sidebar_hidden: false,
+            full_disk_access_asked: false,
             projects: vec![saved_project("/", 1), saved_project("/tmp", 0)],
         };
         let workspace = Workspace::restore(saved);
@@ -1178,6 +1184,7 @@ mod tests {
         let saved = SavedWorkspace {
             active: 7,
             sidebar_hidden: false,
+            full_disk_access_asked: false,
             projects: vec![
                 saved_project("/no/such/folder", 0),
                 empty,

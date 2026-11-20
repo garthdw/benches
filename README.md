@@ -33,6 +33,12 @@ open it once, then choose **Open Anyway** in System Settings → Privacy & Secur
 xattr -dr com.apple.quarantine /Applications/Benches.app
 ```
 
+Programs started in a tab, such as a browser opened by `granted`, run with Benches' privacy
+permissions. If one can't read its own data (Firefox reporting a missing profile, for example),
+add Benches under Full Disk Access in System Settings → Privacy & Security, as you would any
+other terminal, then relaunch it. Benches offers to open that page once, on its first launch
+without the permission.
+
 ## Build from source
 
 You need the Rust toolchain pinned in `rust-toolchain.toml` (rustup installs it), Zig 0.17.x on

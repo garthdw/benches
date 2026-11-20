@@ -25,8 +25,7 @@ use windows::{Fleet, MAIN_WINDOW};
 fn log_to_file_in_bundle() -> anyhow::Result<()> {
     use std::os::fd::AsRawFd;
 
-    let exe = std::env::current_exe()?;
-    if !exe.to_string_lossy().contains(".app/Contents/MacOS/") {
+    if !app::in_bundle() {
         return Ok(());
     }
     let home = std::env::var_os("HOME").context("HOME is unset")?;

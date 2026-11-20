@@ -30,6 +30,7 @@ use benches_core::LogErr;
 use benches_core::config;
 use benches_core::grid::{Grid, Surface};
 use benches_core::protocol::{Event, Visibility};
+use benches_platform::Link;
 use benches_platform::notify::{self, Notification};
 
 /// Asks for a frame without a new view: terminal output only changes the effect slot's pixels.
@@ -87,6 +88,9 @@ pub(crate) struct State {
     /// Why config.toml wasn't applied, at launch or on the last reload; shown until a reload
     /// succeeds or it is dismissed.
     pub(crate) config_error: Option<String>,
+    /// Where to grant Full Disk Access, while the notice asking for it shows.
+    pub(crate) full_disk_access: Option<Link>,
+    pub(crate) full_disk_access_asked: bool,
     /// Points added to the configured font size by ⌘= and ⌘-; never written to disk.
     pub(crate) font_zoom: f64,
     /// Unset in tests and scenes, which then read and write no files.
@@ -118,6 +122,8 @@ impl Default for State {
             sidebar_hidden: Default::default(),
             config: default_config(),
             config_error: Default::default(),
+            full_disk_access: Default::default(),
+            full_disk_access_asked: Default::default(),
             font_zoom: Default::default(),
             paths: Default::default(),
             secure_input: Default::default(),
@@ -318,8 +324,29 @@ fn load_layout(state: &mut State) {
     });
     if let Some(Some(saved)) = saved.log_err("restore layout") {
         state.sidebar_hidden = saved.sidebar_hidden;
+        state.full_disk_access_asked = saved.full_disk_access_asked;
         state.workspace = Workspace::restore(saved);
     }
+}
+
+/// Whether this is the bundled app rather than a `cargo run` binary, which answers to macOS as
+/// the terminal that started it.
+pub(crate) fn in_bundle() -> bool {
+    std::env::current_exe().is_ok_and(|exe| exe.to_string_lossy().contains(".app/Contents/MacOS/"))
+}
+
+/// Either answer is final, so the notice shows only once.
+pub(crate) fn answer_full_disk_access(state: &mut State, open_settings: bool) {
+    let Some(settings) = state.full_disk_access.take() else {
+        return;
+    };
+    state.full_disk_access_asked = true;
+    if open_settings {
+        std::thread::spawn(move || {
+            benches_platform::open(&settings).log_err("open Full Disk Access settings");
+        });
+    }
+    save_layout(state).log_err("save layout");
 }
 
 /// Written to a temporary file and renamed into place, so a crash never leaves half a file.
@@ -328,7 +355,8 @@ pub(crate) fn save_layout(state: &State) -> anyhow::Result<()> {
         return Ok(());
     };
     let path = paths.state();
-    let layout = state.workspace.snapshot(state.sidebar_hidden);
+    let mut layout = state.workspace.snapshot(state.sidebar_hidden);
+    layout.full_disk_access_asked = state.full_disk_access_asked;
     let Some(layout) = state.fleet.deposit(state.window, layout) else {
         return Ok(());
     };
@@ -638,6 +666,9 @@ pub(crate) fn poll(state: &mut State, now: f64, tx: &mut Tx) -> bool {
     if !state.started {
         state.started = true;
         load_layout(state);
+        if !state.full_disk_access_asked && in_bundle() {
+            state.full_disk_access = benches_platform::full_disk_access_settings();
+        }
         if state.workspace.projects.is_empty() {
             let root = state.config.working_directory.clone();
             let tab = state.spawn_tab("shell", None, &root);
@@ -2149,6 +2180,7 @@ mod tests {
         let saved = SavedWorkspace {
             active: 0,
             sidebar_hidden: false,
+            full_disk_access_asked: false,
             projects: vec![saved_project("/"), saved_project(tmp.to_str().unwrap())],
         };
         let mut runtime = runtime_with(State {
@@ -2198,6 +2230,31 @@ mod tests {
             loaded.workspace.snapshot(true),
             state.workspace.snapshot(true)
         );
+    }
+
+    #[test]
+    fn the_full_disk_access_notice_ignores_keys_and_its_answer_is_saved() {
+        let directory = tempfile::tempdir().unwrap();
+        let paths = || config::Paths {
+            dir: directory.path().join("benches"),
+            ghostty_dir: directory.path().join("ghostty"),
+        };
+        let mut runtime = workspace_runtime();
+        runtime.state.paths = Some(paths());
+        runtime.state.full_disk_access = Some(Link::Url("x-apple.systempreferences:".to_owned()));
+        runtime.frame(1.0 / 60.0);
+        press(&mut runtime, Key::Enter, Mods::default());
+        press(&mut runtime, Key::Escape, Mods::default());
+        assert!(runtime.find("full-disk-access").is_some());
+
+        click(&mut runtime, "full-disk-access-dismiss");
+        assert!(runtime.find("full-disk-access").is_none());
+        let mut loaded = State {
+            paths: Some(paths()),
+            ..State::default()
+        };
+        load_layout(&mut loaded);
+        assert!(loaded.full_disk_access_asked);
     }
 
     #[test]
