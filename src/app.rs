@@ -821,6 +821,17 @@ pub(crate) fn poll(state: &mut State, now: f64, tx: &mut Tx) -> bool {
     changed | state.sync_secure_input()
 }
 
+fn modifiers_changed(state: &mut State, mods: Mods) {
+    state.command_held = mods.cmd;
+    let shown = state
+        .workspace
+        .sessions()
+        .filter(|session| session.visibility() == Visibility::Shown);
+    for session in shown {
+        session.modifiers(crate::input::vt_mods(mods));
+    }
+}
+
 pub(crate) fn on_key(state: &mut State, event: &KeyEvent, tx: &mut Tx) -> bool {
     if !state.confirms.is_empty() && matches!(event.key, Key::Enter | Key::Escape) {
         resolve_confirm(state, state.confirms.len() - 1, event.key == Key::Enter, tx);
@@ -944,16 +955,7 @@ pub(crate) fn window_app(
         })
         .compositor(crate::render::TerminalCompositor::default())
         .on_ime(on_ime)
-        .on_modifiers(|state, mods, _| {
-            state.command_held = mods.cmd;
-            let shown = state
-                .workspace
-                .sessions()
-                .filter(|session| session.visibility() == Visibility::Shown);
-            for session in shown {
-                session.modifiers(crate::input::vt_mods(mods));
-            }
-        })
+        .on_modifiers(|state, mods, _| modifiers_changed(state, mods))
         .menu_item(reload_menu_item())
         .on_quit(on_quit)
         .on_close(on_close)
