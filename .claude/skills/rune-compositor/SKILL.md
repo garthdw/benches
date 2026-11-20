@@ -5,7 +5,7 @@ description: Rune's custom GPU drawing contract as used by Benches - Compositor,
 
 # Rune compositor and effect slots
 
-Verified against Rune rev `7dfaa8f` (wgpu `~30.0.1`). If the pin has moved, check anything you rely on.
+Verified against Rune rev `e6deb86` (wgpu `~30.0.1`; Benches locks 30.0.2). If the pin has moved, check anything you rely on.
 
 ## Pattern
 
@@ -31,7 +31,7 @@ Register with `App::new(spec).compositor(..)`. It runs in the window and in head
 ## Rules
 
 - **Colour encoding:** use `site.srgb_blend`, never `format.is_srgb()`, because an isolated layer's `Rgba16Float` is neither. True: output sRGB-encoded values. False: output linear (`rune::color::srgb_decode`). Output is premultiplied; Benches uses `BlendState::PREMULTIPLIED_ALPHA_BLENDING`.
-- **Clipping:** Rune sets the scissor to the slot's clip rect before calling you, so overdraw stays inside the slot.
+- **Clipping:** Rune sets the scissor to the slot's clip rect before calling you, so overdraw stays inside the slot. A slot clipped away entirely gets no call; viewport and scissor are reset to the full target after it.
 - **Partial opacity** on the element puts the slot in its own layer, hence `format` and `origin` varying. Rotation draws upright inside a turned layer.
 - `.effect_bleed(pt)` lets a slot paint past its rect. `.effect_backdrop(true)` requests a backdrop copy.
 - `effect()` returns a normal `El`, so handlers, keys, sizing and children chain as usual.
@@ -44,11 +44,14 @@ Register with `App::new(spec).compositor(..)`. It runs in the window and in head
 | `Compositor` trait methods, `Frame` fields, `EffectSite` fields | [references/api.md](references/api.md) |
 | Native Metal backend limits, wgpu fallback, WGSL, buffers, Benches' pipeline descriptor | [references/metal-backend.md](references/metal-backend.md) |
 
-## File map (under `crates/rune/`)
+## File map (under `crates/`)
 
 | Topic | Path |
 |---|---|
-| Trait, `Frame`, worked example in docs | `src/compose.rs` |
-| `EffectSite`, `draw_with`, scissor | `src/render.rs` (scissor near line 1080) |
-| `El::effect*` | `src/el/effect.rs` |
-| Colour helpers | `rune::color` |
+| Trait, `Frame`, worked example in docs | `rune/src/compose.rs` |
+| `EffectSite`, `EffectHook`, `draw_with`, scissor | `rune/src/render.rs` (scissor in `draw_with_effects`, near line 478) |
+| `Renderer::prepare`, `prepare_lists` | `rune/src/render/upload.rs` |
+| `Instance`, `Kind`, `KIND_*` | `rune/src/render/instance.rs` |
+| `El::effect*` | `rune/src/el/effect.rs` |
+| Colour helpers | `rune::color`, re-exporting `rune-core/src/color.rs` |
+| Native Metal backend, backend choice, `describe_gpu` | `rune-gpu/src/metal/`, `rune-gpu/src/backend.rs` |

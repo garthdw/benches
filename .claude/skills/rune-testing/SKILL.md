@@ -5,7 +5,7 @@ description: Testing and verifying Rune apps in Benches - the headless Runtime h
 
 # Testing Rune apps
 
-Verified against Rune rev `7dfaa8f`. If the pin has moved, check anything you rely on.
+Verified against Rune rev `e6deb86`. If the pin has moved, check anything you rely on.
 
 ## Benches specifics
 
@@ -19,7 +19,7 @@ Say so explicitly when a change depends on any of these:
 
 - Native menu key equivalents, and whether ⌘C or ⌘V reach `on_key`.
 - Real IME behaviour: winit's `interpretKeyEvents`, dead keys, candidate window placement.
-- OS clipboard round trips (headless uses a memory clipboard).
+- OS clipboard round trips (headless runs never touch the OS clipboard; a test can opt into `rune::clipboard::memory()`).
 - Live resize feel, trackpad momentum, display-link pacing.
 - Wall-clock timing against a real PTY, since headless time is virtual.
 
@@ -37,6 +37,10 @@ For these, run the real app and state what was and wasn't checked.
 | Topic | Path |
 |---|---|
 | Flags | `src/tooling/args.rs` |
-| Script parsing | `src/tooling/script.rs`, `src/tooling/key_names.rs` |
+| Headless run | `src/tooling/headless.rs`, `src/tooling/headless/{app,frame}.rs` |
+| Script parsing | `src/tooling/script.rs`, `src/tooling/key_names.rs` (names from `src/input/key_table.rs`) |
+| Public `Runtime` methods | `src/runtime/api.rs`, `src/runtime/input/api.rs`, forwarding to the non-generic `RuntimeCore` |
+| App hooks on a runtime | `src/runtime/driver.rs` (`RuntimeHooks`), `src/app/config.rs` (`Runtime::configure`) |
 | Runtime input | `src/runtime/input/{pointer,keys,gesture,physical}.rs` |
-| Example tests | `src/runtime/tests/app_ime.rs`, `src/runtime/tests/input_clipboard.rs` |
+| Example tests, public API | `tests/integration/*.rs` (one `integration` binary), e.g. `hover_delays.rs`, `selection_copy_breaks.rs` |
+| Example tests, in-crate | `src/runtime/tests/app_ime.rs`, `src/runtime/tests/input_clipboard.rs`; they set the crate-private `rt.hooks`, which Benches can't |
