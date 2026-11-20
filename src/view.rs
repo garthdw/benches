@@ -422,16 +422,6 @@ fn confirm_bar(
     y: f32,
     resolve: impl Fn(&mut State, &mut Tx, bool) + Clone + 'static,
 ) -> El {
-    let button = |key: String, label: &'static str| {
-        el().key(key)
-            .role("button")
-            .label(label)
-            .px(10.0)
-            .py(4.0)
-            .radius(6.0)
-            .fill(theme.bg)
-            .child(text(label).color(theme.text))
-    };
     row()
         .key(key)
         .absolute(12.0, y)
@@ -442,14 +432,68 @@ fn confirm_bar(
         .radius(6.0)
         .fill(theme.card)
         .child(text(message).color(theme.text))
-        .child(button(format!("{key}-yes"), action).on_press_tx({
-            let resolve = resolve.clone();
-            move |state: &mut State, tx: &mut Tx| resolve(state, tx, true)
-        }))
         .child(
-            button(format!("{key}-no"), "Cancel")
+            bar_button(theme, format!("{key}-yes"), action).on_press_tx({
+                let resolve = resolve.clone();
+                move |state: &mut State, tx: &mut Tx| resolve(state, tx, true)
+            }),
+        )
+        .child(
+            bar_button(theme, format!("{key}-no"), "Cancel")
                 .on_press_tx(move |state: &mut State, tx: &mut Tx| resolve(state, tx, false)),
         )
+}
+
+fn bar_button(theme: &tok::Theme, key: impl Into<String>, label: &'static str) -> El {
+    el().key(key.into())
+        .role("button")
+        .label(label)
+        .px(10.0)
+        .py(4.0)
+        .radius(6.0)
+        .fill(theme.bg)
+        .child(text(label).color(theme.text))
+}
+
+/// A notice along the top of the window. Only its buttons answer it, so nothing typed can.
+fn banner(theme: &tok::Theme, key: &'static str, title: &str, detail: El, buttons: Vec<El>) -> El {
+    row()
+        .key(key)
+        .gap(8.0)
+        .items_start()
+        .px(10.0)
+        .py(6.0)
+        .radius(6.0)
+        .fill(theme.card)
+        // Rune's orange accent, whatever accent the system uses.
+        .border(1.0, tok::accent(3, true))
+        .child(
+            col()
+                .gap(4.0)
+                .grow(1.0)
+                .min_w(0.0)
+                .child(text(title.to_owned()).color(theme.text))
+                .child(detail),
+        )
+        .children(buttons)
+}
+
+fn config_error_banner(state: &State, theme: &tok::Theme) -> Option<El> {
+    let error = state.config_error.as_ref()?;
+    // TOML errors point at the column with a caret, which needs even widths.
+    let detail = text(error.trim_end().to_owned())
+        .font(tok::type_::BODY.family(tok::Family::SystemMono))
+        .color(theme.text_secondary)
+        .wrap();
+    let dismiss = bar_button(theme, "config-error-dismiss", "Dismiss")
+        .on_press(|state: &mut State| state.config_error = None);
+    Some(banner(
+        theme,
+        "config-error",
+        "config.toml not applied",
+        detail,
+        vec![dismiss],
+    ))
 }
 
 /// The caret, composition and confirmations belong to whichever terminal takes keys.
@@ -703,45 +747,8 @@ pub(crate) fn view(state: &State, cx: &mut Cx<State>) -> El {
                 .child(text("Open a folder with ⌘N, or drop one here").color(theme.text_secondary)),
         );
     }
-    if let Some(error) = &state.config_error {
-        overlays.push(
-            row()
-                .key("config-error")
-                .pin(Some(12.0), None, Some(12.0), Some(12.0))
-                .gap(8.0)
-                .items_start()
-                .px(10.0)
-                .py(6.0)
-                .radius(6.0)
-                .fill(theme.card)
-                // Rune's orange accent, whatever accent the system uses.
-                .border(1.0, tok::accent(3, true))
-                .child(
-                    col()
-                        .gap(4.0)
-                        .grow(1.0)
-                        .min_w(0.0)
-                        .child(text("config.toml not applied").color(theme.text))
-                        // TOML errors point at the column with a caret, which needs even widths.
-                        .child(
-                            text(error.trim_end().to_owned())
-                                .font(tok::type_::BODY.family(tok::Family::SystemMono))
-                                .color(theme.text_secondary)
-                                .wrap(),
-                        ),
-                )
-                .child(
-                    el().key("config-error-dismiss")
-                        .role("button")
-                        .label("Dismiss")
-                        .px(10.0)
-                        .py(4.0)
-                        .radius(6.0)
-                        .fill(theme.bg)
-                        .child(text("Dismiss").color(theme.text))
-                        .on_press(|state: &mut State| state.config_error = None),
-                ),
-        );
+    if let Some(banner) = config_error_banner(state, &theme) {
+        overlays.push(banner.pin(Some(12.0), None, Some(12.0), Some(12.0)));
     }
     let focus_overlays = focus_overlays(state, &theme);
     let project = state.workspace.project();
