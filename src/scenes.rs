@@ -241,12 +241,22 @@ pub(crate) const SCENES: &[Scene] = &[
         state.palette.open = true;
         state.palette.error = Some("✗ Branch site already exists".to_owned());
     }),
+    ("no-worktrees", |state| {
+        show_workspace_scene(state);
+        state.palette.open = true;
+        state.palette.worktrees = Some(WorktreeChoice {
+            root: PathBuf::from("/Users/me/dev/site"),
+            ..WorktreeChoice::default()
+        });
+        state.palette.error = Some("No worktrees found in ~/dev/site".to_owned());
+    }),
     ("worktrees", |state| {
         show_workspace_scene(state);
         state.palette.edit = TextEdit::new("site");
         state.palette.open = true;
         state.palette.worktrees = Some(WorktreeChoice {
             root: PathBuf::from("/Users/me/dev/site"),
+            fallback_to_root: true,
             pending: None,
             found: vec![
                 jump::Worktree {

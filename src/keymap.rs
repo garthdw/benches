@@ -10,6 +10,8 @@ pub enum Command {
     ToggleGit,
     OpenProject,
     ChangeFolder,
+    OpenWorktree,
+    CreateWorktree,
     MoveToNewWindow,
     MoveToMainWindow,
     MergeIntoMain,
@@ -67,6 +69,14 @@ pub const COMMANDS: &[CommandSpec] = &[
         enabled: |workspace, _, _| workspace.project().is_some(),
         ..spec(Command::ChangeFolder, "Change project folder…", None)
     }),
+    CommandSpec {
+        enabled: |workspace, _, _| workspace.project().is_some(),
+        ..spec(Command::OpenWorktree, "Open worktree…", None)
+    },
+    CommandSpec {
+        enabled: |workspace, _, _| workspace.project().is_some(),
+        ..spec(Command::CreateWorktree, "Create worktree…", None)
+    },
     default(CommandSpec {
         enabled: |workspace, _, _| workspace.projects.len() > 1,
         ..spec(Command::MoveToNewWindow, "Move project to new window", None)
