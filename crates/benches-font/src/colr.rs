@@ -118,7 +118,6 @@ impl<'a> ColrV1<'a> {
         let area = width as usize * height as usize;
         let location = LocationRef::new(&self.coords);
         let mut painter = Painter {
-            location,
             palette: Palette {
                 records: cpal
                     .as_ref()
@@ -132,8 +131,11 @@ impl<'a> ColrV1<'a> {
                 entries: cpal.as_ref().map_or(0, |cpal| cpal.num_palette_entries()),
             },
             width: width as usize,
-            transforms: vec![base],
-            outlines: self.font.outline_glyphs(),
+            paths: Paths {
+                location,
+                outlines: self.font.outline_glyphs(),
+                transforms: vec![base],
+            },
             clips: vec![Clip {
                 cover: vec![1.0; area],
                 bounds: [0, 0, width as usize, height as usize],
@@ -205,11 +207,9 @@ impl Palette<'_> {
 }
 
 struct Painter<'a> {
-    location: LocationRef<'a>,
     palette: Palette<'a>,
     width: usize,
-    transforms: Vec<Transform>,
-    outlines: OutlineGlyphCollection<'a>,
+    paths: Paths<'a>,
     /// Each the intersection of the clips under it.
     clips: Vec<Clip>,
     /// Premultiplied RGBA layers.
@@ -246,20 +246,75 @@ fn invert(transform: &Transform) -> Option<Transform> {
     })
 }
 
-/// An outline in image pixels, through the current transform.
-struct Pen<'t> {
-    transform: &'t Transform,
+/// Glyph outlines and boxes through a stack of transforms from font units.
+struct Paths<'a> {
+    location: LocationRef<'a>,
+    outlines: OutlineGlyphCollection<'a>,
+    transforms: Vec<Transform>,
+}
+
+impl Paths<'_> {
+    fn transform(&self) -> Transform {
+        self.transforms.last().copied().unwrap_or_default()
+    }
+
+    fn push(&mut self, transform: Transform) {
+        let transform = self.transform() * transform;
+        self.transforms.push(transform);
+    }
+
+    fn pop(&mut self) {
+        if self.transforms.len() > 1 {
+            self.transforms.pop();
+        }
+    }
+
+    fn pen(&self) -> Pen {
+        Pen {
+            transform: self.transform(),
+            path: Vec::new(),
+        }
+    }
+
+    /// Glyph `glyph`'s outline through the current transform.
+    fn glyph(&self, glyph: GlyphId) -> Vec<Command> {
+        let mut pen = self.pen();
+        if let Some(outline) = self.outlines.get(glyph) {
+            let settings = DrawSettings::unhinted(Size::unscaled(), self.location);
+            // A broken outline draws what it reached.
+            if let Err(error) = outline.draw(settings, &mut pen) {
+                eprintln!("benches: COLR v1 glyph {glyph}'s outline is broken: {error}");
+            }
+        }
+        pen.path
+    }
+
+    /// `rect` through the current transform.
+    fn rect(&self, rect: BoundingBox) -> Vec<Command> {
+        let mut pen = self.pen();
+        pen.move_to(rect.x_min, rect.y_min);
+        pen.line_to(rect.x_max, rect.y_min);
+        pen.line_to(rect.x_max, rect.y_max);
+        pen.line_to(rect.x_min, rect.y_max);
+        pen.close();
+        pen.path
+    }
+}
+
+/// An outline as path commands, through a transform.
+struct Pen {
+    transform: Transform,
     path: Vec<Command>,
 }
 
-impl Pen<'_> {
+impl Pen {
     fn point(&self, x: f32, y: f32) -> Vector {
         let (x, y) = self.transform.transform(x, y);
         Vector::new(x, y)
     }
 }
 
-impl OutlinePen for Pen<'_> {
+impl OutlinePen for Pen {
     fn move_to(&mut self, x: f32, y: f32) {
         let point = self.point(x, y);
         self.path.push(Command::MoveTo(point));
@@ -286,27 +341,6 @@ impl OutlinePen for Pen<'_> {
 }
 
 impl Painter<'_> {
-    fn transform(&self) -> Transform {
-        self.transforms.last().copied().unwrap_or_default()
-    }
-
-    /// Glyph `glyph`'s outline in image pixels, through the current transform.
-    fn glyph_path(&self, glyph: GlyphId) -> Vec<Command> {
-        let transform = self.transform();
-        let mut pen = Pen {
-            transform: &transform,
-            path: Vec::new(),
-        };
-        if let Some(outline) = self.outlines.get(glyph) {
-            let settings = DrawSettings::unhinted(Size::unscaled(), self.location);
-            // A broken outline draws what it reached.
-            if let Err(error) = outline.draw(settings, &mut pen) {
-                eprintln!("benches: COLR v1 clip glyph {glyph} is broken: {error}");
-            }
-        }
-        pen.path
-    }
-
     /// `path`'s coverage inside the clip on top: only the box the path and that clip share is
     /// rasterised and kept.
     fn mask(&mut self, path: &[Command]) -> Clip {
@@ -641,34 +675,22 @@ fn composite(mode: CompositeMode, source: [f32; 4], destination: [f32; 4]) -> [f
 
 impl ColorPainter for Painter<'_> {
     fn push_transform(&mut self, transform: Transform) {
-        let transform = self.transform() * transform;
-        self.transforms.push(transform);
+        self.paths.push(transform);
     }
 
     fn pop_transform(&mut self) {
-        if self.transforms.len() > 1 {
-            self.transforms.pop();
-        }
+        self.paths.pop();
     }
 
     fn push_clip_glyph(&mut self, glyph: GlyphId) {
-        let path = self.glyph_path(glyph);
+        let path = self.paths.glyph(glyph);
         let clip = self.mask(&path);
         self.clips.push(clip);
     }
 
     fn push_clip_box(&mut self, clip_box: BoundingBox) {
-        let transform = self.transform();
-        let mut pen = Pen {
-            transform: &transform,
-            path: Vec::new(),
-        };
-        pen.move_to(clip_box.x_min, clip_box.y_min);
-        pen.line_to(clip_box.x_max, clip_box.y_min);
-        pen.line_to(clip_box.x_max, clip_box.y_max);
-        pen.line_to(clip_box.x_min, clip_box.y_max);
-        pen.close();
-        let clip = self.mask(&pen.path);
+        let path = self.paths.rect(clip_box);
+        let clip = self.mask(&path);
         self.clips.push(clip);
     }
 
@@ -679,7 +701,7 @@ impl ColorPainter for Painter<'_> {
     }
 
     fn fill(&mut self, brush: Brush<'_>) {
-        let Some(inverse) = invert(&self.transform()) else {
+        let Some(inverse) = invert(&self.paths.transform()) else {
             return;
         };
         let (Some(clip), Some(layer)) = (self.clips.last(), self.layers.last_mut()) else {
@@ -691,11 +713,11 @@ impl ColorPainter for Painter<'_> {
     /// Most of an emoji's paints: a glyph's shape filled, its mask used once and not kept as a
     /// clip.
     fn fill_glyph(&mut self, glyph: GlyphId, brush_transform: Option<Transform>, brush: Brush<'_>) {
-        let path = self.glyph_path(glyph);
+        let path = self.paths.glyph(glyph);
         let clip = self.mask(&path);
-        let transform = brush_transform.map_or(self.transform(), |brush_transform| {
-            self.transform() * brush_transform
-        });
+        let transform = self.paths.transform();
+        let transform =
+            brush_transform.map_or(transform, |brush_transform| transform * brush_transform);
         let Some(inverse) = invert(&transform) else {
             return;
         };
