@@ -376,14 +376,19 @@ impl FaceScaler<'_> {
 
     /// The glyph's ink in pixels, up from its origin.
     fn ink(&mut self, glyph: u16) -> Option<Bounds> {
-        let colr = self.colr.as_ref();
-        if let Some(bounds) = colr.and_then(|colr| colr.bounds(glyph, self.data.pixels)) {
-            return Some(Bounds {
-                x: f64::from(bounds.x_min),
-                y: f64::from(bounds.y_min),
-                width: f64::from(bounds.x_max - bounds.x_min),
-                height: f64::from(bounds.y_max - bounds.y_min),
-            });
+        let data = self.data;
+        let outlined = |bounds: swash::zeno::Bounds| Bounds {
+            x: f64::from(bounds.min.x),
+            y: f64::from(bounds.min.y),
+            width: f64::from(bounds.width()),
+            height: f64::from(bounds.height()),
+        };
+        if let Some(bounds) = self
+            .colr
+            .as_ref()
+            .and_then(|colr| colr.bounds(glyph, data.pixels))
+        {
+            return Some(outlined(bounds));
         }
         let outline = self
             .scaler
@@ -391,17 +396,11 @@ impl FaceScaler<'_> {
             .or_else(|| self.scaler.scale_outline(glyph))
             .filter(|outline| !outline.is_empty());
         if let Some(mut outline) = outline {
-            if self.data.embolden != 0.0 {
-                outline.embolden(self.data.embolden, self.data.embolden);
+            if data.embolden != 0.0 {
+                outline.embolden(data.embolden, data.embolden);
             }
-            outline.transform(&self.data.skew());
-            let bounds = outline.bounds();
-            return Some(Bounds {
-                x: f64::from(bounds.min.x),
-                y: f64::from(bounds.min.y),
-                width: f64::from(bounds.width()),
-                height: f64::from(bounds.height()),
-            });
+            outline.transform(&data.skew());
+            return Some(outlined(outline.bounds()));
         }
         let placement = self
             .render(&Render::new(COLOR_SOURCES), glyph)
@@ -716,28 +715,22 @@ impl Canvas<'_> {
         scale: (f64, f64),
     ) {
         let data = scaler.data;
+        let upright = Transform::scale(scale.0 as f32, scale.1 as f32)
+            .then_translate(origin.0 as f32, origin.1 as f32);
         let colr = scaler.colr.as_ref().and_then(|colr| {
-            colr.rasterize(
-                glyph,
-                data.pixels,
-                (scale.0 as f32, scale.1 as f32),
-                (origin.0 as f32, origin.1 as f32),
-            )
+            colr.rasterize(glyph, data.pixels, &upright, (self.width, self.height))
         });
         if let Some(image) = colr {
             let at = (image.left, self.height as i32 - image.top);
             self.blit_rgba((image.width, image.height), at, &image.rgba);
             return;
         }
-        let transform = data
-            .skew()
-            .then(&Transform::scale(scale.0 as f32, scale.1 as f32))
-            .then_translate(origin.0 as f32, origin.1 as f32);
+        let styled = data.skew().then(&upright);
         let mut colour = Render::new(COLOR_SOURCES);
         colour
             .format(Format::Alpha)
             .embolden(data.embolden)
-            .transform(Some(transform));
+            .transform(Some(styled));
         if let Some(image) = scaler.render(&colour, glyph) {
             self.blit_image(&image, origin, scale);
             return;
@@ -746,7 +739,7 @@ impl Canvas<'_> {
         monochrome
             .format(Format::Alpha)
             .embolden(data.embolden)
-            .transform(Some(transform));
+            .transform(Some(styled));
         if let Some(image) = scaler.render(&monochrome, glyph) {
             self.blit_image(&image, origin, scale);
         }
@@ -1531,6 +1524,60 @@ mod tests {
         (bounds, coverage)
     }
 
+    /// A copy of `file` whose COLR table `edit` has changed in place.
+    fn with_colr(file: &FontFile, edit: impl FnOnce(&mut [u8])) -> FontFile {
+        let colr = file.swash().table(swash::tag_from_bytes(b"COLR")).unwrap();
+        let start = colr.as_ptr() as usize - file.blob.data().as_ptr() as usize;
+        let mut data = file.blob.data().to_vec();
+        edit(&mut data[start..start + colr.len()]);
+        FontFile::new(Blob::new(Arc::new(data)), file.index).unwrap()
+    }
+
+    /// `file` with no COLR clip boxes, by zeroing the COLR table's clip list offset.
+    fn without_clip_boxes(file: &FontFile) -> FontFile {
+        use skrifa::raw::TableProvider;
+        let colr = skrifa::FontRef::from_index(file.blob.data(), file.index)
+            .unwrap()
+            .colr()
+            .unwrap();
+        let field = colr.clip_list_offset_byte_range();
+        with_colr(file, |colr| colr[field].fill(0))
+    }
+
+    #[test]
+    fn a_colr_v1_glyph_without_a_clip_box_measures_its_paint() {
+        let swash = Swash::new();
+        let Some(font) = colr_v1_emoji(&swash) else {
+            return;
+        };
+        let file = without_clip_boxes(&FontFile::load(&font, None).unwrap());
+        assert_ink_is_drawn(&swash, &synthesised(&file, FontStyle::default()));
+    }
+
+    /// The ink `face` measures for 😀 is where it draws, as far as outline control points stray
+    /// from the curves.
+    fn assert_ink_is_drawn(swash: &Swash, face: &Face) {
+        let glyph = Swash::glyph(face, GRINNING).unwrap();
+        let ink = swash
+            .shared
+            .borrow_mut()
+            .scaler(&face.data)
+            .ink(glyph)
+            .unwrap();
+        let (drawn, _) = drawn(swash, face, glyph);
+        for (what, ink, drawn) in [
+            ("left", ink.x, drawn.x),
+            ("bottom", ink.y, drawn.y),
+            ("right", ink.x + ink.width, drawn.x + drawn.width),
+            ("top", ink.y + ink.height, drawn.y + drawn.height),
+        ] {
+            assert!(
+                (ink - drawn).abs() <= 1.5,
+                "{what}: ink {ink}, drawn {drawn}"
+            );
+        }
+    }
+
     /// `file`'s face in `style`, synthesised as for a family without the style.
     fn synthesised(file: &FontFile, style: FontStyle) -> Face {
         let font = Matched {
@@ -1541,6 +1588,25 @@ mod tests {
         data.embolden = if style.bold { 1.0 } else { 0.0 };
         data.skew = style.italic;
         Face::new(data)
+    }
+
+    #[test]
+    fn a_colr_v1_glyph_far_larger_than_its_canvas_draws_the_part_inside() {
+        let swash = Swash::new();
+        let Some(font) = colr_v1_emoji(&swash) else {
+            return;
+        };
+        let face = synthesised(&FontFile::load(&font, None).unwrap(), FontStyle::default());
+        let glyph = Swash::glyph(&face, GRINNING).unwrap();
+        let mut pixels = vec![0; 4 * 64 * 64];
+        swash
+            .with_canvas(&mut pixels, 64, 64, |canvas| {
+                let mut shared = swash.shared.borrow_mut();
+                let mut scaler = shared.scaler(&face.data);
+                canvas.draw(&mut scaler, glyph, (-600.0, -600.0), (50.0, 50.0));
+            })
+            .unwrap();
+        assert!(pixels.iter().any(|&byte| byte != 0));
     }
 
     #[test]
