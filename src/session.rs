@@ -1350,16 +1350,15 @@ mod tests {
         wait_until(
             Duration::from_secs(15),
             || format!("no reply: {:#?}", session.grid().lines()),
+            // Joined, as "end" can land before the reply and wrap it onto the next row.
             || {
                 session
                     .grid()
                     .lines()
-                    .iter()
-                    .any(|line| {
-                        line.contains(
-                            "7501;?:states=idle,working,done,blocked,error:kinds=permission,question,auth",
-                        )
-                    })
+                    .concat()
+                    .contains(
+                        "7501;?:states=idle,working,done,blocked,error:kinds=permission,question,auth",
+                    )
                     .then_some(())
             },
         );
