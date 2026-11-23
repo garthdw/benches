@@ -902,7 +902,7 @@ pub fn terminate(child: &mut Child, pid: &Mutex<Option<i32>>) {
         }
         thread::sleep(Duration::from_millis(10));
     }
-    signal_group(group, Signal::SIGKILL);
+    kill_group(group).log_err("kill process group");
     child.wait().log_err("wait for process");
 }
 
@@ -936,6 +936,31 @@ mod tests {
         assert_eq!(waited, 0);
         kill_group(Pid::from_raw(child.id() as i32)).unwrap();
         assert_eq!(child.wait().unwrap().code(), Some(3));
+    }
+
+    #[test]
+    fn terminate_kills_processes_the_group_was_starting() {
+        // Ignoring SIGHUP leaves the ending to SIGKILL, and macOS's `killpg` can miss a child
+        // being forked, so try a few times to catch one.
+        for _ in 0..5 {
+            let mut child = Command::new("/bin/sh")
+                .args([
+                    "-c",
+                    "trap '' HUP; while :; do sleep 30 & sleep 0.002; done",
+                ])
+                .process_group(0)
+                .spawn()
+                .unwrap();
+            let group = Pid::from_raw(child.id() as i32);
+            thread::sleep(Duration::from_millis(20));
+            terminate(&mut child, &Mutex::new(Some(group.as_raw())));
+            // Killed processes linger as zombies until their new parent reaps them.
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while killpg(group, None) != Err(Errno::ESRCH) {
+                assert!(Instant::now() < deadline, "a process survived");
+                thread::sleep(Duration::from_millis(10));
+            }
+        }
     }
 
     fn idle_publisher(now: Instant) -> Publisher {
