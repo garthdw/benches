@@ -21,22 +21,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      # Any OS cfg can select macOS code, as an `else` or a `not(...)`. Listed files must exist,
-      # so a renamed one isn't silently dropped.
-      - name: Check the filter lists every file with an OS cfg
-        shell: bash
-        run: |
-          listed=$(sed -n "s/^  - //p" .github/macos-paths.yml | sed "s/ *#.*//; s/^'//; s/'\$//")
-          with_cfg=$(git grep -lE 'target_(os|vendor) = "(macos|linux|apple)"' -- '*.rs')
-          missing=$(grep -vxF -f <(echo "$listed") <<<"$with_cfg" || true)
-          stale=$(grep -v '\*' <<<"$listed" | while read -r path; do
-            [ -e "$path" ] || echo "$path"
-          done)
-          if [ -n "$missing$stale" ]; then
-            [ -z "$missing" ] || echo "::error::Add to .github/macos-paths.yml:" $missing
-            [ -z "$stale" ] || echo "::error::Not found, from .github/macos-paths.yml:" $stale
-            exit 1
-          fi
+      - run: .github/check-macos-paths
 
       - uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4.0.3
         id: filter

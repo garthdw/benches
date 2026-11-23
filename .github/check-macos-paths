@@ -1,0 +1,43 @@
+#!/usr/bin/env bash
+# Fails when `.github/macos-paths.yml` misses a Rust file whose behaviour differs on macOS, or
+# lists a path that doesn't exist, so a renamed file isn't silently dropped.
+set -euo pipefail
+cd "$(dirname "$0")/.."
+
+paths=.github/macos-paths.yml
+listed=$(sed -n "s/^  - //p" "$paths" | sed "s/ *#.*//; s/^'//; s/'\$//")
+
+# Any OS cfg can select macOS code, as an `else` or a `not(...)`, and these platform values pick
+# macOS behaviour at run time. The Linux backend only defines its own values of them.
+platform_dependent=$(git grep -lE \
+  'target_(os|vendor) = "(macos|linux|apple)"|SECURE_INPUT_SUPPORTED|LINK_MODIFIER|KeyPlatform::(Mac|current)' \
+  -- '*.rs' ':!crates/benches-platform/src/linux.rs')
+
+# The macOS-only backends, and the modules of their own crate they use, directly or not.
+# Brace imports such as `use crate::{dirs, notify}` aren't followed.
+macos_only=$(git ls-files '*/macos.rs' '*/coretext.rs')
+used_by_macos=$macos_only
+uses() {
+  for file in "$@"; do
+    { grep -oE 'crate::[a-z_]+::' "$file" || true; } | while read -r path; do
+      module=${path#crate::}
+      sibling="$(dirname "$file")/${module%::}.rs"
+      [ ! -e "$sibling" ] || echo "$sibling"
+    done
+  done
+}
+new=$macos_only
+while [ -n "$new" ]; do
+  new=$(uses $new | sort -u | grep -vxF -f <(echo "$used_by_macos") || true)
+  used_by_macos=$(printf '%s\n' "$used_by_macos" "$new")
+done
+
+required=$(printf '%s\n' "$platform_dependent" "$used_by_macos" | sort -u | sed '/^$/d')
+missing=$(grep -vxF -f <(echo "$listed") <<<"$required" || true)
+stale=$(grep -v '\*' <<<"$listed" | while read -r path; do
+  [ -e "$path" ] || echo "$path"
+done)
+
+[ -z "$missing" ] || echo "::error::Add to $paths:" $missing
+[ -z "$stale" ] || echo "::error::Not found, from $paths:" $stale
+[ -z "$missing$stale" ]
