@@ -194,18 +194,16 @@ pub(crate) struct Canvas<'a> {
 /// Ghostty's synthetic italic angle for FreeType faces.
 const SYNTHETIC_SKEW: f32 = 12.0;
 
-/// Bitmap strikes come last, for bitmap-only fonts such as Terminus's OTB files.
-const SOURCES: [Source; 4] = [
+/// The sources that draw in colour, which swash supports as COLR v0 and bitmaps only. A glyph
+/// draws from them first.
+const COLOR_SOURCES: &[Source] = &[
     Source::ColorOutline(0),
     Source::ColorBitmap(StrikeWith::BestFit),
-    Source::Outline,
-    Source::Bitmap(StrikeWith::BestFit),
 ];
-/// The sources that draw in colour, which swash supports as COLR v0 and bitmaps only.
-const COLOR_SOURCES: &[Source] = SOURCES.split_at(2).0;
+/// Bitmap strikes come last, for bitmap-only fonts such as Terminus's OTB files.
+const MONOCHROME_SOURCES: &[Source] = &[Source::Outline, Source::Bitmap(StrikeWith::BestFit)];
 
-/// `family`'s closest match to `style`.
-fn matched(shared: &mut Shared, family: &FamilyInfo, style: FontStyle) -> Option<Matched> {
+fn fontique_style(style: FontStyle) -> (Slant, FontWeight) {
     let slant = if style.italic {
         Slant::Italic
     } else {
@@ -216,11 +214,25 @@ fn matched(shared: &mut Shared, family: &FamilyInfo, style: FontStyle) -> Option
     } else {
         FontWeight::NORMAL
     };
+    (slant, weight)
+}
+
+/// `family`'s closest match to `style`.
+fn matched(shared: &mut Shared, family: &FamilyInfo, style: FontStyle) -> Option<Matched> {
+    let (slant, weight) = fontique_style(style);
     let font = family.match_font(FontWidth::NORMAL, slant, weight, true)?;
-    Some(Matched {
-        file: FontFile::load(font, Some(&mut shared.sources))?,
-        synthesis: font.synthesis(FontWidth::NORMAL, slant, weight),
-    })
+    Matched::new(font, style, Some(&mut shared.sources))
+}
+
+impl Matched {
+    /// `font` in `style`, with what it lacks of the style synthesised.
+    fn new(font: &FontInfo, style: FontStyle, sources: Option<&mut SourceCache>) -> Option<Self> {
+        let (slant, weight) = fontique_style(style);
+        Some(Self {
+            file: FontFile::load(font, sources)?,
+            synthesis: font.synthesis(FontWidth::NORMAL, slant, weight),
+        })
+    }
 }
 
 impl Shared {
@@ -362,42 +374,46 @@ impl FaceScaler<'_> {
         )
     }
 
-    /// The glyph's ink in pixels, up from its origin.
+    /// The glyph's ink in pixels, up from its origin, from the source `draw` draws it from: a
+    /// colour glyph's upright and regular in every style.
     fn ink(&mut self, glyph: u16) -> Option<Bounds> {
-        let colr = self.colr.as_ref();
-        if let Some(bounds) = colr.and_then(|colr| colr.bounds(glyph, self.data.pixels)) {
-            return Some(Bounds {
-                x: f64::from(bounds.x_min),
-                y: f64::from(bounds.y_min),
-                width: f64::from(bounds.x_max - bounds.x_min),
-                height: f64::from(bounds.y_max - bounds.y_min),
-            });
-        }
-        let outline = self
-            .scaler
-            .scale_color_outline(glyph)
-            .or_else(|| self.scaler.scale_outline(glyph))
-            .filter(|outline| !outline.is_empty());
-        if let Some(mut outline) = outline {
-            if self.data.embolden != 0.0 {
-                outline.embolden(self.data.embolden, self.data.embolden);
-            }
-            outline.transform(&self.data.skew());
-            let bounds = outline.bounds();
-            return Some(Bounds {
-                x: f64::from(bounds.min.x),
-                y: f64::from(bounds.min.y),
-                width: f64::from(bounds.width()),
-                height: f64::from(bounds.height()),
-            });
-        }
-        let placement = self.render(&Render::new(&SOURCES), glyph)?.placement;
-        Some(Bounds {
+        let data = self.data;
+        let outlined = |bounds: swash::zeno::Bounds| Bounds {
+            x: f64::from(bounds.min.x),
+            y: f64::from(bounds.min.y),
+            width: f64::from(bounds.width()),
+            height: f64::from(bounds.height()),
+        };
+        let placed = |placement: swash::zeno::Placement| Bounds {
             x: f64::from(placement.left),
             y: f64::from(placement.top) - f64::from(placement.height),
             width: f64::from(placement.width),
             height: f64::from(placement.height),
-        })
+        };
+        if let Some(bounds) = self
+            .colr
+            .as_ref()
+            .and_then(|colr| colr.bounds(glyph, data.pixels))
+        {
+            return Some(outlined(bounds));
+        }
+        let colour = self.scaler.scale_color_outline(glyph);
+        if let Some(outline) = colour.filter(|outline| !outline.is_empty()) {
+            return Some(outlined(outline.bounds()));
+        }
+        if let Some(image) = self.render(&Render::new(COLOR_SOURCES), glyph) {
+            return Some(placed(image.placement));
+        }
+        let outline = self.scaler.scale_outline(glyph);
+        if let Some(mut outline) = outline.filter(|outline| !outline.is_empty()) {
+            if data.embolden != 0.0 {
+                outline.embolden(data.embolden, data.embolden);
+            }
+            outline.transform(&data.skew());
+            return Some(outlined(outline.bounds()));
+        }
+        self.render(&Render::new(MONOCHROME_SOURCES), glyph)
+            .map(|image| placed(image.placement))
     }
 }
 
@@ -698,31 +714,36 @@ impl Canvas<'_> {
         scale: (f64, f64),
     ) {
         let data = scaler.data;
+        let upright = Transform::scale(scale.0 as f32, scale.1 as f32)
+            .then_translate(origin.0 as f32, origin.1 as f32);
+        // Colour glyphs stay upright and regular in every style, as CoreText draws them.
         let colr = scaler.colr.as_ref().and_then(|colr| {
-            colr.rasterize(
-                glyph,
-                data.pixels,
-                (scale.0 as f32, scale.1 as f32),
-                (origin.0 as f32, origin.1 as f32),
-            )
+            colr.rasterize(glyph, data.pixels, &upright, (self.width, self.height))
         });
         if let Some(image) = colr {
             let at = (image.left, self.height as i32 - image.top);
             self.blit_rgba((image.width, image.height), at, &image.rgba);
             return;
         }
-        let transform = data
-            .skew()
-            .then(&Transform::scale(scale.0 as f32, scale.1 as f32))
-            .then_translate(origin.0 as f32, origin.1 as f32);
-        let mut render = Render::new(&SOURCES);
-        render
+        let mut colour = Render::new(COLOR_SOURCES);
+        // A COLR v0 layer in the text's colour draws white, as COLR v1's does.
+        colour.default_color([u8::MAX; 4]).transform(Some(upright));
+        if let Some(image) = scaler.render(&colour, glyph) {
+            self.blit_image(&image, origin, scale);
+            return;
+        }
+        let mut monochrome = Render::new(MONOCHROME_SOURCES);
+        monochrome
             .format(Format::Alpha)
             .embolden(data.embolden)
-            .transform(Some(transform));
-        let Some(image) = scaler.render(&render, glyph) else {
-            return;
-        };
+            .transform(Some(data.skew().then(&upright)));
+        if let Some(image) = scaler.render(&monochrome, glyph) {
+            self.blit_image(&image, origin, scale);
+        }
+    }
+
+    /// Composites a glyph swash rendered with its origin at `origin`, stretched by `scale`.
+    fn blit_image(&mut self, image: &Image, origin: (f64, f64), scale: (f64, f64)) {
         let placement = image.placement;
         let size = (placement.width, placement.height);
         let pixels = &image.data;
@@ -1176,22 +1197,7 @@ mod tests {
     }
 
     fn coverage(swash: &Swash, face: &Face) -> u32 {
-        let mut pixels = vec![0; 4 * 64 * 64];
-        let glyph = Glyph {
-            id: Swash::glyph(face, BOLT).unwrap(),
-            x: 16.0,
-            y: 16.0,
-        };
-        swash
-            .with_canvas(&mut pixels, 64, 64, |canvas| {
-                swash.draw_glyphs(canvas, face, [glyph]);
-            })
-            .unwrap();
-        pixels
-            .iter()
-            .step_by(4)
-            .map(|&alpha| u32::from(alpha))
-            .sum()
+        drawn(swash, face, Swash::glyph(face, BOLT).unwrap()).1
     }
 
     #[test]
@@ -1373,22 +1379,60 @@ mod tests {
         assert!(Swash::glyph(&fallback, '\u{2318}').is_some());
     }
 
-    /// Apple Color Emoji and Noto Color Emoji's CBDT build are bitmaps; tests that need one skip
-    /// without it.
+    const GRINNING: char = '\u{1F600}';
+
+    /// An installed emoji font that `colours` says draws 😀 as a test needs, from every font of
+    /// the emoji families: Noto Color Emoji's CBDT and COLR v1 builds share a family name, so
+    /// matching the family finds one of them. Tests that need one skip without it.
+    fn emoji_font(
+        swash: &Swash,
+        colours: impl Fn(&FontFile, &mut Scaler<'_>, u16) -> bool,
+    ) -> Option<FontInfo> {
+        let shared = &mut *swash.shared.borrow_mut();
+        let fonts: Vec<FontInfo> = emoji_families(&mut shared.system.collection)
+            .into_iter()
+            .filter_map(|id| shared.system.collection.family(id))
+            .flat_map(|family| family.fonts().to_vec())
+            .collect();
+        fonts.into_iter().find(|font| {
+            let Some(file) = FontFile::load(font, Some(&mut shared.sources)) else {
+                return false;
+            };
+            let glyph = file.swash().charmap().map(GRINNING);
+            let mut scaler = shared
+                .scale
+                .builder(file.swash())
+                .size(PIXELS as f32)
+                .build();
+            glyph != 0 && colours(&file, &mut scaler, glyph)
+        })
+    }
+
+    /// An installed emoji font that draws 😀 as a colour bitmap, as Apple Color Emoji and Noto
+    /// Color Emoji's CBDT build do.
+    fn colour_bitmap_emoji(swash: &Swash) -> Option<FontInfo> {
+        emoji_font(swash, |_, scaler, glyph| {
+            Render::new(COLOR_SOURCES)
+                .render(scaler, glyph)
+                .is_some_and(|image| matches!(image.source, Source::ColorBitmap(_)))
+        })
+    }
+
     #[test]
     fn a_new_colour_bitmap_emoji_renders_once() {
         let swash = Swash::new();
-        let face = swash.embedded_face(SYMBOLS_FONT, PIXELS).unwrap();
-        let line = swash.line(&face, "\u{1F600}").unwrap();
+        let Some(font) = colour_bitmap_emoji(&swash) else {
+            return;
+        };
+        let face = synthesised(&FontFile::load(&font, None).unwrap(), FontStyle::default());
+        let line = swash.line(&face, &GRINNING.to_string()).unwrap();
         let rendered = || {
             let shared = swash.shared.borrow();
             let (_, image) = shared.last_color_bitmap.0.as_ref()?;
             Some(image.data.as_ptr())
         };
         let checked = rendered();
-        if checked.is_none() {
-            return;
-        }
+        assert!(checked.is_some(), "checking its colour didn't render it");
         let mut pixels = vec![0; 4 * 64 * 64];
         swash
             .with_canvas(&mut pixels, 64, 64, |canvas| {
@@ -1409,52 +1453,26 @@ mod tests {
         assert!(pixels.iter().any(|&byte| byte != 0));
     }
 
-    const GRINNING: char = '\u{1F600}';
-
     /// An installed emoji font that colours 😀 with COLR v1 alone, as Fedora's Noto Color Emoji
-    /// does; tests that need one skip without it.
-    fn colr_v1_emoji(swash: &Swash) -> Option<(FamilyId, Matched)> {
-        let mut shared = swash.shared.borrow_mut();
-        let families = emoji_families(&mut shared.system.collection);
-        families.into_iter().find_map(|id| {
-            let family = shared.system.collection.family(id)?;
-            let font = matched(&mut shared, &family, FontStyle::default())?;
-            let glyph = font.file.swash().charmap().map(GRINNING);
-            let colr = font.file.colr_v1(&[])?;
-            let mut scaler = shared
-                .scale
-                .builder(font.file.swash())
-                .size(PIXELS as f32)
-                .build();
-            let swash_colours = Render::new(COLOR_SOURCES)
-                .render(&mut scaler, glyph)
-                .is_some();
-            (colr.has(glyph) && !swash_colours).then_some((id, font))
+    /// does.
+    fn colr_v1_emoji(swash: &Swash) -> Option<FontInfo> {
+        emoji_font(swash, |file, scaler, glyph| {
+            let swash_colours = Render::new(COLOR_SOURCES).render(scaler, glyph).is_some();
+            file.colr_v1(&[]).is_some_and(|colr| colr.has(glyph)) && !swash_colours
         })
     }
 
     #[test]
     fn a_colr_v1_glyph_draws_in_colour() {
         let swash = Swash::new();
-        let Some((id, font)) = colr_v1_emoji(&swash) else {
+        let Some(font) = colr_v1_emoji(&swash) else {
             return;
         };
-        let face = Face::new(FaceData::new(font, PIXELS, Some(id), FontStyle::default()).unwrap());
+        let face = synthesised(&FontFile::load(&font, None).unwrap(), FontStyle::default());
         let id = Swash::glyph(&face, GRINNING).unwrap();
         let (left, right) = swash.glyph_ink(&face, id).unwrap();
         assert!(right - left > PIXELS / 2.0, "ink {left}..{right}");
-        let mut pixels = vec![0; 4 * 64 * 64];
-        let glyph = Glyph {
-            id,
-            x: 16.0,
-            y: 16.0,
-        };
-        swash
-            .with_canvas(&mut pixels, 64, 64, |canvas| {
-                swash.draw_glyphs(canvas, &face, [glyph]);
-            })
-            .unwrap();
-        let colour = pixels
+        let colour = canvas(&swash, &face, id)
             .as_chunks::<4>()
             .0
             .iter()
@@ -1462,18 +1480,243 @@ mod tests {
         assert!(colour);
     }
 
+    const CANVAS: u32 = 128;
+    const ORIGIN: f64 = 32.0;
+
+    /// `face` drawing `glyph` with its origin at `ORIGIN` across and up a `CANVAS`-pixel square.
+    fn canvas(swash: &Swash, face: &Face, glyph: u16) -> Vec<u8> {
+        let mut pixels = vec![0; 4 * CANVAS as usize * CANVAS as usize];
+        let at = Glyph {
+            id: glyph,
+            x: ORIGIN,
+            y: ORIGIN,
+        };
+        swash
+            .with_canvas(&mut pixels, CANVAS, CANVAS, |canvas| {
+                swash.draw_glyphs(canvas, face, [at]);
+            })
+            .unwrap();
+        pixels
+    }
+
+    /// Where `face` draws `glyph`, in pixels up from its origin, and how much it covers.
+    fn drawn(swash: &Swash, face: &Face, glyph: u16) -> (Bounds, u32) {
+        let pixels = canvas(swash, face, glyph);
+        let (mut low, mut high, mut coverage) = ((u32::MAX, u32::MAX), (0, 0), 0);
+        for (index, pixel) in pixels.as_chunks::<4>().0.iter().enumerate() {
+            let (column, row) = (index as u32 % CANVAS, index as u32 / CANVAS);
+            if pixel[3] > 0 {
+                low = (low.0.min(column), low.1.min(row));
+                high = (high.0.max(column + 1), high.1.max(row + 1));
+                coverage += u32::from(pixel[3]);
+            }
+        }
+        assert!(coverage > 0, "nothing drawn");
+        let bounds = Bounds {
+            x: f64::from(low.0) - ORIGIN,
+            y: f64::from(CANVAS - high.1) - ORIGIN,
+            width: f64::from(high.0 - low.0),
+            height: f64::from(high.1 - low.1),
+        };
+        (bounds, coverage)
+    }
+
+    /// A copy of `file` whose COLR table `edit` has changed in place.
+    fn with_colr(file: &FontFile, edit: impl FnOnce(&mut [u8])) -> FontFile {
+        let colr = file.swash().table(swash::tag_from_bytes(b"COLR")).unwrap();
+        let start = colr.as_ptr() as usize - file.blob.data().as_ptr() as usize;
+        let mut data = file.blob.data().to_vec();
+        edit(&mut data[start..start + colr.len()]);
+        FontFile::new(Blob::new(Arc::new(data)), file.index).unwrap()
+    }
+
+    /// `file` with no COLR clip boxes, by zeroing the COLR table's clip list offset.
+    fn without_clip_boxes(file: &FontFile) -> FontFile {
+        use skrifa::raw::TableProvider;
+        let colr = skrifa::FontRef::from_index(file.blob.data(), file.index)
+            .unwrap()
+            .colr()
+            .unwrap();
+        let field = colr.clip_list_offset_byte_range();
+        with_colr(file, |colr| colr[field].fill(0))
+    }
+
+    #[test]
+    fn a_colr_v1_glyph_without_a_clip_box_measures_its_paint() {
+        let swash = Swash::new();
+        let Some(font) = colr_v1_emoji(&swash) else {
+            return;
+        };
+        let file = without_clip_boxes(&FontFile::load(&font, None).unwrap());
+        assert_ink_is_drawn(&swash, &synthesised(&file, FontStyle::default()));
+    }
+
+    /// The ink `face` measures for 😀 is where it draws, as far as outline control points stray
+    /// from the curves.
+    fn assert_ink_is_drawn(swash: &Swash, face: &Face) {
+        let glyph = Swash::glyph(face, GRINNING).unwrap();
+        let ink = swash
+            .shared
+            .borrow_mut()
+            .scaler(&face.data)
+            .ink(glyph)
+            .unwrap();
+        let (drawn, _) = drawn(swash, face, glyph);
+        for (what, ink, drawn) in [
+            ("left", ink.x, drawn.x),
+            ("bottom", ink.y, drawn.y),
+            ("right", ink.x + ink.width, drawn.x + drawn.width),
+            ("top", ink.y + ink.height, drawn.y + drawn.height),
+        ] {
+            assert!(
+                (ink - drawn).abs() <= 1.5,
+                "{what}: ink {ink}, drawn {drawn}"
+            );
+        }
+    }
+
+    /// `file`'s face in `style`, synthesised as for a family without the style.
+    fn synthesised(file: &FontFile, style: FontStyle) -> Face {
+        let font = Matched {
+            file: file.clone(),
+            synthesis: Synthesis::default(),
+        };
+        let mut data = FaceData::new(font, PIXELS, None, style).unwrap();
+        data.embolden = if style.bold { 1.0 } else { 0.0 };
+        data.skew = style.italic;
+        Face::new(data)
+    }
+
+    /// 😀 from `file` draws the same in every style, and measures where it draws: colour glyphs
+    /// stay upright and regular, as CoreText draws them.
+    fn assert_styles_leave_emoji_alone(swash: &Swash, file: &FontFile) {
+        let regular = synthesised(file, FontStyle::default());
+        let glyph = Swash::glyph(&regular, GRINNING).unwrap();
+        let expected = canvas(swash, &regular, glyph);
+        assert_ink_is_drawn(swash, &regular);
+        for (bold, italic) in [(true, false), (false, true), (true, true)] {
+            let style = FontStyle { bold, italic };
+            let styled = synthesised(file, style);
+            assert!(
+                canvas(swash, &styled, glyph) == expected,
+                "{style:?} draws differently"
+            );
+            assert_ink_is_drawn(swash, &styled);
+        }
+    }
+
+    #[test]
+    fn colour_bitmap_emoji_ignore_bold_and_italic() {
+        let swash = Swash::new();
+        let Some(font) = colour_bitmap_emoji(&swash) else {
+            return;
+        };
+        assert_styles_leave_emoji_alone(&swash, &FontFile::load(&font, None).unwrap());
+    }
+
+    #[test]
+    fn colr_v1_emoji_ignore_bold_and_italic() {
+        let swash = Swash::new();
+        let Some(font) = colr_v1_emoji(&swash) else {
+            return;
+        };
+        assert_styles_leave_emoji_alone(&swash, &FontFile::load(&font, None).unwrap());
+    }
+
+    /// The COLR v1 emoji font with a COLR v0 table that draws 😀 as two of its glyphs, the
+    /// second in palette entry `over` over the first in entry 0: no installed font is COLR v0.
+    fn colr_v0_emoji(swash: &Swash, over: u16) -> Option<FontFile> {
+        let file = FontFile::load(&colr_v1_emoji(swash)?, None)?;
+        let font = file.swash();
+        let grinning = font.charmap().map(GRINNING);
+        let mut context = ScaleContext::new();
+        let mut scaler = context.builder(font).size(PIXELS as f32).build();
+        // Two glyphs at least half the em across and high, so the second has an opaque middle.
+        let mut layers = (1..font.metrics(&[]).glyph_count).filter(|&glyph| {
+            scaler.scale_outline(glyph).is_some_and(|outline| {
+                let bounds = outline.bounds();
+                f64::from(bounds.width().min(bounds.height())) > PIXELS / 2.0
+            })
+        });
+        let (under, over_glyph) = (layers.next()?, layers.next()?);
+        // Version 0 with one base glyph record at byte 14 and two layer records at byte 20 (each
+        // offset a u32, so two u16s), then the record, then the layers.
+        let table: Vec<u8> = [
+            0, 1, 0, 14, 0, 20, 2, grinning, 0, 2, under, 0, over_glyph, over,
+        ]
+        .into_iter()
+        .flat_map(u16::to_be_bytes)
+        .collect();
+        Some(with_colr(&file, |colr| {
+            colr[..table.len()].copy_from_slice(&table);
+        }))
+    }
+
+    #[test]
+    fn colr_v0_emoji_ignore_bold_and_italic() {
+        let swash = Swash::new();
+        let Some(file) = colr_v0_emoji(&swash, 0xFFFF) else {
+            return;
+        };
+        assert_styles_leave_emoji_alone(&swash, &file);
+    }
+
+    #[test]
+    fn a_colr_v0_layer_in_the_text_colour_draws_white() {
+        let swash = Swash::new();
+        let (Some(text), Some(palette)) = (colr_v0_emoji(&swash, 0xFFFF), colr_v0_emoji(&swash, 0))
+        else {
+            return;
+        };
+        let draw = |file: &FontFile| {
+            let face = synthesised(file, FontStyle::default());
+            canvas(&swash, &face, Swash::glyph(&face, GRINNING).unwrap())
+        };
+        // swash's layer blending loses a little alpha.
+        let white =
+            |&[red, green, blue, alpha]: &[u8; 4]| alpha > 250 && [red, green, blue] == [alpha; 3];
+        let (text, palette) = (draw(&text), draw(&palette));
+        let whitened = text
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .zip(palette.as_chunks::<4>().0)
+            .any(|(text, palette)| white(text) && !white(palette));
+        assert!(whitened);
+    }
+
+    #[test]
+    fn a_colr_v1_glyph_far_larger_than_its_canvas_draws_the_part_inside() {
+        let swash = Swash::new();
+        let Some(font) = colr_v1_emoji(&swash) else {
+            return;
+        };
+        let face = synthesised(&FontFile::load(&font, None).unwrap(), FontStyle::default());
+        let glyph = Swash::glyph(&face, GRINNING).unwrap();
+        let mut pixels = vec![0; 4 * 64 * 64];
+        swash
+            .with_canvas(&mut pixels, 64, 64, |canvas| {
+                let mut shared = swash.shared.borrow_mut();
+                let mut scaler = shared.scaler(&face.data);
+                canvas.draw(&mut scaler, glyph, (-600.0, -600.0), (50.0, 50.0));
+            })
+            .unwrap();
+        assert!(pixels.iter().any(|&byte| byte != 0));
+    }
+
     #[test]
     fn a_colr_v1_only_emoji_font_is_a_colour_fallback() {
         let swash = Swash::new();
-        let Some((_, font)) = colr_v1_emoji(&swash) else {
+        let Some(font) = colr_v1_emoji(&swash) else {
             return;
         };
+        let file = FontFile::load(&font, None).unwrap();
         let cluster = GRINNING.to_string();
         assert!(
             swash
                 .shared
                 .borrow_mut()
-                .fits(&font.file, PIXELS as f32, &cluster, true)
+                .fits(&file, PIXELS as f32, &cluster, true)
         );
     }
 

@@ -16,7 +16,7 @@ use skrifa::outline::{DrawSettings, OutlineGlyphCollection, OutlinePen};
 use skrifa::raw::TableProvider;
 use skrifa::raw::tables::cpal::ColorRecord;
 use skrifa::{FontRef, GlyphId, MetadataProvider};
-use swash::zeno::{Command, Mask, Scratch, Vector};
+use swash::zeno::{self, Bounds, Command, Fill, Mask, Scratch, Vector};
 
 /// A font's COLR v1 glyphs at one variation instance.
 pub(crate) struct ColrV1<'a> {
@@ -25,7 +25,8 @@ pub(crate) struct ColrV1<'a> {
     coords: Vec<NormalizedCoord>,
 }
 
-/// Premultiplied RGBA whose top-left corner is `left`, `top` pixels from the origin, y up.
+/// Premultiplied RGBA whose top-left corner is `left`, `top` pixels from the drawing's origin, y
+/// up.
 pub(crate) struct Image {
     pub(crate) left: i32,
     pub(crate) top: i32,
@@ -33,9 +34,6 @@ pub(crate) struct Image {
     pub(crate) height: u32,
     pub(crate) rgba: Vec<u8>,
 }
-
-/// Wider or taller than this, a glyph is a broken font's, not one worth an allocation.
-const MAX_SIZE: u32 = 1024;
 
 impl<'a> ColrV1<'a> {
     /// The font's COLR v1 glyphs, or `None` when it has none.
@@ -61,64 +59,88 @@ impl<'a> ColrV1<'a> {
         self.glyph(glyph).is_some()
     }
 
-    /// The glyph's clip box at `pixels`, up from its origin; without one, the em square across
-    /// its advance.
-    pub(crate) fn bounds(&self, glyph: u16, pixels: f32) -> Option<BoundingBox> {
-        self.bounds_of(&self.glyph(glyph)?, glyph, pixels)
+    /// Where the glyph's paint inks at `pixels`, in pixels up from its origin.
+    pub(crate) fn bounds(&self, glyph: u16, pixels: f32) -> Option<Bounds> {
+        self.bounds_of(glyph, &self.glyph(glyph)?, pixels, Transform::IDENTITY)
     }
 
-    fn bounds_of(&self, color: &ColorGlyph<'a>, glyph: u16, pixels: f32) -> Option<BoundingBox> {
+    fn bounds_of(
+        &self,
+        glyph: u16,
+        color: &ColorGlyph<'a>,
+        pixels: f32,
+        transform: Transform,
+    ) -> Option<Bounds> {
         let location = LocationRef::new(&self.coords);
-        let size = Size::new(pixels);
-        color.bounding_box(location, size).or_else(|| {
-            let advance = self
-                .font
-                .glyph_metrics(size, location)
-                .advance_width(GlyphId::new(u32::from(glyph)))?;
-            Some(BoundingBox {
-                x_min: 0.0,
-                y_min: -0.25 * pixels,
-                x_max: advance,
-                y_max: pixels,
-            })
+        let em = f32::from(self.font.head().ok()?.units_per_em());
+        let advance = self
+            .font
+            .glyph_metrics(Size::unscaled(), location)
+            .advance_width(GlyphId::new(u32::from(glyph)))?;
+        let paths = self.paths(pixels, transform)?;
+        let em_box = BoundingBox {
+            x_min: 0.0,
+            y_min: -0.25 * em,
+            x_max: advance,
+            y_max: em,
+        };
+        let mut ink = Ink {
+            unclipped: extent(&paths.rect(em_box)),
+            paths,
+            clips: Vec::new(),
+            bounds: None,
+        };
+        color.paint(location, &mut ink).ok()?;
+        ink.bounds
+    }
+
+    /// Paths at `pixels` in the space `transform` maps the glyph's pixels, y up, to.
+    fn paths(&self, pixels: f32, transform: Transform) -> Option<Paths<'_>> {
+        let units = pixels / f32::from(self.font.head().ok()?.units_per_em());
+        let to_pixels = Transform {
+            xx: units,
+            yy: units,
+            ..Transform::IDENTITY
+        };
+        Some(Paths {
+            location: LocationRef::new(&self.coords),
+            outlines: self.font.outline_glyphs(),
+            transforms: vec![transform * to_pixels],
         })
     }
 
-    /// The glyph at `pixels`, stretched by `scale`, with its origin at `origin` (pixels, y up):
-    /// `None` when the font has no paint graph for it.
+    /// The glyph at `pixels`, through `transform` from its pixels to the drawing's, both y up,
+    /// where it falls inside the drawing's `size`: `None` when the font has no paint graph for
+    /// it.
     pub(crate) fn rasterize(
         &self,
         glyph: u16,
         pixels: f32,
-        scale: (f32, f32),
-        origin: (f32, f32),
+        transform: &zeno::Transform,
+        size: (u32, u32),
     ) -> Option<Image> {
         let color = self.glyph(glyph)?;
-        let bounds = self.bounds_of(&color, glyph, pixels)?;
-        let left = (bounds.x_min * scale.0 + origin.0).floor() as i32;
-        let top = (bounds.y_max * scale.1 + origin.1).ceil() as i32;
-        let right = (bounds.x_max * scale.0 + origin.0).ceil() as i32;
-        let bottom = (bounds.y_min * scale.1 + origin.1).floor() as i32;
-        let width = u32::try_from(right - left).ok()?;
-        let height = u32::try_from(top - bottom).ok()?;
-        if width == 0 || height == 0 || width > MAX_SIZE || height > MAX_SIZE {
+        let transform = from_zeno(transform);
+        let bounds = self.bounds_of(glyph, &color, pixels, transform)?;
+        // Clamped before the casts, which a paint transformed far off would overflow.
+        let clamp = |edge: f32, limit: u32| edge.clamp(0.0, limit as f32) as i32;
+        let left = clamp(bounds.min.x.floor(), size.0);
+        let top = clamp(bounds.max.y.ceil(), size.1);
+        let width = u32::try_from(clamp(bounds.max.x.ceil(), size.0) - left).ok()?;
+        let height = u32::try_from(top - clamp(bounds.min.y.floor(), size.1)).ok()?;
+        if width == 0 || height == 0 {
             return None;
         }
-        let units = pixels / f32::from(self.font.head().ok()?.units_per_em());
-        // Font units, y up, to image pixels, y down.
-        let base = Transform {
-            xx: units * scale.0,
-            yx: 0.0,
-            xy: 0.0,
-            yy: -units * scale.1,
-            dx: origin.0 - left as f32,
-            dy: top as f32 - origin.1,
+        // The drawing's pixels, y up, to the image's, y down.
+        let image = Transform {
+            yy: -1.0,
+            dx: -left as f32,
+            dy: top as f32,
+            ..Transform::IDENTITY
         };
         let cpal = self.font.cpal().ok();
         let area = width as usize * height as usize;
-        let location = LocationRef::new(&self.coords);
         let mut painter = Painter {
-            location,
             palette: Palette {
                 records: cpal
                     .as_ref()
@@ -132,8 +154,7 @@ impl<'a> ColrV1<'a> {
                 entries: cpal.as_ref().map_or(0, |cpal| cpal.num_palette_entries()),
             },
             width: width as usize,
-            transforms: vec![base],
-            outlines: self.font.outline_glyphs(),
+            paths: self.paths(pixels, image * transform)?,
             clips: vec![Clip {
                 cover: vec![1.0; area],
                 bounds: [0, 0, width as usize, height as usize],
@@ -141,7 +162,9 @@ impl<'a> ColrV1<'a> {
             layers: vec![vec![[0.0; 4]; area]],
             scratch: Scratch::new(),
         };
-        color.paint(location, &mut painter).ok()?;
+        color
+            .paint(LocationRef::new(&self.coords), &mut painter)
+            .ok()?;
         let rgba = painter
             .layers
             .pop()?
@@ -158,6 +181,9 @@ impl<'a> ColrV1<'a> {
     }
 }
 
+/// The palette index COLR paints with to mean the text's colour.
+const TEXT_COLOR_INDEX: u16 = 0xFFFF;
+
 /// Palette 0, read where a paint asks for a colour: an emoji font's palette has thousands of
 /// entries and a glyph uses a handful.
 struct Palette<'a> {
@@ -167,13 +193,19 @@ struct Palette<'a> {
 }
 
 impl Palette<'_> {
-    /// Straight RGBA in 0..1. 0xFFFF is the text's colour; an emoji's image takes none, so it's
-    /// black.
+    /// Straight RGBA in 0..1, black for an index past the palette. 0xFFFF is the text's colour,
+    /// white as the canvas draws text: a glyph painted in it alone reads as coverage, which the
+    /// renderer tints, and one with other colours keeps it white, as CoreText draws it.
     fn color(&self, index: u16, alpha: f32) -> [f32; 4] {
         let record = (index < self.entries)
             .then(|| self.records.get(self.first + usize::from(index)))
             .flatten();
-        let [red, green, blue, opacity] = record.map_or([0.0, 0.0, 0.0, 1.0], |record| {
+        let missing = if index == TEXT_COLOR_INDEX {
+            [1.0; 4]
+        } else {
+            [0.0, 0.0, 0.0, 1.0]
+        };
+        let [red, green, blue, opacity] = record.map_or(missing, |record| {
             [record.red, record.green, record.blue, record.alpha]
                 .map(|channel| f32::from(channel) / 255.0)
         });
@@ -205,11 +237,9 @@ impl Palette<'_> {
 }
 
 struct Painter<'a> {
-    location: LocationRef<'a>,
     palette: Palette<'a>,
     width: usize,
-    transforms: Vec<Transform>,
-    outlines: OutlineGlyphCollection<'a>,
+    paths: Paths<'a>,
     /// Each the intersection of the clips under it.
     clips: Vec<Clip>,
     /// Premultiplied RGBA layers.
@@ -246,20 +276,75 @@ fn invert(transform: &Transform) -> Option<Transform> {
     })
 }
 
-/// An outline in image pixels, through the current transform.
-struct Pen<'t> {
-    transform: &'t Transform,
+/// Glyph outlines and boxes through a stack of transforms from font units.
+struct Paths<'a> {
+    location: LocationRef<'a>,
+    outlines: OutlineGlyphCollection<'a>,
+    transforms: Vec<Transform>,
+}
+
+impl Paths<'_> {
+    fn transform(&self) -> Transform {
+        self.transforms.last().copied().unwrap_or_default()
+    }
+
+    fn push(&mut self, transform: Transform) {
+        let transform = self.transform() * transform;
+        self.transforms.push(transform);
+    }
+
+    fn pop(&mut self) {
+        if self.transforms.len() > 1 {
+            self.transforms.pop();
+        }
+    }
+
+    fn pen(&self) -> Pen {
+        Pen {
+            transform: self.transform(),
+            path: Vec::new(),
+        }
+    }
+
+    /// Glyph `glyph`'s outline through the current transform.
+    fn glyph(&self, glyph: GlyphId) -> Vec<Command> {
+        let mut pen = self.pen();
+        if let Some(outline) = self.outlines.get(glyph) {
+            let settings = DrawSettings::unhinted(Size::unscaled(), self.location);
+            // A broken outline draws what it reached.
+            if let Err(error) = outline.draw(settings, &mut pen) {
+                eprintln!("benches: COLR v1 glyph {glyph}'s outline is broken: {error}");
+            }
+        }
+        pen.path
+    }
+
+    /// `rect` through the current transform.
+    fn rect(&self, rect: BoundingBox) -> Vec<Command> {
+        let mut pen = self.pen();
+        pen.move_to(rect.x_min, rect.y_min);
+        pen.line_to(rect.x_max, rect.y_min);
+        pen.line_to(rect.x_max, rect.y_max);
+        pen.line_to(rect.x_min, rect.y_max);
+        pen.close();
+        pen.path
+    }
+}
+
+/// An outline as path commands, through a transform.
+struct Pen {
+    transform: Transform,
     path: Vec<Command>,
 }
 
-impl Pen<'_> {
+impl Pen {
     fn point(&self, x: f32, y: f32) -> Vector {
         let (x, y) = self.transform.transform(x, y);
         Vector::new(x, y)
     }
 }
 
-impl OutlinePen for Pen<'_> {
+impl OutlinePen for Pen {
     fn move_to(&mut self, x: f32, y: f32) {
         let point = self.point(x, y);
         self.path.push(Command::MoveTo(point));
@@ -285,28 +370,104 @@ impl OutlinePen for Pen<'_> {
     }
 }
 
-impl Painter<'_> {
-    fn transform(&self) -> Transform {
-        self.transforms.last().copied().unwrap_or_default()
+fn from_zeno(transform: &zeno::Transform) -> Transform {
+    Transform {
+        xx: transform.xx,
+        yx: transform.xy,
+        xy: transform.yx,
+        yy: transform.yy,
+        dx: transform.x,
+        dy: transform.y,
+    }
+}
+
+/// The box around `path`'s points, which holds its curves too.
+fn extent(path: &[Command]) -> Bounds {
+    zeno::bounds(path, Fill::NonZero, None)
+}
+
+/// Where a glyph's paint inks, in the space its paths' first transform maps font units to: each
+/// fill's box inside the clips over it, united. A layer composited to erase still counts, so it
+/// can be larger than the ink.
+struct Ink<'a> {
+    paths: Paths<'a>,
+    /// Where a fill with no clip around it, which covers the plane, inks: the em square across the
+    /// glyph's advance.
+    unclipped: Bounds,
+    /// Each the intersection of the clips under it.
+    clips: Vec<Bounds>,
+    bounds: Option<Bounds>,
+}
+
+impl Ink<'_> {
+    fn clipped(&self, extent: Bounds) -> Bounds {
+        self.clips.last().map_or(extent, |clip| {
+            Bounds::new(
+                Vector::new(extent.min.x.max(clip.min.x), extent.min.y.max(clip.min.y)),
+                Vector::new(extent.max.x.min(clip.max.x), extent.max.y.min(clip.max.y)),
+            )
+        })
     }
 
-    /// Glyph `glyph`'s outline in image pixels, through the current transform.
-    fn glyph_path(&self, glyph: GlyphId) -> Vec<Command> {
-        let transform = self.transform();
-        let mut pen = Pen {
-            transform: &transform,
-            path: Vec::new(),
-        };
-        if let Some(outline) = self.outlines.get(glyph) {
-            let settings = DrawSettings::unhinted(Size::unscaled(), self.location);
-            // A broken outline draws what it reached.
-            if let Err(error) = outline.draw(settings, &mut pen) {
-                eprintln!("benches: COLR v1 clip glyph {glyph} is broken: {error}");
-            }
+    fn fill_inside(&mut self, extent: Bounds) {
+        if extent.is_empty() {
+            return;
         }
-        pen.path
+        self.bounds = Some(self.bounds.map_or(extent, |bounds| {
+            Bounds::new(
+                Vector::new(
+                    bounds.min.x.min(extent.min.x),
+                    bounds.min.y.min(extent.min.y),
+                ),
+                Vector::new(
+                    bounds.max.x.max(extent.max.x),
+                    bounds.max.y.max(extent.max.y),
+                ),
+            )
+        }));
+    }
+}
+
+impl ColorPainter for Ink<'_> {
+    fn push_transform(&mut self, transform: Transform) {
+        self.paths.push(transform);
     }
 
+    fn pop_transform(&mut self) {
+        self.paths.pop();
+    }
+
+    fn push_clip_glyph(&mut self, glyph: GlyphId) {
+        let path = self.paths.glyph(glyph);
+        let clip = self.clipped(extent(&path));
+        self.clips.push(clip);
+    }
+
+    fn push_clip_box(&mut self, clip_box: BoundingBox) {
+        let path = self.paths.rect(clip_box);
+        let clip = self.clipped(extent(&path));
+        self.clips.push(clip);
+    }
+
+    fn pop_clip(&mut self) {
+        self.clips.pop();
+    }
+
+    fn fill(&mut self, _brush: Brush<'_>) {
+        let clip = self.clips.last().copied().unwrap_or(self.unclipped);
+        self.fill_inside(clip);
+    }
+
+    fn fill_glyph(&mut self, glyph: GlyphId, _: Option<Transform>, _: Brush<'_>) {
+        let path = self.paths.glyph(glyph);
+        let extent = self.clipped(extent(&path));
+        self.fill_inside(extent);
+    }
+
+    fn push_layer(&mut self, _mode: CompositeMode) {}
+}
+
+impl Painter<'_> {
     /// `path`'s coverage inside the clip on top: only the box the path and that clip share is
     /// rasterised and kept.
     fn mask(&mut self, path: &[Command]) -> Clip {
@@ -317,25 +478,12 @@ impl Painter<'_> {
         let Some(under) = self.clips.last() else {
             return empty;
         };
-        let (mut low, mut high) = ([f32::MAX; 2], [f32::MIN; 2]);
-        let points = path
-            .iter()
-            .flat_map(|command| match *command {
-                Command::MoveTo(a) | Command::LineTo(a) => [Some(a), None, None],
-                Command::QuadTo(a, b) => [Some(a), Some(b), None],
-                Command::CurveTo(a, b, c) => [Some(a), Some(b), Some(c)],
-                Command::Close => [None, None, None],
-            })
-            .flatten();
-        for point in points {
-            low = [low[0].min(point.x), low[1].min(point.y)];
-            high = [high[0].max(point.x), high[1].max(point.y)];
-        }
+        let extent = extent(path);
         let [under_x0, under_y0, under_x1, under_y1] = under.bounds;
-        let x0 = (low[0].floor().max(0.0) as usize).max(under_x0);
-        let y0 = (low[1].floor().max(0.0) as usize).max(under_y0);
-        let x1 = (high[0].ceil().max(0.0) as usize).min(under_x1);
-        let y1 = (high[1].ceil().max(0.0) as usize).min(under_y1);
+        let x0 = (extent.min.x.floor().max(0.0) as usize).max(under_x0);
+        let y0 = (extent.min.y.floor().max(0.0) as usize).max(under_y0);
+        let x1 = (extent.max.x.ceil().max(0.0) as usize).min(under_x1);
+        let y1 = (extent.max.y.ceil().max(0.0) as usize).min(under_y1);
         if x1 <= x0 || y1 <= y0 {
             return empty;
         }
@@ -641,34 +789,22 @@ fn composite(mode: CompositeMode, source: [f32; 4], destination: [f32; 4]) -> [f
 
 impl ColorPainter for Painter<'_> {
     fn push_transform(&mut self, transform: Transform) {
-        let transform = self.transform() * transform;
-        self.transforms.push(transform);
+        self.paths.push(transform);
     }
 
     fn pop_transform(&mut self) {
-        if self.transforms.len() > 1 {
-            self.transforms.pop();
-        }
+        self.paths.pop();
     }
 
     fn push_clip_glyph(&mut self, glyph: GlyphId) {
-        let path = self.glyph_path(glyph);
+        let path = self.paths.glyph(glyph);
         let clip = self.mask(&path);
         self.clips.push(clip);
     }
 
     fn push_clip_box(&mut self, clip_box: BoundingBox) {
-        let transform = self.transform();
-        let mut pen = Pen {
-            transform: &transform,
-            path: Vec::new(),
-        };
-        pen.move_to(clip_box.x_min, clip_box.y_min);
-        pen.line_to(clip_box.x_max, clip_box.y_min);
-        pen.line_to(clip_box.x_max, clip_box.y_max);
-        pen.line_to(clip_box.x_min, clip_box.y_max);
-        pen.close();
-        let clip = self.mask(&pen.path);
+        let path = self.paths.rect(clip_box);
+        let clip = self.mask(&path);
         self.clips.push(clip);
     }
 
@@ -679,7 +815,7 @@ impl ColorPainter for Painter<'_> {
     }
 
     fn fill(&mut self, brush: Brush<'_>) {
-        let Some(inverse) = invert(&self.transform()) else {
+        let Some(inverse) = invert(&self.paths.transform()) else {
             return;
         };
         let (Some(clip), Some(layer)) = (self.clips.last(), self.layers.last_mut()) else {
@@ -691,11 +827,11 @@ impl ColorPainter for Painter<'_> {
     /// Most of an emoji's paints: a glyph's shape filled, its mask used once and not kept as a
     /// clip.
     fn fill_glyph(&mut self, glyph: GlyphId, brush_transform: Option<Transform>, brush: Brush<'_>) {
-        let path = self.glyph_path(glyph);
+        let path = self.paths.glyph(glyph);
         let clip = self.mask(&path);
-        let transform = brush_transform.map_or(self.transform(), |brush_transform| {
-            self.transform() * brush_transform
-        });
+        let transform = self.paths.transform();
+        let transform =
+            brush_transform.map_or(transform, |brush_transform| transform * brush_transform);
         let Some(inverse) = invert(&transform) else {
             return;
         };
@@ -741,5 +877,15 @@ mod tests {
         };
         assert_eq!(palette.color(0, 1.0), [1.0, 0.0, 0.0, 1.0]);
         assert_eq!(palette.color(1, 1.0), [0.0, 0.0, 0.0, 1.0]);
+    }
+
+    #[test]
+    fn the_text_colour_index_draws_white_for_the_renderer_to_tint() {
+        let palette = Palette {
+            records: &[],
+            first: 0,
+            entries: 0,
+        };
+        assert_eq!(palette.color(0xFFFF, 0.5), [1.0, 1.0, 1.0, 0.5]);
     }
 }
