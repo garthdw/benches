@@ -1,16 +1,8 @@
-use std::fs::File;
-use std::io::{self, Read, Seek};
-use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError, mpsc};
-use std::thread;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
-use benches_core::actor::kill_group;
-use nix::sys::signal::{Signal, killpg};
-use nix::unistd::Pid;
+use benches_core::process::{Cancel, login_args, run, strip_escapes};
 use serde::Deserialize;
 
 /// Where the lookup starts, so a command that only `cd`s is told apart by the `pwd` after it.
@@ -133,168 +125,11 @@ fn parse_worktrees(output: &str) -> Result<Vec<Worktree>> {
         .collect())
 }
 
-/// Lets another thread end a running command, which `run` watches through a clone.
-#[derive(Clone, Default)]
-pub struct Cancel(Arc<Mutex<Lookup>>);
-
-#[derive(Default)]
-enum Lookup {
-    #[default]
-    Starting,
-    Running(Pid),
-    /// Cancelled or finished, so a late `cancel` signals nothing.
-    Done,
-}
-
-impl Cancel {
-    /// Kills the command's process group, or stops it from starting if it hasn't yet.
-    pub fn cancel(&self) -> Result<()> {
-        // Signalled under the lock, which `run` takes before it reaps the group's leader and so
-        // frees the group's id for reuse.
-        let mut lookup = self.lock();
-        match std::mem::replace(&mut *lookup, Lookup::Done) {
-            Lookup::Running(group) => killpg(group, Signal::SIGKILL).context("cancel"),
-            Lookup::Starting | Lookup::Done => Ok(()),
-        }
-    }
-
-    /// Records the command's process group, unless it was cancelled before it started.
-    fn start(&self, group: Pid) -> bool {
-        let mut lookup = self.lock();
-        let starting = matches!(*lookup, Lookup::Starting);
-        if starting {
-            *lookup = Lookup::Running(group);
-        }
-        starting
-    }
-
-    /// Says whether the command was cancelled, after which `cancel` signals nothing.
-    fn finish(&self) -> bool {
-        !matches!(
-            std::mem::replace(&mut *self.lock(), Lookup::Done),
-            Lookup::Running(_)
-        )
-    }
-
-    fn lock(&self) -> MutexGuard<'_, Lookup> {
-        self.0.lock().unwrap_or_else(PoisonError::into_inner)
-    }
-}
-
-/// Runs the login shell with `args` in `cwd` and returns what it printed, ending the whole
-/// process group if it outlasts `timeout` or `cancel` fires.
-fn run(
-    shell: &Path,
-    args: &[String],
-    cwd: &Path,
-    timeout: Duration,
-    what: &str,
-    cancel: &Cancel,
-) -> Result<Output> {
-    // Read once the command exits, without waiting for every other process holding them to
-    // close them, as a pipe's reader would: one the command left running, or one that another
-    // thread forked meanwhile, as macOS has no `pipe2` to make a pipe close-on-exec at once.
-    let mut stdout = tempfile::tempfile().context("create lookup output")?;
-    let mut stderr = tempfile::tempfile().context("create lookup output")?;
-    let mut child = Command::new(shell)
-        .args(args)
-        .current_dir(cwd)
-        .stdin(Stdio::null())
-        .stdout(stdout.try_clone().context("share lookup output")?)
-        .stderr(stderr.try_clone().context("share lookup output")?)
-        .process_group(0)
-        .spawn()
-        .with_context(|| format!("run {}", shell.display()))?;
-    let group = Pid::from_raw(child.id() as i32);
-    let started = cancel.start(group);
-    let (sender, exits) = mpsc::channel();
-    if started {
-        thread::spawn(move || sender.send(wait_for_exit(group)));
-    }
-    let exited = started && matches!(exits.recv_timeout(timeout), Ok(Ok(())));
-    let cancelled = cancel.finish();
-    // Also after a cancel, whose single `killpg` can miss a process being forked.
-    let killed = if cancelled || !exited {
-        kill_group(group).context("kill lookup")
-    } else {
-        Ok(())
-    };
-    // The waiting thread must be done before the reap frees the leader's pid for reuse.
-    exits.iter().for_each(drop);
-    let status = child.wait().context("wait for lookup")?;
-    killed?;
-    if !exited {
-        if cancelled {
-            bail!("“{what}” was cancelled");
-        }
-        bail!("“{what}” took longer than {timeout:?}");
-    }
-    Ok(Output {
-        status,
-        stdout: read_from_start(&mut stdout)?,
-        stderr: read_from_start(&mut stderr)?,
-    })
-}
-
-/// Blocks until the child `pid` exits, leaving it unreaped, so its process group's id stays
-/// reserved while `run` may still signal the group.
-fn wait_for_exit(pid: Pid) -> io::Result<()> {
-    loop {
-        // SAFETY: zeroes are a valid `siginfo_t`.
-        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
-        // SAFETY: `waitid` writes one `siginfo_t`.
-        let waited = unsafe {
-            libc::waitid(
-                libc::P_PID,
-                pid.as_raw() as libc::id_t,
-                &mut info,
-                libc::WEXITED | libc::WNOWAIT,
-            )
-        };
-        if waited == 0 {
-            return Ok(());
-        }
-        let error = io::Error::last_os_error();
-        if error.kind() != io::ErrorKind::Interrupted {
-            return Err(error);
-        }
-    }
-}
-
-fn read_from_start(file: &mut File) -> Result<Vec<u8>> {
-    let mut printed = Vec::new();
-    file.rewind()
-        .and_then(|()| file.read_to_end(&mut printed))
-        .context("read lookup output")?;
-    Ok(printed)
-}
-
 /// The query goes in as separate arguments rather than spliced into the script, so nothing in
 /// it is interpreted by the shell. A command such as `j` may `cd` rather than print, so `pwd`
 /// follows it.
 fn shell_args(shell: &Path, command: &str, query: &str) -> Vec<String> {
     login_args(shell, command, " && pwd", query.split_whitespace())
-}
-
-/// Arguments for a login shell to run `command` with `words` as its arguments, then `after`.
-fn login_args<'a>(
-    shell: &Path,
-    command: &str,
-    after: &str,
-    words: impl Iterator<Item = &'a str>,
-) -> Vec<String> {
-    let fish = shell.file_name().is_some_and(|name| name == "fish");
-    let script = if fish {
-        format!("{command} $argv{after}")
-    } else {
-        format!("{command} \"$@\"{after}")
-    };
-    let mut args = vec!["-l".to_owned(), "-i".to_owned(), "-c".to_owned(), script];
-    if !fish {
-        args.push("benches".to_owned());
-    }
-    args.extend(words.map(str::to_owned));
-    args
 }
 
 /// The last line naming a folder other than where the lookup started, as commands such as
@@ -336,28 +171,14 @@ pub fn relative_to(path: &Path, base: &Path) -> String {
     }
 }
 
-/// Drops CSI sequences such as colours, which is all lookup commands print.
-fn strip_escapes(text: &str) -> String {
-    let mut plain = String::with_capacity(text.len());
-    let mut chars = text.chars();
-    while let Some(char) = chars.next() {
-        if char != '\x1b' {
-            plain.push(char);
-        } else if chars.next() == Some('[') {
-            for char in chars.by_ref() {
-                if ('@'..='~').contains(&char) {
-                    break;
-                }
-            }
-        }
-    }
-    plain
-}
-
 #[cfg(test)]
 mod tests {
+    use std::sync::mpsc;
+    use std::thread;
+
     use nix::errno::Errno;
-    use nix::sys::signal::kill;
+    use nix::sys::signal::{Signal, kill, killpg};
+    use nix::unistd::Pid;
 
     use super::*;
     use crate::test_support::{installed, stub_shell, wait_for_pid, wait_for_pid_exit, wait_until};

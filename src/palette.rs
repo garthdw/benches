@@ -17,6 +17,7 @@ use crate::workspace::{Status, Workspace};
 use benches_core::LogErr;
 use benches_core::config::Config;
 use benches_core::history;
+use benches_core::process::Cancel;
 
 const PALETTE_WIDTH: f32 = 520.0;
 const PALETTE_TOP: f32 = 96.0;
@@ -81,13 +82,13 @@ pub(crate) struct JumpLookup {
     /// When to start the lookup, once typing pauses.
     due: Option<f64>,
     pending: Option<mpsc::Receiver<Option<PathBuf>>>,
-    cancel: jump::Cancel,
+    cancel: Cancel,
     pub(crate) found: Option<PathBuf>,
 }
 
 pub(crate) struct Creation {
     result: mpsc::Receiver<anyhow::Result<PathBuf>>,
-    cancel: jump::Cancel,
+    cancel: Cancel,
 }
 
 /// The repository worktrees the command centre offers after ⌘↵ on the jump command's folder, or
@@ -494,7 +495,7 @@ fn create_worktree(state: &mut State, branch: &str) {
     let Some(root) = state.active_root() else {
         return;
     };
-    let cancel = jump::Cancel::default();
+    let cancel = Cancel::default();
     let (shell, branch) = (state.config.shell.clone(), branch.to_owned());
     let result = spawn_waking(state.waker.clone(), {
         let cancel = cancel.clone();
@@ -732,7 +733,7 @@ pub(crate) fn poll_jump(state: &mut State, now: f64, tx: &mut Tx) -> bool {
     }
     if jump.due.is_some_and(|due| now >= due) {
         jump.due = None;
-        jump.cancel = jump::Cancel::default();
+        jump.cancel = Cancel::default();
         let cancel = jump.cancel.clone();
         let (shell, command, query) = (
             state.config.shell.clone(),

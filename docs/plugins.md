@@ -14,7 +14,7 @@ Worktrunk alone threads through `Action::CreateWorktree`/`ListWorktrees`, `Comma
 
 | Question | Decision | Why |
 | --- | --- | --- |
-| Runtime | External process: a manifest plus any executable | Extends `jump::run` (login shell, process group, timeout, `Cancel`); crash-isolated; any language |
+| Runtime | External process: a manifest plus any executable | Extends `process::run` (login shell, process group, timeout, `Cancel`); crash-isolated; any language |
 | Wire format | JSON Lines on stdin/stdout | Spawn cost dominates; scripts and `wt` already speak JSON (see [Alternatives](#alternatives-considered)) |
 | Plugin powers | Return data only: rows and effects | The host runs a closed effect vocabulary on the UI thread; plugins never touch `State` |
 | When a process runs | Only on invoke or a dynamic lookup | Commands, template prefix rows and row-action labels come from the manifest |
@@ -127,7 +127,7 @@ palette (UI thread) --invoke/query--> PluginHost --> worker thread --> plugin pr
         +---- rows / effects / error over mpsc + Waker; poll runs effects -+
 ```
 
-- **oneshot** (default, phase 2): spawn per request through the login shell, request on stdin, response on stdout, exit. Cancel kills the process group, as `jump::Cancel` does.
+- **oneshot** (default, phase 2): spawn per request through the login shell, request on stdin, response on stdout, exit. Cancel kills the process group, as `process::Cancel` does.
 - **persistent** (phase 4, `mode = "persistent"`): spawned lazily once per app, requests multiplexed by `id`, `cancel` messages, restarted on exit, killed on Reload Config. It removes the login-shell start per call: `fish -l -i -c true` measured 60–170 ms, `wt list` 250 ms end to end.
 - **Timeouts**: the manifest's `timeout`, defaulting to 5 s like `JUMP_TIMEOUT`.
 - **Sharing**: one `PluginHost` per app, shared across windows through an `Arc` as `Fleet` is. Stale responses are dropped by `id`.
@@ -139,7 +139,7 @@ The host goes in `benches-core` so it stays free of Rune; only the palette glue 
 | Location | Holds |
 | --- | --- |
 | `crates/benches-plugin` (new, `plugin.rs` root) | Protocol and manifest types, serde only; shared by the host and Rust plugins |
-| `benches-core::process` | `run`, `login_args`, `Cancel`, `strip_escapes`, moved out of `src/jump.rs` unchanged |
+| `benches-core::process` | `run`, `login_args`, `Cancel`, `strip_escapes`, moved out of `src/jump.rs`, with errors naming the command |
 | `benches-core::plugins` | Discovery, manifest validation, `requires` probing, oneshot and persistent runners |
 | `src/palette.rs` | `Action::Plugin{plugin, contribution, row}`; `Page` and `Busy` replacing `WorktreeChoice` and `Creation`; one debounced `Lookup` replacing `JumpLookup`'s own debounce; ranking bands |
 | `plugins/worktrunk/` (new binary `benches-worktrunk`) | The `wt list` and `wt switch --create` code and tests from `jump.rs` |
