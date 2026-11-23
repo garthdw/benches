@@ -13,7 +13,7 @@ use anyhow::Result;
 use crossbeam_channel::{Receiver, Sender, bounded, unbounded};
 use libghostty_vt::effect::ClipboardLocation;
 use libghostty_vt::key;
-use nix::pty::{Winsize, openpty};
+use nix::pty::{OpenptyResult, Winsize, openpty};
 use nix::sys::select::{FdSet, select};
 use nix::sys::time::{TimeVal, TimeValLike};
 use rune::Waker;
@@ -160,7 +160,7 @@ impl Session {
             ws_xpixel: 0,
             ws_ypixel: 0,
         };
-        let pty = openpty(Some(&size), None)?;
+        let pty = open_pty(Some(&size))?;
         set_cloexec(&pty.master)?;
         set_cloexec(&pty.slave)?;
 
@@ -470,6 +470,13 @@ fn next_id() -> u64 {
     NEXT.fetch_add(1, Ordering::Relaxed)
 }
 
+/// macOS's `openpty` sometimes fails when another thread calls it at the same time.
+fn open_pty(size: Option<&Winsize>) -> nix::Result<OpenptyResult> {
+    static OPENING: Mutex<()> = Mutex::new(());
+    let _opening = OPENING.lock().unwrap_or_else(PoisonError::into_inner);
+    openpty(size, None)
+}
+
 fn set_cloexec(fd: &OwnedFd) -> Result<()> {
     use nix::fcntl::{F_SETFD, FdFlag, fcntl};
     fcntl(fd, F_SETFD(FdFlag::FD_CLOEXEC))?;
@@ -515,7 +522,7 @@ mod tests {
 
     #[test]
     fn output_written_in_pieces_arrives_in_one_batch() {
-        let pty = openpty(None, None).unwrap();
+        let pty = open_pty(None).unwrap();
         let mut slave = File::from(pty.slave);
         let writer = thread::spawn(move || {
             for _ in 0..4 {
