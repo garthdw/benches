@@ -7,8 +7,8 @@ use std::sync::{Arc, LazyLock, Mutex, PoisonError};
 
 use anyhow::{Context, Result};
 use fontique::{
-    Blob, Collection, CollectionOptions, FallbackKey, FamilyId, FamilyInfo, FontStyle as Slant,
-    FontWeight, FontWidth, GenericFamily, Script, SourceCache, Synthesis,
+    Blob, Collection, CollectionOptions, FallbackKey, FamilyId, FamilyInfo, FontInfo,
+    FontStyle as Slant, FontWeight, FontWidth, GenericFamily, Script, SourceCache, Synthesis,
 };
 use harfrust::{Feature, ShapeOptions, ShaperData, ShaperInstance, Tag, UnicodeBuffer, Variation};
 use icu_properties::props::{EmojiPresentation, Script as UnicodeScript};
@@ -34,7 +34,7 @@ pub(crate) struct Swash {
 
 /// One `Font`'s font services, so one pixel size.
 struct Shared {
-    collection: Collection,
+    system: SystemFonts,
     sources: SourceCache,
     scale: ScaleContext,
     /// Each family's font file per style index, so fallback scans after the first only read
@@ -87,15 +87,25 @@ struct FaceScaler<'a> {
     last_color_bitmap: &'a mut LastColorBitmap,
 }
 
-/// The latest scan of the system fonts, which every backend's collection clones.
-static SYSTEM_FONTS: LazyLock<Mutex<(Collection, SourceCache)>> =
-    LazyLock::new(|| Mutex::new((scan_system_fonts(), SourceCache::new_shared())));
+/// The latest scan of the system fonts, which every backend clones.
+static SYSTEM_FONTS: LazyLock<Mutex<(SystemFonts, SourceCache)>> =
+    LazyLock::new(|| Mutex::new((SystemFonts::scan(), SourceCache::new_shared())));
 
-fn scan_system_fonts() -> Collection {
-    Collection::new(CollectionOptions {
-        shared: false,
-        system_fonts: true,
-    })
+/// One scan of the system fonts.
+#[derive(Clone)]
+struct SystemFonts {
+    collection: Collection,
+}
+
+impl SystemFonts {
+    fn scan() -> Self {
+        Self {
+            collection: Collection::new(CollectionOptions {
+                shared: false,
+                system_fonts: true,
+            }),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -144,6 +154,10 @@ impl FontFile {
             offset,
             key,
         })
+    }
+
+    fn load(font: &FontInfo, sources: Option<&mut SourceCache>) -> Option<Self> {
+        Self::new(font.load(sources)?, font.index())
     }
 
     fn swash(&self) -> swash::FontRef<'_> {
@@ -201,7 +215,7 @@ fn matched(shared: &mut Shared, family: &FamilyInfo, style: FontStyle) -> Option
     };
     let font = family.match_font(FontWidth::NORMAL, slant, weight, true)?;
     Some(Matched {
-        file: FontFile::new(font.load(Some(&mut shared.sources))?, font.index())?,
+        file: FontFile::load(font, Some(&mut shared.sources))?,
         synthesis: font.synthesis(FontWidth::NORMAL, slant, weight),
     })
 }
@@ -466,12 +480,11 @@ impl Swash {
 }
 
 /// The system's emoji fonts, in its order of preference.
-fn emoji_families(shared: &mut Shared) -> Vec<FamilyId> {
-    let mut families: Vec<FamilyId> = shared
-        .collection
+fn emoji_families(collection: &mut Collection) -> Vec<FamilyId> {
+    let mut families: Vec<FamilyId> = collection
         .fallback_families(FallbackKey::from(Script::from_bytes(*b"Zsye")))
         .collect();
-    families.extend(shared.collection.generic_families(GenericFamily::Emoji));
+    families.extend(collection.generic_families(GenericFamily::Emoji));
     families
 }
 
@@ -484,26 +497,23 @@ fn fallback_family(
     cluster: &str,
     colour: bool,
 ) -> Option<FamilyId> {
+    let collection = &mut shared.system.collection;
     let mut candidates = if colour {
-        emoji_families(shared)
+        emoji_families(collection)
     } else {
         Vec::new()
     };
     if let Some(script) = script(cluster) {
-        candidates.extend(
-            shared
-                .collection
-                .fallback_families(FallbackKey::from(script)),
-        );
+        candidates.extend(collection.fallback_families(FallbackKey::from(script)));
     }
     for generic in [
         GenericFamily::Monospace,
         GenericFamily::SansSerif,
         GenericFamily::Emoji,
     ] {
-        candidates.extend(shared.collection.generic_families(generic));
+        candidates.extend(collection.generic_families(generic));
     }
-    candidates.extend(shared.collection.family_ids());
+    candidates.extend(collection.family_ids());
     let mut tried = HashSet::<FamilyId, BuildHasherDefault<Fnv>>::default();
     candidates
         .into_iter()
@@ -518,6 +528,7 @@ fn draws(shared: &mut Shared, data: &FaceData, id: FamilyId, cluster: &str, colo
         Some(font) => font.clone(),
         None => {
             let font = shared
+                .system
                 .collection
                 .family(id)
                 .and_then(|family| matched(shared, &family, data.style));
@@ -715,13 +726,13 @@ impl Backend for Swash {
     type Canvas<'a> = Canvas<'a>;
 
     fn new() -> Self {
-        let (collection, sources) = SYSTEM_FONTS
+        let (system, sources) = SYSTEM_FONTS
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .clone();
         Self {
             shared: RefCell::new(Shared {
-                collection,
+                system,
                 sources,
                 scale: ScaleContext::new(),
                 files: FnvMap::default(),
@@ -737,29 +748,34 @@ impl Backend for Swash {
     /// A family installed since the last scan is found after one rescan per backend, as each
     /// config reload builds new backends.
     fn installed_face(&self, family: &str, pixels: f64) -> Option<Face> {
-        let lookup = || self.shared.borrow_mut().collection.family_by_name(family);
+        let lookup = || {
+            self.shared
+                .borrow_mut()
+                .system
+                .collection
+                .family_by_name(family)
+        };
         let found = lookup().or_else(|| {
             if self.rescanned.replace(true) {
                 return None;
             }
-            let collection = scan_system_fonts();
+            let system = SystemFonts::scan();
             SYSTEM_FONTS
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
-                .0 = collection.clone();
-            self.shared.borrow_mut().collection = collection;
+                .0 = system.clone();
+            self.shared.borrow_mut().system = system;
             lookup()
         })?;
         self.face(&found, FontStyle::default(), pixels)
     }
 
     fn monospace_family(&self) -> Option<String> {
-        let mut shared = self.shared.borrow_mut();
-        let id = shared
-            .collection
+        let collection = &mut self.shared.borrow_mut().system.collection;
+        let id = collection
             .generic_families(GenericFamily::Monospace)
             .next()?;
-        shared.collection.family_name(id).map(str::to_owned)
+        collection.family_name(id).map(str::to_owned)
     }
 
     /// A style the family lacks is synthesised, as Ghostty does with FreeType.
@@ -767,6 +783,7 @@ impl Backend for Swash {
         let family = self
             .shared
             .borrow_mut()
+            .system
             .collection
             .family(face.data.family?)?;
         let styled = self.face(&family, style, f64::from(face.data.pixels))?;
@@ -1098,6 +1115,7 @@ mod tests {
         swash
             .shared
             .borrow_mut()
+            .system
             .collection
             .register_fonts(Blob::new(Arc::new(SYMBOLS_FONT)), None);
         let regular = swash.installed_face("Symbols Nerd Font", PIXELS).unwrap();
@@ -1311,8 +1329,9 @@ mod tests {
     /// does; tests that need one skip without it.
     fn colr_v1_emoji(swash: &Swash) -> Option<(FamilyId, Matched)> {
         let mut shared = swash.shared.borrow_mut();
-        emoji_families(&mut shared).into_iter().find_map(|id| {
-            let family = shared.collection.family(id)?;
+        let families = emoji_families(&mut shared.system.collection);
+        families.into_iter().find_map(|id| {
+            let family = shared.system.collection.family(id)?;
             let font = matched(&mut shared, &family, FontStyle::default())?;
             let glyph = font.file.swash().charmap().map(GRINNING);
             let colr = font.file.colr_v1(&[])?;
