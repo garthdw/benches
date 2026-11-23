@@ -12,6 +12,7 @@ The toolchain is pinned in `rust-toolchain.toml`. Building `libghostty-vt` needs
 cargo run                                   # open the app with a live shell
 cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test   # every crate, via default-members
 cargo test ctrl_c_interrupts                # single test, by name substring; some tests spawn real shells
+BENCHES_DBUS_TESTS=1 cargo test -p benches-platform dbus   # Linux: notifications against private dbus-daemons
 cargo run -- --snap out.png --scene fixture --size 620x300   # headless render of fixture VT content
 cargo run --release --features tooling -- --snap out.png --scene fixture   # release builds need `tooling` for headless flags
 cargo test --features swash && cargo run --features swash -- --snap out.png --scene unicode   # the Linux font backend on macOS, to compare with CoreText
