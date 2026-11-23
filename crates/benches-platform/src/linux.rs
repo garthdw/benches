@@ -59,8 +59,13 @@ const RPC_TIMEOUT: Duration = if cfg!(test) {
 pub fn open(link: &Link) -> io::Result<()> {
     match link {
         Link::Url(url) => crate::run(xdg_open(url)),
-        Link::File(path) => show_in_file_manager(path)
-            .or_else(|_| crate::run(xdg_open(path.parent().unwrap_or(path)))),
+        Link::File(path) => show_in_file_manager(path).or_else(|error| {
+            eprintln!(
+                "benches: show {} in the file manager: {error}; opening its folder",
+                path.display()
+            );
+            crate::run(xdg_open(path.parent().unwrap_or(path)))
+        }),
     }
 }
 
