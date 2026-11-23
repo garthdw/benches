@@ -1,16 +1,27 @@
 # Changes to these paths run the macOS CI job. A path filter can't see inside a file, so macOS
-# code lives in whole files, and `ci.yml` fails when a Rust file with an OS cfg isn't listed here
-# by its literal path, or a listed path doesn't exist.
+# code lives in whole files, and `.github/check-macos-paths` fails when a Rust file it should list
+# is missing, or a listed path doesn't exist.
 macos:
+  # The macOS backends, the files that pick them by cfg, and the modules the backends use.
+  - crates/benches-font/src/constraint.rs
   - crates/benches-font/src/coretext.rs
   - crates/benches-font/src/font.rs
+  - crates/benches-font/src/nerd_font_table.rs
   - crates/benches-font/src/swash.rs
+  - crates/benches-platform/src/dirs.rs
   - crates/benches-platform/src/macos.rs
   - crates/benches-platform/src/platform.rs
+  # Behaviour picked at run time by `KeyPlatform`, `LINK_MODIFIER` or `SECURE_INPUT_SUPPORTED`.
+  - crates/benches-core/src/terminal_input.rs
+  - src/input.rs
+  - src/keymap.rs
+  - src/secure_input.rs
+  - src/test_support.rs
   # Their tests run on CoreText, Metal and macOS's processes and shell.
   - src/cell.wgsl
   - src/render.rs
   - src/session.rs
+  - crates/benches-font/assets/**
   - scripts/**
   - assets/**
   - about.toml

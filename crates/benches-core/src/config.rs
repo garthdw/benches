@@ -13,8 +13,8 @@ use crate::LogErr;
 use crate::grid::{DEFAULT_BG, DEFAULT_FG};
 use benches_font::DEFAULT_FONT_FAMILY;
 use benches_font::constraint::Modifier;
+use benches_platform::FALLBACK_SHELL;
 use benches_platform::dirs::{self, Env};
-use benches_platform::{FALLBACK_SHELL, SECURE_INPUT_SUPPORTED};
 
 const DEFAULT_FONT_SIZE: f64 = 18.0;
 /// Ghostty's default for `notify-on-command-finish-after`.
@@ -169,8 +169,8 @@ struct File {
     /// Ghostty's `working-directory`, then home.
     #[serde(rename = "working-directory")]
     working_directory: Option<String>,
-    /// Whether to turn on secure keyboard entry while a program reads a password. Falls back to
-    /// Ghostty's `macos-auto-secure-input` on macOS, then on.
+    /// Whether to turn on secure keyboard entry, which only macOS has, while a program reads a
+    /// password. Falls back to Ghostty's `macos-auto-secure-input`, then on.
     #[serde(rename = "auto-secure-input")]
     auto_secure_input: Option<bool>,
     /// Whether a command finishing out of sight marks its tab: `never`, or `unfocused` or
@@ -348,8 +348,8 @@ fn default_config_text() -> String {
          # The folder new projects start in: a path, `~/...`, `home` or `inherit`; unset uses\n\
          # Ghostty's `working-directory`, then home.\n\
          # working-directory = \"~/dev\"\n\
-         # Turn on secure keyboard entry while a program reads a password; unset uses Ghostty's\n\
-         # `macos-auto-secure-input` on macOS, then true.\n\
+         # Turn on secure keyboard entry (macOS) while a program reads a password; unset uses\n\
+         # Ghostty's `macos-auto-secure-input`, then true.\n\
          # auto-secure-input = false\n\
          # Mark a tab when a command finishes out of sight (`unfocused`, or `never`) and how long\n\
          # it must have run, as in Ghostty; unset uses Ghostty's, then `never` and 5s.\n\
@@ -511,7 +511,6 @@ impl Config {
                 .auto_secure_input
                 .or_else(|| {
                     ghostty_value("macos-auto-secure-input")
-                        .filter(|_| SECURE_INPUT_SUPPORTED)
                         .and_then(|value| value.parse().log_err("macos-auto-secure-input"))
                 })
                 .unwrap_or(defaults.auto_secure_input),
@@ -1069,10 +1068,7 @@ mod tests {
             Config::load(&paths, Config::default()).0.auto_secure_input
         };
         assert!(auto(None, None));
-        assert_eq!(
-            auto(None, Some("macos-auto-secure-input = false\n")),
-            !SECURE_INPUT_SUPPORTED
-        );
+        assert!(!auto(None, Some("macos-auto-secure-input = false\n")));
         assert!(auto(
             Some("auto-secure-input = true\n"),
             Some("macos-auto-secure-input = false\n")
