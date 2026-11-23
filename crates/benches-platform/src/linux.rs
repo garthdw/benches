@@ -35,8 +35,8 @@ pub fn ghostty_theme_dirs(env: Env) -> Vec<PathBuf> {
         .collect()
 }
 
-/// `share/benches/terminfo` beside `bin`.
-pub const TERMINFO_DIR: &str = "share/benches/terminfo";
+/// `share/benches` beside `bin`.
+pub const RESOURCES_DIR: &str = "share/benches";
 
 /// `$XDG_DATA_HOME` and then `$XDG_DATA_DIRS`, most important first.
 fn data_dirs(env: Env) -> Vec<PathBuf> {

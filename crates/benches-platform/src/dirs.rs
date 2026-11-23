@@ -31,7 +31,16 @@ pub fn ghostty_theme_dirs(env: Env) -> Vec<PathBuf> {
 
 /// Where a compiled terminfo directory installed with the executable `exe` may be.
 pub fn terminfo_dir(exe: &Path) -> Option<PathBuf> {
-    Some(exe.parent()?.parent()?.join(os::TERMINFO_DIR))
+    Some(resources_dir(exe)?.join("terminfo"))
+}
+
+/// Where the plugins installed with the executable `exe` may be.
+pub fn bundled_plugins_dir(exe: &Path) -> Option<PathBuf> {
+    Some(resources_dir(exe)?.join("plugins"))
+}
+
+fn resources_dir(exe: &Path) -> Option<PathBuf> {
+    Some(exe.parent()?.parent()?.join(os::RESOURCES_DIR))
 }
 
 pub(crate) fn home(env: Env) -> Option<PathBuf> {
