@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::io::{self, IsTerminal};
+use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::OnceLock;
@@ -115,6 +116,36 @@ fn tpgid(stat: &str) -> Option<i32> {
     let (_, fields) = stat.rsplit_once(')')?;
     let group = fields.split_whitespace().nth(5)?.parse().ok()?;
     (group > 0).then_some(group)
+}
+
+/// Opens the replica through its primary, as glibc's `openpty` does, so it's the right one even
+/// where `/dev/pts` belongs to another devpts instance, as in some sandboxes. Kernels before
+/// 4.13 lack `TIOCGPTPEER`, so those open it by name.
+pub fn open_pty_replica(primary: BorrowedFd) -> io::Result<OwnedFd> {
+    // SAFETY: `TIOCGPTPEER` takes open flags and returns a new descriptor.
+    let descriptor = unsafe {
+        libc::ioctl(
+            primary.as_raw_fd(),
+            libc::TIOCGPTPEER,
+            libc::O_RDWR | libc::O_NOCTTY | libc::O_CLOEXEC,
+        )
+    };
+    if descriptor >= 0 {
+        // SAFETY: `descriptor` is new and nothing else owns it.
+        return Ok(unsafe { OwnedFd::from_raw_fd(descriptor) });
+    }
+    let error = io::Error::last_os_error();
+    if !matches!(error.raw_os_error(), Some(libc::EINVAL | libc::ENOTTY)) {
+        return Err(error);
+    }
+    let mut name = [0u8; 128];
+    // SAFETY: `ptsname_r` writes at most `name.len()` bytes, ending with a nul.
+    let error =
+        unsafe { libc::ptsname_r(primary.as_raw_fd(), name.as_mut_ptr().cast(), name.len()) };
+    if error != 0 {
+        return Err(io::Error::from_raw_os_error(error));
+    }
+    crate::open_pty_replica_at(&name)
 }
 
 /// Linux has no system-wide locale setting beyond the variables `missing_locale` already reads.

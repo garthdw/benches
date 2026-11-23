@@ -1,4 +1,5 @@
 use std::io;
+use std::os::fd::{AsRawFd, BorrowedFd, OwnedFd};
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -72,6 +73,24 @@ pub fn process_cwd(pid: i32) -> Option<PathBuf> {
 pub fn foreground_process_group(pid: i32) -> Option<i32> {
     let info = pid_info::<libc::proc_bsdinfo>(pid, libc::PROC_PIDTBSDINFO)?;
     i32::try_from(info.e_tpgid).ok()
+}
+
+/// Asks the driver for the replica's name, as `ptsname` on macOS fills a static buffer that
+/// another thread's call can overwrite.
+pub fn open_pty_replica(primary: BorrowedFd) -> io::Result<OwnedFd> {
+    let mut name = [0; 128];
+    // SAFETY: `TIOCPTYGNAME` writes at most 128 bytes, the size its request number encodes.
+    let result = unsafe {
+        libc::ioctl(
+            primary.as_raw_fd(),
+            libc::TIOCPTYGNAME.into(),
+            name.as_mut_ptr(),
+        )
+    };
+    if result < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    crate::open_pty_replica_at(&name)
 }
 
 pub fn system_locale() -> Option<String> {

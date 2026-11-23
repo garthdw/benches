@@ -1,8 +1,13 @@
 //! The operating system services Benches uses, with one backend per supported OS.
 
+use std::ffi::{CStr, OsStr};
 use std::io;
+use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::PathBuf;
 use std::process::Command;
+use std::sync::{Mutex, PoisonError};
 
 pub mod dirs;
 #[cfg(target_os = "linux")]
@@ -47,6 +52,63 @@ pub fn process_cwd(pid: i32) -> Option<PathBuf> {
 /// The foreground process group of the terminal that `pid` controls.
 pub fn foreground_process_group(pid: i32) -> Option<i32> {
     os::foreground_process_group(pid)
+}
+
+/// Both ends of a pseudo-terminal: the primary end the terminal reads and writes, and the
+/// replica end the shell gets as its controlling terminal.
+#[derive(Debug)]
+pub struct Pty {
+    pub primary: OwnedFd,
+    pub replica: OwnedFd,
+}
+
+/// Opens a PTY of `cols` by `rows` with both ends close-on-exec from the start, as `openpty`
+/// can't, so a child that another thread forks meanwhile doesn't inherit them and keep the
+/// terminal open after its session closes.
+pub fn open_pty(cols: u16, rows: u16) -> io::Result<Pty> {
+    let primary = {
+        // macOS's `posix_openpt` sometimes fails when another thread calls it at the same time.
+        static OPENING: Mutex<()> = Mutex::new(());
+        let _opening = OPENING.lock().unwrap_or_else(PoisonError::into_inner);
+        // SAFETY: `posix_openpt` takes only flags.
+        let descriptor =
+            unsafe { libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY | libc::O_CLOEXEC) };
+        if descriptor < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: `descriptor` is new and nothing else owns it.
+        unsafe { OwnedFd::from_raw_fd(descriptor) }
+    };
+    // SAFETY: both take the primary descriptor, which stays open throughout.
+    if unsafe { libc::grantpt(primary.as_raw_fd()) } < 0
+        || unsafe { libc::unlockpt(primary.as_raw_fd()) } < 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    let replica = os::open_pty_replica(primary.as_fd())?;
+    let size = libc::winsize {
+        ws_row: rows,
+        ws_col: cols,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    // SAFETY: `TIOCSWINSZ` reads one `winsize`.
+    if unsafe { libc::ioctl(replica.as_raw_fd(), libc::TIOCSWINSZ as _, &size) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(Pty { primary, replica })
+}
+
+/// Opens the replica named by `name`, the nul-terminated path a lookup on its primary filled in.
+fn open_pty_replica_at(name: &[u8]) -> io::Result<OwnedFd> {
+    let name = CStr::from_bytes_until_nul(name).map_err(io::Error::other)?;
+    // std opens files close-on-exec.
+    let replica = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(libc::O_NOCTTY)
+        .open(OsStr::from_bytes(name.to_bytes()))?;
+    Ok(replica.into())
 }
 
 /// The user's locale as the system names it, such as `en_GB@rg=zazzzz`.
@@ -157,5 +219,36 @@ pub mod notify {
                 }
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn both_ends_of_a_pty_are_close_on_exec_from_the_start() {
+        let pty = open_pty(80, 24).unwrap();
+        for end in [&pty.primary, &pty.replica] {
+            // SAFETY: `F_GETFD` only reads the descriptor's flags.
+            let flags = unsafe { libc::fcntl(end.as_raw_fd(), libc::F_GETFD) };
+            assert_eq!(flags & libc::FD_CLOEXEC, libc::FD_CLOEXEC);
+        }
+    }
+
+    #[test]
+    fn a_pty_opens_at_the_size_asked_for() {
+        let pty = open_pty(100, 30).unwrap();
+        let mut size = libc::winsize {
+            ws_row: 0,
+            ws_col: 0,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
+        // SAFETY: `TIOCGWINSZ` writes one `winsize`.
+        let result =
+            unsafe { libc::ioctl(pty.primary.as_raw_fd(), libc::TIOCGWINSZ as _, &mut size) };
+        assert_eq!(result, 0);
+        assert_eq!((size.ws_col, size.ws_row), (100, 30));
     }
 }
