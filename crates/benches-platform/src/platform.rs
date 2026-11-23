@@ -66,19 +66,7 @@ pub struct Pty {
 /// can't, so a child that another thread forks meanwhile doesn't inherit them and keep the
 /// terminal open after its session closes.
 pub fn open_pty(cols: u16, rows: u16) -> io::Result<Pty> {
-    let primary = {
-        // macOS's `posix_openpt` sometimes fails when another thread calls it at the same time.
-        static OPENING: Mutex<()> = Mutex::new(());
-        let _opening = OPENING.lock().unwrap_or_else(PoisonError::into_inner);
-        // SAFETY: `posix_openpt` takes only flags.
-        let descriptor =
-            unsafe { libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY | libc::O_CLOEXEC) };
-        if descriptor < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        // SAFETY: `descriptor` is new and nothing else owns it.
-        unsafe { OwnedFd::from_raw_fd(descriptor) }
-    };
+    let primary = open_pty_primary()?;
     // SAFETY: both take the primary descriptor, which stays open throughout.
     if unsafe { libc::grantpt(primary.as_raw_fd()) } < 0
         || unsafe { libc::unlockpt(primary.as_raw_fd()) } < 0
@@ -97,6 +85,31 @@ pub fn open_pty(cols: u16, rows: u16) -> io::Result<Pty> {
         return Err(io::Error::last_os_error());
     }
     Ok(Pty { primary, replica })
+}
+
+/// Opens a new PTY's primary end. macOS's `posix_openpt` sometimes fails with an errno of -6,
+/// which no constant names, when another thread or process opens a PTY at the same moment. The
+/// lock keeps this process's threads apart and the retries cover other processes.
+fn open_pty_primary() -> io::Result<OwnedFd> {
+    static OPENING: Mutex<()> = Mutex::new(());
+    let _opening = OPENING.lock().unwrap_or_else(PoisonError::into_inner);
+    let mut attempts = 1;
+    loop {
+        // SAFETY: `posix_openpt` takes only flags.
+        let descriptor =
+            unsafe { libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY | libc::O_CLOEXEC) };
+        if descriptor >= 0 {
+            // SAFETY: `descriptor` is new and nothing else owns it.
+            return Ok(unsafe { OwnedFd::from_raw_fd(descriptor) });
+        }
+        let error = io::Error::last_os_error();
+        if error.raw_os_error() != Some(-6) || attempts == 10 {
+            return Err(error);
+        }
+        attempts += 1;
+        // Long enough for another process's open to finish.
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
 }
 
 /// Opens the replica named by `name`, the nul-terminated path a lookup on its primary filled in.
@@ -233,6 +246,29 @@ mod tests {
             // SAFETY: `F_GETFD` only reads the descriptor's flags.
             let flags = unsafe { libc::fcntl(end.as_raw_fd(), libc::F_GETFD) };
             assert_eq!(flags & libc::FD_CLOEXEC, libc::FD_CLOEXEC);
+        }
+    }
+
+    #[test]
+    fn secure_input_can_be_set_from_several_threads_at_once() {
+        if !SECURE_INPUT_SUPPORTED {
+            return;
+        }
+        let start = std::sync::Arc::new(std::sync::Barrier::new(4));
+        let setters: Vec<_> = (0..4)
+            .map(|_| {
+                let start = start.clone();
+                std::thread::spawn(move || {
+                    start.wait();
+                    for _ in 0..10 {
+                        set_secure_input(true).unwrap();
+                        set_secure_input(false).unwrap();
+                    }
+                })
+            })
+            .collect();
+        for setter in setters {
+            setter.join().unwrap();
         }
     }
 

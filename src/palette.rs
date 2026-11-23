@@ -1757,27 +1757,6 @@ mod tests {
         });
     }
 
-    /// The pid a stub shell wrote to `file`, once it has.
-    fn wait_for_pid(file: &Path) -> i32 {
-        wait_until(
-            Duration::from_secs(15),
-            || format!("no pid in {}", file.display()),
-            || std::fs::read_to_string(file).ok()?.trim().parse().ok(),
-        )
-    }
-
-    fn wait_for_pid_exit(pid: i32, timeout: Duration, what: &str) {
-        wait_until(
-            timeout,
-            || format!("{what} is still running"),
-            || {
-                nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None)
-                    .is_err()
-                    .then_some(())
-            },
-        );
-    }
-
     #[test]
     fn creating_a_worktree_runs_wt_switch_and_opens_the_result_as_a_project() {
         let created = tempfile::tempdir().unwrap();

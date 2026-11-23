@@ -14,6 +14,7 @@ use crossbeam_channel::{Receiver, Sender, bounded, unbounded};
 use libghostty_vt::effect::ClipboardLocation;
 use libghostty_vt::key;
 use nix::sys::select::{FdSet, select};
+use nix::sys::signal::{SigHandler, Signal, signal};
 use nix::sys::time::{TimeVal, TimeValLike};
 use rune::Waker;
 
@@ -178,12 +179,22 @@ impl Session {
         if let Some(locale) = missing_locale(|name| std::env::var_os(name), system_locale) {
             process.env("LANG", locale);
         }
+        let descriptors = descriptor_limit();
         // SAFETY: only async-signal-safe calls run between fork and exec.
         unsafe {
-            process.pre_exec(|| {
+            process.pre_exec(move || {
+                // An ignored signal stays ignored through exec, so when Benches is started as a
+                // script's background job, which ignores SIGINT, nothing in its tabs could be
+                // interrupted.
+                for ignorable in Signal::iterator()
+                    .filter(|signal| ![Signal::SIGKILL, Signal::SIGSTOP].contains(signal))
+                {
+                    signal(ignorable, SigHandler::SigDfl)?;
+                }
                 if libc::login_tty(0) < 0 {
                     return Err(std::io::Error::last_os_error());
                 }
+                close_inherited_descriptors_on_exec(descriptors);
                 Ok(())
             });
         }
@@ -460,6 +471,40 @@ impl Session {
 fn next_id() -> u64 {
     static NEXT: AtomicU64 = AtomicU64::new(1);
     NEXT.fetch_add(1, Ordering::Relaxed)
+}
+
+/// Makes every descriptor above stderr close on exec, in a forked child. Another thread can have
+/// one open without the flag, such as a pipe std makes on macOS with `pipe` and then `fcntl`,
+/// which the shell would otherwise hold for the tab's lifetime. They're marked rather than
+/// closed, as std reports a failed exec through one. `limit` comes from `descriptor_limit`, read
+/// before the fork. Only async-signal-safe calls.
+fn close_inherited_descriptors_on_exec(limit: libc::c_int) {
+    #[cfg(target_os = "linux")]
+    // SAFETY: `close_range` only changes descriptor flags.
+    if unsafe { libc::close_range(3, libc::c_uint::MAX, libc::CLOSE_RANGE_CLOEXEC as _) } == 0 {
+        return;
+    }
+    for descriptor in 3..limit {
+        // SAFETY: setting a descriptor's flags touches nothing else, and fails harmlessly for one
+        // that isn't open.
+        unsafe { libc::fcntl(descriptor, libc::F_SETFD, libc::FD_CLOEXEC) };
+    }
+}
+
+/// One past the highest descriptor this process can open, capped to stay enough for any
+/// descriptor Benches opens without a loop of millions under a huge limit.
+fn descriptor_limit() -> libc::c_int {
+    const MOST: libc::rlim_t = 1 << 16;
+    let mut limit = libc::rlimit {
+        rlim_cur: MOST,
+        rlim_max: MOST,
+    };
+    // SAFETY: `getrlimit` writes one `rlimit`.
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } < 0 {
+        Err::<(), _>(std::io::Error::last_os_error()).log_err("read the descriptor limit");
+        return MOST as libc::c_int;
+    }
+    limit.rlim_cur.min(MOST) as libc::c_int
 }
 
 #[cfg(test)]
@@ -1359,10 +1404,13 @@ mod tests {
             "printf '\\033]7501;state=blocked:kind=permission\\033\\\\'",
         );
         wait_for_alert(&session);
-        assert_eq!(
-            notify_events(&session),
-            [(String::new(), "Needs permission".into())]
+        // The actor raises the alert before it queues the notification.
+        let notified = wait_until(
+            Duration::from_secs(15),
+            || "no notification".to_owned(),
+            || Some(notify_events(&session)).filter(|events| !events.is_empty()),
         );
+        assert_eq!(notified, [(String::new(), "Needs permission".into())]);
         type_line(
             &session,
             "printf '\\a\\033]7501;state=blocked:kind=question\\033\\\\'; echo two",
@@ -1436,36 +1484,133 @@ mod tests {
         assert_eq!(alive, Err(Errno::ESRCH));
     }
 
-    fn pgrep(pattern: &str) -> bool {
+    /// Whether a process runs exactly `command`, not just a shell with it in its arguments.
+    fn pgrep(command: &str) -> bool {
         Command::new("pgrep")
-            .args(["-f", pattern])
+            .args(["-fx", command])
             .output()
             .map(|output| !output.stdout.is_empty())
             .unwrap()
     }
 
+    /// A `sleep` that no other test process runs, as another worktree's tests may run alongside.
+    fn unique_sleep(seconds: u32) -> String {
+        format!("sleep {seconds}.{}", std::process::id())
+    }
+
+    /// Waits until a process running exactly `command` is `running` or not. A killed process can
+    /// still be listed for a moment after the signal is sent.
+    fn wait_for_process(command: &str, running: bool) {
+        wait_until(
+            Duration::from_secs(15),
+            || {
+                let state = if running { "never started" } else { "survived" };
+                format!("“{command}” {state}")
+            },
+            || (pgrep(command) == running).then_some(()),
+        );
+    }
+
     #[test]
     fn a_dropped_session_takes_its_command_with_it() {
+        let sleep = unique_sleep(4243);
         let session = Session::spawn(
-            Some("sleep 4243"),
+            Some(&sleep),
             Path::new("/tmp"),
             &default_config(),
             Arc::new(|| {}),
         )
         .unwrap();
-        wait_until(
-            Duration::from_secs(15),
-            || "sleep never started".to_owned(),
-            || pgrep("sleep 4243").then_some(()),
-        );
+        wait_for_process(&sleep, true);
         let finished = session.finished();
         drop(session);
         assert!(finished.recv_timeout(Duration::from_secs(5)).is_err());
-        let survivors = Command::new("pgrep")
-            .args(["-f", "sleep 4243"])
-            .output()
+        wait_for_process(&sleep, false);
+    }
+
+    #[test]
+    fn a_tab_inherits_no_descriptor_left_open_on_exec() {
+        use std::os::fd::{FromRawFd, OwnedFd};
+        // Not `sh`, which on macOS starts the real shell with nothing but stdio.
+        let Some(bash) = installed("bash") else {
+            return;
+        };
+        let file = tempfile::tempfile().unwrap();
+        // A copy without close-on-exec, as a pipe another thread is making briefly is, numbered
+        // above any the shell opens itself.
+        // SAFETY: `F_DUPFD` only copies a descriptor this test owns.
+        let copy = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_DUPFD, 200) };
+        assert!(copy >= 200);
+        // SAFETY: `copy` is new and nothing else owns it.
+        let _copy = unsafe { OwnedFd::from_raw_fd(copy) };
+        let listing = tempfile::tempdir().unwrap();
+        let listed = listing.path().join("fds");
+        let command = format!(
+            "ls /dev/fd > '{0}.part' && mv '{0}.part' '{0}'",
+            listed.display()
+        );
+        let _session = Session::spawn(
+            Some(&command),
+            Path::new("/tmp"),
+            &Config {
+                shell: bash,
+                ..default_config()
+            },
+            Arc::new(|| {}),
+        )
+        .unwrap();
+        let open = wait_until(
+            Duration::from_secs(15),
+            || "the descriptors were never listed".to_owned(),
+            || std::fs::read_to_string(&listed).ok(),
+        );
+        assert!(
+            !open
+                .split_whitespace()
+                .any(|descriptor| descriptor == copy.to_string()),
+            "{copy} is open in the tab: {open}"
+        );
+    }
+
+    /// Set in the copy of the test binary that runs with SIGINT ignored.
+    const SIGINT_IGNORED: &str = "BENCHES_TEST_SIGINT_IGNORED";
+
+    #[test]
+    fn a_command_can_be_interrupted_though_benches_started_ignoring_sigint() {
+        if std::env::var_os(SIGINT_IGNORED).is_none() {
+            // A copy of this binary, as a disposition is process-wide, and ignoring SIGINT is
+            // how a script's background job starts.
+            let name = "session::tests::a_command_can_be_interrupted_though_benches_started_ignoring_sigint";
+            let mut copy = Command::new(std::env::current_exe().unwrap());
+            copy.args(["--exact", name]).env(SIGINT_IGNORED, "1");
+            // SAFETY: `signal` is async-signal-safe.
+            unsafe {
+                copy.pre_exec(|| {
+                    signal(Signal::SIGINT, SigHandler::SigIgn)?;
+                    Ok(())
+                });
+            }
+            let output = copy.output().unwrap();
+            let printed = String::from_utf8_lossy(&output.stdout);
+            assert!(output.status.success(), "{printed}");
+            assert!(printed.contains("1 passed"), "{printed}");
+            return;
+        }
+        let sleep = unique_sleep(4244);
+        let _session = Session::spawn(
+            Some(&sleep),
+            Path::new("/tmp"),
+            &default_config(),
+            Arc::new(|| {}),
+        )
+        .unwrap();
+        wait_for_process(&sleep, true);
+        let interrupted = Command::new("pkill")
+            .args(["-INT", "-fx", &sleep])
+            .status()
             .unwrap();
-        assert_eq!(String::from_utf8_lossy(&survivors.stdout), "");
+        assert!(interrupted.success());
+        wait_for_process(&sleep, false);
     }
 
     #[test]
@@ -1479,16 +1624,13 @@ mod tests {
             shell: bash,
             ..default_config()
         });
-        type_line(&session, "sleep 4242 & echo started");
+        let sleep = unique_sleep(4242);
+        type_line(&session, &format!("{sleep} & echo started"));
         wait_for_line(&session, "started");
         let finished = session.finished();
         drop(session);
         assert!(finished.recv_timeout(Duration::from_secs(5)).is_err());
-        let survivors = Command::new("pgrep")
-            .args(["-f", "sleep 4242"])
-            .output()
-            .unwrap();
-        assert_eq!(String::from_utf8_lossy(&survivors.stdout), "");
+        wait_for_process(&sleep, false);
     }
 
     #[test]
@@ -1540,7 +1682,8 @@ mod tests {
     #[test]
     fn ctrl_c_interrupts_the_foreground_process() {
         let session = spawn_shell();
-        type_line(&session, "echo started; sleep 4343 && echo slept");
+        let sleep = unique_sleep(4343);
+        type_line(&session, &format!("echo started; {sleep} && echo slept"));
         wait_for_line(&session, "started");
         wait_for_busy(&session, true);
         let ctrl_c = crate::input::map_text(
@@ -1552,7 +1695,7 @@ mod tests {
             Some(rune::PhysicalKeyCode::KeyC),
             Some('c'),
         );
-        let sleeping = || pgrep("sleep 4343");
+        let sleeping = || pgrep(&sleep);
         // `sleep` holds the terminal before it resets its signal handling, so an early ^C is lost.
         // Resend only after the previous one has had time to take effect.
         wait_until(

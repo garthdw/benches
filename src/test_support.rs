@@ -1,8 +1,10 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
+use nix::sys::signal::kill;
+use nix::unistd::Pid;
 use rune::{Chord, ChordKey, ChordMod, Env, Key, KeyEvent, KeyPlatform, Mods, Runtime, Waker};
 
 use crate::app::{State, on_key, poll};
@@ -220,6 +222,24 @@ pub(crate) fn wait_until<T>(
         assert!(Instant::now() < deadline, "{}", describe());
         std::thread::sleep(Duration::from_millis(10));
     }
+}
+
+/// The pid a test command wrote to `file`.
+pub(crate) fn wait_for_pid(file: &Path) -> i32 {
+    wait_until(
+        Duration::from_secs(15),
+        || format!("no pid in {}", file.display()),
+        || std::fs::read_to_string(file).ok()?.trim().parse().ok(),
+    )
+}
+
+/// Waits for `pid` to be reaped, as a zombie still answers `kill`.
+pub(crate) fn wait_for_pid_exit(pid: i32, timeout: Duration, what: &str) {
+    wait_until(
+        timeout,
+        || format!("{what} is still running"),
+        || kill(Pid::from_raw(pid), None).is_err().then_some(()),
+    );
 }
 
 /// Runs frames until `done`, so polls pick up what live sessions do, and returns the last
