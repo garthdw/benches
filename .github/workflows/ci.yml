@@ -44,16 +44,17 @@ jobs:
         with:
           version: 0.17.1
 
-      # Winit and fontique's headers; the fonts the tests expect (the `monospace` family, emoji,
-      # and Unifont as a single-face family); zsh, which tests otherwise skip; and lavapipe's
-      # software Vulkan for `--snap`.
+      # What the README's Linux build steps install, less `build-essential`, which the runner has:
+      # libxkbcommon to link against (Wayland and fontconfig are loaded at run time), its X11
+      # library, and Mesa's Vulkan drivers. Then for the tests: fontconfig and the fonts they
+      # expect (the `monospace` family, emoji, and Unifont as a single-face family), and zsh,
+      # which they otherwise skip.
       - run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            pkg-config libxkbcommon-dev libwayland-dev libfontconfig-dev \
+            libxkbcommon-dev libxkbcommon-x11-0 mesa-vulkan-drivers \
             fontconfig fonts-dejavu-core fonts-noto-color-emoji fonts-unifont \
-            zsh \
-            mesa-vulkan-drivers libvulkan1
+            zsh
 
       # The default font. The static build, as earlier releases put icons in its private use area.
       - run: |
