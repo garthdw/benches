@@ -363,6 +363,17 @@ mod tests {
     }
 
     #[test]
+    fn map_key_edits_the_line_as_this_platform_does() {
+        let event = KeyEvent {
+            key: Key::Backspace,
+            mods: crate::test_support::command(),
+        };
+        if let Some(expected) = line_editing(&event, KeyPlatform::current()) {
+            assert_eq!(map_key(&event, Some(Code::Backspace), None), Some(expected));
+        }
+    }
+
+    #[test]
     fn option_b_is_escape_b() {
         let mut terminal = new_terminal(20, 5).unwrap();
         let option = Mods {
