@@ -43,6 +43,8 @@ pub struct Config {
     pub command_finish_after: Option<Duration>,
     pub clipboard_read: ClipboardAccess,
     pub clipboard_write: ClipboardAccess,
+    /// `plugins.disabled`: the names of command palette plugins to leave out.
+    pub disabled_plugins: Vec<String>,
     /// How long a progress report lasts without an update; not read from `config.toml`.
     pub progress_timeout: Duration,
 }
@@ -137,6 +139,7 @@ impl Default for Config {
             command_finish_after: None,
             clipboard_read: ClipboardAccess::Ask,
             clipboard_write: ClipboardAccess::Allow,
+            disabled_plugins: Vec::new(),
             progress_timeout: PROGRESS_TIMEOUT,
         }
     }
@@ -190,6 +193,17 @@ struct File {
     /// `ask`. Falls back to Ghostty's setting.
     #[serde(rename = "clipboard-write")]
     clipboard_write: Option<ClipboardAccess>,
+    /// Command palette plugins.
+    #[serde(default)]
+    plugins: PluginsFile,
+}
+
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct PluginsFile {
+    /// The names of plugins to leave out, such as `worktrunk`.
+    #[serde(default)]
+    disabled: Vec<String>,
 }
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
@@ -373,6 +387,10 @@ fn default_config_text() -> String {
          # The maximum height of icons, as a percentage or in pixels, like Ghostty's\n\
          # `adjust-icon-height`; unset uses Ghostty's.\n\
          # adjust-icon-height = \"-10%\"\n\
+         \n\
+         [plugins]\n\
+         # The names of command palette plugins to leave out.\n\
+         # disabled = [\"worktrunk\"]\n\
          {tabs}",
         size = defaults.font.size,
     )
@@ -530,6 +548,7 @@ impl Config {
                 "clipboard-write",
                 defaults.clipboard_write,
             ),
+            disabled_plugins: file.plugins.disabled,
             progress_timeout: defaults.progress_timeout,
         }
     }
@@ -1013,6 +1032,14 @@ mod tests {
         );
         assert_eq!(git_command(Some("git-command = \"\"\n")), None);
         assert_eq!(git_command(Some("git-command = \"  \"\n")), None);
+    }
+
+    #[test]
+    fn plugins_can_be_disabled_by_name() {
+        let (_root, paths) = paths(Some("[plugins]\ndisabled = [\"worktrunk\"]\n"), None);
+        let config = Config::load(&paths, Config::default()).0;
+        assert_eq!(config.disabled_plugins, ["worktrunk"]);
+        assert!(Config::default().disabled_plugins.is_empty());
     }
 
     #[test]
