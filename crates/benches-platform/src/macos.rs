@@ -15,7 +15,26 @@ use objc2_user_notifications::{
 };
 
 use crate::Link;
+use crate::dirs::{self, Env};
 use crate::notify::Notification;
+
+/// The config folder, where `state.json` has always been.
+pub fn state_home(env: Env) -> Option<PathBuf> {
+    dirs::config_home(env)
+}
+
+pub fn log_file(env: Env) -> Option<PathBuf> {
+    Some(dirs::home(env)?.join("Library/Logs/benches.log"))
+}
+
+pub fn ghostty_theme_dirs(_env: Env) -> Vec<PathBuf> {
+    vec![PathBuf::from(
+        "/Applications/Ghostty.app/Contents/Resources/ghostty/themes",
+    )]
+}
+
+/// In the app bundle's resources, beside `Contents/MacOS`.
+pub const TERMINFO_DIR: &str = "Resources/terminfo";
 
 pub fn open(link: &Link) -> io::Result<()> {
     crate::run(open_command(link))
@@ -201,6 +220,20 @@ fn session_for(identifier: &str) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dirs::tests::lookup;
+
+    #[test]
+    fn state_stays_in_the_config_folder_and_the_log_in_library_logs() {
+        let vars = [("HOME", "/home/me"), ("XDG_STATE_HOME", "/state")];
+        assert_eq!(
+            dirs::state_dir(&lookup(&vars)),
+            Some(PathBuf::from("/home/me/.config/benches"))
+        );
+        assert_eq!(
+            dirs::log_file(&lookup(&vars)),
+            Some(PathBuf::from("/home/me/Library/Logs/benches.log"))
+        );
+    }
 
     fn args(link: Link) -> Vec<String> {
         open_command(&link)
