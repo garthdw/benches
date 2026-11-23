@@ -487,7 +487,7 @@ fn set_cloexec(fd: &OwnedFd) -> Result<()> {
 mod tests {
     use super::*;
     use crate::app::default_config;
-    use crate::test_support::wait_until;
+    use crate::test_support::{installed, wait_until};
     use benches_core::config::Theme;
     use benches_core::grid::{FRAME, GridBuilder, Presentation, Scrollbar, new_terminal};
     use benches_core::protocol::{Progress, ProgressKind};
@@ -1096,15 +1096,13 @@ mod tests {
 
     #[test]
     fn the_reported_directory_wins_over_the_process_directory() {
-        let fish = Path::new("/opt/homebrew/bin/fish");
-        if !fish.exists() {
+        let Some(fish) = installed("fish") else {
             return;
-        }
-        let config = Config {
-            shell: fish.into(),
-            ..default_config()
         };
-        let session = Session::spawn(None, Path::new("/tmp"), &config, Arc::new(|| {})).unwrap();
+        let session = spawn_ready(&Config {
+            shell: fish,
+            ..default_config()
+        });
         // Fish reports the symlink `/tmp`, where the process's directory reads `/private/tmp`.
         type_line(&session, "cd /tmp");
         wait_until(
@@ -1494,11 +1492,13 @@ mod tests {
     fn a_background_job_ends_with_its_dropped_shell() {
         // The job has its own process group, so it only hears the hangup when the shell passes
         // it on, as bash and zsh do and dash, Ubuntu's `sh`, doesn't.
-        let config = Config {
-            shell: PathBuf::from("/bin/bash"),
-            ..default_config()
+        let Some(bash) = installed("bash") else {
+            return;
         };
-        let session = Session::spawn(None, Path::new("/tmp"), &config, Arc::new(|| {})).unwrap();
+        let session = spawn_ready(&Config {
+            shell: bash,
+            ..default_config()
+        });
         type_line(&session, "sleep 4242 & echo started");
         wait_for_line(&session, "started");
         let finished = session.finished();

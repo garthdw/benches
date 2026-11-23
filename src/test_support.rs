@@ -161,6 +161,23 @@ pub(crate) fn stub_shell(body: &str) -> (tempfile::TempDir, PathBuf, PathBuf) {
     (directory, shell, record)
 }
 
+/// `program` as found on `PATH`, which on NixOS is the only place a shell such as bash lives.
+/// Says so when it's missing, as the caller then skips its checks.
+pub(crate) fn installed(program: &str) -> Option<PathBuf> {
+    let found = std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
+        .map(|directory| directory.join(program))
+        .find(|path| {
+            use std::os::unix::fs::PermissionsExt;
+            path.metadata().is_ok_and(|metadata| {
+                metadata.is_file() && metadata.permissions().mode() & 0o111 != 0
+            })
+        });
+    if found.is_none() {
+        eprintln!("skipped: no {program} on PATH");
+    }
+    found
+}
+
 pub(crate) fn wait_until<T>(
     timeout: Duration,
     describe: impl Fn() -> String,
