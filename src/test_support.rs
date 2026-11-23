@@ -170,7 +170,6 @@ pub(crate) fn second_window(fleet: &Fleet, window: WindowId) -> Runtime<State> {
 
 /// Stands in for the login shell, so no real `wt` runs. It records its arguments and runs `body`.
 pub(crate) fn stub_shell(body: &str) -> (tempfile::TempDir, PathBuf, PathBuf) {
-    use std::os::unix::fs::PermissionsExt;
     let directory = tempfile::tempdir().unwrap();
     let record = directory.path().join("args");
     let shell = directory.path().join("stub-shell");
@@ -178,8 +177,16 @@ pub(crate) fn stub_shell(body: &str) -> (tempfile::TempDir, PathBuf, PathBuf) {
         "#!/bin/sh\nprintf '%s\\n' \"$@\" >> '{}'\n{body}\n",
         record.display()
     );
-    std::fs::write(&shell, script).unwrap();
-    std::fs::set_permissions(&shell, std::fs::Permissions::from_mode(0o755)).unwrap();
+    // Written by another process: a child forked meanwhile by one of this process's threads
+    // would hold its write fd until it execs, and Linux refuses to run a file open for writing
+    // (ETXTBSY), even under another name.
+    let written = std::process::Command::new("/bin/sh")
+        .args(["-c", r#"printf '%s' "$1" > "$0" && chmod 755 "$0""#])
+        .arg(&shell)
+        .arg(script)
+        .status()
+        .unwrap();
+    assert!(written.success(), "stub shell not written: {written}");
     (directory, shell, record)
 }
 

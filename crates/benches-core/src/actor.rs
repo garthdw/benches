@@ -1253,15 +1253,15 @@ mod tests {
     #[test]
     fn echo_off_with_line_editing_is_a_password_prompt() {
         use nix::sys::termios::{SetArg, tcsetattr};
-        let pty = nix::pty::openpty(None, None).unwrap();
-        assert!(!password_prompt(&pty.master));
-        let mut termios = tcgetattr(&pty.slave).unwrap();
+        let pty = benches_platform::open_pty(80, 24).unwrap();
+        assert!(!password_prompt(&pty.primary));
+        let mut termios = tcgetattr(&pty.replica).unwrap();
         termios.local_flags.remove(LocalFlags::ECHO);
-        tcsetattr(&pty.slave, SetArg::TCSANOW, &termios).unwrap();
-        assert!(password_prompt(&pty.master));
+        tcsetattr(&pty.replica, SetArg::TCSANOW, &termios).unwrap();
+        assert!(password_prompt(&pty.primary));
         termios.local_flags.remove(LocalFlags::ICANON);
-        tcsetattr(&pty.slave, SetArg::TCSANOW, &termios).unwrap();
-        assert!(!password_prompt(&pty.master));
+        tcsetattr(&pty.replica, SetArg::TCSANOW, &termios).unwrap();
+        assert!(!password_prompt(&pty.primary));
     }
     #[test]
     fn focus_is_reported_only_when_the_program_asked() {

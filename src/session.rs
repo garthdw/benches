@@ -1,6 +1,6 @@
 use std::fs::File;
 use std::io::{Read, Write};
-use std::os::fd::{AsFd, AsRawFd, OwnedFd};
+use std::os::fd::{AsFd, AsRawFd};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -13,7 +13,6 @@ use anyhow::Result;
 use crossbeam_channel::{Receiver, Sender, bounded, unbounded};
 use libghostty_vt::effect::ClipboardLocation;
 use libghostty_vt::key;
-use nix::pty::{OpenptyResult, Winsize, openpty};
 use nix::sys::select::{FdSet, select};
 use nix::sys::time::{TimeVal, TimeValLike};
 use rune::Waker;
@@ -24,7 +23,9 @@ use benches_core::config::Config;
 use benches_core::grid::{Grid, Surface, bundled_terminfo, terminfo_name};
 use benches_core::protocol::{Event, Msg, Visibility};
 use benches_core::terminal_input::{Hover, KeyInput, PointerInput, PointerPhase, WheelInput};
-use benches_platform::{FALLBACK_LOCALE, foreground_process_group, process_cwd, system_locale};
+use benches_platform::{
+    FALLBACK_LOCALE, foreground_process_group, open_pty, process_cwd, system_locale,
+};
 
 const BATCH_GAP: Duration = Duration::from_micros(50);
 const BATCH_LIMIT: Duration = Duration::from_millis(1);
@@ -154,15 +155,7 @@ pub struct Session {
 impl Session {
     pub fn spawn(command: Option<&str>, cwd: &Path, config: &Config, waker: Waker) -> Result<Self> {
         let (cols, rows) = (80, 24);
-        let size = Winsize {
-            ws_col: cols,
-            ws_row: rows,
-            ws_xpixel: 0,
-            ws_ypixel: 0,
-        };
-        let pty = open_pty(Some(&size))?;
-        set_cloexec(&pty.master)?;
-        set_cloexec(&pty.slave)?;
+        let pty = open_pty(cols, rows)?;
 
         let mut process = Command::new(&config.shell);
         process.args(["-l", "-i"]);
@@ -181,7 +174,7 @@ impl Session {
             .env("COLORTERM", "truecolor")
             .env("TERM_PROGRAM", "benches")
             .env("SHELL", &config.shell)
-            .stdin(Stdio::from(pty.slave));
+            .stdin(Stdio::from(pty.replica));
         if let Some(locale) = missing_locale(|name| std::env::var_os(name), system_locale) {
             process.env("LANG", locale);
         }
@@ -195,12 +188,11 @@ impl Session {
             });
         }
         // Cloned before spawning so a failure can't leave a started child unreaped.
-        let mut reader = File::from(pty.master.try_clone()?);
-        let mut writer = File::from(pty.master.try_clone()?);
+        let mut reader = File::from(pty.primary.try_clone()?);
+        let mut writer = File::from(pty.primary.try_clone()?);
         let child = process.spawn()?;
         let pid = Arc::new(Mutex::new(Some(child.id() as i32)));
 
-        let master = pty.master;
         let (output_tx, output_rx) = bounded(64);
         thread::spawn(move || {
             let mut buffer = [0; 64 * 1024];
@@ -236,7 +228,7 @@ impl Session {
             input: input_tx,
             child,
             pid: pid.clone(),
-            master,
+            master: pty.primary,
             slot: grid.clone(),
             alerted: alerted.clone(),
             hover: hover.clone(),
@@ -470,19 +462,6 @@ fn next_id() -> u64 {
     NEXT.fetch_add(1, Ordering::Relaxed)
 }
 
-/// macOS's `openpty` sometimes fails when another thread calls it at the same time.
-fn open_pty(size: Option<&Winsize>) -> nix::Result<OpenptyResult> {
-    static OPENING: Mutex<()> = Mutex::new(());
-    let _opening = OPENING.lock().unwrap_or_else(PoisonError::into_inner);
-    openpty(size, None)
-}
-
-fn set_cloexec(fd: &OwnedFd) -> Result<()> {
-    use nix::fcntl::{F_SETFD, FdFlag, fcntl};
-    fcntl(fd, F_SETFD(FdFlag::FD_CLOEXEC))?;
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -531,18 +510,18 @@ mod tests {
 
     #[test]
     fn output_written_in_pieces_arrives_in_one_batch() {
-        let pty = open_pty(None).unwrap();
-        let mut slave = File::from(pty.slave);
+        let pty = open_pty(80, 24).unwrap();
+        let mut replica = File::from(pty.replica);
         let writer = thread::spawn(move || {
             for _ in 0..4 {
-                slave.write_all(&[b'x'; 1000]).unwrap();
+                replica.write_all(&[b'x'; 1000]).unwrap();
             }
-            slave
+            replica
         });
-        let mut master = File::from(pty.master);
+        let mut primary = File::from(pty.primary);
         let mut buffer = [0; 64 * 1024];
         let length = read_batch(
-            &mut master,
+            &mut primary,
             &mut buffer,
             Duration::from_millis(500),
             Duration::from_secs(5),
