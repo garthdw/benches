@@ -187,6 +187,13 @@ pub(crate) fn no_worktrees(root: &Path) -> WhenEmpty {
     ))
 }
 
+/// What ⌘↵ does on a row, offered beside Enter.
+struct RowAction {
+    /// Shown after ⌘↵ below the selected row.
+    hint: &'static str,
+    action: Action,
+}
+
 impl State {
     /// The page's rows whose `matches` contain the query's letters in order.
     fn visible_rows(&self) -> Vec<&PageRow> {
@@ -277,6 +284,8 @@ pub(crate) enum Action {
     CreateWorktree(String),
     /// Lists the worktrees of the named active project, filtered.
     ListWorktrees(String, String),
+    /// Lists the worktrees of a folder, opening the folder itself when it has none.
+    Worktrees(PathBuf),
     Run(String),
     Tray(String),
 }
@@ -284,7 +293,17 @@ pub(crate) enum Action {
 impl Action {
     /// Whether ⌘↵ does something on this row, where `palette_rows` was asked for tray rows.
     fn takes_command_enter(&self) -> bool {
-        matches!(self, Action::Tray(_) | Action::Jump(_))
+        matches!(self, Action::Tray(_)) || self.row_action().is_some()
+    }
+
+    fn row_action(&self) -> Option<RowAction> {
+        match self {
+            Action::Jump(root) => Some(RowAction {
+                hint: "worktrees",
+                action: Action::Worktrees(root.clone()),
+            }),
+            _ => None,
+        }
     }
 
     fn label(&self, working_directory: &Path) -> String {
@@ -305,6 +324,10 @@ impl Action {
             Action::ListWorktrees(project, filter) => {
                 format!("Open a worktree of {project} matching “{filter}”")
             }
+            Action::Worktrees(root) => format!(
+                "Open a worktree of {}",
+                jump::relative_to(root, working_directory)
+            ),
             Action::Run(command) => format!("Run “{}” in a new tab", history::flattened(command)),
             Action::Tray(command) => {
                 format!("Run “{}” in the tray", history::flattened(command))
@@ -627,14 +650,8 @@ fn run_palette(state: &mut State, index: usize, tray: bool, tx: &mut Tx) {
     let Some(action) = actions.get(index.min(actions.len().saturating_sub(1))) else {
         return;
     };
-    match action {
-        Action::Jump(root) if tray => list_worktrees(
-            state,
-            root.clone(),
-            WhenEmpty::Run(Action::Jump(root.clone())),
-            "",
-            tx,
-        ),
+    match action.row_action() {
+        Some(row_action) if tray => run_action(state, &row_action.action, tx),
         _ if tray && !action.takes_command_enter() => {}
         _ => close_and_run(state, action, tx),
     }
@@ -658,6 +675,13 @@ pub(crate) fn run_action(state: &mut State, action: &Action, tx: &mut Tx) {
         Action::StopTray(index, _) => tray_action(state, *index, Some("stop")),
         Action::CreateWorktree(branch) => create_worktree(state, branch),
         Action::ListWorktrees(_, filter) => list_project_worktrees(state, filter, tx),
+        Action::Worktrees(root) => list_worktrees(
+            state,
+            root.clone(),
+            WhenEmpty::Run(Action::Jump(root.clone())),
+            "",
+            tx,
+        ),
         Action::Run(command) => open_tab(state, &history::flattened(command), Some(command)),
         Action::Tray(command) => open_tray(state, command),
     }
@@ -878,13 +902,13 @@ pub(crate) fn view(
                         Action::Command(command) => command.hint(),
                         _ => None,
                     };
-                    let alternative = match action {
-                        Action::Run(_) => Some("in the tray"),
-                        Action::Jump(_) => Some("worktrees"),
-                        _ => None,
-                    }
-                    .filter(|_| is_selected && !state.command_held)
-                    .map(|hint| format!("{command_return} {hint}"));
+                    let alternative = (is_selected && !state.command_held)
+                        .then(|| match action {
+                            Action::Run(_) => Some("in the tray"),
+                            _ => action.row_action().map(|row_action| row_action.hint),
+                        })
+                        .flatten()
+                        .map(|hint| format!("{command_return} {hint}"));
                     let enter = match (is_selected, state.command_held) {
                         (false, _) => None,
                         (true, false) => Some(return_key.as_str()),
