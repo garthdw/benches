@@ -501,17 +501,26 @@ mod tests {
     use std::process::ExitStatus;
     use std::time::Duration;
 
-    /// Waits for the prompt, so what a test types follows it as a user's would: a shell without
-    /// line editing, such as dash, prints its prompt after the type-ahead the terminal echoed.
     fn spawn_shell() -> Session {
-        let session =
-            Session::spawn(None, Path::new("/tmp"), &default_config(), Arc::new(|| {})).unwrap();
+        spawn_ready(&default_config())
+    }
+
+    /// Returns once the shell has run a command and prompted again, so what a test types follows
+    /// a prompt as a user's would: a login profile can print before the first prompt, and a
+    /// shell without line editing, such as dash, prints its prompt after any type-ahead the
+    /// terminal echoed. The command's output differs from its echo, which can't match it.
+    fn spawn_ready(config: &Config) -> Session {
+        let session = Session::spawn(None, Path::new("/tmp"), config, Arc::new(|| {})).unwrap();
+        type_line(&session, "printf 'benches-%s\\n' ready");
         wait_until(
             Duration::from_secs(15),
-            || "the shell never prompted".to_owned(),
+            || format!("the shell never prompted: {:#?}", session.grid().lines()),
             || {
                 let lines = session.grid().lines();
-                lines
+                let ready = lines
+                    .iter()
+                    .rposition(|line| line.trim_end().ends_with("benches-ready"))?;
+                lines[ready + 1..]
                     .iter()
                     .any(|line| !line.trim().is_empty())
                     .then_some(())
@@ -1161,11 +1170,10 @@ mod tests {
     }
 
     fn spawn_with_threshold(threshold: Duration) -> Session {
-        let config = Config {
+        spawn_ready(&Config {
             command_finish_after: Some(threshold),
             ..default_config()
-        };
-        Session::spawn(None, Path::new("/tmp"), &config, Arc::new(|| {})).unwrap()
+        })
     }
 
     // Marks are doubled, as when a shell and its integration both emit them.
