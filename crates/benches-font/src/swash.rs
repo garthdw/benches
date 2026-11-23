@@ -3,7 +3,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashSet;
 use std::hash::BuildHasherDefault;
 use std::rc::Rc;
-use std::sync::{Arc, LazyLock, Mutex, PoisonError};
+use std::sync::{Arc, LazyLock, Mutex, OnceLock, PoisonError};
 
 use anyhow::{Context, Result};
 use fontique::{
@@ -95,6 +95,8 @@ static SYSTEM_FONTS: LazyLock<Mutex<(SystemFonts, SourceCache)>> =
 #[derive(Clone)]
 struct SystemFonts {
     collection: Collection,
+    /// Every family in the order the last fallback step tries them, sorted on first use.
+    last_resort: Arc<OnceLock<Box<[FamilyId]>>>,
 }
 
 impl SystemFonts {
@@ -104,6 +106,7 @@ impl SystemFonts {
                 shared: false,
                 system_fonts: true,
             }),
+            last_resort: Arc::default(),
         }
     }
 }
@@ -490,7 +493,7 @@ fn emoji_families(collection: &mut Collection) -> Vec<FamilyId> {
 
 /// The first family to draw `cluster` in `data`'s style, in colour if `colour`: an emoji font for
 /// emoji, then the system's fallback for the cluster's script, then the generic families, then
-/// any family. Its font is left in `shared.fonts`.
+/// every family in the last resort's order. Its font is left in `shared.fonts`.
 fn fallback_family(
     shared: &mut Shared,
     data: &FaceData,
@@ -513,12 +516,40 @@ fn fallback_family(
     ] {
         candidates.extend(collection.generic_families(generic));
     }
-    candidates.extend(collection.family_ids());
     let mut tried = HashSet::<FamilyId, BuildHasherDefault<Fnv>>::default();
-    candidates
+    let mut try_family =
+        |shared: &mut Shared, id| tried.insert(id) && draws(shared, data, id, cluster, colour);
+    if let Some(id) = candidates.into_iter().find(|&id| try_family(shared, id)) {
+        return Some(id);
+    }
+    let last_resort = Arc::clone(&shared.system.last_resort);
+    last_resort
+        .get_or_init(|| last_resort_order(&mut shared.system.collection))
+        .iter()
+        .copied()
+        .find(|&id| try_family(shared, id))
+}
+
+/// Every family, monospace first and then by name, as the collection iterates in a random order.
+/// A family is monospace when the `post` table of any of its fonts says it has a fixed pitch:
+/// any, as a family's fonts, and so its default, come in the scan's random order too. Its own
+/// source cache maps each file once, and unmaps them all once sorted.
+fn last_resort_order(collection: &mut Collection) -> Box<[FamilyId]> {
+    let mut sources = SourceCache::default();
+    let ids: Vec<FamilyId> = collection.family_ids().collect();
+    let mut families: Vec<(bool, String, FamilyId)> = ids
         .into_iter()
-        .filter(|&id| tried.insert(id))
-        .find(|&id| draws(shared, data, id, cluster, colour))
+        .filter_map(|id| {
+            let family = collection.family(id)?;
+            let monospace = family.fonts().iter().any(|font| {
+                FontFile::load(font, Some(&mut sources))
+                    .is_some_and(|file| file.swash().metrics(&[]).is_monospace)
+            });
+            Some((!monospace, family.name().to_owned(), id))
+        })
+        .collect();
+    families.sort_unstable();
+    families.into_iter().map(|(_, _, id)| id).collect()
 }
 
 /// Whether family `id` draws `cluster` in `data`'s style, leaving its font in `shared.fonts`.
@@ -1236,6 +1267,24 @@ mod tests {
         let fallback = Rc::downgrade(&swash.face_for(&face, "\u{03A9}").unwrap().data);
         drop((face, swash));
         assert!(fallback.upgrade().is_none());
+    }
+
+    /// No script or generic fallback on macOS has U+23BF, so only the last step finds it there.
+    /// A system with no font for it has nothing to compare.
+    #[test]
+    fn the_last_fallback_step_picks_the_same_family_on_every_scan() {
+        let families: HashSet<String> = (0..4)
+            .filter_map(|_| {
+                let swash = Swash::new();
+                swash.shared.borrow_mut().system = SystemFonts::scan();
+                let face = swash.embedded_face(SYMBOLS_FONT, PIXELS).unwrap();
+                let fallback = swash.face_for(&face, "\u{23BF}")?;
+                let collection = &mut swash.shared.borrow_mut().system.collection;
+                let name = collection.family_name(fallback.data.family?);
+                name.map(str::to_owned)
+            })
+            .collect();
+        assert!(families.len() <= 1, "{families:?}");
     }
 
     #[test]
