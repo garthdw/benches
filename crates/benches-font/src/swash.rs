@@ -803,11 +803,19 @@ impl Backend for Swash {
         line.width
     }
 
-    fn canvas<'a>(&self, out: &'a mut [u8], width: u32, height: u32) -> Option<Canvas<'a>> {
-        (out.len() >= width as usize * height as usize * 4).then_some(Canvas {
-            pixels: out,
-            width,
-            height,
+    fn with_canvas<R>(
+        &self,
+        out: &mut [u8],
+        width: u32,
+        height: u32,
+        draw: impl FnOnce(&mut Canvas<'_>) -> R,
+    ) -> Option<R> {
+        (out.len() >= width as usize * height as usize * 4).then(|| {
+            draw(&mut Canvas {
+                pixels: out,
+                width,
+                height,
+            })
         })
     }
 
@@ -975,14 +983,16 @@ mod coretext_parity {
             assert_close(&what("ink left"), expected.0, actual.0);
             assert_close(&what("ink right"), expected.1, actual.1);
             let text = character.to_string();
-            let expected = {
-                let canvas = coretext.canvas(&mut pixels, 64, 64).unwrap();
-                coretext.line_ink(&canvas, &coretext.line(ours, &text).unwrap())
-            };
-            let actual = {
-                let canvas = swash.canvas(&mut pixels, 64, 64).unwrap();
-                swash.line_ink(&canvas, &swash.line(theirs, &text).unwrap())
-            };
+            let expected = coretext
+                .with_canvas(&mut pixels, 64, 64, |canvas| {
+                    coretext.line_ink(canvas, &coretext.line(ours, &text).unwrap())
+                })
+                .unwrap();
+            let actual = swash
+                .with_canvas(&mut pixels, 64, 64, |canvas| {
+                    swash.line_ink(canvas, &swash.line(theirs, &text).unwrap())
+                })
+                .unwrap();
             for (name, expected, actual) in [
                 ("line ink x", expected.x, actual.x),
                 ("line ink y", expected.y, actual.y),
@@ -1025,17 +1035,16 @@ mod tests {
 
     fn coverage(swash: &Swash, face: &Face) -> u32 {
         let mut pixels = vec![0; 4 * 64 * 64];
-        let mut canvas = Canvas {
-            pixels: &mut pixels,
-            width: 64,
-            height: 64,
-        };
         let glyph = Glyph {
             id: Swash::glyph(face, BOLT).unwrap(),
             x: 16.0,
             y: 16.0,
         };
-        swash.draw_glyphs(&mut canvas, face, [glyph]);
+        swash
+            .with_canvas(&mut pixels, 64, 64, |canvas| {
+                swash.draw_glyphs(canvas, face, [glyph]);
+            })
+            .unwrap();
         pixels
             .iter()
             .step_by(4)
@@ -1136,13 +1145,16 @@ mod tests {
         let swash = Swash::new();
         let face = swash.embedded_face(SYMBOLS_FONT, PIXELS).unwrap();
         let mut pixels = vec![0; 4 * 64 * 64];
-        let mut canvas = swash.canvas(&mut pixels, 64, 8).unwrap();
         let glyph = Glyph {
             id: Swash::glyph(&face, BOLT).unwrap(),
             x: 16.0,
             y: 0.0,
         };
-        swash.draw_glyphs(&mut canvas, &face, [glyph]);
+        swash
+            .with_canvas(&mut pixels, 64, 8, |canvas| {
+                swash.draw_glyphs(canvas, &face, [glyph]);
+            })
+            .unwrap();
         assert!(pixels[4 * 64 * 8..].iter().all(|&byte| byte == 0));
     }
 
@@ -1156,16 +1168,16 @@ mod tests {
         let glyph = Swash::glyph(&face, 'A').unwrap();
         assert!(swash.glyph_ink(&face, glyph).is_some());
         let mut pixels = vec![0; 4 * 32 * 32];
-        let mut canvas = swash.canvas(&mut pixels, 32, 32).unwrap();
-        swash.draw_glyphs(
-            &mut canvas,
-            &face,
-            [Glyph {
-                id: glyph,
-                x: 8.0,
-                y: 8.0,
-            }],
-        );
+        let glyph = Glyph {
+            id: glyph,
+            x: 8.0,
+            y: 8.0,
+        };
+        swash
+            .with_canvas(&mut pixels, 32, 32, |canvas| {
+                swash.draw_glyphs(canvas, &face, [glyph]);
+            })
+            .unwrap();
         assert!(pixels.iter().any(|&byte| byte != 0));
     }
 
