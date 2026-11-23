@@ -149,7 +149,7 @@ impl Backend for CoreText {
         }
     }
 
-    fn metrics(face: &Self::Face) -> FaceMetrics {
+    fn metrics(&self, face: &Self::Face) -> FaceMetrics {
         // SAFETY: plain metric getters on a live font.
         unsafe {
             FaceMetrics {
@@ -164,8 +164,8 @@ impl Backend for CoreText {
         }
     }
 
-    fn shape(face: &Self::Face, text: &str) -> Option<Vec<Glyph>> {
-        let line = Self::line(face, text)?;
+    fn shape(&self, face: &Self::Face, text: &str) -> Option<Vec<Glyph>> {
+        let line = self.line(face, text)?;
         // SAFETY: a plain getter on a live line.
         let runs = unsafe { line.glyph_runs() };
         // SAFETY: a line's glyph runs are `CTRun`s.
@@ -200,7 +200,7 @@ impl Backend for CoreText {
         Some(shaped)
     }
 
-    fn glyph_ink(face: &Self::Face, glyph: u16) -> InkExtent {
+    fn glyph_ink(&self, face: &Self::Face, glyph: u16) -> InkExtent {
         let mut glyph = glyph;
         let mut rect = CGRect::ZERO;
         // SAFETY: one glyph and one rect, matching the count of 1.
@@ -215,7 +215,7 @@ impl Backend for CoreText {
         (rect.size.width > 0.0).then_some((rect.origin.x, rect.origin.x + rect.size.width))
     }
 
-    fn line(face: &Self::Face, text: &str) -> Option<Self::Line> {
+    fn line(&self, face: &Self::Face, text: &str) -> Option<Self::Line> {
         // SAFETY: the extern statics are immutable CoreFoundation constants.
         let (font_key, color_key, enabled) = unsafe {
             (
@@ -276,7 +276,7 @@ impl Backend for CoreText {
         })
     }
 
-    fn line_ink(canvas: &Canvas<'_>, line: &Self::Line) -> Bounds {
+    fn line_ink(&self, canvas: &Canvas<'_>, line: &Self::Line) -> Bounds {
         // SAFETY: `line` and the context are live.
         let ink = unsafe { line.image_bounds(Some(&canvas.context)) };
         Bounds {
@@ -289,7 +289,7 @@ impl Backend for CoreText {
 
     /// Applies the placement as three CTM steps, in its order, since folding them into one matrix
     /// rounds differently.
-    fn draw_line(canvas: &mut Canvas<'_>, line: &Self::Line, placement: Placement) {
+    fn draw_line(&self, canvas: &mut Canvas<'_>, line: &Self::Line, placement: Placement) {
         let context = Some(&*canvas.context);
         CGContext::translate_ctm(context, placement.offset.0, placement.offset.1);
         CGContext::scale_ctm(context, placement.scale.0, placement.scale.1);
@@ -300,6 +300,7 @@ impl Backend for CoreText {
     }
 
     fn draw_glyphs(
+        &self,
         canvas: &mut Canvas<'_>,
         face: &Self::Face,
         glyphs: impl IntoIterator<Item = Glyph>,
