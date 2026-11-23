@@ -374,7 +374,8 @@ impl FaceScaler<'_> {
         )
     }
 
-    /// The glyph's ink in pixels, up from its origin.
+    /// The glyph's ink in pixels, up from its origin, from the source `draw` draws it from: a
+    /// colour glyph's upright and regular in every style.
     fn ink(&mut self, glyph: u16) -> Option<Bounds> {
         let data = self.data;
         let outlined = |bounds: swash::zeno::Bounds| Bounds {
@@ -383,6 +384,12 @@ impl FaceScaler<'_> {
             width: f64::from(bounds.width()),
             height: f64::from(bounds.height()),
         };
+        let placed = |placement: swash::zeno::Placement| Bounds {
+            x: f64::from(placement.left),
+            y: f64::from(placement.top) - f64::from(placement.height),
+            width: f64::from(placement.width),
+            height: f64::from(placement.height),
+        };
         if let Some(bounds) = self
             .colr
             .as_ref()
@@ -390,31 +397,23 @@ impl FaceScaler<'_> {
         {
             return Some(outlined(bounds));
         }
-        let outline = self
-            .scaler
-            .scale_color_outline(glyph)
-            .or_else(|| self.scaler.scale_outline(glyph))
-            .filter(|outline| !outline.is_empty());
-        if let Some(mut outline) = outline {
+        let colour = self.scaler.scale_color_outline(glyph);
+        if let Some(outline) = colour.filter(|outline| !outline.is_empty()) {
+            return Some(outlined(outline.bounds()));
+        }
+        if let Some(image) = self.render(&Render::new(COLOR_SOURCES), glyph) {
+            return Some(placed(image.placement));
+        }
+        let outline = self.scaler.scale_outline(glyph);
+        if let Some(mut outline) = outline.filter(|outline| !outline.is_empty()) {
             if data.embolden != 0.0 {
                 outline.embolden(data.embolden, data.embolden);
             }
             outline.transform(&data.skew());
             return Some(outlined(outline.bounds()));
         }
-        let placement = self
-            .render(&Render::new(COLOR_SOURCES), glyph)
-            .map(|image| image.placement)
-            .or_else(|| {
-                self.render(&Render::new(MONOCHROME_SOURCES), glyph)
-                    .map(|image| image.placement)
-            })?;
-        Some(Bounds {
-            x: f64::from(placement.left),
-            y: f64::from(placement.top) - f64::from(placement.height),
-            width: f64::from(placement.width),
-            height: f64::from(placement.height),
-        })
+        self.render(&Render::new(MONOCHROME_SOURCES), glyph)
+            .map(|image| placed(image.placement))
     }
 }
 
@@ -717,6 +716,7 @@ impl Canvas<'_> {
         let data = scaler.data;
         let upright = Transform::scale(scale.0 as f32, scale.1 as f32)
             .then_translate(origin.0 as f32, origin.1 as f32);
+        // Colour glyphs stay upright and regular in every style, as CoreText draws them.
         let colr = scaler.colr.as_ref().and_then(|colr| {
             colr.rasterize(glyph, data.pixels, &upright, (self.width, self.height))
         });
@@ -725,14 +725,9 @@ impl Canvas<'_> {
             self.blit_rgba((image.width, image.height), at, &image.rgba);
             return;
         }
-        let styled = data.skew().then(&upright);
         let mut colour = Render::new(COLOR_SOURCES);
         // A COLR v0 layer in the text's colour draws white, as COLR v1's does.
-        colour
-            .format(Format::Alpha)
-            .default_color([u8::MAX; 4])
-            .embolden(data.embolden)
-            .transform(Some(styled));
+        colour.default_color([u8::MAX; 4]).transform(Some(upright));
         if let Some(image) = scaler.render(&colour, glyph) {
             self.blit_image(&image, origin, scale);
             return;
@@ -741,7 +736,7 @@ impl Canvas<'_> {
         monochrome
             .format(Format::Alpha)
             .embolden(data.embolden)
-            .transform(Some(styled));
+            .transform(Some(data.skew().then(&upright)));
         if let Some(image) = scaler.render(&monochrome, glyph) {
             self.blit_image(&image, origin, scale);
         }
@@ -1592,6 +1587,42 @@ mod tests {
         Face::new(data)
     }
 
+    /// 😀 from `file` draws the same in every style, and measures where it draws: colour glyphs
+    /// stay upright and regular, as CoreText draws them.
+    fn assert_styles_leave_emoji_alone(swash: &Swash, file: &FontFile) {
+        let regular = synthesised(file, FontStyle::default());
+        let glyph = Swash::glyph(&regular, GRINNING).unwrap();
+        let expected = canvas(swash, &regular, glyph);
+        assert_ink_is_drawn(swash, &regular);
+        for (bold, italic) in [(true, false), (false, true), (true, true)] {
+            let style = FontStyle { bold, italic };
+            let styled = synthesised(file, style);
+            assert!(
+                canvas(swash, &styled, glyph) == expected,
+                "{style:?} draws differently"
+            );
+            assert_ink_is_drawn(swash, &styled);
+        }
+    }
+
+    #[test]
+    fn colour_bitmap_emoji_ignore_bold_and_italic() {
+        let swash = Swash::new();
+        let Some(font) = colour_bitmap_emoji(&swash) else {
+            return;
+        };
+        assert_styles_leave_emoji_alone(&swash, &FontFile::load(&font, None).unwrap());
+    }
+
+    #[test]
+    fn colr_v1_emoji_ignore_bold_and_italic() {
+        let swash = Swash::new();
+        let Some(font) = colr_v1_emoji(&swash) else {
+            return;
+        };
+        assert_styles_leave_emoji_alone(&swash, &FontFile::load(&font, None).unwrap());
+    }
+
     /// The COLR v1 emoji font with a COLR v0 table that draws 😀 as two of its glyphs, the
     /// second in palette entry `over` over the first in entry 0: no installed font is COLR v0.
     fn colr_v0_emoji(swash: &Swash, over: u16) -> Option<FontFile> {
@@ -1619,6 +1650,15 @@ mod tests {
         Some(with_colr(&file, |colr| {
             colr[..table.len()].copy_from_slice(&table);
         }))
+    }
+
+    #[test]
+    fn colr_v0_emoji_ignore_bold_and_italic() {
+        let swash = Swash::new();
+        let Some(file) = colr_v0_emoji(&swash, 0xFFFF) else {
+            return;
+        };
+        assert_styles_leave_emoji_alone(&swash, &file);
     }
 
     #[test]

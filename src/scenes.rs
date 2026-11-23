@@ -29,6 +29,14 @@ const SCENE_UNICODE: &str = concat!(
     "\x1b[44;37m \u{E7A8} \x1b[34;42m\u{E0C6}\x1b[30m \u{F418} main \x1b[32;43m\u{E0C6}\x1b[30m \u{F0E7} \x1b[33;49m\u{E0C6}\x1b[0m \u{F07B} \u{F418}x \u{F07B}\u{F418} \u{F07B}\r\n"
 );
 
+/// Emoji in each style, which leaves them upright and regular.
+const SCENE_EMOJI: &str = concat!(
+    "regular \u{1F600}\u{1F680}\u{2764}\u{FE0F}|\r\n",
+    "\x1b[1mbold    \u{1F600}\u{1F680}\u{2764}\u{FE0F}|\x1b[0m\r\n",
+    "\x1b[3mitalic  \u{1F600}\u{1F680}\u{2764}\u{FE0F}|\x1b[0m\r\n",
+    "\x1b[1;3mboth    \u{1F600}\u{1F680}\u{2764}\u{FE0F}|\x1b[0m\r\n",
+);
+
 /// The default font's cell at the scale the snapshots render at, so images span whole cells.
 const IMAGE_SCENE_CELL: (u32, u32) = (23, 45);
 const SCENE_IMAGE_PIXELS: &str =
@@ -185,6 +193,7 @@ pub(crate) const SCENES: &[Scene] = &[
     ("unicode", |state| {
         show_scene(state, SCENE_UNICODE.as_bytes())
     }),
+    ("emoji", |state| show_scene(state, SCENE_EMOJI.as_bytes())),
     ("images", |state| {
         show_tab(
             state,
