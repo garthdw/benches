@@ -1,7 +1,8 @@
+use std::borrow::Cow;
 use std::cell::{Cell, RefCell};
 use std::collections::HashSet;
 use std::hash::BuildHasherDefault;
-use std::rc::{Rc, Weak};
+use std::rc::Rc;
 use std::sync::{Arc, LazyLock, Mutex, PoisonError};
 
 use anyhow::{Context, Result};
@@ -13,7 +14,8 @@ use harfrust::{Feature, ShapeOptions, ShaperData, ShaperInstance, Tag, UnicodeBu
 use icu_properties::props::{EmojiPresentation, Script as UnicodeScript};
 use icu_properties::{CodePointMapData, CodePointSetData, PropertyNamesShort};
 use swash::CacheKey;
-use swash::scale::{Render, ScaleContext, Scaler, Source, StrikeWith, image::Content};
+use swash::scale::image::{Content, Image};
+use swash::scale::{Render, ScaleContext, Scaler, Source, StrikeWith};
 use swash::zeno::{Angle, Format, Transform};
 use unicode_segmentation::UnicodeSegmentation;
 
@@ -24,7 +26,7 @@ use crate::{
 
 /// Fonts found through fontique, shaped by harfrust and drawn by swash.
 pub(crate) struct Swash {
-    shared: Rc<RefCell<Shared>>,
+    shared: RefCell<Shared>,
     /// Whether this backend has rescanned the system fonts for a missing family.
     rescanned: Cell<bool>,
 }
@@ -41,6 +43,45 @@ struct Shared {
     fonts: FnvMap<(FamilyId, usize), Option<Rc<FaceData>>>,
     /// The family each cluster falls back to, per style index; `None` when no family has it.
     clusters: [FnvMap<String, Option<FamilyId>>; 4],
+    /// Kept between shapes for its allocation.
+    buffer: UnicodeBuffer,
+    last_color_bitmap: LastColorBitmap,
+}
+
+/// The colour bitmap rendered last, by font, glyph and pixel size. A colour bitmap ignores the
+/// transform and embolden, and every source list reaches it only after colour outlines, so any
+/// render of its glyph gives it again: a new emoji renders once for its colour check, its ink and
+/// its drawing.
+#[derive(Default)]
+struct LastColorBitmap(Option<((CacheKey, u16, u32), Image)>);
+
+impl LastColorBitmap {
+    fn render(
+        &mut self,
+        render: &Render<'_>,
+        scaler: &mut Scaler<'_>,
+        font: CacheKey,
+        pixels: f32,
+        glyph: u16,
+    ) -> Option<Cow<'_, Image>> {
+        let key = (font, glyph, pixels.to_bits());
+        if self.0.as_ref().is_some_and(|(last, _)| *last == key) {
+            return self.0.as_ref().map(|(_, image)| Cow::Borrowed(image));
+        }
+        let image = render.render(scaler, glyph)?;
+        if !matches!(image.source, Source::ColorBitmap(_)) {
+            return Some(Cow::Owned(image));
+        }
+        let (_, image) = self.0.insert((key, image));
+        Some(Cow::Borrowed(image))
+    }
+}
+
+/// A face's scaler, built once for every glyph a call measures or draws.
+struct FaceScaler<'a> {
+    data: &'a FaceData,
+    scaler: Scaler<'a>,
+    last_color_bitmap: &'a mut LastColorBitmap,
 }
 
 /// The latest scan of the system fonts, which every backend's collection clones.
@@ -61,8 +102,6 @@ pub(crate) struct Face {
 }
 
 struct FaceData {
-    /// Weak, as `Shared` caches fallback faces; the backend owns it.
-    shared: Weak<RefCell<Shared>>,
     blob: Blob<u8>,
     index: u32,
     /// Where the font's table directory starts in `blob`, for swash.
@@ -157,34 +196,75 @@ fn matched(shared: &mut Shared, family: &FamilyInfo, style: FontStyle) -> Option
     )
 }
 
-/// Whether `font` has a glyph for every character of `cluster`, each drawn in colour if `colour`.
-fn fits(
-    font: swash::FontRef<'_>,
-    scale: &mut ScaleContext,
-    pixels: f32,
-    cluster: &str,
-    colour: bool,
-) -> bool {
-    let charmap = font.charmap();
-    let mut glyphs = cluster
-        .chars()
-        .filter(|&character| !is_joiner(character))
-        .map(|character| charmap.map(character));
-    if !colour {
-        return glyphs.all(|glyph| glyph != 0);
+impl Shared {
+    /// Whether `font` has a glyph for every character of `cluster`, each drawn in colour if
+    /// `colour`.
+    fn fits(&mut self, font: swash::FontRef<'_>, pixels: f32, cluster: &str, colour: bool) -> bool {
+        let charmap = font.charmap();
+        let mut glyphs = cluster
+            .chars()
+            .filter(|&character| !is_joiner(character))
+            .map(|character| charmap.map(character));
+        if !colour {
+            return glyphs.all(|glyph| glyph != 0);
+        }
+        let mut scaler = self.scale.builder(font).size(pixels).build();
+        let render = Render::new(COLOR_SOURCES);
+        glyphs.all(|glyph| {
+            glyph != 0
+                && self
+                    .last_color_bitmap
+                    .render(&render, &mut scaler, font.key, pixels, glyph)
+                    .is_some()
+        })
     }
-    let mut scaler = scale.builder(font).size(pixels).build();
-    glyphs.all(|glyph| {
-        glyph != 0
-            && Render::new(COLOR_SOURCES)
-                .render(&mut scaler, glyph)
-                .is_some()
-    })
+
+    fn scaler<'a>(&'a mut self, data: &'a FaceData) -> FaceScaler<'a> {
+        FaceScaler {
+            scaler: self
+                .scale
+                .builder(data.swash())
+                // CoreText doesn't hint either, and hinting would move glyphs off Ghostty's metrics.
+                .hint(false)
+                .size(data.pixels)
+                .normalized_coords(&data.coords)
+                .build(),
+            last_color_bitmap: &mut self.last_color_bitmap,
+            data,
+        }
+    }
+
+    /// The glyphs of `text` in `face` alone, and their total advance.
+    fn shape(&mut self, face: &Face, text: &str) -> Option<(Vec<Glyph>, f64)> {
+        let data = &face.data;
+        let font = harfrust::FontRef::from_index(data.blob.data(), data.index).ok()?;
+        let shaper = data
+            .shaper
+            .shaper(&font)
+            .instance(Some(&data.instance))
+            .build();
+        let mut buffer = std::mem::take(&mut self.buffer);
+        buffer.push_str(text);
+        buffer.guess_segment_properties();
+        let shaped = shaper.shape(buffer, ShapeOptions::new().features(&face.features));
+        let scale = f64::from(data.pixels) / f64::from(shaper.units_per_em());
+        let mut pen = 0.0;
+        let mut glyphs = Vec::with_capacity(shaped.len());
+        for (info, position) in shaped.glyph_infos().iter().zip(shaped.glyph_positions()) {
+            glyphs.push(Glyph {
+                id: u16::try_from(info.glyph_id).ok()?,
+                x: pen + f64::from(position.x_offset) * scale,
+                y: f64::from(position.y_offset) * scale,
+            });
+            pen += f64::from(position.x_advance) * scale;
+        }
+        self.buffer = shaped.clear();
+        Some((glyphs, pen))
+    }
 }
 
 impl FaceData {
     fn new(
-        shared: &Weak<RefCell<Shared>>,
         Matched {
             blob,
             index,
@@ -229,7 +309,6 @@ impl FaceData {
             0.0
         };
         Some(Self {
-            shared: shared.clone(),
             offset,
             key,
             shaper: ShaperData::new(&font),
@@ -253,16 +332,6 @@ impl FaceData {
         }
     }
 
-    fn scaler<'a>(&'a self, context: &'a mut ScaleContext) -> Scaler<'a> {
-        context
-            .builder(self.swash())
-            // CoreText doesn't hint either, and hinting would move glyphs off Ghostty's metrics.
-            .hint(false)
-            .size(self.pixels)
-            .normalized_coords(&self.coords)
-            .build()
-    }
-
     fn skew(&self) -> Transform {
         if self.skew {
             Transform::skew(Angle::from_degrees(SYNTHETIC_SKEW), Angle::ZERO)
@@ -270,21 +339,31 @@ impl FaceData {
             Transform::IDENTITY
         }
     }
+}
+
+impl FaceScaler<'_> {
+    fn render(&mut self, render: &Render<'_>, glyph: u16) -> Option<Cow<'_, Image>> {
+        self.last_color_bitmap.render(
+            render,
+            &mut self.scaler,
+            self.data.key,
+            self.data.pixels,
+            glyph,
+        )
+    }
 
     /// The glyph's ink in pixels, up from its origin.
-    fn ink(&self, glyph: u16) -> Option<Bounds> {
-        let shared = self.shared.upgrade()?;
-        let mut shared = shared.borrow_mut();
-        let mut scaler = self.scaler(&mut shared.scale);
-        let outline = scaler
+    fn ink(&mut self, glyph: u16) -> Option<Bounds> {
+        let outline = self
+            .scaler
             .scale_color_outline(glyph)
-            .or_else(|| scaler.scale_outline(glyph))
+            .or_else(|| self.scaler.scale_outline(glyph))
             .filter(|outline| !outline.is_empty());
         if let Some(mut outline) = outline {
-            if self.embolden != 0.0 {
-                outline.embolden(self.embolden, self.embolden);
+            if self.data.embolden != 0.0 {
+                outline.embolden(self.data.embolden, self.data.embolden);
             }
-            outline.transform(&self.skew());
+            outline.transform(&self.data.skew());
             let bounds = outline.bounds();
             return Some(Bounds {
                 x: f64::from(bounds.min.x),
@@ -293,7 +372,7 @@ impl FaceData {
                 height: f64::from(bounds.height()),
             });
         }
-        let placement = Render::new(&SOURCES).render(&mut scaler, glyph)?.placement;
+        let placement = self.render(&Render::new(&SOURCES), glyph)?.placement;
         Some(Bounds {
             x: f64::from(placement.left),
             y: f64::from(placement.top) - f64::from(placement.height),
@@ -349,48 +428,40 @@ fn script(cluster: &str) -> Option<Script> {
 impl Swash {
     fn face(&self, family: &FamilyInfo, style: FontStyle, pixels: f64) -> Option<Face> {
         let font = matched(&mut self.shared.borrow_mut(), family, style)?;
-        FaceData::new(
-            &Rc::downgrade(&self.shared),
-            font,
-            pixels,
-            Some(family.id()),
-            style,
-        )
-        .map(Face::new)
+        FaceData::new(font, pixels, Some(family.id()), style).map(Face::new)
     }
-}
 
-/// The face that draws `cluster`: `face` itself when it can, else a fallback with its features.
-fn face_for(face: &Face, cluster: &str) -> Option<Face> {
-    let data = &face.data;
-    let shared = data.shared.upgrade()?;
-    let mut shared = shared.borrow_mut();
-    let emoji = is_emoji(cluster);
-    if fits(data.swash(), &mut shared.scale, data.pixels, cluster, emoji) {
-        return Some(face.clone());
-    }
-    let style = Font::face_index(data.style);
-    let family = match shared.clusters[style].get(cluster) {
-        Some(family) => *family,
-        None => {
-            // An emoji no font colours, such as with only a COLR v1 font installed, takes a
-            // monochrome glyph, the face's own first.
-            let family = fallback_family(&mut shared, data, cluster, emoji).or_else(|| {
-                let monochrome =
-                    emoji && !fits(data.swash(), &mut shared.scale, data.pixels, cluster, false);
-                monochrome
-                    .then(|| fallback_family(&mut shared, data, cluster, false))
-                    .flatten()
-            });
-            shared.clusters[style].insert(cluster.to_owned(), family);
-            family
+    /// The face that draws `cluster`: `face` itself when it can, else a fallback with its features.
+    fn face_for(&self, face: &Face, cluster: &str) -> Option<Face> {
+        let data = &face.data;
+        let mut shared = self.shared.borrow_mut();
+        let emoji = is_emoji(cluster);
+        if shared.fits(data.swash(), data.pixels, cluster, emoji) {
+            return Some(face.clone());
         }
-    }?;
-    let fallback = shared.fonts.get(&(family, style)).cloned().flatten()?;
-    Some(Face {
-        data: fallback,
-        features: face.features.clone(),
-    })
+        let style = Font::face_index(data.style);
+        let family = match shared.clusters[style].get(cluster) {
+            Some(family) => *family,
+            None => {
+                // An emoji no font colours, such as with only a COLR v1 font installed, takes a
+                // monochrome glyph, the face's own first.
+                let family = fallback_family(&mut shared, data, cluster, emoji).or_else(|| {
+                    let monochrome =
+                        emoji && !shared.fits(data.swash(), data.pixels, cluster, false);
+                    monochrome
+                        .then(|| fallback_family(&mut shared, data, cluster, false))
+                        .flatten()
+                });
+                shared.clusters[style].insert(cluster.to_owned(), family);
+                family
+            }
+        }?;
+        let fallback = shared.fonts.get(&(family, style)).cloned().flatten()?;
+        Some(Face {
+            data: fallback,
+            features: face.features.clone(),
+        })
+    }
 }
 
 /// The first family to draw `cluster` in `data`'s style, in colour if `colour`: an emoji font for
@@ -450,56 +521,16 @@ fn draws(shared: &mut Shared, data: &FaceData, id: FamilyId, cluster: &str, colo
     let Some(file) = file else {
         return false;
     };
-    if !fits(
-        file.swash(),
-        &mut shared.scale,
-        data.pixels,
-        cluster,
-        colour,
-    ) {
+    if !shared.fits(file.swash(), data.pixels, cluster, colour) {
         return false;
     }
     shared
         .fonts
         .entry((id, style))
         .or_insert_with(|| {
-            FaceData::new(
-                &data.shared,
-                file,
-                f64::from(data.pixels),
-                Some(id),
-                data.style,
-            )
-            .map(Rc::new)
+            FaceData::new(file, f64::from(data.pixels), Some(id), data.style).map(Rc::new)
         })
         .is_some()
-}
-
-/// The glyphs of `text` in `face` alone, and their total advance.
-fn shape(face: &Face, text: &str) -> Option<(Vec<Glyph>, f64)> {
-    let data = &face.data;
-    let font = harfrust::FontRef::from_index(data.blob.data(), data.index).ok()?;
-    let shaper = data
-        .shaper
-        .shaper(&font)
-        .instance(Some(&data.instance))
-        .build();
-    let mut buffer = UnicodeBuffer::new();
-    buffer.push_str(text);
-    buffer.guess_segment_properties();
-    let shaped = shaper.shape(buffer, ShapeOptions::new().features(&face.features));
-    let scale = f64::from(data.pixels) / f64::from(shaper.units_per_em());
-    let mut pen = 0.0;
-    let mut glyphs = Vec::with_capacity(shaped.len());
-    for (info, position) in shaped.glyph_infos().iter().zip(shaped.glyph_positions()) {
-        glyphs.push(Glyph {
-            id: u16::try_from(info.glyph_id).ok()?,
-            x: pen + f64::from(position.x_offset) * scale,
-            y: f64::from(position.y_offset) * scale,
-        });
-        pen += f64::from(position.x_advance) * scale;
-    }
-    Some((glyphs, pen))
 }
 
 /// Source-over of one premultiplied pixel.
@@ -591,25 +622,24 @@ impl Canvas<'_> {
 
     /// Draws `glyph` with its origin at `origin`, in pixels up from the canvas's bottom-left, with
     /// its outline stretched by `scale`.
-    fn draw(&mut self, face: &Face, glyph: u16, origin: (f64, f64), scale: (f64, f64)) {
-        let data = &face.data;
-        let image = {
-            let Some(shared) = data.shared.upgrade() else {
-                return;
-            };
-            let mut shared = shared.borrow_mut();
-            let mut scaler = data.scaler(&mut shared.scale);
-            let transform = data
-                .skew()
-                .then(&Transform::scale(scale.0 as f32, scale.1 as f32))
-                .then_translate(origin.0 as f32, origin.1 as f32);
-            Render::new(&SOURCES)
-                .format(Format::Alpha)
-                .embolden(data.embolden)
-                .transform(Some(transform))
-                .render(&mut scaler, glyph)
-        };
-        let Some(image) = image else {
+    fn draw(
+        &mut self,
+        scaler: &mut FaceScaler<'_>,
+        glyph: u16,
+        origin: (f64, f64),
+        scale: (f64, f64),
+    ) {
+        let data = scaler.data;
+        let transform = data
+            .skew()
+            .then(&Transform::scale(scale.0 as f32, scale.1 as f32))
+            .then_translate(origin.0 as f32, origin.1 as f32);
+        let mut render = Render::new(&SOURCES);
+        render
+            .format(Format::Alpha)
+            .embolden(data.embolden)
+            .transform(Some(transform));
+        let Some(image) = scaler.render(&render, glyph) else {
             return;
         };
         let placement = image.placement;
@@ -668,14 +698,16 @@ impl Backend for Swash {
             .unwrap_or_else(PoisonError::into_inner)
             .clone();
         Self {
-            shared: Rc::new(RefCell::new(Shared {
+            shared: RefCell::new(Shared {
                 collection,
                 sources,
                 scale: ScaleContext::new(),
                 files: FnvMap::default(),
                 fonts: FnvMap::default(),
                 clusters: Default::default(),
-            })),
+                buffer: UnicodeBuffer::new(),
+                last_color_bitmap: LastColorBitmap::default(),
+            }),
             rescanned: Cell::new(false),
         }
     }
@@ -727,15 +759,9 @@ impl Backend for Swash {
     fn embedded_face(&self, bytes: &'static [u8], pixels: f64) -> Result<Face> {
         let font = Matched::new(Blob::new(Arc::new(bytes)), 0, Synthesis::default())
             .context("swash couldn't read the font data")?;
-        FaceData::new(
-            &Rc::downgrade(&self.shared),
-            font,
-            pixels,
-            None,
-            FontStyle::default(),
-        )
-        .map(Face::new)
-        .context("swash couldn't read the font data")
+        FaceData::new(font, pixels, None, FontStyle::default())
+            .map(Face::new)
+            .context("swash couldn't read the font data")
     }
 
     fn with_features(face: Face, features: &[FontFeature]) -> Face {
@@ -766,7 +792,7 @@ impl Backend for Swash {
         )
     }
 
-    fn metrics(face: &Face) -> FaceMetrics {
+    fn metrics(&self, face: &Face) -> FaceMetrics {
         let data = &face.data;
         let metrics = data.swash().metrics(&data.coords).scale(data.pixels);
         // Fonts with an old OS/2 table lack these; Ghostty measures the glyphs instead.
@@ -775,7 +801,7 @@ impl Backend for Swash {
                 return f64::from(height);
             }
             Self::glyph(face, character)
-                .and_then(|glyph| data.ink(glyph))
+                .and_then(|glyph| self.shared.borrow_mut().scaler(data).ink(glyph))
                 .map_or(0.0, |ink| ink.height)
         };
         FaceMetrics {
@@ -789,20 +815,23 @@ impl Backend for Swash {
         }
     }
 
-    fn shape(face: &Face, text: &str) -> Option<Vec<Glyph>> {
-        shape(face, text).map(|(glyphs, _)| glyphs)
+    fn shape(&self, face: &Face, text: &str) -> Option<Vec<Glyph>> {
+        self.shared
+            .borrow_mut()
+            .shape(face, text)
+            .map(|(glyphs, _)| glyphs)
     }
 
-    fn glyph_ink(face: &Face, glyph: u16) -> InkExtent {
-        let ink = face.data.ink(glyph)?;
+    fn glyph_ink(&self, face: &Face, glyph: u16) -> InkExtent {
+        let ink = self.shared.borrow_mut().scaler(&face.data).ink(glyph)?;
         (ink.width > 0.0).then_some((ink.x, ink.x + ink.width))
     }
 
-    fn line(face: &Face, text: &str) -> Option<Line> {
+    fn line(&self, face: &Face, text: &str) -> Option<Line> {
         let mut runs: Vec<(Face, String)> = Vec::new();
         for cluster in text.graphemes(true) {
             // A cluster no font has draws as the face's missing glyph.
-            let chosen = face_for(face, cluster).unwrap_or_else(|| face.clone());
+            let chosen = self.face_for(face, cluster).unwrap_or_else(|| face.clone());
             match runs.last_mut() {
                 Some((last, run)) if last.same(&chosen) => run.push_str(cluster),
                 _ => runs.push((chosen, cluster.to_owned())),
@@ -813,7 +842,7 @@ impl Backend for Swash {
             width: 0.0,
         };
         for (face, text) in runs {
-            let (mut glyphs, advance) = shape(&face, &text)?;
+            let (mut glyphs, advance) = self.shared.borrow_mut().shape(&face, &text)?;
             for glyph in &mut glyphs {
                 glyph.x += line.width;
             }
@@ -827,28 +856,42 @@ impl Backend for Swash {
         line.width
     }
 
-    fn canvas<'a>(&self, out: &'a mut [u8], width: u32, height: u32) -> Option<Canvas<'a>> {
-        (out.len() >= width as usize * height as usize * 4).then_some(Canvas {
-            pixels: out,
-            width,
-            height,
+    fn with_canvas<R>(
+        &self,
+        out: &mut [u8],
+        width: u32,
+        height: u32,
+        draw: impl FnOnce(&mut Canvas<'_>) -> R,
+    ) -> Option<R> {
+        (out.len() >= width as usize * height as usize * 4).then(|| {
+            draw(&mut Canvas {
+                pixels: out,
+                width,
+                height,
+            })
         })
     }
 
-    fn line_ink(_canvas: &Canvas<'_>, line: &Line) -> Bounds {
-        let corners = line.runs.iter().flat_map(|(face, glyphs)| {
-            glyphs.iter().filter_map(|glyph| {
-                let ink = face.data.ink(glyph.id).filter(|ink| ink.width > 0.0)?;
+    fn line_ink(&self, _canvas: &Canvas<'_>, line: &Line) -> Bounds {
+        let mut shared = self.shared.borrow_mut();
+        let mut union: Option<((f64, f64), (f64, f64))> = None;
+        for (face, glyphs) in &line.runs {
+            let mut scaler = shared.scaler(&face.data);
+            for glyph in glyphs {
+                let Some(ink) = scaler.ink(glyph.id).filter(|ink| ink.width > 0.0) else {
+                    continue;
+                };
                 let low = (glyph.x + ink.x, glyph.y + ink.y);
-                Some((low, (low.0 + ink.width, low.1 + ink.height)))
-            })
-        });
-        let union = corners.reduce(|(low, high), (glyph_low, glyph_high)| {
-            (
-                (low.0.min(glyph_low.0), low.1.min(glyph_low.1)),
-                (high.0.max(glyph_high.0), high.1.max(glyph_high.1)),
-            )
-        });
+                let high = (low.0 + ink.width, low.1 + ink.height);
+                union = Some(match union {
+                    Some((union_low, union_high)) => (
+                        (union_low.0.min(low.0), union_low.1.min(low.1)),
+                        (union_high.0.max(high.0), union_high.1.max(high.1)),
+                    ),
+                    None => (low, high),
+                });
+            }
+        }
         let ((x, y), (right, top)) = union.unwrap_or_default();
         Bounds {
             x,
@@ -858,26 +901,35 @@ impl Backend for Swash {
         }
     }
 
-    fn draw_line(canvas: &mut Canvas<'_>, line: &Line, placement: Placement) {
+    fn draw_line(&self, canvas: &mut Canvas<'_>, line: &Line, placement: Placement) {
+        let mut shared = self.shared.borrow_mut();
         let Placement {
             offset,
             scale,
             origin,
         } = placement;
         for (face, glyphs) in &line.runs {
+            let mut scaler = shared.scaler(&face.data);
             for glyph in glyphs {
                 let at = (
                     offset.0 + scale.0 * (glyph.x - origin.0),
                     offset.1 + scale.1 * (glyph.y - origin.1),
                 );
-                canvas.draw(face, glyph.id, at, scale);
+                canvas.draw(&mut scaler, glyph.id, at, scale);
             }
         }
     }
 
-    fn draw_glyphs(canvas: &mut Canvas<'_>, face: &Face, glyphs: impl IntoIterator<Item = Glyph>) {
+    fn draw_glyphs(
+        &self,
+        canvas: &mut Canvas<'_>,
+        face: &Face,
+        glyphs: impl IntoIterator<Item = Glyph>,
+    ) {
+        let mut shared = self.shared.borrow_mut();
+        let mut scaler = shared.scaler(&face.data);
         for glyph in glyphs {
-            canvas.draw(face, glyph.id, (glyph.x, glyph.y), (1.0, 1.0));
+            canvas.draw(&mut scaler, glyph.id, (glyph.x, glyph.y), (1.0, 1.0));
         }
     }
 
@@ -911,16 +963,13 @@ mod coretext_parity {
     /// `Font` takes its metrics from the main face only.
     #[test]
     fn main_face_metrics_match_coretext() {
-        let expected = CoreText::metrics(
-            &CoreText::new()
+        let (coretext, swash) = (CoreText::new(), Swash::new());
+        let expected = coretext.metrics(
+            &coretext
                 .installed_face(DEFAULT_FONT_FAMILY, PIXELS)
                 .unwrap(),
         );
-        let actual = Swash::metrics(
-            &Swash::new()
-                .installed_face(DEFAULT_FONT_FAMILY, PIXELS)
-                .unwrap(),
-        );
+        let actual = swash.metrics(&swash.installed_face(DEFAULT_FONT_FAMILY, PIXELS).unwrap());
         for (what, expected, actual) in [
             ("ascent", expected.ascent, actual.ascent),
             ("descent", expected.descent, actual.descent),
@@ -980,20 +1029,22 @@ mod coretext_parity {
                 Swash::advance(theirs, glyph),
             );
             let (expected, actual) = (
-                CoreText::glyph_ink(ours, glyph).unwrap(),
-                Swash::glyph_ink(theirs, glyph).unwrap(),
+                coretext.glyph_ink(ours, glyph).unwrap(),
+                swash.glyph_ink(theirs, glyph).unwrap(),
             );
             assert_close(&what("ink left"), expected.0, actual.0);
             assert_close(&what("ink right"), expected.1, actual.1);
             let text = character.to_string();
-            let expected = {
-                let canvas = coretext.canvas(&mut pixels, 64, 64).unwrap();
-                CoreText::line_ink(&canvas, &CoreText::line(ours, &text).unwrap())
-            };
-            let actual = {
-                let canvas = swash.canvas(&mut pixels, 64, 64).unwrap();
-                Swash::line_ink(&canvas, &Swash::line(theirs, &text).unwrap())
-            };
+            let expected = coretext
+                .with_canvas(&mut pixels, 64, 64, |canvas| {
+                    coretext.line_ink(canvas, &coretext.line(ours, &text).unwrap())
+                })
+                .unwrap();
+            let actual = swash
+                .with_canvas(&mut pixels, 64, 64, |canvas| {
+                    swash.line_ink(canvas, &swash.line(theirs, &text).unwrap())
+                })
+                .unwrap();
             for (name, expected, actual) in [
                 ("line ink x", expected.x, actual.x),
                 ("line ink y", expected.y, actual.y),
@@ -1028,23 +1079,24 @@ mod tests {
         swash.styled(&regular, style).unwrap()
     }
 
-    fn ink(face: &Face) -> (f64, f64) {
-        Swash::glyph_ink(face, Swash::glyph(face, BOLT).unwrap()).unwrap()
+    fn ink(swash: &Swash, face: &Face) -> (f64, f64) {
+        swash
+            .glyph_ink(face, Swash::glyph(face, BOLT).unwrap())
+            .unwrap()
     }
 
-    fn coverage(face: &Face) -> u32 {
+    fn coverage(swash: &Swash, face: &Face) -> u32 {
         let mut pixels = vec![0; 4 * 64 * 64];
-        let mut canvas = Canvas {
-            pixels: &mut pixels,
-            width: 64,
-            height: 64,
-        };
         let glyph = Glyph {
             id: Swash::glyph(face, BOLT).unwrap(),
             x: 16.0,
             y: 16.0,
         };
-        Swash::draw_glyphs(&mut canvas, face, [glyph]);
+        swash
+            .with_canvas(&mut pixels, 64, 64, |canvas| {
+                swash.draw_glyphs(canvas, face, [glyph]);
+            })
+            .unwrap();
         pixels
             .iter()
             .step_by(4)
@@ -1066,7 +1118,7 @@ mod tests {
             ),
         );
         assert!(bold.data.embolden > 0.0);
-        assert!(coverage(&bold) > coverage(&regular));
+        assert!(coverage(&swash, &bold) > coverage(&swash, &regular));
     }
 
     #[test]
@@ -1080,7 +1132,9 @@ mod tests {
             },
         );
         assert!(italic.data.skew);
-        assert!(ink(&italic).1 > ink(&symbols(&swash, FontStyle::default())).1 + 1.0);
+        assert!(
+            ink(&swash, &italic).1 > ink(&swash, &symbols(&swash, FontStyle::default())).1 + 1.0
+        );
     }
 
     #[test]
@@ -1113,8 +1167,8 @@ mod tests {
                 value: 1,
             }],
         );
-        face_for(&plain, "\u{03A9}").unwrap();
-        let fallback = face_for(&featured, "\u{03A9}").unwrap();
+        swash.face_for(&plain, "\u{03A9}").unwrap();
+        let fallback = swash.face_for(&featured, "\u{03A9}").unwrap();
         assert!(Rc::ptr_eq(&fallback.features, &featured.features));
     }
 
@@ -1123,8 +1177,8 @@ mod tests {
         let swash = Swash::new();
         let face = swash.embedded_face(SYMBOLS_FONT, PIXELS).unwrap();
         let (first, second) = (
-            face_for(&face, "\u{03A9}").unwrap(),
-            face_for(&face, "\u{03C8}").unwrap(),
+            swash.face_for(&face, "\u{03A9}").unwrap(),
+            swash.face_for(&face, "\u{03C8}").unwrap(),
         );
         assert!(first.same(&second));
     }
@@ -1133,10 +1187,9 @@ mod tests {
     fn dropping_the_backend_frees_its_fallback_fonts() {
         let swash = Swash::new();
         let face = swash.embedded_face(SYMBOLS_FONT, PIXELS).unwrap();
-        face_for(&face, "\u{03A9}").unwrap();
-        let shared = Rc::downgrade(&swash.shared);
+        let fallback = Rc::downgrade(&swash.face_for(&face, "\u{03A9}").unwrap().data);
         drop((face, swash));
-        assert!(shared.upgrade().is_none());
+        assert!(fallback.upgrade().is_none());
     }
 
     #[test]
@@ -1144,13 +1197,16 @@ mod tests {
         let swash = Swash::new();
         let face = swash.embedded_face(SYMBOLS_FONT, PIXELS).unwrap();
         let mut pixels = vec![0; 4 * 64 * 64];
-        let mut canvas = swash.canvas(&mut pixels, 64, 8).unwrap();
         let glyph = Glyph {
             id: Swash::glyph(&face, BOLT).unwrap(),
             x: 16.0,
             y: 0.0,
         };
-        Swash::draw_glyphs(&mut canvas, &face, [glyph]);
+        swash
+            .with_canvas(&mut pixels, 64, 8, |canvas| {
+                swash.draw_glyphs(canvas, &face, [glyph]);
+            })
+            .unwrap();
         assert!(pixels[4 * 64 * 8..].iter().all(|&byte| byte == 0));
     }
 
@@ -1162,18 +1218,18 @@ mod tests {
             return;
         };
         let glyph = Swash::glyph(&face, 'A').unwrap();
-        assert!(Swash::glyph_ink(&face, glyph).is_some());
+        assert!(swash.glyph_ink(&face, glyph).is_some());
         let mut pixels = vec![0; 4 * 32 * 32];
-        let mut canvas = swash.canvas(&mut pixels, 32, 32).unwrap();
-        Swash::draw_glyphs(
-            &mut canvas,
-            &face,
-            [Glyph {
-                id: glyph,
-                x: 8.0,
-                y: 8.0,
-            }],
-        );
+        let glyph = Glyph {
+            id: glyph,
+            x: 8.0,
+            y: 8.0,
+        };
+        swash
+            .with_canvas(&mut pixels, 32, 32, |canvas| {
+                swash.draw_glyphs(canvas, &face, [glyph]);
+            })
+            .unwrap();
         assert!(pixels.iter().any(|&byte| byte != 0));
     }
 
@@ -1181,8 +1237,44 @@ mod tests {
     fn an_emoji_no_font_colours_falls_back_to_a_monochrome_glyph() {
         let swash = Swash::new();
         let face = swash.embedded_face(SYMBOLS_FONT, PIXELS).unwrap();
-        let fallback = face_for(&face, "\u{2318}\u{FE0F}").unwrap();
+        let fallback = swash.face_for(&face, "\u{2318}\u{FE0F}").unwrap();
         assert!(Swash::glyph(&fallback, '\u{2318}').is_some());
+    }
+
+    /// Apple Color Emoji and Noto Color Emoji's CBDT build are bitmaps; tests that need one skip
+    /// without it.
+    #[test]
+    fn a_new_colour_bitmap_emoji_renders_once() {
+        let swash = Swash::new();
+        let face = swash.embedded_face(SYMBOLS_FONT, PIXELS).unwrap();
+        let line = swash.line(&face, "\u{1F600}").unwrap();
+        let rendered = || {
+            let shared = swash.shared.borrow();
+            let (_, image) = shared.last_color_bitmap.0.as_ref()?;
+            Some(image.data.as_ptr())
+        };
+        let checked = rendered();
+        if checked.is_none() {
+            return;
+        }
+        let mut pixels = vec![0; 4 * 64 * 64];
+        swash
+            .with_canvas(&mut pixels, 64, 64, |canvas| {
+                swash.line_ink(canvas, &line);
+                assert_eq!(rendered(), checked, "measuring rendered it again");
+                swash.draw_line(
+                    canvas,
+                    &line,
+                    Placement {
+                        offset: (16.0, 16.0),
+                        scale: (1.0, 1.0),
+                        origin: (0.0, 0.0),
+                    },
+                );
+            })
+            .unwrap();
+        assert_eq!(rendered(), checked, "drawing rendered it again");
+        assert!(pixels.iter().any(|&byte| byte != 0));
     }
 
     #[test]

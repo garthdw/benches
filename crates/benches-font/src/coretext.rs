@@ -1,4 +1,3 @@
-use std::marker::PhantomData;
 use std::ptr::NonNull;
 
 use anyhow::{Context, Result};
@@ -23,15 +22,9 @@ pub(crate) struct CoreText {
     color_space: Option<CFRetained<CGColorSpace>>,
 }
 
-/// A bitmap context drawing into the buffer it borrows.
-pub(crate) struct Canvas<'a> {
+/// A bitmap context drawing into the buffer `with_canvas` lends it.
+pub(crate) struct Canvas {
     context: CFRetained<CGContext>,
-    pixels: PhantomData<&'a mut [u8]>,
-}
-
-/// Keeps the pixels borrowed until the context is released, not just until the canvas's last use.
-impl Drop for Canvas<'_> {
-    fn drop(&mut self) {}
 }
 
 fn face(name: &str, pixels: f64) -> CFRetained<CTFont> {
@@ -51,7 +44,7 @@ fn feature_dictionary(feature: FontFeature) -> CFRetained<CFDictionary<CFString,
 impl Backend for CoreText {
     type Face = CFRetained<CTFont>;
     type Line = CFRetained<CTLine>;
-    type Canvas<'a> = Canvas<'a>;
+    type Canvas<'a> = Canvas;
 
     fn new() -> Self {
         Self {
@@ -149,7 +142,7 @@ impl Backend for CoreText {
         }
     }
 
-    fn metrics(face: &Self::Face) -> FaceMetrics {
+    fn metrics(&self, face: &Self::Face) -> FaceMetrics {
         // SAFETY: plain metric getters on a live font.
         unsafe {
             FaceMetrics {
@@ -164,8 +157,8 @@ impl Backend for CoreText {
         }
     }
 
-    fn shape(face: &Self::Face, text: &str) -> Option<Vec<Glyph>> {
-        let line = Self::line(face, text)?;
+    fn shape(&self, face: &Self::Face, text: &str) -> Option<Vec<Glyph>> {
+        let line = self.line(face, text)?;
         // SAFETY: a plain getter on a live line.
         let runs = unsafe { line.glyph_runs() };
         // SAFETY: a line's glyph runs are `CTRun`s.
@@ -200,7 +193,7 @@ impl Backend for CoreText {
         Some(shaped)
     }
 
-    fn glyph_ink(face: &Self::Face, glyph: u16) -> InkExtent {
+    fn glyph_ink(&self, face: &Self::Face, glyph: u16) -> InkExtent {
         let mut glyph = glyph;
         let mut rect = CGRect::ZERO;
         // SAFETY: one glyph and one rect, matching the count of 1.
@@ -215,7 +208,7 @@ impl Backend for CoreText {
         (rect.size.width > 0.0).then_some((rect.origin.x, rect.origin.x + rect.size.width))
     }
 
-    fn line(face: &Self::Face, text: &str) -> Option<Self::Line> {
+    fn line(&self, face: &Self::Face, text: &str) -> Option<Self::Line> {
         // SAFETY: the extern statics are immutable CoreFoundation constants.
         let (font_key, color_key, enabled) = unsafe {
             (
@@ -250,12 +243,18 @@ impl Backend for CoreText {
         }
     }
 
-    fn canvas<'a>(&self, out: &'a mut [u8], width: u32, height: u32) -> Option<Canvas<'a>> {
+    fn with_canvas<R>(
+        &self,
+        out: &mut [u8],
+        width: u32,
+        height: u32,
+        draw: impl FnOnce(&mut Canvas) -> R,
+    ) -> Option<R> {
         if out.len() < width as usize * height as usize * 4 {
             return None;
         }
-        // SAFETY: `out` holds that many bytes, and the canvas borrows it for as long as the
-        // context lives.
+        // SAFETY: `out` holds that many bytes, and outlives the context, which only the canvas
+        // holds and which is released before this returns.
         let context = unsafe {
             CGBitmapContextCreate(
                 out.as_mut_ptr().cast(),
@@ -270,13 +269,10 @@ impl Backend for CoreText {
         // LCD smoothing would give coverage glyphs unequal channels and read as colour.
         CGContext::set_should_smooth_fonts(Some(&context), false);
         CGContext::set_rgb_fill_color(Some(&context), 1.0, 1.0, 1.0, 1.0);
-        Some(Canvas {
-            context,
-            pixels: PhantomData,
-        })
+        Some(draw(&mut Canvas { context }))
     }
 
-    fn line_ink(canvas: &Canvas<'_>, line: &Self::Line) -> Bounds {
+    fn line_ink(&self, canvas: &Canvas, line: &Self::Line) -> Bounds {
         // SAFETY: `line` and the context are live.
         let ink = unsafe { line.image_bounds(Some(&canvas.context)) };
         Bounds {
@@ -289,18 +285,19 @@ impl Backend for CoreText {
 
     /// Applies the placement as three CTM steps, in its order, since folding them into one matrix
     /// rounds differently.
-    fn draw_line(canvas: &mut Canvas<'_>, line: &Self::Line, placement: Placement) {
+    fn draw_line(&self, canvas: &mut Canvas, line: &Self::Line, placement: Placement) {
         let context = Some(&*canvas.context);
         CGContext::translate_ctm(context, placement.offset.0, placement.offset.1);
         CGContext::scale_ctm(context, placement.scale.0, placement.scale.1);
         CGContext::translate_ctm(context, -placement.origin.0, -placement.origin.1);
         CGContext::set_text_position(context, 0.0, 0.0);
-        // SAFETY: `line` and the context are live, and the canvas borrows the pixels.
+        // SAFETY: `line` and the context are live, and `with_canvas` keeps the pixels borrowed.
         unsafe { line.draw(&canvas.context) };
     }
 
     fn draw_glyphs(
-        canvas: &mut Canvas<'_>,
+        &self,
+        canvas: &mut Canvas,
         face: &Self::Face,
         glyphs: impl IntoIterator<Item = Glyph>,
     ) {

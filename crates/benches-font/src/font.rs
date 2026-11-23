@@ -133,22 +133,30 @@ trait Backend {
     /// The face's own glyph for `character`, without fallback.
     fn glyph(face: &Self::Face, character: char) -> Option<u16>;
     fn advance(face: &Self::Face, glyph: u16) -> f64;
-    fn metrics(face: &Self::Face) -> FaceMetrics;
+    fn metrics(&self, face: &Self::Face) -> FaceMetrics;
 
     /// The glyphs of `text` as `line` shapes it. Only glyphs from the face itself draw correctly
     /// through `draw_glyphs`, so callers shape only characters the face has.
-    fn shape(face: &Self::Face, text: &str) -> Option<Vec<Glyph>>;
-    fn glyph_ink(face: &Self::Face, glyph: u16) -> InkExtent;
-    fn line(face: &Self::Face, text: &str) -> Option<Self::Line>;
+    fn shape(&self, face: &Self::Face, text: &str) -> Option<Vec<Glyph>>;
+    fn glyph_ink(&self, face: &Self::Face, glyph: u16) -> InkExtent;
+    fn line(&self, face: &Self::Face, text: &str) -> Option<Self::Line>;
     fn line_width(line: &Self::Line) -> f64;
 
-    /// A canvas drawing over `out`, which callers clear first, or `None` if `out` is smaller than `width` by `height` pixels.
-    fn canvas<'a>(&self, out: &'a mut [u8], width: u32, height: u32) -> Option<Self::Canvas<'a>>;
+    /// `draw`'s result on a canvas drawing over `out`, which callers clear first, or `None` if
+    /// `out` is smaller than `width` by `height` pixels.
+    fn with_canvas<R>(
+        &self,
+        out: &mut [u8],
+        width: u32,
+        height: u32,
+        draw: impl FnOnce(&mut Self::Canvas<'_>) -> R,
+    ) -> Option<R>;
     /// The line's ink, with `y` measured up from its baseline.
-    fn line_ink(canvas: &Self::Canvas<'_>, line: &Self::Line) -> Bounds;
-    fn draw_line(canvas: &mut Self::Canvas<'_>, line: &Self::Line, placement: Placement);
+    fn line_ink(&self, canvas: &Self::Canvas<'_>, line: &Self::Line) -> Bounds;
+    fn draw_line(&self, canvas: &mut Self::Canvas<'_>, line: &Self::Line, placement: Placement);
     /// Each glyph at its origin, in pixels up from the bottom of the canvas.
     fn draw_glyphs(
+        &self,
         canvas: &mut Self::Canvas<'_>,
         face: &Self::Face,
         glyphs: impl IntoIterator<Item = Glyph>,
@@ -357,7 +365,7 @@ impl Font {
             underline_thickness,
             x_height,
             cap_height,
-        } = Os::metrics(regular);
+        } = backend.metrics(regular);
         // Cell and icon metrics follow Ghostty's `Metrics.calc` in `src/font/Metrics.zig`
         // (MIT, © Mitchell Hashimoto, Ghostty contributors).
         let face_height = ascent + descent + leading;
@@ -435,17 +443,17 @@ impl Font {
         {
             return Some(GlyphKind::Coverage);
         }
-        let line = Os::line(font, text)?;
-        {
-            let mut canvas = self.backend.canvas(out, width, self.cell_height)?;
-            let placement = single
-                .and_then(Constraint::of)
-                .and_then(|constraint| {
-                    self.constrained(constraint, Os::line_ink(&canvas, &line), cells)
-                })
-                .unwrap_or_else(|| self.centred(Os::line_width(&line), width));
-            Os::draw_line(&mut canvas, &line, placement);
-        }
+        let line = self.backend.line(font, text)?;
+        self.backend
+            .with_canvas(out, width, self.cell_height, |canvas| {
+                let placement = single
+                    .and_then(Constraint::of)
+                    .and_then(|constraint| {
+                        self.constrained(constraint, self.backend.line_ink(canvas, &line), cells)
+                    })
+                    .unwrap_or_else(|| self.centred(Os::line_width(&line), width));
+                self.backend.draw_line(canvas, &line, placement);
+            })?;
         Some(glyph_kind(out))
     }
 
@@ -519,7 +527,10 @@ impl Font {
             .borrow_mut()
             .entry((face, character))
             .or_insert_with(|| {
-                match Os::shape(&self.faces[face], character.encode_utf8(&mut [0; 4]))?[..] {
+                match self
+                    .backend
+                    .shape(&self.faces[face], character.encode_utf8(&mut [0; 4]))?[..]
+                {
                     [glyph] => Some(glyph.id),
                     _ => None,
                 }
@@ -531,7 +542,7 @@ impl Font {
             .ink
             .borrow_mut()
             .entry((face, glyph))
-            .or_insert_with(|| Os::glyph_ink(&self.faces[face], glyph))
+            .or_insert_with(|| self.backend.glyph_ink(&self.faces[face], glyph))
     }
 
     /// The glyphs of `shaped` placed in the cell grid, each with its ink's horizontal extent.
@@ -592,7 +603,7 @@ impl Font {
     fn shape_run(&self, run: &str, face: usize) -> ShapedRun {
         let length = run.chars().count();
         let text: Rc<str> = run.into();
-        let Some(shaped) = Os::shape(&self.faces[face], run) else {
+        let Some(shaped) = self.backend.shape(&self.faces[face], run) else {
             return ShapedRun {
                 text,
                 signatures: vec![0; length].into(),
@@ -653,18 +664,18 @@ impl Font {
     ) -> Option<GlyphKind> {
         let face = Self::face_index(style);
         let font = &self.faces[face];
-        let placed = self.placed(face, &Os::shape(font, run)?);
+        let placed = self.placed(face, &self.backend.shape(font, run)?);
         out.clear();
         out.resize((self.cell_width * self.cell_height * 4) as usize, 0);
-        let mut canvas = self
-            .backend
-            .canvas(out, self.cell_width, self.cell_height)?;
         let origin = index as f64 * f64::from(self.cell_width);
         let glyphs = self.painting(&placed, index).map(|placed| Glyph {
             x: placed.glyph.x - origin,
             ..placed.glyph
         });
-        Os::draw_glyphs(&mut canvas, font, glyphs);
+        self.backend
+            .with_canvas(out, self.cell_width, self.cell_height, |canvas| {
+                self.backend.draw_glyphs(canvas, font, glyphs);
+            })?;
         Some(GlyphKind::Coverage)
     }
 
@@ -770,7 +781,7 @@ mod tests {
     }
 
     fn icon_height_single(font: &Font) -> f64 {
-        let metrics = Os::metrics(&font.faces[0]);
+        let metrics = font.backend.metrics(&font.faces[0]);
         (2.0 * metrics.cap_height + metrics.ascent + metrics.descent + metrics.leading) / 3.0
     }
 
