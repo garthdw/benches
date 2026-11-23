@@ -442,6 +442,16 @@ impl Swash {
     }
 }
 
+/// The system's emoji fonts, in its order of preference.
+fn emoji_families(shared: &mut Shared) -> Vec<FamilyId> {
+    let mut families: Vec<FamilyId> = shared
+        .collection
+        .fallback_families(FallbackKey::from(Script::from_bytes(*b"Zsye")))
+        .collect();
+    families.extend(shared.collection.generic_families(GenericFamily::Emoji));
+    families
+}
+
 /// The first family to draw `cluster` in `data`'s style, in colour if `colour`: an emoji font for
 /// emoji, then the system's fallback for the cluster's script, then the generic families, then
 /// any family. Its font is left in `shared.fonts`.
@@ -451,15 +461,11 @@ fn fallback_family(
     cluster: &str,
     colour: bool,
 ) -> Option<FamilyId> {
-    let mut candidates = Vec::new();
-    if colour {
-        candidates.extend(
-            shared
-                .collection
-                .fallback_families(FallbackKey::from(Script::from_bytes(*b"Zsye"))),
-        );
-        candidates.extend(shared.collection.generic_families(GenericFamily::Emoji));
-    }
+    let mut candidates = if colour {
+        emoji_families(shared)
+    } else {
+        Vec::new()
+    };
     if let Some(script) = script(cluster) {
         candidates.extend(
             shared
@@ -549,6 +555,12 @@ impl Canvas<'_> {
                 }
             }
         }
+    }
+
+    fn blit_rgba(&mut self, size: (u32, u32), at: (i32, i32), rgba: &[u8]) {
+        self.blit(size, at, |index| {
+            std::array::from_fn(|channel| rgba.get(index * 4 + channel).copied().unwrap_or(0))
+        });
     }
 
     /// Composites premultiplied RGBA `width` by `height` stretched by `scale`, with its top-left
@@ -643,11 +655,7 @@ impl Canvas<'_> {
                     });
                 } else {
                     // swash composites colour outline layers premultiplied.
-                    self.blit(size, at, |index| {
-                        std::array::from_fn(|channel| {
-                            pixels.get(index * 4 + channel).copied().unwrap_or(0)
-                        })
-                    });
+                    self.blit_rgba(size, at, pixels);
                 }
             }
         }
