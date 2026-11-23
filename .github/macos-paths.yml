@@ -3,6 +3,7 @@
 # is missing, or a listed path doesn't exist.
 macos:
   # The macOS backends, the files that pick them by cfg, and the modules the backends use.
+  - crates/benches-core/src/actor.rs
   - crates/benches-font/src/constraint.rs
   - crates/benches-font/src/coretext.rs
   - crates/benches-font/src/font.rs
