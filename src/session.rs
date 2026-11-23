@@ -1436,36 +1436,48 @@ mod tests {
         assert_eq!(alive, Err(Errno::ESRCH));
     }
 
-    fn pgrep(pattern: &str) -> bool {
+    /// Whether a process runs exactly `command`, not just a shell with it in its arguments.
+    fn pgrep(command: &str) -> bool {
         Command::new("pgrep")
-            .args(["-f", pattern])
+            .args(["-fx", command])
             .output()
             .map(|output| !output.stdout.is_empty())
             .unwrap()
     }
 
+    /// A `sleep` that no other test process runs, as another worktree's tests may run alongside.
+    fn unique_sleep(seconds: u32) -> String {
+        format!("sleep {seconds}.{}", std::process::id())
+    }
+
+    /// Waits until a process running exactly `command` is `running` or not. A killed process can
+    /// still be listed for a moment after the signal is sent.
+    fn wait_for_process(command: &str, running: bool) {
+        wait_until(
+            Duration::from_secs(15),
+            || {
+                let state = if running { "never started" } else { "survived" };
+                format!("“{command}” {state}")
+            },
+            || (pgrep(command) == running).then_some(()),
+        );
+    }
+
     #[test]
     fn a_dropped_session_takes_its_command_with_it() {
+        let sleep = unique_sleep(4243);
         let session = Session::spawn(
-            Some("sleep 4243"),
+            Some(&sleep),
             Path::new("/tmp"),
             &default_config(),
             Arc::new(|| {}),
         )
         .unwrap();
-        wait_until(
-            Duration::from_secs(15),
-            || "sleep never started".to_owned(),
-            || pgrep("sleep 4243").then_some(()),
-        );
+        wait_for_process(&sleep, true);
         let finished = session.finished();
         drop(session);
         assert!(finished.recv_timeout(Duration::from_secs(5)).is_err());
-        let survivors = Command::new("pgrep")
-            .args(["-f", "sleep 4243"])
-            .output()
-            .unwrap();
-        assert_eq!(String::from_utf8_lossy(&survivors.stdout), "");
+        wait_for_process(&sleep, false);
     }
 
     #[test]
@@ -1479,16 +1491,13 @@ mod tests {
             shell: bash,
             ..default_config()
         });
-        type_line(&session, "sleep 4242 & echo started");
+        let sleep = unique_sleep(4242);
+        type_line(&session, &format!("{sleep} & echo started"));
         wait_for_line(&session, "started");
         let finished = session.finished();
         drop(session);
         assert!(finished.recv_timeout(Duration::from_secs(5)).is_err());
-        let survivors = Command::new("pgrep")
-            .args(["-f", "sleep 4242"])
-            .output()
-            .unwrap();
-        assert_eq!(String::from_utf8_lossy(&survivors.stdout), "");
+        wait_for_process(&sleep, false);
     }
 
     #[test]
@@ -1540,7 +1549,8 @@ mod tests {
     #[test]
     fn ctrl_c_interrupts_the_foreground_process() {
         let session = spawn_shell();
-        type_line(&session, "echo started; sleep 4343 && echo slept");
+        let sleep = unique_sleep(4343);
+        type_line(&session, &format!("echo started; {sleep} && echo slept"));
         wait_for_line(&session, "started");
         wait_for_busy(&session, true);
         let ctrl_c = crate::input::map_text(
@@ -1552,7 +1562,7 @@ mod tests {
             Some(rune::PhysicalKeyCode::KeyC),
             Some('c'),
         );
-        let sleeping = || pgrep("sleep 4343");
+        let sleeping = || pgrep(&sleep);
         // `sleep` holds the terminal before it resets its signal handling, so an early ^C is lost.
         // Resend only after the previous one has had time to take effect.
         wait_until(
