@@ -1,4 +1,5 @@
 use std::cell::{Cell, RefCell};
+use std::io;
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::path::PathBuf;
 use std::process::Child;
@@ -860,6 +861,28 @@ fn signal_group(group: Pid, signal: Signal) {
     }
 }
 
+/// SIGKILLs every process in `group`. The caller must not have reaped the group's leader yet, as
+/// a reaped leader's group id can be reused by a new, unrelated group.
+///
+/// macOS's `killpg` can miss a process the group is forking as it runs, so there it repeats until
+/// only zombies are left, which macOS refuses to signal. Linux's `fork` fails in a process that a
+/// group kill has reached, and Linux signals zombies, so there one SIGKILL is enough.
+pub fn kill_group(group: Pid) -> io::Result<()> {
+    let deadline = Instant::now() + Duration::from_secs(1);
+    loop {
+        match killpg(group, Signal::SIGKILL) {
+            Err(Errno::ESRCH | Errno::EPERM) => return Ok(()),
+            Err(error) => return Err(error.into()),
+            Ok(()) if !cfg!(target_os = "macos") => return Ok(()),
+            Ok(()) if Instant::now() > deadline => {
+                return Err(io::Error::other("a process outlived SIGKILL"));
+            }
+            // Killed processes take a moment to become zombies.
+            Ok(()) => thread::sleep(Duration::from_millis(1)),
+        }
+    }
+}
+
 /// Call before reaping `Child`, which frees its pid for reuse.
 pub(crate) fn forget(pid: &Mutex<Option<i32>>) {
     *pid.lock().unwrap_or_else(PoisonError::into_inner) = None;
@@ -885,9 +908,35 @@ pub fn terminate(child: &mut Child, pid: &Mutex<Option<i32>>) {
 
 #[cfg(test)]
 mod tests {
+    use std::os::unix::process::CommandExt;
+    use std::process::Command;
+
     use super::*;
     use crate::grid::Metrics;
     use crate::test_support::TEST_SURFACE;
+
+    #[test]
+    fn killing_a_group_leaves_its_exited_leader_to_be_reaped() {
+        let mut child = Command::new("/bin/sh")
+            .args(["-c", "exit 3"])
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        // SAFETY: zeroes are a valid `siginfo_t`.
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        // SAFETY: `waitid` writes one `siginfo_t`, and `WNOWAIT` leaves the child unreaped.
+        let waited = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                child.id(),
+                &mut info,
+                libc::WEXITED | libc::WNOWAIT,
+            )
+        };
+        assert_eq!(waited, 0);
+        kill_group(Pid::from_raw(child.id() as i32)).unwrap();
+        assert_eq!(child.wait().unwrap().code(), Some(3));
+    }
 
     fn idle_publisher(now: Instant) -> Publisher {
         Publisher {
