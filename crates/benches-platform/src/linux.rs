@@ -2,17 +2,19 @@ use std::collections::HashMap;
 use std::io::{self, IsTerminal};
 use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
-use std::pin::pin;
+use std::pin::{Pin, pin};
 use std::process::Command;
 use std::sync::OnceLock;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use async_channel::{Receiver, Sender};
 use async_io::Timer;
 use futures_util::StreamExt;
 use futures_util::future::{self, Either};
+use futures_util::stream::Fuse;
+use zbus::proxy::{OwnerChangedStream, SignalStream};
 use zbus::zvariant::Value;
-use zbus::{Connection, Proxy};
+use zbus::{Connection, Proxy, connection};
 
 use crate::dirs::{self, Env};
 use crate::notify::Notification;
@@ -47,14 +49,24 @@ fn data_dirs(env: Env) -> Vec<PathBuf> {
         .collect()
 }
 
-/// Covers connecting, D-Bus activation of the service and the call itself.
-const RPC_TIMEOUT: Duration = Duration::from_secs(10);
+/// Covers connecting, D-Bus activation of the service and the call itself. Tests wait it out, so
+/// theirs is shorter, though long enough to connect on a busy machine.
+const RPC_TIMEOUT: Duration = if cfg!(test) {
+    Duration::from_secs(2)
+} else {
+    Duration::from_secs(10)
+};
 
 pub fn open(link: &Link) -> io::Result<()> {
     match link {
         Link::Url(url) => crate::run(xdg_open(url)),
-        Link::File(path) => show_in_file_manager(path)
-            .or_else(|_| crate::run(xdg_open(path.parent().unwrap_or(path)))),
+        Link::File(path) => show_in_file_manager(path).or_else(|error| {
+            eprintln!(
+                "benches: show {} in the file manager: {error}; opening its folder",
+                path.display()
+            );
+            crate::run(xdg_open(path.parent().unwrap_or(path)))
+        }),
     }
 }
 
@@ -64,8 +76,16 @@ fn xdg_open(target: impl AsRef<std::ffi::OsStr>) -> Command {
     command
 }
 
+/// Fails with `TimedOut` unless `call` finishes within `RPC_TIMEOUT`.
+async fn timeout<T>(call: impl Future<Output = zbus::Result<T>>) -> io::Result<T> {
+    match future::select(pin!(call), Timer::after(RPC_TIMEOUT)).await {
+        Either::Left((result, _)) => result.map_err(io::Error::other),
+        Either::Right(_) => Err(io::ErrorKind::TimedOut.into()),
+    }
+}
+
 fn show_in_file_manager(path: &Path) -> io::Result<()> {
-    let call = async {
+    async_io::block_on(timeout(async {
         let connection = Connection::session().await?;
         let manager = Proxy::new(
             &connection,
@@ -77,11 +97,7 @@ fn show_in_file_manager(path: &Path) -> io::Result<()> {
         manager
             .call::<_, _, ()>("ShowItems", &(vec![file_uri(path)], ""))
             .await
-    };
-    match async_io::block_on(future::select(pin!(call), Timer::after(RPC_TIMEOUT))) {
-        Either::Left((shown, _)) => shown.map_err(io::Error::other),
-        Either::Right(_) => Err(io::ErrorKind::TimedOut.into()),
-    }
+    }))
 }
 
 fn file_uri(path: &Path) -> String {
@@ -181,89 +197,201 @@ pub fn set_secure_input(_enabled: bool) -> io::Result<()> {
     Err(io::ErrorKind::Unsupported.into())
 }
 
-/// Set once the notification thread is running; it drops the receiver if it gives up.
+/// Set once the notification thread is running.
 static POSTS: OnceLock<Sender<(u64, Notification)>> = OnceLock::new();
 
 pub fn start_notifications(on_click: impl Fn(Option<u64>) + Send + 'static) {
-    let (posts, queued) = async_channel::unbounded();
-    let worker = std::thread::Builder::new()
-        .name("benches-notifications".into())
-        .spawn(move || {
-            if let Err(error) = async_io::block_on(serve_notifications(queued, on_click)) {
-                eprintln!("benches: notifications: {error}");
+    match spawn_notifications(connection::Builder::session, on_click) {
+        Ok(posts) => {
+            if POSTS.set(posts).is_err() {
+                eprintln!("benches: notifications were already started");
             }
-        });
-    if let Err(error) = worker {
-        eprintln!("benches: start notifications: {error}");
-        return;
+        }
+        Err(error) => eprintln!("benches: start notifications: {error}"),
     }
-    if POSTS.set(posts).is_err() {
-        eprintln!("benches: notifications were already started");
-    }
+}
+
+/// Starts the notification thread on the bus that `bus` connects to, returning where to post.
+fn spawn_notifications(
+    bus: impl Fn() -> zbus::Result<connection::Builder<'static>> + Send + 'static,
+    on_click: impl Fn(Option<u64>) + Send + 'static,
+) -> io::Result<Sender<(u64, Notification)>> {
+    let (posts, queued) = async_channel::unbounded();
+    std::thread::Builder::new()
+        .name("benches-notifications".into())
+        .spawn(move || async_io::block_on(serve_notifications(bus, queued, on_click)))?;
+    Ok(posts)
 }
 
 pub fn post_notification(session: u64, notification: &Notification) {
     if let Some(posts) = POSTS.get() {
-        // Fails only once the notification thread has given up, which it logged.
+        // Fails only if the notification thread has died, which a panic message reports.
         posts.try_send((session, notification.clone())).ok();
     }
 }
 
 /// Posts what arrives on `queued`, replacing each session's last notification, and reports
-/// clicks on them. Notifications belonging to other apps are ignored.
+/// clicks on them. Notifications belonging to other apps are ignored. It connects when a post
+/// arrives and it has no connection, so it outlives restarts of the bus and the server.
 async fn serve_notifications(
+    bus: impl Fn() -> zbus::Result<connection::Builder<'static>>,
     queued: Receiver<(u64, Notification)>,
     on_click: impl Fn(Option<u64>),
-) -> zbus::Result<()> {
-    let connection = Connection::session().await?;
-    let server = Proxy::new(
-        &connection,
-        "org.freedesktop.Notifications",
-        "/org/freedesktop/Notifications",
-        "org.freedesktop.Notifications",
-    )
-    .await?;
-    // Subscribed before posting, so no click is missed.
-    let mut clicks = server.receive_signal("ActionInvoked").await?;
-    let mut closes = server.receive_signal("NotificationClosed").await?;
-    let capabilities: Vec<String> = server.call("GetCapabilities", &()).await?;
-    let markup = capabilities
-        .iter()
-        .any(|capability| capability == "body-markup");
-    let hints = HashMap::from([("sound-name", Value::from("message-new-instant"))]);
-    // The server's id for each session's notification, which a new one replaces.
-    let mut shown: HashMap<u64, u32> = HashMap::new();
+) {
     let mut queued = pin!(queued);
-    loop {
-        futures_util::select! {
-            (session, notification) = queued.select_next_some() => {
-                let replaces = shown.get(&session).copied().unwrap_or(0);
-                let posted = server
-                    .call::<_, _, u32>(
-                        "Notify",
-                        &notify_args(replaces, content(&notification, markup), &hints),
-                    )
-                    .await;
-                match posted {
-                    Ok(id) => {
-                        shown.insert(session, id);
+    let mut backoff = Backoff::default();
+    let mut post = queued.next().await;
+    // Without a server, or while backing off, the post is dropped.
+    while let Some((session, notification)) = post.take() {
+        if backoff.ready(Instant::now()) {
+            match Server::connect(&bus).await {
+                Ok(mut server) => {
+                    backoff = Backoff::default();
+                    server.post(session, &notification).await;
+                    post = server.serve(&mut queued, &on_click).await;
+                }
+                Err(error) => {
+                    eprintln!("benches: connect to the notification server: {error}");
+                    backoff.failed(Instant::now());
+                }
+            }
+        }
+        if post.is_none() {
+            post = queued.next().await;
+        }
+    }
+}
+
+/// The notification server, over one connection to the bus.
+struct Server {
+    proxy: Proxy<'static>,
+    clicks: SignalStream<'static>,
+    closes: SignalStream<'static>,
+    owners: Fuse<OwnerChangedStream<'static>>,
+    markup: bool,
+    hints: Hints<'static>,
+    /// The server's id for each session's notification, which a new one replaces.
+    shown: HashMap<u64, u32>,
+}
+
+impl Server {
+    async fn connect(
+        bus: impl Fn() -> zbus::Result<connection::Builder<'static>>,
+    ) -> io::Result<Self> {
+        timeout(async {
+            let connection = bus()?.build().await?;
+            let proxy = Proxy::new(
+                &connection,
+                "org.freedesktop.Notifications",
+                "/org/freedesktop/Notifications",
+                "org.freedesktop.Notifications",
+            )
+            .await?;
+            // Subscribed before posting, so no click is missed.
+            let clicks = proxy.receive_signal("ActionInvoked").await?;
+            let closes = proxy.receive_signal("NotificationClosed").await?;
+            let capabilities: Vec<String> = proxy.call("GetCapabilities", &()).await?;
+            // After `GetCapabilities`, which may start the server.
+            let owners = proxy.receive_owner_changed().await?.fuse();
+            Ok(Self {
+                markup: capabilities
+                    .iter()
+                    .any(|capability| capability == "body-markup"),
+                proxy,
+                clicks,
+                closes,
+                owners,
+                hints: Hints::from([("sound-name", Value::from("message-new-instant"))]),
+                shown: HashMap::new(),
+            })
+        })
+        .await
+    }
+
+    /// Posts and reports clicks until the connection closes, another server takes over, or the
+    /// posts stop. Returns a post that found the connection closed, for the next one.
+    async fn serve(
+        &mut self,
+        queued: &mut Pin<&mut Receiver<(u64, Notification)>>,
+        on_click: &impl Fn(Option<u64>),
+    ) -> Option<(u64, Notification)> {
+        loop {
+            // Server changes and signals first, so a post never goes out with stale ids, and a
+            // click before the close that usually follows it.
+            futures_util::select_biased! {
+                // A new server numbers its notifications afresh, so `shown` would be wrong.
+                _ = self.owners.next() => return None,
+                message = self.clicks.next() => match message {
+                    Some(message) => {
+                        if let Ok((id, _action)) = message.body().deserialize::<(u32, String)>()
+                            && let Some((&session, _)) =
+                                self.shown.iter().find(|(_, shown)| **shown == id)
+                        {
+                            on_click(Some(session));
+                        }
                     }
-                    Err(error) => eprintln!("benches: post notification: {error}"),
-                }
+                    None => return None,
+                },
+                message = self.closes.next() => match message {
+                    Some(message) => {
+                        if let Ok((id, _reason)) = message.body().deserialize::<(u32, u32)>() {
+                            self.shown.retain(|_, shown| *shown != id);
+                        }
+                    }
+                    None => return None,
+                },
+                post = queued.next() => match post {
+                    Some(post) if self.proxy.connection().is_closed() => return Some(post),
+                    Some((session, notification)) => self.post(session, &notification).await,
+                    None => return None,
+                },
             }
-            message = clicks.select_next_some() => {
-                if let Ok((id, _action)) = message.body().deserialize::<(u32, String)>()
-                    && let Some((&session, _)) = shown.iter().find(|(_, shown)| **shown == id)
-                {
-                    on_click(Some(session));
-                }
+        }
+    }
+
+    /// A server that never answers drops this post rather than holding up the next.
+    async fn post(&mut self, session: u64, notification: &Notification) {
+        let replaces = self.shown.get(&session).copied().unwrap_or(0);
+        let posted = timeout(self.proxy.call::<_, _, u32>(
+            "Notify",
+            &notify_args(replaces, content(notification, self.markup), &self.hints),
+        ))
+        .await;
+        match posted {
+            Ok(id) => {
+                self.shown.insert(session, id);
             }
-            message = closes.select_next_some() => {
-                if let Ok((id, _reason)) = message.body().deserialize::<(u32, u32)>() {
-                    shown.retain(|_, shown| *shown != id);
-                }
-            }
-            complete => return Ok(()),
+            Err(error) => eprintln!("benches: post notification: {error}"),
+        }
+    }
+}
+
+/// Spaces out attempts to connect while they fail, so posts to an unreachable server don't
+/// each wait out `RPC_TIMEOUT`.
+struct Backoff {
+    delay: Duration,
+    next_attempt: Option<Instant>,
+}
+
+impl Backoff {
+    const FIRST: Duration = Duration::from_secs(1);
+    const LONGEST: Duration = Duration::from_secs(60);
+
+    fn ready(&self, now: Instant) -> bool {
+        self.next_attempt.is_none_or(|next| now >= next)
+    }
+
+    fn failed(&mut self, now: Instant) {
+        self.next_attempt = Some(now + self.delay);
+        self.delay = (self.delay * 2).min(Self::LONGEST);
+    }
+}
+
+impl Default for Backoff {
+    fn default() -> Self {
+        Self {
+            delay: Self::FIRST,
+            next_attempt: None,
         }
     }
 }
@@ -418,5 +546,283 @@ mod tests {
             content(&notification("<built>"), true),
             ("Done".into(), "a&amp;b\n&lt;built&gt;".into())
         );
+    }
+
+    #[test]
+    fn failed_connections_wait_longer_each_time_up_to_a_minute() {
+        let start = Instant::now();
+        let mut backoff = Backoff::default();
+        assert!(backoff.ready(start));
+        backoff.failed(start);
+        assert!(!backoff.ready(start + Duration::from_millis(999)));
+        assert!(backoff.ready(start + Duration::from_secs(1)));
+        backoff.failed(start);
+        assert!(!backoff.ready(start + Duration::from_millis(1999)));
+        for _ in 0..10 {
+            backoff.failed(start);
+        }
+        assert!(backoff.ready(start + Duration::from_secs(60)));
+    }
+
+    /// A bus at `socket`, as `spawn_notifications` takes it.
+    fn bus_at(
+        socket: &Path,
+    ) -> impl Fn() -> zbus::Result<connection::Builder<'static>> + Send + 'static {
+        let address = format!("unix:path={}", socket.display());
+        move || connection::Builder::address(address.as_str())
+    }
+
+    #[test]
+    fn connecting_to_a_bus_that_never_answers_times_out() {
+        let dir = tempfile::tempdir().expect("a temporary folder");
+        let socket = dir.path().join("bus");
+        let _listener = std::os::unix::net::UnixListener::bind(&socket).expect("binds");
+        let connected = async_io::block_on(Server::connect(bus_at(&socket)));
+        assert_eq!(
+            connected.err().map(|error| error.kind()),
+            Some(io::ErrorKind::TimedOut)
+        );
+    }
+
+    /// D-Bus tests run against private `dbus-daemon`s, only when `BENCHES_DBUS_TESTS` is set:
+    /// `BENCHES_DBUS_TESTS=1 cargo test -p benches-platform dbus`.
+    mod dbus {
+        use std::io::{BufRead, BufReader};
+        use std::process::{Child, Stdio};
+        use std::sync::atomic::{AtomicU32, Ordering};
+        use std::sync::mpsc;
+
+        use tempfile::TempDir;
+        use zbus::object_server::SignalEmitter;
+        use zbus::zvariant::OwnedValue;
+
+        use super::*;
+
+        fn enabled() -> bool {
+            let enabled = std::env::var("BENCHES_DBUS_TESTS").is_ok_and(|value| value == "1")
+                && Command::new("dbus-daemon")
+                    .arg("--version")
+                    .output()
+                    .is_ok_and(|output| output.status.success());
+            if !enabled {
+                eprintln!("skipped: needs BENCHES_DBUS_TESTS=1 and dbus-daemon");
+            }
+            enabled
+        }
+
+        /// A session bus of its own at a fixed socket, so it can be restarted at the same address.
+        struct Bus {
+            dir: TempDir,
+            daemon: Child,
+        }
+
+        impl Bus {
+            fn start() -> Self {
+                let dir = tempfile::tempdir().expect("a temporary folder");
+                let daemon = Self::daemon(&dir.path().join("bus"));
+                Self { dir, daemon }
+            }
+
+            fn daemon(socket: &Path) -> Child {
+                let mut daemon = Command::new("dbus-daemon")
+                    .args(["--session", "--nofork", "--print-address"])
+                    .arg(format!("--address=unix:path={}", socket.display()))
+                    .stdout(Stdio::piped())
+                    .spawn()
+                    .expect("dbus-daemon starts");
+                // It prints its address once it listens.
+                let printed = BufReader::new(daemon.stdout.take().expect("piped stdout"))
+                    .read_line(&mut String::new())
+                    .expect("dbus-daemon's output is read");
+                assert!(printed > 0, "dbus-daemon exited: {:?}", daemon.wait());
+                daemon
+            }
+
+            fn socket(&self) -> PathBuf {
+                self.dir.path().join("bus")
+            }
+
+            fn restart(&mut self) {
+                self.stop();
+                std::fs::remove_file(self.socket()).ok();
+                self.daemon = Self::daemon(&self.socket());
+            }
+
+            fn stop(&mut self) {
+                self.daemon.kill().ok();
+                self.daemon.wait().ok();
+            }
+
+            /// Serves a `Stub` that reports what each notification replaces and its body on
+            /// `notified`.
+            fn serve(&self, notified: mpsc::Sender<(u32, String)>) -> zbus::Connection {
+                async_io::block_on(async {
+                    bus_at(&self.socket())()?
+                        .name("org.freedesktop.Notifications")?
+                        .serve_at(
+                            "/org/freedesktop/Notifications",
+                            Stub {
+                                notified,
+                                last_id: AtomicU32::new(0),
+                            },
+                        )?
+                        .build()
+                        .await
+                })
+                .expect("the stub server starts")
+            }
+
+            /// Starts the notification thread on this bus, returning where to post and the
+            /// sessions whose notifications were clicked.
+            fn notifications(&self) -> (Sender<(u64, Notification)>, mpsc::Receiver<Option<u64>>) {
+                let (clicked, clicks) = mpsc::channel();
+                let posts = spawn_notifications(bus_at(&self.socket()), move |session| {
+                    clicked.send(session).ok();
+                })
+                .expect("the notification thread starts");
+                (posts, clicks)
+            }
+        }
+
+        impl Drop for Bus {
+            fn drop(&mut self) {
+                self.stop();
+            }
+        }
+
+        /// Reports what each notification replaces and its body, clicks it at once, and never
+        /// answers one whose body ends in "hang".
+        struct Stub {
+            notified: mpsc::Sender<(u32, String)>,
+            last_id: AtomicU32,
+        }
+
+        #[zbus::interface(name = "org.freedesktop.Notifications")]
+        impl Stub {
+            fn get_capabilities(&self) -> Vec<String> {
+                Vec::new()
+            }
+
+            #[allow(clippy::too_many_arguments)]
+            async fn notify(
+                &self,
+                #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
+                _app: String,
+                replaces: u32,
+                _icon: String,
+                _summary: String,
+                body: String,
+                _actions: Vec<String>,
+                _hints: HashMap<String, OwnedValue>,
+                _timeout: i32,
+            ) -> u32 {
+                if body.ends_with("hang") {
+                    std::future::pending::<()>().await;
+                }
+                let id = if replaces == 0 {
+                    self.last_id.fetch_add(1, Ordering::Relaxed) + 1
+                } else {
+                    replaces
+                };
+                self.notified.send((replaces, body)).ok();
+                Self::action_invoked(&emitter, id, "default").await.ok();
+                id
+            }
+
+            #[zbus(signal)]
+            async fn action_invoked(
+                emitter: &SignalEmitter<'_>,
+                id: u32,
+                action: &str,
+            ) -> zbus::Result<()>;
+        }
+
+        fn notification(body: &str) -> Notification {
+            Notification {
+                title: "Done".into(),
+                subtitle: "proj".into(),
+                body: body.into(),
+            }
+        }
+
+        const WAIT: Duration = Duration::from_secs(5);
+
+        /// The body of the next notification posted.
+        fn next_body(notified: &mpsc::Receiver<(u32, String)>) -> Option<String> {
+            notified.recv_timeout(WAIT).ok().map(|(_, body)| body)
+        }
+
+        #[test]
+        fn a_post_the_server_never_answers_does_not_hold_up_later_ones() {
+            if !enabled() {
+                return;
+            }
+            let bus = Bus::start();
+            let (notified, bodies) = mpsc::channel();
+            let _stub = bus.serve(notified);
+            let (posts, clicks) = bus.notifications();
+
+            posts.try_send((1, notification("hang"))).ok();
+            posts.try_send((2, notification("after"))).ok();
+            assert_eq!(next_body(&bodies).as_deref(), Some("proj\nafter"));
+            assert_eq!(clicks.recv_timeout(WAIT), Ok(Some(2)));
+        }
+
+        #[test]
+        fn posts_and_clicks_resume_once_the_bus_is_back() {
+            if !enabled() {
+                return;
+            }
+            let mut bus = Bus::start();
+            let (notified, bodies) = mpsc::channel();
+            let stub = bus.serve(notified.clone());
+            let (posts, clicks) = bus.notifications();
+            posts.try_send((1, notification("before"))).ok();
+            assert_eq!(next_body(&bodies).as_deref(), Some("proj\nbefore"));
+            assert_eq!(clicks.recv_timeout(WAIT), Ok(Some(1)));
+
+            drop(stub);
+            bus.restart();
+            let _stub = bus.serve(notified);
+            // Posts sent before the thread notices the old connection is gone may be lost.
+            let resumed = (0..10).any(|_| {
+                posts.try_send((2, notification("after"))).ok();
+                bodies
+                    .recv_timeout(RPC_TIMEOUT * 2)
+                    .ok()
+                    .map(|(_, body)| body)
+                    .as_deref()
+                    == Some("proj\nafter")
+            });
+            assert!(resumed, "no post reached the restarted bus");
+            assert_eq!(clicks.recv_timeout(WAIT), Ok(Some(2)));
+        }
+
+        #[test]
+        fn a_restarted_server_s_ids_are_not_mistaken_for_ours() {
+            if !enabled() {
+                return;
+            }
+            let bus = Bus::start();
+            let (notified, posted) = mpsc::channel();
+            let stub = bus.serve(notified.clone());
+            let (posts, clicks) = bus.notifications();
+            posts.try_send((1, notification("before"))).ok();
+            assert_eq!(posted.recv_timeout(WAIT), Ok((0, "proj\nbefore".into())));
+            assert_eq!(clicks.recv_timeout(WAIT), Ok(Some(1)));
+
+            // Released first, as the bus refuses a new owner while the old one's hangup is pending.
+            async_io::block_on(stub.release_name("org.freedesktop.Notifications"))
+                .expect("the stub releases its name");
+            drop(stub);
+            let _stub = bus.serve(notified);
+            // The new server numbers its notifications afresh, so replacing the old one's id
+            // would replace some other app's notification.
+            let fresh = (0..10).any(|_| {
+                posts.try_send((1, notification("after"))).ok();
+                posted.recv_timeout(WAIT) == Ok((0, "proj\nafter".into()))
+            });
+            assert!(fresh, "every post replaced the old server's id");
+        }
     }
 }
