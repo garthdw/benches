@@ -2,7 +2,7 @@
 
 This file provides guidance to AI coding agents when working with code in this repository.
 
-Benches is a native macOS workspace where each project is a group of terminals, built on [Rune](https://github.com/anomalyco/rune) (UI) and `libghostty-vt` (terminal emulation). macOS only.
+Benches is a native workspace where each project is a group of terminals, built on [Rune](https://github.com/anomalyco/rune) (UI) and `libghostty-vt` (terminal emulation). It runs on macOS and on Linux, where it is built from source; releases are macOS only. The README's "Building on Linux" lists the Linux packages.
 
 ## Commands
 
@@ -19,16 +19,18 @@ cargo run -- config init                    # write a commented config.toml and 
 cargo run -- config migrate                 # refresh the schema file and the `#:schema` line of an existing config.toml
 cargo run -- config schema > schema/config.schema.json   # regenerate the committed schema
 scripts/nerd-font-table PATH/nerd_font_tables.zig   # regenerate crates/benches-font/src/nerd_font_table.rs from Ghostty's generated table, then cargo fmt
-scripts/bundle                              # release build into a signed target/release/Benches.app, without installing
-scripts/install                             # scripts/bundle, then into ~/Applications/Benches.app, relaunching a running copy
-scripts/icon                                # regenerate assets/benches.icns from scripts/icon.swift
+scripts/bundle                              # macOS: release build into a signed target/release/Benches.app, without installing
+scripts/install                             # macOS: scripts/bundle, then into ~/Applications/Benches.app, relaunching a running copy
+scripts/icon                                # macOS: regenerate assets/benches.icns from scripts/icon.swift
 ```
+
+On Linux, the tests also expect fontconfig's `monospace` family, an emoji font, Unifont, `/bin/bash` and `pgrep` (`sudo apt install fonts-dejavu-core fonts-noto-color-emoji fonts-unifont procps` on Debian and Ubuntu; add `zsh` for the tests that skip without it), and Monaspace Neon, the default font, which they don't package: install its static fonts from [its releases](https://github.com/githubnext/monaspace/releases) into `~/.local/share/fonts`. Without a GPU, `--snap` runs on Mesa's lavapipe.
 
 `scripts/bundle` needs `cargo-about` (`cargo install cargo-about --features cli`): it writes the About panel's third-party notices from `about.toml` and `about.hbs`, whose non-Cargo entries (Ghostty, the Zig and C libraries linked into libghostty-vt, the Symbols Nerd Font) are kept by hand. Code ported from Ghostty says so in a header comment.
 
 `--snap`, `--scene` and the other headless flags come from Rune. Scenes are registered in `AppSpec::scenes` in `window_app` in `src/app.rs`.
 
-`scripts/install` uses the pinned Rune checkout's installer and launches the app with a Finder-like environment, so nothing from the calling terminal leaks into tabs. It signs with the identity in `MAC_APP_SIGN` (create an Apple Development certificate in Xcode → Settings → Accounts → Manage Certificates; `security find-identity -v -p codesigning` lists it), or ad hoc without one, in which case macOS may ask again for folder access after each install, and a Full Disk Access grant must be added again. A bundled app logs to `~/Library/Logs/benches.log`.
+`scripts/install` uses the pinned Rune checkout's installer and launches the app with a Finder-like environment, so nothing from the calling terminal leaks into tabs. It signs with the identity in `MAC_APP_SIGN` (create an Apple Development certificate in Xcode → Settings → Accounts → Manage Certificates; `security find-identity -v -p codesigning` lists it), or ad hoc without one, in which case macOS may ask again for folder access after each install, and a Full Disk Access grant must be added again. A bundled app logs to `~/Library/Logs/benches.log`. On Linux, a launch whose stderr isn't a terminal logs to `~/.local/state/benches/benches.log` (`dirs::log_file`).
 
 CI (`.github/workflows/ci.yml`) runs the checks on macOS and, without `cargo fmt`, on Ubuntu, where it also uploads a `--snap` of the fixture scene as the `linux-fixture` artifact. Its Linux job lists the packages and fonts (Monaspace's static build, Noto Color Emoji, Unifont) that the tests expect.
 
@@ -38,10 +40,12 @@ Publishing a GitHub release for a `vX.Y.Z` tag runs `.github/workflows/release.y
 
 The repository is a Cargo workspace:
 
-- `crates/benches-platform` (`platform.rs`): OS services, so far opening a URL and revealing a file, and `dirs.rs`, the XDG-aware folders for config, state, logs, Ghostty's themes and the installed terminfo. `notify.rs`, `secure_input.rs` and the `session.rs` process queries move here next.
+- `crates/benches-platform` (`platform.rs`): OS services behind one API: opening a link, process queries, the system locale and the fallback locale and shell, thread priority, the Full Disk Access settings link, the secure-input call and notifications. `platform.rs` declares each and forwards to `os`, which `#[cfg(target_os)]` binds to `macos.rs` or `linux.rs`; each OS's dependencies are target-specific in the crate's `Cargo.toml`. On Linux, each D-Bus user (notifications, revealing a file) runs a tokio runtime on its own thread. `dirs.rs` holds the folders for config, state, logs, Ghostty's themes and the installed terminfo (`PREFIX/share/benches/terminfo` beside `PREFIX/bin` on Linux), branching with `cfg!`.
 - `crates/benches-font` (`font.rs` is the crate root): `font`, `coretext`, `swash`, `constraint`, `sprite` and `nerd_font_table`, with `DEFAULT_FONT_FAMILY` and the `Fnv` hasher.
 - `crates/benches-core` (`core.rs`, which also holds `LogErr`): `actor`, `protocol`, `grid`, `terminal_input`, `link`, `search`, `images`, `config` and `history`.
-- The root `benches` package: `app`, `view`, `input`, `render`, `session`, `workspace`, `windows`, `palette`, `keymap`, `find`, `jump`, `scenes`, `notify`, `secure_input` and `main`.
+- The root `benches` package: `app`, `view`, `input`, `render`, `session`, `workspace`, `windows`, `palette`, `keymap`, `find`, `jump`, `scenes`, `secure_input` and `main`.
+
+Other platform differences stay where they're used, behind `cfg!(target_os = "macos")` or `#[cfg]` (`rg target_os` finds them), apart from `keymap.rs`'s `Keys`, which pairs each chord for macOS and Linux through Rune's `KeyPlatform`. Rune's native menu, which holds the Reload Config item, exists only on macOS.
 
 Data flows one way from the PTY to the screen, and each `Session` owns its own threads:
 
@@ -63,7 +67,7 @@ shell <-> PTY --reader thread--> bounded channel --> actor thread (owns Terminal
 - **`sprite.rs`**: procedural box drawing, blocks, Powerline glyphs and tiling underlines, so they meet their neighbours with no seams.
 - **`workspace.rs`**: projects (folders) holding tabs and a tray, each with its own `Session`. Selection hides the outgoing session and shows the incoming one: a hidden session keeps reading its PTY but doesn't publish grids or wake the UI, so a flood in a background tab costs nothing on the UI thread. The compositor resizes every session to the terminal area, so hidden tabs are already the right size when shown, and keys its quad cache by session id because generations restart per session.
 - **Windows**: each window has its own `State` and `Workspace`, so selection, hidden sessions and sizing stay per window. `Fleet` (in `windows.rs`) hands a `Project` to another window's inbox, which takes it in `poll` and retargets each tab's `Retarget` waker. Closing a torn-off window merges its projects back into the main window; closing the main window quits. Torn-off windows aren't restored: the layout saved at quit lists their projects after the main window's.
-- **Reported directory**: the actor stores the local pwd from `on_pwd_changed` (OSC 7/9;9/1337, parsed in `link.rs`, ignoring other hosts), and `Session::cwd` prefers it over `proc_pidinfo`.
+- **Reported directory**: the actor stores the local pwd from `on_pwd_changed` (OSC 7/9;9/1337, parsed in `link.rs`, ignoring other hosts), and `Session::cwd` prefers it over the platform crate's `process_cwd`.
 - **`app.rs`**: `State`, `window_app` (the `AppSpec` and hooks), `poll`, `on_key` and the tab, layout and close-confirm logic. `main.rs` is only the entry point and `config` CLI dispatch.
 - **`input.rs`**: maps Rune key events to `KeyInput`; the actor encodes them with libghostty's encoder using the terminal's current modes. Returning `None` from `map_key` keeps a key (such as a ⌘ chord) away from the terminal.
 - **Pointer input** (`terminal_input.rs`): the UI sends raw `Msg::Pointer` and `Msg::Wheel`, and `TerminalInput` on the actor decides between mouse reports, selection, alt-screen arrows and scrollback, because only the actor knows the terminal's modes.
