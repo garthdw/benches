@@ -530,14 +530,14 @@ fn fallback_family(
         .find(|&id| try_family(shared, id))
 }
 
-/// Every family, monospace first and then by name, as the collection iterates in a random order.
+/// Every family in `last_resort_rank` order, as the collection iterates in a random order.
 /// A family is monospace when the `post` table of any of its fonts says it has a fixed pitch:
 /// any, as a family's fonts, and so its default, come in the scan's random order too. Its own
 /// source cache maps each file once, and unmaps them all once sorted.
 fn last_resort_order(collection: &mut Collection) -> Box<[FamilyId]> {
     let mut sources = SourceCache::default();
     let ids: Vec<FamilyId> = collection.family_ids().collect();
-    let mut families: Vec<(bool, String, FamilyId)> = ids
+    let mut families: Vec<_> = ids
         .into_iter()
         .filter_map(|id| {
             let family = collection.family(id)?;
@@ -545,11 +545,16 @@ fn last_resort_order(collection: &mut Collection) -> Box<[FamilyId]> {
                 FontFile::load(font, Some(&mut sources))
                     .is_some_and(|file| file.swash().metrics(&[]).is_monospace)
             });
-            Some((!monospace, family.name().to_owned(), id))
+            Some((last_resort_rank(monospace, family.name()), id))
         })
         .collect();
     families.sort_unstable();
-    families.into_iter().map(|(_, _, id)| id).collect()
+    families.into_iter().map(|(_, id)| id).collect()
+}
+
+/// Where a family comes in the last fallback step: monospace first, then by name.
+fn last_resort_rank(monospace: bool, name: &str) -> (bool, String) {
+    (!monospace, name.to_owned())
 }
 
 /// Whether family `id` draws `cluster` in `data`'s style, leaving its font in `shared.fonts`.
