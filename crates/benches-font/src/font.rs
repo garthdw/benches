@@ -1066,11 +1066,11 @@ mod tests {
             .collect()
     }
 
-    fn alone(font: &Font, text: &str) -> Vec<Vec<u8>> {
+    fn alone(font: &Font, text: &str, style: FontStyle) -> Vec<Vec<u8>> {
         text.chars()
             .map(|character| {
                 let mut pixels = Vec::new();
-                font.rasterize(&character.to_string(), REGULAR, 1, &mut pixels);
+                font.rasterize(&character.to_string(), style, 1, &mut pixels);
                 pixels
             })
             .collect()
@@ -1129,7 +1129,7 @@ mod tests {
     fn a_ligature_changes_both_of_its_cells() {
         let font = with_features(&[]);
         assert_eq!(differing(&font, "!="), [true, true]);
-        let (shaped, plain) = (cells(&font, "!="), alone(&font, "!="));
+        let (shaped, plain) = (cells(&font, "!="), alone(&font, "!=", REGULAR));
         assert_ne!(shaped[0], plain[0]);
         assert_ne!(shaped[1], plain[1]);
         assert_eq!(shaped[0].len(), plain[0].len());
@@ -1139,7 +1139,7 @@ mod tests {
     fn disabling_liga_leaves_a_run_unshaped_and_enabling_a_set_shapes_it() {
         let font = with_features(&["-liga"]);
         assert_eq!(differing(&font, "!="), [false, false]);
-        assert_eq!(cells(&font, "!="), alone(&font, "!="));
+        assert_eq!(cells(&font, "!="), alone(&font, "!=", REGULAR));
         // Monaspace builds `!=` from `liga`, so `calt` alone doesn't change it.
         assert_eq!(differing(&with_features(&["-calt"]), "!="), [true, true]);
         // `ss01` redraws `==`, which is plain by default.
