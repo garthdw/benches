@@ -61,3 +61,31 @@ pub fn wheel_by(dy: f32) -> WheelInput {
         mods: key::Mods::empty(),
     }
 }
+
+/// Writes an executable script. Another process writes it: a child forked meanwhile by one of
+/// this process's threads would hold a write fd until it execs, and Linux refuses to run a file
+/// open for writing (ETXTBSY), even under another name.
+pub fn write_executable(path: &std::path::Path, contents: &str) {
+    let written = std::process::Command::new("/bin/sh")
+        .args(["-c", r#"printf '%s' "$1" > "$0" && chmod 755 "$0""#])
+        .arg(path)
+        .arg(contents)
+        .status()
+        .unwrap();
+    assert!(
+        written.success(),
+        "{} not written: {written}",
+        path.display()
+    );
+}
+
+/// A plugins folder holding one plugin, `stub`, with `manifest` as its `plugin.toml` and
+/// `script` as its `run` executable, a `/bin/sh` script.
+pub fn stub_plugin(manifest: &str, script: &str) -> tempfile::TempDir {
+    let directory = tempfile::tempdir().unwrap();
+    let plugin = directory.path().join("stub");
+    std::fs::create_dir(&plugin).unwrap();
+    std::fs::write(plugin.join("plugin.toml"), manifest).unwrap();
+    write_executable(&plugin.join("run"), &format!("#!/bin/sh\n{script}\n"));
+    directory
+}

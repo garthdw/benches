@@ -664,7 +664,7 @@ fn command_finish_after(mode: Option<String>, after: Option<String>) -> Option<D
 }
 
 /// Ghostty's duration syntax: units such as `500ms`, `5s` and `1m30s`, added up.
-fn parse_duration(text: &str) -> Result<Duration> {
+pub(crate) fn parse_duration(text: &str) -> Result<Duration> {
     let mut total = Duration::ZERO;
     let mut rest = text.trim();
     anyhow::ensure!(!rest.is_empty(), "empty duration");
