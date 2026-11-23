@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::io::{self, IsTerminal};
 use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
-use std::pin::pin;
+use std::pin::{Pin, pin};
 use std::process::Command;
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
@@ -13,7 +13,7 @@ use futures_util::StreamExt;
 use futures_util::future::{self, Either};
 use zbus::proxy::SignalStream;
 use zbus::zvariant::Value;
-use zbus::{Proxy, connection};
+use zbus::{Connection, Proxy, connection};
 
 use crate::dirs::{self, Env};
 use crate::notify::Notification;
@@ -85,7 +85,7 @@ async fn timeout<T>(call: impl Future<Output = zbus::Result<T>>) -> io::Result<T
 
 fn show_in_file_manager(path: &Path) -> io::Result<()> {
     async_io::block_on(timeout(async {
-        let connection = connection::Builder::session()?.build().await?;
+        let connection = Connection::session().await?;
         let manager = Proxy::new(
             &connection,
             "org.freedesktop.FileManager1",
@@ -238,69 +238,23 @@ async fn serve_notifications(
     on_click: impl Fn(Option<u64>),
 ) {
     let mut queued = pin!(queued);
-    let mut server: Option<Server> = None;
     let mut backoff = Backoff::default();
-    loop {
-        let event = match &mut server {
-            Some(server) => futures_util::select! {
-                post = queued.next() => Event::from_post(post),
-                message = server.clicks.next() => message.map_or(Event::Disconnected, Event::Clicked),
-                message = server.closes.next() => message.map_or(Event::Disconnected, Event::Closed),
-            },
-            None => Event::from_post(queued.next().await),
-        };
-        match event {
-            Event::Post(session, notification) => {
-                if server.is_none() && backoff.ready(Instant::now()) {
-                    match Server::connect(&bus).await {
-                        Ok(connected) => {
-                            backoff = Backoff::default();
-                            server = Some(connected);
-                        }
-                        Err(error) => {
-                            eprintln!("benches: connect to the notification server: {error}");
-                            backoff.failed(Instant::now());
-                        }
-                    }
-                }
-                // Without a server, the post is dropped.
-                if let Some(server) = &mut server
-                    && let Err(error) = server.post(session, &notification).await
-                {
-                    eprintln!("benches: post notification: {error}");
-                }
-            }
-            Event::Clicked(message) => {
-                if let Some(session) = server.as_ref().and_then(|server| server.clicked(&message)) {
-                    on_click(Some(session));
-                }
-            }
-            Event::Closed(message) => {
-                if let Some(server) = &mut server {
-                    server.closed(&message);
-                }
-            }
-            Event::Disconnected => server = None,
-            Event::Stopped => return,
+    // Without a server, or while backing off, the post is dropped.
+    while let Some((session, notification)) = queued.next().await {
+        if !backoff.ready(Instant::now()) {
+            continue;
         }
-    }
-}
-
-enum Event {
-    Post(u64, Notification),
-    Clicked(zbus::Message),
-    Closed(zbus::Message),
-    /// The connection to the bus closed, ending the signal streams.
-    Disconnected,
-    /// Every sender of posts is gone.
-    Stopped,
-}
-
-impl Event {
-    fn from_post(post: Option<(u64, Notification)>) -> Self {
-        post.map_or(Self::Stopped, |(session, notification)| {
-            Self::Post(session, notification)
-        })
+        match Server::connect(&bus).await {
+            Ok(mut server) => {
+                backoff = Backoff::default();
+                server.post(session, &notification).await;
+                server.serve(&mut queued, &on_click).await;
+            }
+            Err(error) => {
+                eprintln!("benches: connect to the notification server: {error}");
+                backoff.failed(Instant::now());
+            }
+        }
     }
 }
 
@@ -310,6 +264,7 @@ struct Server {
     clicks: SignalStream<'static>,
     closes: SignalStream<'static>,
     markup: bool,
+    hints: Hints<'static>,
     /// The server's id for each session's notification, which a new one replaces.
     shown: HashMap<u64, u32>,
 }
@@ -338,23 +293,56 @@ impl Server {
                 proxy,
                 clicks,
                 closes,
+                hints: Hints::from([("sound-name", Value::from("message-new-instant"))]),
                 shown: HashMap::new(),
             })
         })
         .await
     }
 
+    /// Posts and reports clicks until the connection closes, which ends the signal streams, or
+    /// the posts stop.
+    async fn serve(
+        &mut self,
+        queued: &mut Pin<&mut Receiver<(u64, Notification)>>,
+        on_click: &impl Fn(Option<u64>),
+    ) {
+        loop {
+            futures_util::select! {
+                post = queued.next() => match post {
+                    Some((session, notification)) => self.post(session, &notification).await,
+                    None => return,
+                },
+                message = self.clicks.next() => match message {
+                    Some(message) => {
+                        if let Some(session) = self.clicked(&message) {
+                            on_click(Some(session));
+                        }
+                    }
+                    None => return,
+                },
+                message = self.closes.next() => match message {
+                    Some(message) => self.closed(&message),
+                    None => return,
+                },
+            }
+        }
+    }
+
     /// A server that never answers drops this post rather than holding up the next.
-    async fn post(&mut self, session: u64, notification: &Notification) -> io::Result<()> {
+    async fn post(&mut self, session: u64, notification: &Notification) {
         let replaces = self.shown.get(&session).copied().unwrap_or(0);
-        let hints = Hints::from([("sound-name", Value::from("message-new-instant"))]);
-        let id = timeout(self.proxy.call::<_, _, u32>(
+        let posted = timeout(self.proxy.call::<_, _, u32>(
             "Notify",
-            &notify_args(replaces, content(notification, self.markup), &hints),
+            &notify_args(replaces, content(notification, self.markup), &self.hints),
         ))
-        .await?;
-        self.shown.insert(session, id);
-        Ok(())
+        .await;
+        match posted {
+            Ok(id) => {
+                self.shown.insert(session, id);
+            }
+            Err(error) => eprintln!("benches: post notification: {error}"),
+        }
     }
 
     /// The session whose notification an `ActionInvoked` signal is for, if it is one of ours.
@@ -571,16 +559,20 @@ mod tests {
         assert!(backoff.ready(start + Duration::from_secs(60)));
     }
 
+    /// A bus at `socket`, as `spawn_notifications` takes it.
+    fn bus_at(
+        socket: &Path,
+    ) -> impl Fn() -> zbus::Result<connection::Builder<'static>> + Send + 'static {
+        let address = format!("unix:path={}", socket.display());
+        move || connection::Builder::address(address.as_str())
+    }
+
     #[test]
     fn connecting_to_a_bus_that_never_answers_times_out() {
-        let socket = std::env::temp_dir().join(format!("benches-silent-{}", std::process::id()));
-        std::fs::remove_file(&socket).ok();
+        let dir = tempfile::tempdir().expect("a temporary folder");
+        let socket = dir.path().join("bus");
         let _listener = std::os::unix::net::UnixListener::bind(&socket).expect("binds");
-        let address = format!("unix:path={}", socket.display());
-        let connected = async_io::block_on(Server::connect(|| {
-            connection::Builder::address(address.as_str())
-        }));
-        std::fs::remove_file(&socket).ok();
+        let connected = async_io::block_on(Server::connect(bus_at(&socket)));
         assert_eq!(
             connected.err().map(|error| error.kind()),
             Some(io::ErrorKind::TimedOut)
@@ -595,6 +587,7 @@ mod tests {
         use std::sync::atomic::{AtomicU32, Ordering};
         use std::sync::mpsc;
 
+        use tempfile::TempDir;
         use zbus::object_server::SignalEmitter;
         use zbus::zvariant::OwnedValue;
 
@@ -614,72 +607,92 @@ mod tests {
 
         /// A session bus of its own at a fixed socket, so it can be restarted at the same address.
         struct Bus {
-            socket: PathBuf,
+            dir: TempDir,
             daemon: Child,
         }
 
         impl Bus {
-            fn start(name: &str) -> Self {
-                let socket = std::env::temp_dir()
-                    .join(format!("benches-dbus-{name}-{}", std::process::id()));
-                let daemon = Self::daemon(&socket);
-                Self { socket, daemon }
+            fn start() -> Self {
+                let dir = tempfile::tempdir().expect("a temporary folder");
+                let daemon = Self::daemon(&dir.path().join("bus"));
+                Self { dir, daemon }
             }
 
             fn daemon(socket: &Path) -> Child {
-                std::fs::remove_file(socket).ok();
                 let mut daemon = Command::new("dbus-daemon")
                     .args(["--session", "--nofork", "--print-address"])
                     .arg(format!("--address=unix:path={}", socket.display()))
                     .stdout(Stdio::piped())
                     .spawn()
                     .expect("dbus-daemon starts");
-                let mut address = String::new();
+                // It prints its address once it listens.
                 BufReader::new(daemon.stdout.take().expect("piped stdout"))
-                    .read_line(&mut address)
+                    .read_line(&mut String::new())
                     .expect("dbus-daemon prints its address");
                 daemon
             }
 
-            fn address(&self) -> String {
-                format!("unix:path={}", self.socket.display())
-            }
-
-            fn connect(
-                &self,
-            ) -> impl Fn() -> zbus::Result<connection::Builder<'static>> + Send + 'static
-            {
-                let address = self.address();
-                move || connection::Builder::address(address.as_str())
+            fn socket(&self) -> PathBuf {
+                self.dir.path().join("bus")
             }
 
             fn restart(&mut self) {
                 self.stop();
-                self.daemon = Self::daemon(&self.socket);
+                std::fs::remove_file(self.socket()).ok();
+                self.daemon = Self::daemon(&self.socket());
             }
 
             fn stop(&mut self) {
                 self.daemon.kill().ok();
                 self.daemon.wait().ok();
             }
+
+            /// Serves a `Stub` that reports what each notification replaces and its body on
+            /// `notified`.
+            fn serve(&self, notified: mpsc::Sender<(u32, String)>) -> zbus::Connection {
+                async_io::block_on(async {
+                    bus_at(&self.socket())()?
+                        .name("org.freedesktop.Notifications")?
+                        .serve_at(
+                            "/org/freedesktop/Notifications",
+                            Stub {
+                                notified,
+                                last_id: AtomicU32::new(0),
+                            },
+                        )?
+                        .build()
+                        .await
+                })
+                .expect("the stub server starts")
+            }
+
+            /// Starts the notification thread on this bus, returning where to post and the
+            /// sessions whose notifications were clicked.
+            fn notifications(&self) -> (Sender<(u64, Notification)>, mpsc::Receiver<Option<u64>>) {
+                let (clicked, clicks) = mpsc::channel();
+                let posts = spawn_notifications(bus_at(&self.socket()), move |session| {
+                    clicked.send(session).ok();
+                })
+                .expect("the notification thread starts");
+                (posts, clicks)
+            }
         }
 
         impl Drop for Bus {
             fn drop(&mut self) {
                 self.stop();
-                std::fs::remove_file(&self.socket).ok();
             }
         }
 
-        /// Reports each notification's body, clicks it at once, and never answers one whose body
-        /// ends in "hang".
-        struct Server {
-            notified: mpsc::Sender<String>,
+        /// Reports what each notification replaces and its body, clicks it at once, and never
+        /// answers one whose body ends in "hang".
+        struct Stub {
+            notified: mpsc::Sender<(u32, String)>,
             last_id: AtomicU32,
         }
 
         #[zbus::interface(name = "org.freedesktop.Notifications")]
-        impl Server {
+        impl Stub {
             fn get_capabilities(&self) -> Vec<String> {
                 Vec::new()
             }
@@ -705,7 +718,7 @@ mod tests {
                 } else {
                     replaces
                 };
-                self.notified.send(body).ok();
+                self.notified.send((replaces, body)).ok();
                 Self::action_invoked(&emitter, id, "default").await.ok();
                 id
             }
@@ -718,23 +731,6 @@ mod tests {
             ) -> zbus::Result<()>;
         }
 
-        fn serve(bus: &Bus, notified: mpsc::Sender<String>) -> zbus::Connection {
-            async_io::block_on(async {
-                connection::Builder::address(bus.address().as_str())?
-                    .name("org.freedesktop.Notifications")?
-                    .serve_at(
-                        "/org/freedesktop/Notifications",
-                        Server {
-                            notified,
-                            last_id: AtomicU32::new(0),
-                        },
-                    )?
-                    .build()
-                    .await
-            })
-            .expect("the stub server starts")
-        }
-
         fn notification(body: &str) -> Notification {
             Notification {
                 title: "Done".into(),
@@ -745,23 +741,24 @@ mod tests {
 
         const WAIT: Duration = Duration::from_secs(5);
 
+        /// The body of the next notification posted.
+        fn next_body(notified: &mpsc::Receiver<(u32, String)>) -> Option<String> {
+            notified.recv_timeout(WAIT).ok().map(|(_, body)| body)
+        }
+
         #[test]
         fn a_post_the_server_never_answers_does_not_hold_up_later_ones() {
             if !enabled() {
                 return;
             }
-            let bus = Bus::start("hang");
+            let bus = Bus::start();
             let (notified, bodies) = mpsc::channel();
-            let _server = serve(&bus, notified);
-            let (clicked, clicks) = mpsc::channel();
-            let posts = spawn_notifications(bus.connect(), move |session| {
-                clicked.send(session).ok();
-            })
-            .expect("the notification thread starts");
+            let _stub = bus.serve(notified);
+            let (posts, clicks) = bus.notifications();
 
             posts.try_send((1, notification("hang"))).ok();
             posts.try_send((2, notification("after"))).ok();
-            assert_eq!(bodies.recv_timeout(WAIT).as_deref(), Ok("proj\nafter"));
+            assert_eq!(next_body(&bodies).as_deref(), Some("proj\nafter"));
             assert_eq!(clicks.recv_timeout(WAIT), Ok(Some(2)));
         }
 
@@ -770,25 +767,26 @@ mod tests {
             if !enabled() {
                 return;
             }
-            let mut bus = Bus::start("restart");
+            let mut bus = Bus::start();
             let (notified, bodies) = mpsc::channel();
-            let server = serve(&bus, notified.clone());
-            let (clicked, clicks) = mpsc::channel();
-            let posts = spawn_notifications(bus.connect(), move |session| {
-                clicked.send(session).ok();
-            })
-            .expect("the notification thread starts");
+            let stub = bus.serve(notified.clone());
+            let (posts, clicks) = bus.notifications();
             posts.try_send((1, notification("before"))).ok();
-            assert_eq!(bodies.recv_timeout(WAIT).as_deref(), Ok("proj\nbefore"));
+            assert_eq!(next_body(&bodies).as_deref(), Some("proj\nbefore"));
             assert_eq!(clicks.recv_timeout(WAIT), Ok(Some(1)));
 
-            drop(server);
+            drop(stub);
             bus.restart();
-            let _server = serve(&bus, notified);
+            let _stub = bus.serve(notified);
             // Posts sent before the thread notices the old connection is gone may be lost.
             let resumed = (0..10).any(|_| {
                 posts.try_send((2, notification("after"))).ok();
-                bodies.recv_timeout(RPC_TIMEOUT * 2).as_deref() == Ok("proj\nafter")
+                bodies
+                    .recv_timeout(RPC_TIMEOUT * 2)
+                    .ok()
+                    .map(|(_, body)| body)
+                    .as_deref()
+                    == Some("proj\nafter")
             });
             assert!(resumed, "no post reached the restarted bus");
             assert_eq!(clicks.recv_timeout(WAIT), Ok(Some(2)));

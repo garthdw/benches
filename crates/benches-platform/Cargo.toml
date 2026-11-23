@@ -40,3 +40,6 @@ zbus = { version = "5.19", default-features = false, features = ["async-io"] }
 async-io = "2"
 async-channel = "2"
 futures-util = "0.3"
+
+[dev-dependencies]
+tempfile.workspace = true
