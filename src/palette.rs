@@ -21,9 +21,9 @@ use benches_core::process::Cancel;
 
 const PALETTE_WIDTH: f32 = 520.0;
 const PALETTE_TOP: f32 = 96.0;
-/// Waits for typing to pause, as the lookup starts a login shell.
-const JUMP_DEBOUNCE: Duration = Duration::from_millis(250);
-const JUMP_TIMEOUT: Duration = Duration::from_secs(5);
+/// Waits for typing to pause, as a lookup starts a login shell.
+const LOOKUP_DEBOUNCE: Duration = Duration::from_millis(250);
+const LOOKUP_TIMEOUT: Duration = Duration::from_secs(5);
 /// Longer than a lookup, as `wt switch --create` runs the project's `pre-start` hooks first.
 const WORKTREE_TIMEOUT: Duration = Duration::from_secs(120);
 const HISTORY_ROWS: usize = 8;
@@ -39,7 +39,7 @@ pub(crate) struct Palette {
     pub(crate) selected: usize,
     /// The query `selected` was chosen for.
     selected_query: String,
-    pub(crate) jump: JumpLookup,
+    pub(crate) jump: Lookup<PathBuf>,
     pub(crate) worktrees: Option<WorktreeChoice>,
     /// A `wt switch --create` running off the UI thread, answering with the new worktree's path.
     pub(crate) creation: Option<Creation>,
@@ -75,15 +75,51 @@ pub(crate) struct Rows {
     ghost: Option<String>,
 }
 
-/// The jump command's folder for the command centre's query.
+/// Something found for the command centre's query off the UI thread, such as the jump command's
+/// folder.
 #[derive(Default)]
-pub(crate) struct JumpLookup {
+pub(crate) struct Lookup<T> {
     pub(crate) query: String,
     /// When to start the lookup, once typing pauses.
     due: Option<f64>,
-    pending: Option<mpsc::Receiver<Option<PathBuf>>>,
+    pending: Option<mpsc::Receiver<Option<T>>>,
     cancel: Cancel,
-    pub(crate) found: Option<PathBuf>,
+    pub(crate) found: Option<T>,
+}
+
+impl<T> Lookup<T> {
+    /// Follows `query`, cancelling the lookup a change supersedes, and calls `start` once typing
+    /// pauses to begin looking it up off the UI thread. An empty query looks nothing up. Returns
+    /// whether `found` changed.
+    fn poll(
+        &mut self,
+        query: &str,
+        now: f64,
+        tx: &mut Tx,
+        start: impl FnOnce(String, Cancel) -> mpsc::Receiver<Option<T>>,
+    ) -> bool {
+        let mut changed = false;
+        if query != self.query {
+            changed = self.found.take().is_some();
+            self.query = query.to_owned();
+            self.pending = None;
+            self.cancel.cancel().log_err("cancel lookup");
+            self.due = (!query.is_empty()).then(|| {
+                tx.wake_after(LOOKUP_DEBOUNCE);
+                now + LOOKUP_DEBOUNCE.as_secs_f64()
+            });
+        }
+        if self.due.is_some_and(|due| now >= due) {
+            self.due = None;
+            self.cancel = Cancel::default();
+            self.pending = Some(start(self.query.clone(), self.cancel.clone()));
+        }
+        if let Some(found) = take_answer(&mut self.pending) {
+            self.found = found;
+            changed = true;
+        }
+        changed
+    }
 }
 
 pub(crate) struct Creation {
@@ -469,6 +505,13 @@ fn spawn_waking<T: Send + 'static>(
     receiver
 }
 
+/// The answer `pending` holds, if it has come, which ends the wait for it.
+fn take_answer<T>(pending: &mut Option<mpsc::Receiver<T>>) -> Option<T> {
+    let answer = pending.as_ref()?.try_recv().ok()?;
+    *pending = None;
+    Some(answer)
+}
+
 pub(crate) fn poll_history(state: &mut State) -> bool {
     let palette = &mut state.palette;
     let Some(pending) = &palette.history_pending else {
@@ -580,7 +623,7 @@ fn list_worktrees(
     let pending = spawn_waking(state.waker.clone(), {
         let (shell, root) = (state.config.shell.clone(), root.clone());
         move || {
-            jump::worktrees(&shell, &root, JUMP_TIMEOUT)
+            jump::worktrees(&shell, &root, LOOKUP_TIMEOUT)
                 .log_err("wt list")
                 .unwrap_or_default()
         }
@@ -719,43 +762,14 @@ pub(crate) fn poll_jump(state: &mut State, now: f64, tx: &mut Tx) -> bool {
         Query::Search(query) if state.palette.open => query,
         _ => "",
     };
-    let jump = &mut state.palette.jump;
-    let mut changed = false;
-    if query != jump.query {
-        changed = jump.found.take().is_some();
-        jump.query = query.to_owned();
-        jump.pending = None;
-        jump.cancel.cancel().log_err("cancel jump command");
-        jump.due = (!query.is_empty()).then(|| {
-            tx.wake_after(JUMP_DEBOUNCE);
-            now + JUMP_DEBOUNCE.as_secs_f64()
-        });
-    }
-    if jump.due.is_some_and(|due| now >= due) {
-        jump.due = None;
-        jump.cancel = Cancel::default();
-        let cancel = jump.cancel.clone();
-        let (shell, command, query) = (
-            state.config.shell.clone(),
-            command.clone(),
-            jump.query.clone(),
-        );
-        jump.pending = Some(spawn_waking(state.waker.clone(), move || {
-            jump::lookup(&shell, &command, &query, JUMP_TIMEOUT, &cancel)
+    state.palette.jump.poll(query, now, tx, |query, cancel| {
+        let (shell, command) = (state.config.shell.clone(), command.clone());
+        spawn_waking(state.waker.clone(), move || {
+            jump::lookup(&shell, &command, &query, LOOKUP_TIMEOUT, &cancel)
                 .log_err("jump command")
                 .flatten()
-        }));
-    }
-    if let Some(found) = jump
-        .pending
-        .as_ref()
-        .and_then(|pending| pending.try_recv().ok())
-    {
-        jump.pending = None;
-        jump.found = found;
-        changed = true;
-    }
-    changed
+        })
+    })
 }
 
 fn enter_hint(theme: &tok::Theme, hint: Option<&str>) -> Option<El> {
@@ -1833,7 +1847,7 @@ mod tests {
         let pid = wait_for_pid(&pid_file);
         press(&mut runtime, Key::Text("x".into()), Mods::default());
         runtime.frame(2000.0);
-        wait_for_pid_exit(pid, JUMP_TIMEOUT / 2, "lookup");
+        wait_for_pid_exit(pid, LOOKUP_TIMEOUT / 2, "lookup");
     }
 
     #[test]
