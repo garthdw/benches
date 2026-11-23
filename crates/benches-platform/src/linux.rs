@@ -47,8 +47,13 @@ fn data_dirs(env: Env) -> Vec<PathBuf> {
         .collect()
 }
 
-/// Covers connecting, D-Bus activation of the service and the call itself.
-const RPC_TIMEOUT: Duration = Duration::from_secs(10);
+/// Covers connecting, D-Bus activation of the service and the call itself. Tests wait it out, so
+/// theirs is short.
+const RPC_TIMEOUT: Duration = if cfg!(test) {
+    Duration::from_millis(500)
+} else {
+    Duration::from_secs(10)
+};
 
 pub fn open(link: &Link) -> io::Result<()> {
     match link {
@@ -228,22 +233,26 @@ async fn serve_notifications(
     bus: impl Fn() -> zbus::Result<connection::Builder<'static>>,
     queued: Receiver<(u64, Notification)>,
     on_click: impl Fn(Option<u64>),
-) -> zbus::Result<()> {
-    let connection = bus()?.build().await?;
-    let server = Proxy::new(
-        &connection,
-        "org.freedesktop.Notifications",
-        "/org/freedesktop/Notifications",
-        "org.freedesktop.Notifications",
-    )
+) -> io::Result<()> {
+    let (server, mut clicks, mut closes, markup) = timeout(async {
+        let connection = bus()?.build().await?;
+        let server = Proxy::new(
+            &connection,
+            "org.freedesktop.Notifications",
+            "/org/freedesktop/Notifications",
+            "org.freedesktop.Notifications",
+        )
+        .await?;
+        // Subscribed before posting, so no click is missed.
+        let clicks = server.receive_signal("ActionInvoked").await?;
+        let closes = server.receive_signal("NotificationClosed").await?;
+        let capabilities: Vec<String> = server.call("GetCapabilities", &()).await?;
+        let markup = capabilities
+            .iter()
+            .any(|capability| capability == "body-markup");
+        Ok((server, clicks, closes, markup))
+    })
     .await?;
-    // Subscribed before posting, so no click is missed.
-    let mut clicks = server.receive_signal("ActionInvoked").await?;
-    let mut closes = server.receive_signal("NotificationClosed").await?;
-    let capabilities: Vec<String> = server.call("GetCapabilities", &()).await?;
-    let markup = capabilities
-        .iter()
-        .any(|capability| capability == "body-markup");
     let hints = HashMap::from([("sound-name", Value::from("message-new-instant"))]);
     // The server's id for each session's notification, which a new one replaces.
     let mut shown: HashMap<u64, u32> = HashMap::new();
@@ -252,12 +261,12 @@ async fn serve_notifications(
         futures_util::select! {
             (session, notification) = queued.select_next_some() => {
                 let replaces = shown.get(&session).copied().unwrap_or(0);
-                let posted = server
-                    .call::<_, _, u32>(
-                        "Notify",
-                        &notify_args(replaces, content(&notification, markup), &hints),
-                    )
-                    .await;
+                // A server that never answers drops this post rather than holding up the next.
+                let posted = timeout(server.call::<_, _, u32>(
+                    "Notify",
+                    &notify_args(replaces, content(&notification, markup), &hints),
+                ))
+                .await;
                 match posted {
                     Ok(id) => {
                         shown.insert(session, id);
@@ -432,5 +441,198 @@ mod tests {
             content(&notification("<built>"), true),
             ("Done".into(), "a&amp;b\n&lt;built&gt;".into())
         );
+    }
+
+    #[test]
+    fn connecting_to_a_bus_that_never_answers_times_out() {
+        let socket = std::env::temp_dir().join(format!("benches-silent-{}", std::process::id()));
+        std::fs::remove_file(&socket).ok();
+        let _listener = std::os::unix::net::UnixListener::bind(&socket).expect("binds");
+        let address = format!("unix:path={}", socket.display());
+        let (_posts, queued) = async_channel::unbounded();
+        let served = async_io::block_on(serve_notifications(
+            || connection::Builder::address(address.as_str()),
+            queued,
+            |_| {},
+        ));
+        std::fs::remove_file(&socket).ok();
+        assert_eq!(
+            served.map_err(|error| error.kind()),
+            Err(io::ErrorKind::TimedOut)
+        );
+    }
+
+    /// D-Bus tests run against private `dbus-daemon`s, only when `BENCHES_DBUS_TESTS` is set:
+    /// `BENCHES_DBUS_TESTS=1 cargo test -p benches-platform dbus`.
+    mod dbus {
+        use std::io::{BufRead, BufReader};
+        use std::process::{Child, Stdio};
+        use std::sync::atomic::{AtomicU32, Ordering};
+        use std::sync::mpsc;
+
+        use zbus::object_server::SignalEmitter;
+        use zbus::zvariant::OwnedValue;
+
+        use super::*;
+
+        fn enabled() -> bool {
+            let enabled = std::env::var_os("BENCHES_DBUS_TESTS").is_some()
+                && Command::new("dbus-daemon")
+                    .arg("--version")
+                    .output()
+                    .is_ok_and(|output| output.status.success());
+            if !enabled {
+                eprintln!("skipped: needs BENCHES_DBUS_TESTS=1 and dbus-daemon");
+            }
+            enabled
+        }
+
+        /// A session bus of its own at a fixed socket, so it can be restarted at the same address.
+        struct Bus {
+            socket: PathBuf,
+            daemon: Child,
+        }
+
+        impl Bus {
+            fn start(name: &str) -> Self {
+                let socket = std::env::temp_dir()
+                    .join(format!("benches-dbus-{name}-{}", std::process::id()));
+                let daemon = Self::daemon(&socket);
+                Self { socket, daemon }
+            }
+
+            fn daemon(socket: &Path) -> Child {
+                std::fs::remove_file(socket).ok();
+                let mut daemon = Command::new("dbus-daemon")
+                    .args(["--session", "--nofork", "--print-address"])
+                    .arg(format!("--address=unix:path={}", socket.display()))
+                    .stdout(Stdio::piped())
+                    .spawn()
+                    .expect("dbus-daemon starts");
+                let mut address = String::new();
+                BufReader::new(daemon.stdout.take().expect("piped stdout"))
+                    .read_line(&mut address)
+                    .expect("dbus-daemon prints its address");
+                daemon
+            }
+
+            fn address(&self) -> String {
+                format!("unix:path={}", self.socket.display())
+            }
+
+            fn connect(
+                &self,
+            ) -> impl Fn() -> zbus::Result<connection::Builder<'static>> + Send + 'static
+            {
+                let address = self.address();
+                move || connection::Builder::address(address.as_str())
+            }
+
+            fn stop(&mut self) {
+                self.daemon.kill().ok();
+                self.daemon.wait().ok();
+            }
+        }
+
+        impl Drop for Bus {
+            fn drop(&mut self) {
+                self.stop();
+                std::fs::remove_file(&self.socket).ok();
+            }
+        }
+
+        /// Reports each notification's body, clicks it at once, and never answers one whose body
+        /// ends in "hang".
+        struct Server {
+            notified: mpsc::Sender<String>,
+            last_id: AtomicU32,
+        }
+
+        #[zbus::interface(name = "org.freedesktop.Notifications")]
+        impl Server {
+            fn get_capabilities(&self) -> Vec<String> {
+                Vec::new()
+            }
+
+            #[allow(clippy::too_many_arguments)]
+            async fn notify(
+                &self,
+                #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
+                _app: String,
+                replaces: u32,
+                _icon: String,
+                _summary: String,
+                body: String,
+                _actions: Vec<String>,
+                _hints: HashMap<String, OwnedValue>,
+                _timeout: i32,
+            ) -> u32 {
+                if body.ends_with("hang") {
+                    std::future::pending::<()>().await;
+                }
+                let id = if replaces == 0 {
+                    self.last_id.fetch_add(1, Ordering::Relaxed) + 1
+                } else {
+                    replaces
+                };
+                self.notified.send(body).ok();
+                Self::action_invoked(&emitter, id, "default").await.ok();
+                id
+            }
+
+            #[zbus(signal)]
+            async fn action_invoked(
+                emitter: &SignalEmitter<'_>,
+                id: u32,
+                action: &str,
+            ) -> zbus::Result<()>;
+        }
+
+        fn serve(bus: &Bus, notified: mpsc::Sender<String>) -> zbus::Connection {
+            async_io::block_on(async {
+                connection::Builder::address(bus.address().as_str())?
+                    .name("org.freedesktop.Notifications")?
+                    .serve_at(
+                        "/org/freedesktop/Notifications",
+                        Server {
+                            notified,
+                            last_id: AtomicU32::new(0),
+                        },
+                    )?
+                    .build()
+                    .await
+            })
+            .expect("the stub server starts")
+        }
+
+        fn notification(body: &str) -> Notification {
+            Notification {
+                title: "Done".into(),
+                subtitle: "proj".into(),
+                body: body.into(),
+            }
+        }
+
+        const WAIT: Duration = Duration::from_secs(5);
+
+        #[test]
+        fn a_post_the_server_never_answers_does_not_hold_up_later_ones() {
+            if !enabled() {
+                return;
+            }
+            let bus = Bus::start("hang");
+            let (notified, bodies) = mpsc::channel();
+            let _server = serve(&bus, notified);
+            let (clicked, clicks) = mpsc::channel();
+            let posts = spawn_notifications(bus.connect(), move |session| {
+                clicked.send(session).ok();
+            })
+            .expect("the notification thread starts");
+
+            posts.try_send((1, notification("hang"))).ok();
+            posts.try_send((2, notification("after"))).ok();
+            assert_eq!(bodies.recv_timeout(WAIT).as_deref(), Ok("proj\nafter"));
+            assert_eq!(clicks.recv_timeout(WAIT), Ok(Some(2)));
+        }
     }
 }
