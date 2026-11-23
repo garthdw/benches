@@ -12,10 +12,12 @@
 
 `device, queue, encoder, target, format, size (device px), dt, update_ms, rt: &mut Runtime<S>, ui: &mut Renderer`.
 
+- `size` never exceeds the device's `max_texture_dimension_2d`: a window surface is clamped to it, and a resize past it keeps the previous drawable and viewport.
 - `f.device_key()`: the device can change between frames. Rebuild GPU resources when the key changes. Never compare `wgpu::Device`s, whose ids repeat across instances.
 - `f.srgb_blend()`.
+- `f.fade_stops()`: the frame's packed `ScrollFade::stops`, `[0.0, 0.0]` when no scroller uses them. Only `draw_ui` hands them to the renderer; see the scroll-fade rule in `SKILL.md`.
 - `f.write_buffer(buffer, offset, data)`: `queue.write_buffer` via reused staging. Offset and length must be multiples of 4. It needs the `Frame`, so it isn't usable from inside the `draw_with` closure, where Benches uses `queue.write_buffer`.
-- `f.draw_ui()`: the default frame with no slots handled. It uploads with the crate-private `prepare_ui`, which on an 8-bit sRGB-blended target rounds flat translucent fills and greyscale glyph ink to bytes before blending, as the CPU boot painter does. `f.ui.prepare` (Benches' path) leaves that off, so Rune's own chrome in a compositor frame can differ by 1 LSB at the CPU-to-GPU hand-over; nothing a compositor can switch.
+- `f.draw_ui()`: the default frame with no slots handled. It sets the fade stops and uploads with the crate-private `prepare_ui`, which on an 8-bit sRGB-blended target rounds flat translucent fills and greyscale glyph ink to bytes before blending, as the CPU boot painter does. `f.ui.prepare` (Benches' path) leaves that off, so Rune's own chrome in a compositor frame can differ by 1 LSB at the CPU-to-GPU hand-over; nothing a compositor can switch.
 
 ## EffectSite (argument to the draw closure)
 
@@ -32,3 +34,4 @@
 | `srgb_blend` | How to encode colours |
 | `index` | Position in the painter stream |
 | `backdrop` | `Option<&TextureView>`, a copy of the target so far; only when the slot set `effect_backdrop(true)` |
+| `fade_stops` | The renderer's packed scroll-fade stops, matching `clip_alpha_stops` in `CLIP_WGSL` |

@@ -4,12 +4,14 @@
 
 `KeyEvent { key: Key, mods: Mods }`.
 
-- `Key`: `Text(String)` (Space is `Text(" ")`), `Enter, Backspace, Delete, Left, Right, Up, Down, Home, End, PageUp, PageDown, Insert, PrintScreen, ScrollLock, Pause, Escape, Tab, Function(u8), ContextMenu, Modifier{..}` (a modifier pressed or released on its own, only sent if the app opts in with `App::modifier_keys`), and `Command(char)`. `Key` is `#[non_exhaustive]`, so a `match` needs a `_` arm.
+- `Key`: `Text(String)`, `Enter, Backspace, Delete, Left, Right, Up, Down, Home, End, PageUp, PageDown, Insert, PrintScreen, ScrollLock, Pause, Escape, Tab, Function(u8), ContextMenu, Modifier{..}` (a modifier pressed or released on its own, only sent if the app opts in with `App::modifier_keys`), and `Command(char)`. `Key` is `#[non_exhaustive]`, so a `match` needs a `_` arm.
 - `Command(c)` is any character typed with ⌘ (letter, digit, punctuation), lowercased. With Shift the character follows the layout (⌘⇧7 is `Command('&')` on US, `Command('/')` on German), so match shifted shortcuts on `tx.physical_key()`. Exception: ⌘Space arrives as `Text(" ")` with `mods.cmd`.
+- `Text` carries what the layout typed (winit's `text_with_all_modifiers`) unless that is empty or a control character, or the key is a chord (on macOS ⌘ or Ctrl held; elsewhere ⌘, Ctrl or Alt, but not Ctrl with Alt, which is AltGr), so Space is `Text(" ")` on most layouts but Shift+Space on a Persian layout is `Text("\u{200C}")`. With `.ime_option_as_alt(true)` winit hands Rune the characters without Option, so ⌥Space is `Text(" ")` with `mods.alt`.
+- Off macOS, Alt+letter without Ctrl is a chord: it never types into a focused field and reaches `on_key`.
 - `Mods { shift, cmd, alt, ctrl, logo }`. On macOS `cmd` and `logo` are both ⌘.
 - During a key handler: `tx.physical_key() -> Option<PhysicalKeyCode>`, `tx.key_base() -> Option<char>` (the character under the current layout with no modifiers), `tx.key_repeat()`, `tx.mods()`, `tx.input_time()`. `El::on_key_up` hears releases (logical key; a root handler gets unclaimed ones); an `on_physical_input` that takes a release hides it from `on_key_up`.
 - With Ctrl held, winit on macOS reports the logical key as the shift-only character (`create_key_event`), so ⌃2 arrives as `Key::Text("2")` with `mods.ctrl`, not `Command`. ⌃⌘ combos are `Command`.
-- `Key::Dead` from winit maps to **no logical event at all**, so `on_key` never runs for it.
+- A dead key that types nothing (`Key::Dead` with no text) maps to **no logical event at all**, so `on_key` never runs for it. A dead key that carries text (a second dead key on Windows, `'` then `'` typing `''`) arrives as `Text` unless a chord modifier is held. While `.ime_cursor()` has the input method, macOS composes dead keys as IME preedit and commit instead.
 
 ## Physical input
 

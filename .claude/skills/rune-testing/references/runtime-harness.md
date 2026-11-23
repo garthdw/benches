@@ -15,7 +15,7 @@ rt.key(KeyEvent { key: Key::Tab, mods: Mods::default() });
 rt.frame(1.0 / 60.0);
 ```
 
-`Runtime<S>` is a thin `#[repr(C)]` wrapper over the non-generic `RuntimeCore`. Only `state`, `poll` and `on_key` are public fields after it. `App::on_focus`, `on_modifiers`, `on_visibility` and `on_ime` go into crate-private `hooks`, filled only by `Runtime::configure`, which is `pub(crate)`. So with `Runtime::new`, `window_focus(false)` and modifier changes through `physical_input` reach no app hook. Benches tests call the hook directly: `runtime.update(|state, tx| on_window_focus(state, false, tx))`, `runtime.update(|state, _| modifiers_changed(state, mods))`, or `on_ime(&mut state, &ime, &mut tx)`. The public `App::headless_runtime(size, env)` does apply every hook, but takes its state from the `App`'s `init` and runs `setup`, so `test_support::runtime_with` doesn't use it.
+`Runtime<S>` is a thin `#[repr(C)]` wrapper over the non-generic `RuntimeCore`. Only `state`, `poll` and `on_key` are public fields after it. `App::on_focus`, `on_modifiers`, `on_visibility` and `on_ime` go into crate-private `hooks`, filled only by `Runtime::configure`, which is `pub(crate)`. So with `Runtime::new`, `window_focus(false)` and modifier changes through `physical_input` reach no app hook. Benches tests call the hook directly: `runtime.update(|state, tx| on_window_focus(state, false, tx))`, `runtime.update(|state, _| modifiers_changed(state, mods))`, or `on_ime(&mut state, &ime, &mut tx)`. The public `App::headless_runtime(size, env)` does apply every hook, but takes its state from the `App`'s `init` and runs `setup`, so `runtime_with` in `src/test_support.rs` doesn't use it: it sets `state.started` (so the first `poll` spawns no shell), wires `poll` and `on_key` and runs the first frame.
 
 Driving input (points, window space):
 
@@ -32,6 +32,7 @@ Inspect with:
 
 - `find(key) -> Option<(f32, f32)>`: element centre in points, `None` once exiting.
 - `presented(key) -> Option<([x, y, w, h], opacity)>`: drawn rect as of the last frame, exiting elements included.
+- Both take a key or a key path such as `card-2/title`, skipping unkeyed wrappers between the keys.
 - `pointer()`, `cursor()`, `pressing()`, `has_focus()`, `has_pending_input()`, `wake_deadline()`.
 - `stats.commits`: view re-runs. Unchanged across a `frame` means a paint-only frame. `live_pending()` is true while a live source has an update waiting.
 - `file_dialog()` shows the pending `Tx::open_file`/`save_file`/`open_folder` request; `resolve_file_dialog(Some(path))` or `None` (cancel) answers it, and the callback runs on the next frame. Errors if none is open.
