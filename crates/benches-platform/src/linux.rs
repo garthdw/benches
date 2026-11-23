@@ -316,12 +316,11 @@ impl Server {
         on_click: &impl Fn(Option<u64>),
     ) -> Option<(u64, Notification)> {
         loop {
-            futures_util::select! {
-                post = queued.next() => match post {
-                    Some(post) if self.proxy.connection().is_closed() => return Some(post),
-                    Some((session, notification)) => self.post(session, &notification).await,
-                    None => return None,
-                },
+            // Server changes and signals first, so a post never goes out with stale ids, and a
+            // click before the close that usually follows it.
+            futures_util::select_biased! {
+                // A new server numbers its notifications afresh, so `shown` would be wrong.
+                _ = self.owners.next() => return None,
                 message = self.clicks.next() => match message {
                     Some(message) => {
                         if let Ok((id, _action)) = message.body().deserialize::<(u32, String)>()
@@ -341,8 +340,11 @@ impl Server {
                     }
                     None => return None,
                 },
-                // A new server numbers its notifications afresh, so `shown` would be wrong.
-                _ = self.owners.next() => return None,
+                post = queued.next() => match post {
+                    Some(post) if self.proxy.connection().is_closed() => return Some(post),
+                    Some((session, notification)) => self.post(session, &notification).await,
+                    None => return None,
+                },
             }
         }
     }
