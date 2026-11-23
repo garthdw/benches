@@ -12,7 +12,7 @@ use rune::{
 
 use crate::app::{State, open_project, open_tab, open_tray, run_command, tray_action};
 use crate::jump;
-use crate::keymap::{COMMANDS, Command, CommandSpec, chord_hint};
+use crate::keymap::{COMMANDS, Command, CommandSpec, chord_hint, field_shortcut};
 use crate::workspace::{Status, Workspace};
 use benches_core::LogErr;
 use benches_core::config::Config;
@@ -662,6 +662,9 @@ fn palette_key(state: &mut State, event: &KeyEvent, tx: &mut Tx) -> bool {
         }
         return true;
     }
+    if field_shortcut(state, event, tx) {
+        return true;
+    }
     if state.palette.worktrees.is_some() {
         return worktree_key(state, event);
     }
@@ -944,6 +947,24 @@ mod tests {
         press(&mut runtime, Key::Escape, Mods::default());
         runtime.frame(3.0 / 60.0);
         assert!(runtime.find("palette").is_none());
+    }
+
+    #[test]
+    fn a_tab_digit_switches_tabs_rather_than_typing() {
+        let mut runtime = palette_runtime();
+        press_chord(
+            &mut runtime,
+            &format!("{}2", crate::keymap::TAB_DIGIT.here()),
+        );
+        assert_eq!(runtime.state.workspace.projects[0].active_tab, 1);
+        assert_eq!(runtime.state.palette.edit.text, "");
+    }
+
+    #[test]
+    fn the_next_prompt_chord_moves_the_selection_rather_than_the_terminal() {
+        let mut runtime = palette_runtime();
+        press_command(&mut runtime, Command::NextPrompt);
+        assert_eq!(runtime.state.palette.selected, 1);
     }
 
     #[test]
@@ -1731,17 +1752,28 @@ mod tests {
     }
 
     fn poll_until_created(runtime: &mut Runtime<State>) {
-        let mut frame = 1.0;
+        frame_until(runtime, "the worktree creation to end", |runtime| {
+            runtime.state.palette.creation.is_none()
+        });
+    }
+
+    /// The pid a stub shell wrote to `file`, once it has.
+    fn wait_for_pid(file: &Path) -> i32 {
         wait_until(
             Duration::from_secs(15),
-            || "timed out".to_owned(),
+            || format!("no pid in {}", file.display()),
+            || std::fs::read_to_string(file).ok()?.trim().parse().ok(),
+        )
+    }
+
+    fn wait_for_pid_exit(pid: i32, timeout: Duration, what: &str) {
+        wait_until(
+            timeout,
+            || format!("{what} is still running"),
             || {
-                if runtime.state.palette.creation.is_none() {
-                    return Some(());
-                }
-                frame += 1.0;
-                runtime.frame(frame / 60.0);
-                None
+                nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None)
+                    .is_err()
+                    .then_some(())
             },
         );
     }
@@ -1795,24 +1827,11 @@ mod tests {
             pid_file.display()
         ));
         let mut runtime = create_worktree_from_palette(shell, "feature-x");
-        let deadline = std::time::Instant::now() + Duration::from_secs(15);
-        let pid = loop {
-            if let Some(pid) = std::fs::read_to_string(&pid_file)
-                .ok()
-                .and_then(|text| text.trim().parse::<i32>().ok())
-            {
-                break pid;
-            }
-            assert!(std::time::Instant::now() < deadline, "timed out");
-            std::thread::sleep(Duration::from_millis(20));
-        };
+        let pid = wait_for_pid(&pid_file);
         press(&mut runtime, Key::Escape, Mods::default());
         assert!(runtime.state.palette.creation.is_none());
         assert!(!runtime.state.palette.open);
-        while nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None).is_ok() {
-            assert!(std::time::Instant::now() < deadline, "wt was not killed");
-            std::thread::sleep(Duration::from_millis(20));
-        }
+        wait_for_pid_exit(pid, Duration::from_secs(15), "wt");
         runtime.frame(1000.0);
         assert_eq!(runtime.state.workspace.projects.len(), 2);
     }
@@ -1831,27 +1850,10 @@ mod tests {
         press(&mut runtime, Key::Text("site".into()), Mods::default());
         runtime.frame(0.0);
         runtime.frame(1000.0);
-        let deadline = std::time::Instant::now() + Duration::from_secs(15);
-        let pid = loop {
-            if let Some(pid) = std::fs::read_to_string(&pid_file)
-                .ok()
-                .and_then(|text| text.trim().parse::<i32>().ok())
-            {
-                break pid;
-            }
-            assert!(std::time::Instant::now() < deadline, "timed out");
-            std::thread::sleep(Duration::from_millis(20));
-        };
+        let pid = wait_for_pid(&pid_file);
         press(&mut runtime, Key::Text("x".into()), Mods::default());
         runtime.frame(2000.0);
-        let deadline = std::time::Instant::now() + JUMP_TIMEOUT / 2;
-        while nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None).is_ok() {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "lookup was not killed"
-            );
-            std::thread::sleep(Duration::from_millis(20));
-        }
+        wait_for_pid_exit(pid, JUMP_TIMEOUT / 2, "lookup");
     }
 
     #[test]

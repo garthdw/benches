@@ -275,6 +275,7 @@ fn strip_escapes(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{installed, stub_shell};
 
     const TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -373,27 +374,24 @@ mod tests {
     fn a_command_that_cds_finds_the_folder_in_sh_style_shells() {
         let (_root, folder) = awkward_folder();
         let query = folder.to_str().unwrap();
-        let installed = ["/bin/sh", "/bin/zsh"]
-            .into_iter()
-            .filter(|shell| Path::new(shell).exists());
-        for shell in installed {
+        for shell in std::iter::once(PathBuf::from("/bin/sh")).chain(installed("zsh")) {
             assert_eq!(
-                lookup(Path::new(shell), "cd", query, TIMEOUT, &Cancel::default()).unwrap(),
+                lookup(&shell, "cd", query, TIMEOUT, &Cancel::default()).unwrap(),
                 Some(folder.clone()),
-                "{shell}"
+                "{}",
+                shell.display()
             );
         }
     }
 
     #[test]
     fn a_command_that_cds_finds_the_folder_in_fish() {
-        let fish = Path::new("/opt/homebrew/bin/fish");
-        if !fish.exists() {
+        let Some(fish) = installed("fish") else {
             return;
-        }
+        };
         let (_root, folder) = awkward_folder();
         let found = lookup(
-            fish,
+            &fish,
             "cd",
             folder.to_str().unwrap(),
             TIMEOUT,
@@ -418,21 +416,6 @@ mod tests {
             .unwrap(),
             None
         );
-    }
-
-    /// A shell that records its arguments instead of running the script, then runs `body`.
-    fn stub_shell(body: &str) -> (tempfile::TempDir, PathBuf, PathBuf) {
-        use std::os::unix::fs::PermissionsExt;
-        let root = tempfile::tempdir().unwrap();
-        let record = root.path().join("args");
-        let shell = root.path().join("stub-shell");
-        let script = format!(
-            "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\n{body}\n",
-            record.display()
-        );
-        std::fs::write(&shell, script).unwrap();
-        std::fs::set_permissions(&shell, std::fs::Permissions::from_mode(0o755)).unwrap();
-        (root, shell, record)
     }
 
     #[test]

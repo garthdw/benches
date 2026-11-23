@@ -13,7 +13,7 @@ use anyhow::Result;
 use crossbeam_channel::{Receiver, Sender, bounded, unbounded};
 use libghostty_vt::effect::ClipboardLocation;
 use libghostty_vt::key;
-use nix::pty::{Winsize, openpty};
+use nix::pty::{OpenptyResult, Winsize, openpty};
 use nix::sys::select::{FdSet, select};
 use nix::sys::time::{TimeVal, TimeValLike};
 use rune::Waker;
@@ -160,7 +160,7 @@ impl Session {
             ws_xpixel: 0,
             ws_ypixel: 0,
         };
-        let pty = openpty(Some(&size), None)?;
+        let pty = open_pty(Some(&size))?;
         set_cloexec(&pty.master)?;
         set_cloexec(&pty.slave)?;
 
@@ -470,6 +470,13 @@ fn next_id() -> u64 {
     NEXT.fetch_add(1, Ordering::Relaxed)
 }
 
+/// macOS's `openpty` sometimes fails when another thread calls it at the same time.
+fn open_pty(size: Option<&Winsize>) -> nix::Result<OpenptyResult> {
+    static OPENING: Mutex<()> = Mutex::new(());
+    let _opening = OPENING.lock().unwrap_or_else(PoisonError::into_inner);
+    openpty(size, None)
+}
+
 fn set_cloexec(fd: &OwnedFd) -> Result<()> {
     use nix::fcntl::{F_SETFD, FdFlag, fcntl};
     fcntl(fd, F_SETFD(FdFlag::FD_CLOEXEC))?;
@@ -480,7 +487,7 @@ fn set_cloexec(fd: &OwnedFd) -> Result<()> {
 mod tests {
     use super::*;
     use crate::app::default_config;
-    use crate::test_support::wait_until;
+    use crate::test_support::{installed, wait_until};
     use benches_core::config::Theme;
     use benches_core::grid::{FRAME, GridBuilder, Presentation, Scrollbar, new_terminal};
     use benches_core::protocol::{Progress, ProgressKind};
@@ -494,17 +501,26 @@ mod tests {
     use std::process::ExitStatus;
     use std::time::Duration;
 
-    /// Waits for the prompt, so what a test types follows it as a user's would: a shell without
-    /// line editing, such as dash, prints its prompt after the type-ahead the terminal echoed.
     fn spawn_shell() -> Session {
-        let session =
-            Session::spawn(None, Path::new("/tmp"), &default_config(), Arc::new(|| {})).unwrap();
+        spawn_ready(&default_config())
+    }
+
+    /// Returns once the shell has run a command and prompted again, so what a test types follows
+    /// a prompt as a user's would: a login profile can print before the first prompt, and a
+    /// shell without line editing, such as dash, prints its prompt after any type-ahead the
+    /// terminal echoed. The command's output differs from its echo, which can't match it.
+    fn spawn_ready(config: &Config) -> Session {
+        let session = Session::spawn(None, Path::new("/tmp"), config, Arc::new(|| {})).unwrap();
+        type_line(&session, "printf 'benches-%s\\n' ready");
         wait_until(
             Duration::from_secs(15),
-            || "the shell never prompted".to_owned(),
+            || format!("the shell never prompted: {:#?}", session.grid().lines()),
             || {
                 let lines = session.grid().lines();
-                lines
+                let ready = lines
+                    .iter()
+                    .rposition(|line| line.trim_end().ends_with("benches-ready"))?;
+                lines[ready + 1..]
                     .iter()
                     .any(|line| !line.trim().is_empty())
                     .then_some(())
@@ -515,7 +531,7 @@ mod tests {
 
     #[test]
     fn output_written_in_pieces_arrives_in_one_batch() {
-        let pty = openpty(None, None).unwrap();
+        let pty = open_pty(None).unwrap();
         let mut slave = File::from(pty.slave);
         let writer = thread::spawn(move || {
             for _ in 0..4 {
@@ -1080,15 +1096,13 @@ mod tests {
 
     #[test]
     fn the_reported_directory_wins_over_the_process_directory() {
-        let fish = Path::new("/opt/homebrew/bin/fish");
-        if !fish.exists() {
+        let Some(fish) = installed("fish") else {
             return;
-        }
-        let config = Config {
-            shell: fish.into(),
-            ..default_config()
         };
-        let session = Session::spawn(None, Path::new("/tmp"), &config, Arc::new(|| {})).unwrap();
+        let session = spawn_ready(&Config {
+            shell: fish,
+            ..default_config()
+        });
         // Fish reports the symlink `/tmp`, where the process's directory reads `/private/tmp`.
         type_line(&session, "cd /tmp");
         wait_until(
@@ -1154,11 +1168,10 @@ mod tests {
     }
 
     fn spawn_with_threshold(threshold: Duration) -> Session {
-        let config = Config {
+        spawn_ready(&Config {
             command_finish_after: Some(threshold),
             ..default_config()
-        };
-        Session::spawn(None, Path::new("/tmp"), &config, Arc::new(|| {})).unwrap()
+        })
     }
 
     // Marks are doubled, as when a shell and its integration both emit them.
@@ -1343,16 +1356,15 @@ mod tests {
         wait_until(
             Duration::from_secs(15),
             || format!("no reply: {:#?}", session.grid().lines()),
+            // Joined, as "end" can land before the reply and wrap it onto the next row.
             || {
                 session
                     .grid()
                     .lines()
-                    .iter()
-                    .any(|line| {
-                        line.contains(
-                            "7501;?:states=idle,working,done,blocked,error:kinds=permission,question,auth",
-                        )
-                    })
+                    .concat()
+                    .contains(
+                        "7501;?:states=idle,working,done,blocked,error:kinds=permission,question,auth",
+                    )
                     .then_some(())
             },
         );
@@ -1449,7 +1461,8 @@ mod tests {
         Command::new("pgrep")
             .args(["-f", pattern])
             .output()
-            .is_ok_and(|output| !output.stdout.is_empty())
+            .map(|output| !output.stdout.is_empty())
+            .unwrap()
     }
 
     #[test]
@@ -1480,11 +1493,13 @@ mod tests {
     fn a_background_job_ends_with_its_dropped_shell() {
         // The job has its own process group, so it only hears the hangup when the shell passes
         // it on, as bash and zsh do and dash, Ubuntu's `sh`, doesn't.
-        let config = Config {
-            shell: PathBuf::from("/bin/bash"),
-            ..default_config()
+        let Some(bash) = installed("bash") else {
+            return;
         };
-        let session = Session::spawn(None, Path::new("/tmp"), &config, Arc::new(|| {})).unwrap();
+        let session = spawn_ready(&Config {
+            shell: bash,
+            ..default_config()
+        });
         type_line(&session, "sleep 4242 & echo started");
         wait_for_line(&session, "started");
         let finished = session.finished();
@@ -1558,25 +1573,24 @@ mod tests {
             Some(rune::PhysicalKeyCode::KeyC),
             Some('c'),
         );
-        let sleeping = || {
-            Command::new("pgrep")
-                .args(["-f", "sleep 4343"])
-                .output()
-                .unwrap()
-                .status
-                .success()
-        };
+        let sleeping = || pgrep("sleep 4343");
         // `sleep` holds the terminal before it resets its signal handling, so an early ^C is lost.
         // Resend only after the previous one has had time to take effect.
-        let deadline = Instant::now() + Duration::from_secs(15);
-        while sleeping() {
-            assert!(Instant::now() < deadline, "sleep was never interrupted");
-            session.key(ctrl_c.clone());
-            let settled = Instant::now() + Duration::from_secs(1);
-            while sleeping() && Instant::now() < settled {
-                thread::sleep(Duration::from_millis(20));
-            }
-        }
+        wait_until(
+            Duration::from_secs(15),
+            || "sleep was never interrupted".to_owned(),
+            || {
+                if !sleeping() {
+                    return Some(());
+                }
+                session.key(ctrl_c.clone());
+                let settled = Instant::now() + Duration::from_secs(1);
+                while sleeping() && Instant::now() < settled {
+                    thread::sleep(Duration::from_millis(20));
+                }
+                None
+            },
+        );
         wait_for_busy(&session, false);
         type_line(&session, "echo after-4");
         wait_for_line(&session, "after-4");

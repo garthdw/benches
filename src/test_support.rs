@@ -90,7 +90,8 @@ pub(crate) fn command() -> Mods {
     held(!mac, false, false, mac)
 }
 
-/// The key event the keyboard sends for `chord` here, such as `mod+shift+]`.
+/// The key event a US keyboard sends for `chord` here: `mod+shift+]` is ⌘ with "}" on macOS, and
+/// `alt+2` is Alt with the text "2" on Linux, as Rune only makes a `Command` key under `cmd`.
 pub(crate) fn chord_event(chord: &str) -> KeyEvent {
     let chord = Chord::parse(chord).unwrap();
     let platform = KeyPlatform::current();
@@ -104,7 +105,18 @@ pub(crate) fn chord_event(chord: &str) -> KeyEvent {
         has(ChordMod::Super) || (primary && mac),
     );
     let key = match chord.key() {
-        ChordKey::Char(character) => Key::Command(character),
+        ChordKey::Char(character) => {
+            let typed = if mods.shift {
+                us_shifted(character)
+            } else {
+                character
+            };
+            if mods.cmd {
+                Key::Command(typed.to_ascii_lowercase())
+            } else {
+                Key::Text(typed.to_string())
+            }
+        }
         ChordKey::Enter => Key::Enter,
         ChordKey::Up => Key::Up,
         ChordKey::Down => Key::Down,
@@ -113,6 +125,16 @@ pub(crate) fn chord_event(chord: &str) -> KeyEvent {
         key => panic!("no test key for {key:?}"),
     };
     KeyEvent { key, mods }
+}
+
+/// The character Shift and `character` type on a US layout.
+fn us_shifted(character: char) -> char {
+    let (plain, shifted) = ("`1234567890-=[]\\;',./", "~!@#$%^&*()_+{}|:\"<>?");
+    plain
+        .chars()
+        .zip(shifted.chars())
+        .find(|&(key, _)| key == character)
+        .map_or(character.to_ascii_uppercase(), |(_, typed)| typed)
 }
 
 pub(crate) fn press_chord(runtime: &mut Runtime<State>, chord: &str) {
@@ -161,6 +183,23 @@ pub(crate) fn stub_shell(body: &str) -> (tempfile::TempDir, PathBuf, PathBuf) {
     (directory, shell, record)
 }
 
+/// `program` as found on `PATH`, which on NixOS is the only place a shell such as bash lives.
+/// Says so when it's missing, as the caller then skips its checks.
+pub(crate) fn installed(program: &str) -> Option<PathBuf> {
+    let found = std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
+        .map(|directory| directory.join(program))
+        .find(|path| {
+            use std::os::unix::fs::PermissionsExt;
+            path.metadata().is_ok_and(|metadata| {
+                metadata.is_file() && metadata.permissions().mode() & 0o111 != 0
+            })
+        });
+    if found.is_none() {
+        eprintln!("skipped: no {program} on PATH");
+    }
+    found
+}
+
 pub(crate) fn wait_until<T>(
     timeout: Duration,
     describe: impl Fn() -> String,
@@ -174,6 +213,28 @@ pub(crate) fn wait_until<T>(
         assert!(Instant::now() < deadline, "{}", describe());
         std::thread::sleep(Duration::from_millis(10));
     }
+}
+
+/// Runs frames until `done`, so polls pick up what live sessions do, and returns the last
+/// frame's number for a test that runs more after it.
+pub(crate) fn frame_until(
+    runtime: &mut Runtime<State>,
+    waiting_for: &str,
+    done: impl Fn(&Runtime<State>) -> bool,
+) -> f64 {
+    let mut frame = 1.0;
+    wait_until(
+        Duration::from_secs(15),
+        || format!("timed out waiting for {waiting_for}"),
+        || {
+            if done(runtime) {
+                return Some(frame);
+            }
+            frame += 1.0;
+            runtime.frame(frame / 60.0);
+            None
+        },
+    )
 }
 
 pub(crate) fn one_project() -> Workspace {

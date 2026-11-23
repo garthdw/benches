@@ -4,6 +4,7 @@ use rune::tok;
 use rune::{El, Key, KeyEvent, TextEdit, Tx, row, text, text_input};
 
 use crate::app::State;
+use crate::keymap::field_shortcut;
 use crate::session::Session;
 
 const FIND_WIDTH: f32 = 180.0;
@@ -76,6 +77,7 @@ fn find_key(state: &mut State, event: &KeyEvent, tx: &mut Tx) -> bool {
                 session.search_step(!event.mods.shift);
             }
         }
+        _ if field_shortcut(state, event, tx) => {}
         _ => {
             // A poll after the edit lands sends the query.
             tx.wake_after(Duration::ZERO);
@@ -157,5 +159,6 @@ mod tests {
         press_chord(&mut runtime, &format!("{}2", TAB_DIGIT.here()));
         runtime.frame(3.0 / 60.0);
         assert!(runtime.find("find").is_none());
+        assert_eq!(runtime.state.find.edit.text, "");
     }
 }

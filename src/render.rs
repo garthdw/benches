@@ -1950,7 +1950,7 @@ mod tests {
                 row % 6 + 1,
                 row,
                 row % 6 + 1,
-                row * 977,
+                u32::from(row) * 977,
             );
             bytes.extend_from_slice(line.as_bytes());
             bytes.extend_from_slice(line.as_bytes());

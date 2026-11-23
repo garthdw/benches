@@ -1313,8 +1313,9 @@ mod tests {
     fn shifted_tab_digits_do_not_switch_tabs() {
         let mut runtime = workspace_runtime();
         let shifted = chord_event(&format!("shift+{}2", TAB_DIGIT.here()));
+        let digit = chord_event(&format!("{}2", TAB_DIGIT.here())).key.clone();
         press(&mut runtime, shifted.key.clone(), shifted.mods);
-        press(&mut runtime, Key::Command('@'), shifted.mods);
+        press(&mut runtime, digit, shifted.mods);
         let workspace = &runtime.state.workspace;
         assert_eq!((workspace.active, workspace.projects[0].active_tab), (0, 0));
     }
@@ -1847,19 +1848,13 @@ mod tests {
         );
         state.workspace.show_overlay(Some(tab));
         let mut runtime = runtime_with(state);
-        let deadline = std::time::Instant::now() + Duration::from_secs(15);
-        let mut frame = 1.0;
-        while runtime
-            .state
-            .workspace
-            .focused_tab()
-            .is_some_and(|(_, tab)| tab.status == Status::Running)
-        {
-            assert!(std::time::Instant::now() < deadline, "timed out");
-            std::thread::sleep(Duration::from_millis(20));
-            frame += 1.0;
-            runtime.frame(frame / 60.0);
-        }
+        frame_until(&mut runtime, "the overlay process to exit", |runtime| {
+            !runtime
+                .state
+                .workspace
+                .focused_tab()
+                .is_some_and(|(_, tab)| tab.status == Status::Running)
+        });
         let status = runtime.state.workspace.overlay_session().map(|_| {
             runtime
                 .state
@@ -1877,14 +1872,9 @@ mod tests {
         let tab = state.spawn_tab("lazygit", Some("sleep 0.2"), Path::new("/tmp"));
         state.workspace.show_overlay(Some(tab));
         let mut runtime = runtime_with(state);
-        let deadline = std::time::Instant::now() + Duration::from_secs(15);
-        let mut frame = 1.0;
-        while runtime.state.workspace.overlay_sessions().count() > 0 {
-            assert!(std::time::Instant::now() < deadline, "timed out");
-            std::thread::sleep(Duration::from_millis(20));
-            frame += 1.0;
-            runtime.frame(frame / 60.0);
-        }
+        frame_until(&mut runtime, "the overlay to be dropped", |runtime| {
+            runtime.state.workspace.overlay_sessions().count() == 0
+        });
         assert_eq!(overlay_id(&runtime), None);
     }
 
@@ -1928,26 +1918,22 @@ mod tests {
         runtime_with(state)
     }
 
-    fn poll_until(runtime: &mut Runtime<State>, done: impl Fn(&Tab) -> bool) {
-        let mut frame = 1.0;
-        wait_until(
-            std::time::Duration::from_secs(15),
-            || "timed out".to_owned(),
-            || {
-                if done(&runtime.state.workspace.projects[0].tray[0]) {
-                    return Some(());
-                }
-                frame += 1.0;
-                runtime.frame(frame / 60.0);
-                None
-            },
-        );
+    fn poll_tray_until(
+        runtime: &mut Runtime<State>,
+        waiting_for: &str,
+        done: impl Fn(&Tab) -> bool,
+    ) {
+        frame_until(runtime, waiting_for, |runtime| {
+            done(&runtime.state.workspace.projects[0].tray[0])
+        });
     }
 
     #[test]
     fn a_crashing_tray_process_shows_as_failed() {
         let mut runtime = live_tray("sh -c 'sleep 0.2; exit 4'");
-        poll_until(&mut runtime, |tab| tab.status != Status::Running);
+        poll_tray_until(&mut runtime, "the tray process to exit", |tab| {
+            tab.status != Status::Running
+        });
         let tray = &runtime.state.workspace.projects[0].tray[0];
         assert_eq!(tray.status, Status::Failed("exit 4".to_owned()));
         assert_eq!(
@@ -1969,22 +1955,11 @@ mod tests {
         }
         state.workspace.select_tab(0);
         let mut runtime = runtime_with(state);
-        let mut frame = 1.0;
-        wait_until(
-            Duration::from_secs(15),
-            || "timed out".to_owned(),
-            || {
-                if runtime.state.workspace.projects[0].tabs[1]
-                    .progress
-                    .is_some()
-                {
-                    return Some(());
-                }
-                frame += 1.0;
-                runtime.frame(frame / 60.0);
-                None
-            },
-        );
+        frame_until(&mut runtime, "the background tab's progress", |runtime| {
+            runtime.state.workspace.projects[0].tabs[1]
+                .progress
+                .is_some()
+        });
         let project = &runtime.state.workspace.projects[0];
         assert_eq!(
             project.tabs[1].progress,
@@ -2005,7 +1980,9 @@ mod tests {
             runtime.state.workspace.projects[0].tray[0].session.id(),
             old
         );
-        poll_until(&mut runtime, |tab| tab.session.id() != old);
+        poll_tray_until(&mut runtime, "the restarted tray process", |tab| {
+            tab.session.id() != old
+        });
         let tray = &runtime.state.workspace.projects[0].tray[0];
         assert_eq!(tray.status, Status::Running);
         assert_eq!(tray.command.as_deref(), Some("sleep 100"));
@@ -2024,7 +2001,9 @@ mod tests {
         let mut runtime = live_tray("sleep 100");
         let old = runtime.state.workspace.projects[0].tray[0].session.id();
         run_tray_action_from_palette(&mut runtime, "restart sleep");
-        poll_until(&mut runtime, |tab| tab.session.id() != old);
+        poll_tray_until(&mut runtime, "the restarted tray process", |tab| {
+            tab.session.id() != old
+        });
         let tray = &runtime.state.workspace.projects[0].tray[0];
         assert_eq!(tray.status, Status::Running);
     }
@@ -2033,7 +2012,9 @@ mod tests {
     fn the_palette_stops_a_tray_process() {
         let mut runtime = live_tray("sleep 100");
         run_tray_action_from_palette(&mut runtime, "stop sleep");
-        poll_until(&mut runtime, |tab| tab.status == Status::Stopped);
+        poll_tray_until(&mut runtime, "the tray process to stop", |tab| {
+            tab.status == Status::Stopped
+        });
     }
 
     #[test]
@@ -2043,23 +2024,22 @@ mod tests {
             .workspace
             .add_project(Project::new("/tmp".into(), vec![]));
         open_tab(&mut state, "shell", Some("cd /usr/bin && sleep 100"));
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while state.session().and_then(Session::cwd) != Some("/usr/bin".into()) {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "shell never left /tmp"
-            );
-            std::thread::sleep(std::time::Duration::from_millis(20));
-        }
+        wait_until(
+            Duration::from_secs(5),
+            || "shell never left /tmp".to_owned(),
+            || (state.session().and_then(Session::cwd) == Some("/usr/bin".into())).then_some(()),
+        );
         open_tray(&mut state, "sleep 100");
         let mut runtime = runtime_with(state);
         let in_usr_bin = |tab: &Tab| tab.session.cwd() == Some("/usr/bin".into());
-        poll_until(&mut runtime, in_usr_bin);
+        poll_tray_until(&mut runtime, "the tray process in /usr/bin", in_usr_bin);
         let old = runtime.state.workspace.projects[0].tray[0].session.id();
         restart_tray(&mut runtime.state, 0);
-        poll_until(&mut runtime, |tab| {
-            tab.session.id() != old && in_usr_bin(tab)
-        });
+        poll_tray_until(
+            &mut runtime,
+            "the restarted tray process in /usr/bin",
+            |tab| tab.session.id() != old && in_usr_bin(tab),
+        );
     }
 
     #[test]
@@ -2291,14 +2271,9 @@ mod tests {
         open_tab(&mut state, "quick", Some("sh -c 'exit 0'"));
         let mut runtime = runtime_with(state);
         let old = runtime.state.workspace.active_session().map(Session::id);
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
-        let mut frame = 1.0;
-        while runtime.find("restart-hint").is_none() {
-            assert!(std::time::Instant::now() < deadline, "timed out");
-            std::thread::sleep(std::time::Duration::from_millis(20));
-            frame += 1.0;
-            runtime.frame(frame / 60.0);
-        }
+        let frame = frame_until(&mut runtime, "the restart hint", |runtime| {
+            runtime.find("restart-hint").is_some()
+        });
         runtime.key(KeyEvent {
             key: Key::Enter,
             mods: Mods::default(),
