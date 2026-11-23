@@ -395,10 +395,10 @@ mod tests {
     fn a_cancelled_command_ends_while_another_process_holds_its_output_open() {
         let pids = tempfile::tempdir().unwrap();
         let (holder_file, pid_file) = (pids.path().join("holder"), pids.path().join("pid"));
-        // `set -m` puts the holder in a process group of its own, out of reach of the cancel, as
-        // it would each later job, so the last command replaces the shell instead.
+        // bash's `set -m` puts the holder in a process group of its own, out of reach of the
+        // cancel. dash's `set -m` does nothing without a terminal, and dash is Debian's `/bin/sh`.
         let (_directory, shell, _) = stub_shell(&format!(
-            "set -m; sleep 30 & echo $! > '{}'; echo $$ > '{}'; exec sleep 30",
+            "/bin/bash -c 'set -m; sleep 30 & echo $! >&3' 3> '{}'; echo $$ > '{}'; exec sleep 30",
             holder_file.display(),
             pid_file.display()
         ));
