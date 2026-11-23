@@ -18,7 +18,8 @@ use crate::dirs::{self, Env};
 use crate::notify::Notification;
 use crate::{Link, LinkModifier};
 
-/// The config folder, where `state.json` has always been.
+/// The config folder, as macOS has no XDG state directory and existing installs keep their
+/// saved layout there.
 pub fn state_home(env: Env) -> Option<PathBuf> {
     dirs::config_home(env)
 }
