@@ -1,7 +1,8 @@
 # Benches
 
-A native macOS terminal workspace. Each project is a folder with its own group of terminal tabs, so
-switching projects brings back the shells, editors and agents you left running there.
+A native terminal workspace for macOS and Linux. Each project is a folder with its own group of
+terminal tabs, so switching projects brings back the shells, editors and agents you left running
+there.
 
 Benches is built on [Rune](https://github.com/anomalyco/rune) for the UI and
 [libghostty-vt](https://github.com/ghostty-org/ghostty) for terminal emulation, and reads your
@@ -18,7 +19,7 @@ Ghostty config for its font and theme.
 - A git overlay (`⌘G`, `lazygit` by default).
 - Find in scrollback (`⌘F`), jump between prompts (`⌘↑`/`⌘↓`), and select the last command's output.
 - A notification when a long command finishes in a tab you aren't looking at.
-- Secure keyboard entry turns on by itself while a program reads a password.
+- On macOS, secure keyboard entry turns on by itself while a program reads a password.
 - Tear a project off into its own window and merge it back.
 - Kitty graphics, OSC 52 clipboard, hyperlinks, and Nerd Font icons sized like Ghostty sizes them.
 
@@ -48,8 +49,46 @@ to bundle the app's third-party notices (`cargo install cargo-about --features c
 
 ```sh
 cargo run          # run from the checkout
-scripts/install    # build a signed Benches.app into ~/Applications
+scripts/install    # build a signed Benches.app into ~/Applications (macOS)
 ```
+
+## Building on Linux
+
+There is no Linux release yet, so build from source. Besides Rust and Zig (`cargo-about` is only
+for bundling on macOS), the build needs a C toolchain and libxkbcommon to link against, and the
+app needs a Vulkan driver (Mesa's includes lavapipe, a software renderer) and, on X11,
+`libxkbcommon-x11-0`. On Debian or Ubuntu:
+
+```sh
+sudo apt install build-essential libxkbcommon-dev libxkbcommon-x11-0 mesa-vulkan-drivers
+cargo run --release
+```
+
+Desktop environments usually provide the rest:
+
+- fontconfig, to find fonts.
+- An XDG desktop portal with a file chooser, such as `xdg-desktop-portal-gtk`, for the folder
+  picker. `xdg-desktop-portal-wlr` alone has none.
+- A notification daemon, for command-finished notifications.
+- `xdg-open`, to open links.
+
+Benches follows the XDG base directories: config and your own themes in `~/.config/benches`, and
+the saved layout, and the log of a launch without a terminal, in `~/.local/state/benches`. Themes
+are also found where a Ghostty package installs them, such as `/usr/share/ghostty/themes`.
+
+App shortcuts use Ctrl+Shift where macOS uses ⌘ (`⌘P` is Ctrl+Shift+P, `⇧⌘,` is Ctrl+Shift+,),
+so that plain Ctrl chords reach the terminal. These differ more:
+
+| Action               | macOS       | Linux                          |
+| -------------------- | ----------- | ------------------------------ |
+| Previous/next tab    | `⇧⌘[` `⇧⌘]` | Ctrl+Page Up, Ctrl+Page Down   |
+| Tab 1 to 9           | `⌘1`–`⌘9`   | Alt+1–9                        |
+| Project 1 to 9       | `⌃1`–`⌃9`   | Ctrl+Shift+1–9                 |
+| Previous/next prompt | `⌘↑` `⌘↓`   | Ctrl+Shift+Up, Ctrl+Shift+Down |
+| Open a link          | `⌘`-click   | Ctrl-click                     |
+
+Secure keyboard entry, the Reload Config menu item and the `⌘⌫`, `⌘←`/`⌘→` and `⌥←`/`⌥→`
+line-editing keys are macOS only.
 
 ## Configuration
 
@@ -57,7 +96,7 @@ Benches works without a config file. Font and theme settings fall back to
 `~/.config/ghostty/config`. To customise it:
 
 ```sh
-benches=/Applications/Benches.app/Contents/MacOS/Benches
+benches=/Applications/Benches.app/Contents/MacOS/Benches   # or target/release/benches on Linux
 $benches config init      # write ~/.config/benches/config.toml with every option commented
 $benches config migrate   # refresh the schema reference after an upgrade
 ```
@@ -68,7 +107,7 @@ starting folder, clipboard access and notifications. Each option is documented i
 
 ## Terminfo and ssh
 
-The bundled app sets `TERM=xterm-ghostty` and points `TERMINFO` at a compiled copy of Ghostty's entry, so programs such as nvim see undercurl, synchronized output and true colour. Builds outside a bundle (`cargo run`) fall back to `xterm-256color`.
+The bundled app sets `TERM=xterm-ghostty` and points `TERMINFO` at a compiled copy of Ghostty's entry, so programs such as nvim see undercurl, synchronized output and true colour. Builds outside a bundle (`cargo run`), and so Linux builds, fall back to `xterm-256color`.
 
 ssh doesn't forward `TERMINFO`, so remote hosts need the entry installed once:
 
