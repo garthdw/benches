@@ -1313,8 +1313,9 @@ mod tests {
     fn shifted_tab_digits_do_not_switch_tabs() {
         let mut runtime = workspace_runtime();
         let shifted = chord_event(&format!("shift+{}2", TAB_DIGIT.here()));
+        let digit = chord_event(&format!("{}2", TAB_DIGIT.here())).key.clone();
         press(&mut runtime, shifted.key.clone(), shifted.mods);
-        press(&mut runtime, Key::Command('@'), shifted.mods);
+        press(&mut runtime, digit, shifted.mods);
         let workspace = &runtime.state.workspace;
         assert_eq!((workspace.active, workspace.projects[0].active_tab), (0, 0));
     }

@@ -90,7 +90,8 @@ pub(crate) fn command() -> Mods {
     held(!mac, false, false, mac)
 }
 
-/// The key event the keyboard sends for `chord` here, such as `mod+shift+]`.
+/// The key event a US keyboard sends for `chord` here: `mod+shift+]` is ⌘ with "}" on macOS, and
+/// `alt+2` is Alt with the text "2" on Linux, as Rune only makes a `Command` key under `cmd`.
 pub(crate) fn chord_event(chord: &str) -> KeyEvent {
     let chord = Chord::parse(chord).unwrap();
     let platform = KeyPlatform::current();
@@ -104,7 +105,18 @@ pub(crate) fn chord_event(chord: &str) -> KeyEvent {
         has(ChordMod::Super) || (primary && mac),
     );
     let key = match chord.key() {
-        ChordKey::Char(character) => Key::Command(character),
+        ChordKey::Char(character) => {
+            let typed = if mods.shift {
+                us_shifted(character)
+            } else {
+                character
+            };
+            if mods.cmd {
+                Key::Command(typed.to_ascii_lowercase())
+            } else {
+                Key::Text(typed.to_string())
+            }
+        }
         ChordKey::Enter => Key::Enter,
         ChordKey::Up => Key::Up,
         ChordKey::Down => Key::Down,
@@ -113,6 +125,16 @@ pub(crate) fn chord_event(chord: &str) -> KeyEvent {
         key => panic!("no test key for {key:?}"),
     };
     KeyEvent { key, mods }
+}
+
+/// The character Shift and `character` type on a US layout.
+fn us_shifted(character: char) -> char {
+    let (plain, shifted) = ("`1234567890-=[]\\;',./", "~!@#$%^&*()_+{}|:\"<>?");
+    plain
+        .chars()
+        .zip(shifted.chars())
+        .find(|&(key, _)| key == character)
+        .map_or(character.to_ascii_uppercase(), |(_, typed)| typed)
 }
 
 pub(crate) fn press_chord(runtime: &mut Runtime<State>, chord: &str) {
