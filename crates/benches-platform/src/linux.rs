@@ -324,14 +324,21 @@ impl Server {
                 },
                 message = self.clicks.next() => match message {
                     Some(message) => {
-                        if let Some(session) = self.clicked(&message) {
+                        if let Ok((id, _action)) = message.body().deserialize::<(u32, String)>()
+                            && let Some((&session, _)) =
+                                self.shown.iter().find(|(_, shown)| **shown == id)
+                        {
                             on_click(Some(session));
                         }
                     }
                     None => return None,
                 },
                 message = self.closes.next() => match message {
-                    Some(message) => self.closed(&message),
+                    Some(message) => {
+                        if let Ok((id, _reason)) = message.body().deserialize::<(u32, u32)>() {
+                            self.shown.retain(|_, shown| *shown != id);
+                        }
+                    }
                     None => return None,
                 },
                 // A new server numbers its notifications afresh, so `shown` would be wrong.
@@ -353,21 +360,6 @@ impl Server {
                 self.shown.insert(session, id);
             }
             Err(error) => eprintln!("benches: post notification: {error}"),
-        }
-    }
-
-    /// The session whose notification an `ActionInvoked` signal is for, if it is one of ours.
-    fn clicked(&self, message: &zbus::Message) -> Option<u64> {
-        let (id, _action) = message.body().deserialize::<(u32, String)>().ok()?;
-        self.shown
-            .iter()
-            .find(|(_, shown)| **shown == id)
-            .map(|(&session, _)| session)
-    }
-
-    fn closed(&mut self, message: &zbus::Message) {
-        if let Ok((id, _reason)) = message.body().deserialize::<(u32, u32)>() {
-            self.shown.retain(|_, shown| *shown != id);
         }
     }
 }
