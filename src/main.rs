@@ -63,6 +63,10 @@ fn main() {
         }
         return;
     }
+    if args == ["plugin", "schema"] {
+        print!("{}", benches_plugin::schema());
+        return;
+    }
     log_to_file_without_terminal().log_err("log file");
     let fleet = Fleet::default();
     let app = window_app(&fleet, MAIN_WINDOW, |state| {
