@@ -33,9 +33,10 @@ objc2-user-notifications = { version = "0.3", default-features = false, features
   "UNUserNotificationCenter",
 ] }
 
-# zbus over tokio, with a runtime on each D-Bus user's thread. Rune's own D-Bus services use zbus 5
-# over async-io, so Linux builds compile both.
+# Rune's D-Bus stack, zbus 5 over async-io, so Linux builds compile one zbus. Each D-Bus user
+# blocks on its futures on its own thread.
 [target.'cfg(target_os = "linux")'.dependencies]
-zbus = { version = "6", default-features = false, features = ["tokio", "proxy"] }
-tokio = { version = "1", features = ["rt", "time", "sync", "macros"] }
+zbus = { version = "5.19", default-features = false, features = ["async-io"] }
+async-io = "2"
+async-channel = "2"
 futures-util = "0.3"

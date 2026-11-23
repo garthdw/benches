@@ -2,13 +2,17 @@ use std::collections::HashMap;
 use std::io::{self, IsTerminal};
 use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
+use std::pin::pin;
 use std::process::Command;
 use std::sync::OnceLock;
 use std::time::Duration;
 
+use async_channel::{Receiver, Sender};
+use async_io::Timer;
 use futures_util::StreamExt;
-use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
-use zbus::{Connection, OwnedVariant, Proxy, Str};
+use futures_util::future::{self, Either};
+use zbus::zvariant::Value;
+use zbus::{Connection, Proxy};
 
 use crate::dirs::{self, Env};
 use crate::notify::Notification;
@@ -46,13 +50,6 @@ fn data_dirs(env: Env) -> Vec<PathBuf> {
 /// Covers connecting, D-Bus activation of the service and the call itself.
 const RPC_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// zbus needs a runtime, so each D-Bus user runs one on its own thread.
-fn runtime() -> io::Result<tokio::runtime::Runtime> {
-    tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-}
-
 pub fn open(link: &Link) -> io::Result<()> {
     match link {
         Link::Url(url) => crate::run(xdg_open(url)),
@@ -68,25 +65,23 @@ fn xdg_open(target: impl AsRef<std::ffi::OsStr>) -> Command {
 }
 
 fn show_in_file_manager(path: &Path) -> io::Result<()> {
-    runtime()?.block_on(async {
-        let call = async {
-            let connection = Connection::session().await?;
-            let manager = Proxy::new(
-                &connection,
-                "org.freedesktop.FileManager1",
-                "/org/freedesktop/FileManager1",
-                "org.freedesktop.FileManager1",
-            )
-            .await?;
-            manager
-                .call::<_, _, ()>("ShowItems", &(vec![file_uri(path)], ""))
-                .await
-        };
-        tokio::time::timeout(RPC_TIMEOUT, call)
+    let call = async {
+        let connection = Connection::session().await?;
+        let manager = Proxy::new(
+            &connection,
+            "org.freedesktop.FileManager1",
+            "/org/freedesktop/FileManager1",
+            "org.freedesktop.FileManager1",
+        )
+        .await?;
+        manager
+            .call::<_, _, ()>("ShowItems", &(vec![file_uri(path)], ""))
             .await
-            .map_err(io::Error::other)?
-            .map_err(io::Error::other)
-    })
+    };
+    match async_io::block_on(future::select(pin!(call), Timer::after(RPC_TIMEOUT))) {
+        Either::Left((shown, _)) => shown.map_err(io::Error::other),
+        Either::Right(_) => Err(io::ErrorKind::TimedOut.into()),
+    }
 }
 
 fn file_uri(path: &Path) -> String {
@@ -187,19 +182,14 @@ pub fn set_secure_input(_enabled: bool) -> io::Result<()> {
 }
 
 /// Set once the notification thread is running; it drops the receiver if it gives up.
-static POSTS: OnceLock<UnboundedSender<(u64, Notification)>> = OnceLock::new();
+static POSTS: OnceLock<Sender<(u64, Notification)>> = OnceLock::new();
 
 pub fn start_notifications(on_click: impl Fn(Option<u64>) + Send + 'static) {
-    let (posts, queued) = unbounded_channel();
+    let (posts, queued) = async_channel::unbounded();
     let worker = std::thread::Builder::new()
         .name("benches-notifications".into())
         .spawn(move || {
-            let served = runtime().and_then(|runtime| {
-                runtime
-                    .block_on(serve_notifications(queued, on_click))
-                    .map_err(io::Error::other)
-            });
-            if let Err(error) = served {
+            if let Err(error) = async_io::block_on(serve_notifications(queued, on_click)) {
                 eprintln!("benches: notifications: {error}");
             }
         });
@@ -215,14 +205,14 @@ pub fn start_notifications(on_click: impl Fn(Option<u64>) + Send + 'static) {
 pub fn post_notification(session: u64, notification: &Notification) {
     if let Some(posts) = POSTS.get() {
         // Fails only once the notification thread has given up, which it logged.
-        posts.send((session, notification.clone())).ok();
+        posts.try_send((session, notification.clone())).ok();
     }
 }
 
 /// Posts what arrives on `queued`, replacing each session's last notification, and reports
 /// clicks on them. Notifications belonging to other apps are ignored.
 async fn serve_notifications(
-    mut queued: UnboundedReceiver<(u64, Notification)>,
+    queued: Receiver<(u64, Notification)>,
     on_click: impl Fn(Option<u64>),
 ) -> zbus::Result<()> {
     let connection = Connection::session().await?;
@@ -240,15 +230,13 @@ async fn serve_notifications(
     let markup = capabilities
         .iter()
         .any(|capability| capability == "body-markup");
-    let hints = HashMap::from([(
-        "sound-name",
-        OwnedVariant::from(Str::from_static("message-new-instant")),
-    )]);
+    let hints = HashMap::from([("sound-name", Value::from("message-new-instant"))]);
     // The server's id for each session's notification, which a new one replaces.
     let mut shown: HashMap<u64, u32> = HashMap::new();
+    let mut queued = pin!(queued);
     loop {
-        tokio::select! {
-            Some((session, notification)) = queued.recv() => {
+        futures_util::select! {
+            (session, notification) = queued.select_next_some() => {
                 let replaces = shown.get(&session).copied().unwrap_or(0);
                 let (summary, body) = content(&notification, markup);
                 let posted = server
@@ -264,19 +252,19 @@ async fn serve_notifications(
                     Err(error) => eprintln!("benches: post notification: {error}"),
                 }
             }
-            Some(message) = clicks.next() => {
+            message = clicks.select_next_some() => {
                 if let Ok((id, _action)) = message.body().deserialize::<(u32, String)>()
                     && let Some((&session, _)) = shown.iter().find(|(_, shown)| **shown == id)
                 {
                     on_click(Some(session));
                 }
             }
-            Some(message) = closes.next() => {
+            message = closes.select_next_some() => {
                 if let Ok((id, _reason)) = message.body().deserialize::<(u32, u32)>() {
                     shown.retain(|_, shown| *shown != id);
                 }
             }
-            else => return Ok(()),
+            complete => return Ok(()),
         }
     }
 }
