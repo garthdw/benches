@@ -273,6 +273,13 @@ pub fn shortcut(state: &mut State, event: &KeyEvent, tx: &mut Tx) -> bool {
     true
 }
 
+/// `shortcut` for the text a focused field's editor would type, from the field's key handler,
+/// which runs first. Off macOS an Alt chord, such as the Alt+digit tab chords, isn't a command
+/// chord, so it arrives as text. Other keys are left to the field before `on_key`.
+pub fn field_shortcut(state: &mut State, event: &KeyEvent, tx: &mut Tx) -> bool {
+    matches!(event.key, Key::Text(_)) && shortcut(state, event, tx)
+}
+
 pub fn pressed(binding: &str, event: &KeyEvent, tx: &Tx) -> bool {
     Chord::parse(binding).is_ok_and(|chord| chord.matches_tx(event, tx))
 }

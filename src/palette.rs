@@ -12,7 +12,7 @@ use rune::{
 
 use crate::app::{State, open_project, open_tab, open_tray, run_command, tray_action};
 use crate::jump;
-use crate::keymap::{COMMANDS, Command, CommandSpec, chord_hint};
+use crate::keymap::{COMMANDS, Command, CommandSpec, chord_hint, field_shortcut};
 use crate::workspace::{Status, Workspace};
 use benches_core::LogErr;
 use benches_core::config::Config;
@@ -662,6 +662,9 @@ fn palette_key(state: &mut State, event: &KeyEvent, tx: &mut Tx) -> bool {
         }
         return true;
     }
+    if field_shortcut(state, event, tx) {
+        return true;
+    }
     if state.palette.worktrees.is_some() {
         return worktree_key(state, event);
     }
@@ -944,6 +947,24 @@ mod tests {
         press(&mut runtime, Key::Escape, Mods::default());
         runtime.frame(3.0 / 60.0);
         assert!(runtime.find("palette").is_none());
+    }
+
+    #[test]
+    fn a_tab_digit_switches_tabs_rather_than_typing() {
+        let mut runtime = palette_runtime();
+        press_chord(
+            &mut runtime,
+            &format!("{}2", crate::keymap::TAB_DIGIT.here()),
+        );
+        assert_eq!(runtime.state.workspace.projects[0].active_tab, 1);
+        assert_eq!(runtime.state.palette.edit.text, "");
+    }
+
+    #[test]
+    fn the_next_prompt_chord_moves_the_selection_rather_than_the_terminal() {
+        let mut runtime = palette_runtime();
+        press_command(&mut runtime, Command::NextPrompt);
+        assert_eq!(runtime.state.palette.selected, 1);
     }
 
     #[test]
