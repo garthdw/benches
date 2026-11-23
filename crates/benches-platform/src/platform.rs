@@ -250,6 +250,29 @@ mod tests {
     }
 
     #[test]
+    fn secure_input_can_be_set_from_several_threads_at_once() {
+        if !SECURE_INPUT_SUPPORTED {
+            return;
+        }
+        let start = std::sync::Arc::new(std::sync::Barrier::new(4));
+        let setters: Vec<_> = (0..4)
+            .map(|_| {
+                let start = start.clone();
+                std::thread::spawn(move || {
+                    start.wait();
+                    for _ in 0..10 {
+                        set_secure_input(true).unwrap();
+                        set_secure_input(false).unwrap();
+                    }
+                })
+            })
+            .collect();
+        for setter in setters {
+            setter.join().unwrap();
+        }
+    }
+
+    #[test]
     fn a_pty_opens_at_the_size_asked_for() {
         let pty = open_pty(100, 30).unwrap();
         let mut size = libc::winsize {

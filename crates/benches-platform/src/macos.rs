@@ -3,6 +3,7 @@ use std::os::fd::{AsRawFd, BorrowedFd, OwnedFd};
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Mutex, PoisonError};
 
 use block2::RcBlock;
 use objc2::rc::Retained;
@@ -150,6 +151,10 @@ unsafe extern "C" {
 }
 
 pub fn set_secure_input(enabled: bool) -> io::Result<()> {
+    // The calls sometimes fail with paramErr while another thread makes one. The app makes them
+    // only from the UI thread, but tests running in parallel race.
+    static SETTING: Mutex<()> = Mutex::new(());
+    let _setting = SETTING.lock().unwrap_or_else(PoisonError::into_inner);
     // SAFETY: plain Carbon calls with no arguments.
     let status = unsafe {
         if enabled {
