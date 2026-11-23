@@ -102,11 +102,7 @@ pub(crate) struct Face {
 }
 
 struct FaceData {
-    blob: Blob<u8>,
-    index: u32,
-    /// Where the font's table directory starts in `blob`, for swash.
-    offset: u32,
-    key: CacheKey,
+    file: FontFile,
     pixels: f32,
     family: Option<FamilyId>,
     style: FontStyle,
@@ -118,19 +114,25 @@ struct FaceData {
     shaper: ShaperData,
 }
 
-/// A font file and what it needs synthesised to match a style.
+/// One font in a font file or collection.
 #[derive(Clone)]
-struct Matched {
+struct FontFile {
     blob: Blob<u8>,
     index: u32,
     /// Where the font's table directory starts in `blob`, for swash.
     offset: u32,
     key: CacheKey,
+}
+
+/// A font file and what it needs synthesised to match a style.
+#[derive(Clone)]
+struct Matched {
+    file: FontFile,
     synthesis: Synthesis,
 }
 
-impl Matched {
-    fn new(blob: Blob<u8>, index: u32, synthesis: Synthesis) -> Option<Self> {
+impl FontFile {
+    fn new(blob: Blob<u8>, index: u32) -> Option<Self> {
         let font = swash::FontRef::from_index(blob.data(), usize::try_from(index).ok()?)?;
         let (offset, key) = (font.offset, font.key);
         Some(Self {
@@ -138,7 +140,6 @@ impl Matched {
             index,
             offset,
             key,
-            synthesis,
         })
     }
 
@@ -189,17 +190,17 @@ fn matched(shared: &mut Shared, family: &FamilyInfo, style: FontStyle) -> Option
         FontWeight::NORMAL
     };
     let font = family.match_font(FontWidth::NORMAL, slant, weight, true)?;
-    Matched::new(
-        font.load(Some(&mut shared.sources))?,
-        font.index(),
-        font.synthesis(FontWidth::NORMAL, slant, weight),
-    )
+    Some(Matched {
+        file: FontFile::new(font.load(Some(&mut shared.sources))?, font.index())?,
+        synthesis: font.synthesis(FontWidth::NORMAL, slant, weight),
+    })
 }
 
 impl Shared {
     /// Whether `font` has a glyph for every character of `cluster`, each drawn in colour if
     /// `colour`.
-    fn fits(&mut self, font: swash::FontRef<'_>, pixels: f32, cluster: &str, colour: bool) -> bool {
+    fn fits(&mut self, file: &FontFile, pixels: f32, cluster: &str, colour: bool) -> bool {
+        let font = file.swash();
         let charmap = font.charmap();
         let mut glyphs = cluster
             .chars()
@@ -223,7 +224,7 @@ impl Shared {
         FaceScaler {
             scaler: self
                 .scale
-                .builder(data.swash())
+                .builder(data.file.swash())
                 // CoreText doesn't hint either, and hinting would move glyphs off Ghostty's metrics.
                 .hint(false)
                 .size(data.pixels)
@@ -237,7 +238,7 @@ impl Shared {
     /// The glyphs of `text` in `face` alone, and their total advance.
     fn shape(&mut self, face: &Face, text: &str) -> Option<(Vec<Glyph>, f64)> {
         let data = &face.data;
-        let font = harfrust::FontRef::from_index(data.blob.data(), data.index).ok()?;
+        let font = harfrust::FontRef::from_index(data.file.blob.data(), data.file.index).ok()?;
         let shaper = data
             .shaper
             .shaper(&font)
@@ -265,18 +266,12 @@ impl Shared {
 
 impl FaceData {
     fn new(
-        Matched {
-            blob,
-            index,
-            offset,
-            key,
-            synthesis,
-        }: Matched,
+        Matched { file, synthesis }: Matched,
         pixels: f64,
         family: Option<FamilyId>,
         style: FontStyle,
     ) -> Option<Self> {
-        let font = harfrust::FontRef::from_index(blob.data(), index).ok()?;
+        let font = harfrust::FontRef::from_index(file.blob.data(), file.index).ok()?;
         // fontique 0.12 asks for `slnt=14` where the axis leans right at negative angles.
         let variations = synthesis
             .variation_settings()
@@ -298,22 +293,14 @@ impl FaceData {
         let pixels = pixels as f32;
         let embolden = if synthesis.embolden() {
             // Ghostty's FreeType heuristic: 1/64 pixel per 2048 units of 26.6 face height.
-            let swash = swash::FontRef {
-                data: blob.data(),
-                offset,
-                key,
-            };
-            let metrics = swash.metrics(&coords).scale(pixels);
+            let metrics = file.swash().metrics(&coords).scale(pixels);
             ((metrics.ascent + metrics.descent + metrics.leading) * 2.0).ceil() / 64.0
         } else {
             0.0
         };
         Some(Self {
-            offset,
-            key,
             shaper: ShaperData::new(&font),
-            blob,
-            index,
+            file,
             pixels,
             family,
             style,
@@ -322,14 +309,6 @@ impl FaceData {
             coords,
             instance,
         })
-    }
-
-    fn swash(&self) -> swash::FontRef<'_> {
-        swash::FontRef {
-            data: self.blob.data(),
-            offset: self.offset,
-            key: self.key,
-        }
     }
 
     fn skew(&self) -> Transform {
@@ -346,7 +325,7 @@ impl FaceScaler<'_> {
         self.last_color_bitmap.render(
             render,
             &mut self.scaler,
-            self.data.key,
+            self.data.file.key,
             self.data.pixels,
             glyph,
         )
@@ -436,7 +415,7 @@ impl Swash {
         let data = &face.data;
         let mut shared = self.shared.borrow_mut();
         let emoji = is_emoji(cluster);
-        if shared.fits(data.swash(), data.pixels, cluster, emoji) {
+        if shared.fits(&data.file, data.pixels, cluster, emoji) {
             return Some(face.clone());
         }
         let style = Font::face_index(data.style);
@@ -446,8 +425,7 @@ impl Swash {
                 // An emoji no font colours, such as with only a COLR v1 font installed, takes a
                 // monochrome glyph, the face's own first.
                 let family = fallback_family(&mut shared, data, cluster, emoji).or_else(|| {
-                    let monochrome =
-                        emoji && !shared.fits(data.swash(), data.pixels, cluster, false);
+                    let monochrome = emoji && !shared.fits(&data.file, data.pixels, cluster, false);
                     monochrome
                         .then(|| fallback_family(&mut shared, data, cluster, false))
                         .flatten()
@@ -507,28 +485,28 @@ fn fallback_family(
 /// Whether family `id` draws `cluster` in `data`'s style, leaving its font in `shared.fonts`.
 fn draws(shared: &mut Shared, data: &FaceData, id: FamilyId, cluster: &str, colour: bool) -> bool {
     let style = Font::face_index(data.style);
-    let file = match shared.files.get(&(id, style)) {
-        Some(file) => file.clone(),
+    let font = match shared.files.get(&(id, style)) {
+        Some(font) => font.clone(),
         None => {
-            let file = shared
+            let font = shared
                 .collection
                 .family(id)
                 .and_then(|family| matched(shared, &family, data.style));
-            shared.files.insert((id, style), file.clone());
-            file
+            shared.files.insert((id, style), font.clone());
+            font
         }
     };
-    let Some(file) = file else {
+    let Some(font) = font else {
         return false;
     };
-    if !shared.fits(file.swash(), data.pixels, cluster, colour) {
+    if !shared.fits(&font.file, data.pixels, cluster, colour) {
         return false;
     }
     shared
         .fonts
         .entry((id, style))
         .or_insert_with(|| {
-            FaceData::new(file, f64::from(data.pixels), Some(id), data.style).map(Rc::new)
+            FaceData::new(font, f64::from(data.pixels), Some(id), data.style).map(Rc::new)
         })
         .is_some()
 }
@@ -748,8 +726,8 @@ impl Backend for Swash {
             .collection
             .family(face.data.family?)?;
         let styled = self.face(&family, style, f64::from(face.data.pixels))?;
-        let unchanged = styled.data.blob.id() == face.data.blob.id()
-            && styled.data.index == face.data.index
+        let unchanged = styled.data.file.blob.id() == face.data.file.blob.id()
+            && styled.data.file.index == face.data.file.index
             && styled.data.coords == face.data.coords
             && styled.data.embolden == 0.0
             && !styled.data.skew;
@@ -757,8 +735,12 @@ impl Backend for Swash {
     }
 
     fn embedded_face(&self, bytes: &'static [u8], pixels: f64) -> Result<Face> {
-        let font = Matched::new(Blob::new(Arc::new(bytes)), 0, Synthesis::default())
+        let file = FontFile::new(Blob::new(Arc::new(bytes)), 0)
             .context("swash couldn't read the font data")?;
+        let font = Matched {
+            file,
+            synthesis: Synthesis::default(),
+        };
         FaceData::new(font, pixels, None, FontStyle::default())
             .map(Face::new)
             .context("swash couldn't read the font data")
@@ -779,13 +761,14 @@ impl Backend for Swash {
     }
 
     fn glyph(face: &Face, character: char) -> Option<u16> {
-        Some(face.data.swash().charmap().map(character)).filter(|&glyph| glyph != 0)
+        Some(face.data.file.swash().charmap().map(character)).filter(|&glyph| glyph != 0)
     }
 
     fn advance(face: &Face, glyph: u16) -> f64 {
         let data = &face.data;
         f64::from(
-            data.swash()
+            data.file
+                .swash()
                 .glyph_metrics(&data.coords)
                 .scale(data.pixels)
                 .advance_width(glyph),
@@ -794,7 +777,7 @@ impl Backend for Swash {
 
     fn metrics(&self, face: &Face) -> FaceMetrics {
         let data = &face.data;
-        let metrics = data.swash().metrics(&data.coords).scale(data.pixels);
+        let metrics = data.file.swash().metrics(&data.coords).scale(data.pixels);
         // Fonts with an old OS/2 table lack these; Ghostty measures the glyphs instead.
         let measured = |height: f32, character: char| {
             if height > 0.0 {
@@ -936,6 +919,7 @@ impl Backend for Swash {
     #[cfg(test)]
     fn postscript_name(face: &Face) -> String {
         face.data
+            .file
             .swash()
             .localized_strings()
             .find_by_id(swash::StringId::PostScript, None)
