@@ -404,11 +404,14 @@ impl Plane {
     }
 }
 
+/// Job ids, unique across atlases: a rasterizer outlives the atlas a device change replaces, so
+/// a late result must not match another atlas's request.
+static NEXT_JOB: AtomicU64 = AtomicU64::new(0);
+
 struct Atlas {
     slots: FnvMap<GlyphKey, AtlasSlot>,
     /// Glyphs out with the rasterizer, by job id.
     requested: HashMap<u64, GlyphKey>,
-    next_job: u64,
     /// Counts builds, to tell the rasterizer which requests are stale.
     frame: u64,
     coverage: Plane,
@@ -426,7 +429,6 @@ impl Atlas {
         Self {
             slots: FnvMap::default(),
             requested: HashMap::new(),
-            next_job: 0,
             frame: 0,
             coverage: Plane::new(ATLAS_SIZE),
             color: Plane::new(COLOR_ATLAS_SIZE),
@@ -518,8 +520,7 @@ impl Atlas {
             Some(AtlasSlot::Pending(wanted)) => wanted.store(self.frame, Ordering::Release),
             None => {
                 let wanted = Arc::new(AtomicU64::new(self.frame));
-                let id = self.next_job;
-                self.next_job += 1;
+                let id = NEXT_JOB.fetch_add(1, Ordering::Relaxed);
                 let job = Job {
                     id,
                     wanted: wanted.clone(),
@@ -1661,6 +1662,23 @@ mod tests {
         assert!(atlas.glyph(&jobs, key).is_none());
         assert!(atlas.missing);
         assert_eq!(queued.len(), 1);
+    }
+
+    #[test]
+    fn an_atlas_for_a_new_device_never_reuses_the_old_ones_job_ids() {
+        let (jobs, queued) = crossbeam_channel::unbounded();
+        let key = |character| GlyphKey {
+            text: GlyphText::Character(character),
+            style: FontStyle::default(),
+            cells: 1,
+        };
+        let mut old = Atlas::new(0);
+        old.glyph(&jobs, key('a'));
+        let mut new = Atlas::new(0);
+        new.glyph(&jobs, key('b'));
+        let ids: Vec<u64> = queued.try_iter().map(|job| job.id).collect();
+        assert_eq!(ids.len(), 2);
+        assert_ne!(ids[0], ids[1]);
     }
 
     #[test]
