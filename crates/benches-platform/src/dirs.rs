@@ -21,7 +21,7 @@ pub fn state_dir(env: Env) -> Option<PathBuf> {
 
 /// The log a launch without a terminal writes to.
 pub fn log_file(env: Env) -> Option<PathBuf> {
-    os::log_file(env)
+    Some(os::log_dir(env)?.join("benches.log"))
 }
 
 /// The folders Ghostty installs its themes in, searched after the user's own.

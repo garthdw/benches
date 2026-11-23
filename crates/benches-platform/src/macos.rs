@@ -14,17 +14,17 @@ use objc2_user_notifications::{
     UNUserNotificationCenterDelegate,
 };
 
-use crate::Link;
 use crate::dirs::{self, Env};
 use crate::notify::Notification;
+use crate::{Link, LinkModifier};
 
 /// The config folder, where `state.json` has always been.
 pub fn state_home(env: Env) -> Option<PathBuf> {
     dirs::config_home(env)
 }
 
-pub fn log_file(env: Env) -> Option<PathBuf> {
-    Some(dirs::home(env)?.join("Library/Logs/benches.log"))
+pub fn log_dir(env: Env) -> Option<PathBuf> {
+    Some(dirs::home(env)?.join("Library/Logs"))
 }
 
 pub fn ghostty_theme_dirs(_env: Env) -> Vec<PathBuf> {
@@ -83,7 +83,24 @@ pub const FALLBACK_LOCALE: &str = "en_US.UTF-8";
 
 pub const FALLBACK_SHELL: &str = "/bin/zsh";
 
+/// Whether this is the bundled app rather than a `cargo run` binary, which answers to macOS as
+/// the terminal that started it.
+fn in_bundle() -> bool {
+    std::env::current_exe().is_ok_and(|exe| exe.to_string_lossy().contains(".app/Contents/MacOS/"))
+}
+
+pub fn launched_without_terminal() -> bool {
+    in_bundle()
+}
+
+/// ⌘, as for the app's own shortcuts.
+pub const LINK_MODIFIER: LinkModifier = LinkModifier::Super;
+
+/// Only the bundled app has permissions of its own to grant.
 pub fn full_disk_access_settings() -> Option<Link> {
+    if !in_bundle() {
+        return None;
+    }
     let home = std::env::var_os("HOME")?;
     // Every Mac has this file, and only Full Disk Access lets a process read it.
     let database = PathBuf::from(home).join("Library/Application Support/com.apple.TCC/TCC.db");

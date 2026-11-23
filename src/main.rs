@@ -14,8 +14,6 @@ mod view;
 mod windows;
 mod workspace;
 
-use std::io::IsTerminal;
-
 use anyhow::Context;
 use app::window_app;
 use benches_core::{LogErr, config};
@@ -26,12 +24,7 @@ use windows::{Fleet, MAIN_WINDOW};
 fn log_to_file_without_terminal() -> anyhow::Result<()> {
     use std::os::fd::AsRawFd;
 
-    let launched_without_terminal = if cfg!(target_os = "macos") {
-        app::in_bundle()
-    } else {
-        !std::io::stderr().is_terminal()
-    };
-    if !launched_without_terminal {
+    if !benches_platform::launched_without_terminal() {
         return Ok(());
     }
     let path = benches_platform::dirs::log_file(&|name| std::env::var_os(name))

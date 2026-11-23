@@ -3,6 +3,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
+use benches_platform::LinkModifier;
 use libghostty_vt::effect::ClipboardMime;
 use libghostty_vt::key::{Key as Vt, Mods as VtMods};
 use libghostty_vt::mode::Mode;
@@ -48,12 +49,10 @@ pub struct PointerInput {
     pub mods: key::Mods,
 }
 
-/// Held to hover and open links: ⌘ on macOS, and Ctrl on Linux, where the window manager
-/// usually takes Super.
-pub const LINK_MODS: key::Mods = if cfg!(target_os = "macos") {
-    key::Mods::SUPER
-} else {
-    key::Mods::CTRL
+/// Held to hover and open links.
+pub const LINK_MODS: key::Mods = match benches_platform::LINK_MODIFIER {
+    LinkModifier::Ctrl => key::Mods::CTRL,
+    LinkModifier::Super => key::Mods::SUPER,
 };
 
 /// What the pointer over the terminal would do, which picks its cursor.

@@ -13,8 +13,8 @@ use crate::LogErr;
 use crate::grid::{DEFAULT_BG, DEFAULT_FG};
 use benches_font::DEFAULT_FONT_FAMILY;
 use benches_font::constraint::Modifier;
-use benches_platform::FALLBACK_SHELL;
 use benches_platform::dirs::{self, Env};
+use benches_platform::{FALLBACK_SHELL, SECURE_INPUT_SUPPORTED};
 
 const DEFAULT_FONT_SIZE: f64 = 18.0;
 /// Ghostty's default for `notify-on-command-finish-after`.
@@ -511,7 +511,7 @@ impl Config {
                 .auto_secure_input
                 .or_else(|| {
                     ghostty_value("macos-auto-secure-input")
-                        .filter(|_| cfg!(target_os = "macos"))
+                        .filter(|_| SECURE_INPUT_SUPPORTED)
                         .and_then(|value| value.parse().log_err("macos-auto-secure-input"))
                 })
                 .unwrap_or(defaults.auto_secure_input),
@@ -1071,7 +1071,7 @@ mod tests {
         assert!(auto(None, None));
         assert_eq!(
             auto(None, Some("macos-auto-secure-input = false\n")),
-            !cfg!(target_os = "macos")
+            !SECURE_INPUT_SUPPORTED
         );
         assert!(auto(
             Some("auto-secure-input = true\n"),

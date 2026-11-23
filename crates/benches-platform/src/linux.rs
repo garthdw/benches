@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::io;
+use std::io::{self, IsTerminal};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::OnceLock;
@@ -9,16 +9,16 @@ use futures_util::StreamExt;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 use zbus::{Connection, OwnedVariant, Proxy, Str};
 
-use crate::Link;
 use crate::dirs::{self, Env};
 use crate::notify::Notification;
+use crate::{Link, LinkModifier};
 
 pub fn state_home(env: Env) -> Option<PathBuf> {
     dirs::xdg_home(env, "XDG_STATE_HOME", ".local/state")
 }
 
-pub fn log_file(env: Env) -> Option<PathBuf> {
-    Some(dirs::state_dir(env)?.join("benches.log"))
+pub fn log_dir(env: Env) -> Option<PathBuf> {
+    dirs::state_dir(env)
 }
 
 pub fn ghostty_theme_dirs(env: Env) -> Vec<PathBuf> {
@@ -126,6 +126,13 @@ pub const FALLBACK_LOCALE: &str = "C.UTF-8";
 
 /// Every POSIX system has it, unlike zsh.
 pub const FALLBACK_SHELL: &str = "/bin/sh";
+
+pub fn launched_without_terminal() -> bool {
+    !io::stderr().is_terminal()
+}
+
+/// Ctrl, as the window manager usually takes Super.
+pub const LINK_MODIFIER: LinkModifier = LinkModifier::Ctrl;
 
 /// Linux keeps a nice value per thread, so this lowers only the calling one.
 pub fn lower_thread_priority() -> io::Result<()> {
