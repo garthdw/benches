@@ -727,8 +727,10 @@ impl Canvas<'_> {
         }
         let styled = data.skew().then(&upright);
         let mut colour = Render::new(COLOR_SOURCES);
+        // A COLR v0 layer in the text's colour draws white, as COLR v1's does.
         colour
             .format(Format::Alpha)
+            .default_color([u8::MAX; 4])
             .embolden(data.embolden)
             .transform(Some(styled));
         if let Some(image) = scaler.render(&colour, glyph) {
@@ -1588,6 +1590,59 @@ mod tests {
         data.embolden = if style.bold { 1.0 } else { 0.0 };
         data.skew = style.italic;
         Face::new(data)
+    }
+
+    /// The COLR v1 emoji font with a COLR v0 table that draws 😀 as two of its glyphs, the
+    /// second in palette entry `over` over the first in entry 0: no installed font is COLR v0.
+    fn colr_v0_emoji(swash: &Swash, over: u16) -> Option<FontFile> {
+        let file = FontFile::load(&colr_v1_emoji(swash)?, None)?;
+        let font = file.swash();
+        let grinning = font.charmap().map(GRINNING);
+        let mut context = ScaleContext::new();
+        let mut scaler = context.builder(font).size(PIXELS as f32).build();
+        // Two glyphs at least half the em across and high, so the second has an opaque middle.
+        let mut layers = (1..font.metrics(&[]).glyph_count).filter(|&glyph| {
+            scaler.scale_outline(glyph).is_some_and(|outline| {
+                let bounds = outline.bounds();
+                f64::from(bounds.width().min(bounds.height())) > PIXELS / 2.0
+            })
+        });
+        let (under, over_glyph) = (layers.next()?, layers.next()?);
+        // Version 0 with one base glyph record at byte 14 and two layer records at byte 20 (each
+        // offset a u32, so two u16s), then the record, then the layers.
+        let table: Vec<u8> = [
+            0, 1, 0, 14, 0, 20, 2, grinning, 0, 2, under, 0, over_glyph, over,
+        ]
+        .into_iter()
+        .flat_map(u16::to_be_bytes)
+        .collect();
+        Some(with_colr(&file, |colr| {
+            colr[..table.len()].copy_from_slice(&table);
+        }))
+    }
+
+    #[test]
+    fn a_colr_v0_layer_in_the_text_colour_draws_white() {
+        let swash = Swash::new();
+        let (Some(text), Some(palette)) = (colr_v0_emoji(&swash, 0xFFFF), colr_v0_emoji(&swash, 0))
+        else {
+            return;
+        };
+        let draw = |file: &FontFile| {
+            let face = synthesised(file, FontStyle::default());
+            canvas(&swash, &face, Swash::glyph(&face, GRINNING).unwrap())
+        };
+        // swash's layer blending loses a little alpha.
+        let white =
+            |&[red, green, blue, alpha]: &[u8; 4]| alpha > 250 && [red, green, blue] == [alpha; 3];
+        let (text, palette) = (draw(&text), draw(&palette));
+        let whitened = text
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .zip(palette.as_chunks::<4>().0)
+            .any(|(text, palette)| white(text) && !white(palette));
+        assert!(whitened);
     }
 
     #[test]

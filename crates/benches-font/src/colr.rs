@@ -181,6 +181,9 @@ impl<'a> ColrV1<'a> {
     }
 }
 
+/// The palette index COLR paints with to mean the text's colour.
+const TEXT_COLOR_INDEX: u16 = 0xFFFF;
+
 /// Palette 0, read where a paint asks for a colour: an emoji font's palette has thousands of
 /// entries and a glyph uses a handful.
 struct Palette<'a> {
@@ -190,13 +193,19 @@ struct Palette<'a> {
 }
 
 impl Palette<'_> {
-    /// Straight RGBA in 0..1. 0xFFFF is the text's colour; an emoji's image takes none, so it's
-    /// black.
+    /// Straight RGBA in 0..1, black for an index past the palette. 0xFFFF is the text's colour,
+    /// white as the canvas draws text: a glyph painted in it alone reads as coverage, which the
+    /// renderer tints, and one with other colours keeps it white, as CoreText draws it.
     fn color(&self, index: u16, alpha: f32) -> [f32; 4] {
         let record = (index < self.entries)
             .then(|| self.records.get(self.first + usize::from(index)))
             .flatten();
-        let [red, green, blue, opacity] = record.map_or([0.0, 0.0, 0.0, 1.0], |record| {
+        let missing = if index == TEXT_COLOR_INDEX {
+            [1.0; 4]
+        } else {
+            [0.0, 0.0, 0.0, 1.0]
+        };
+        let [red, green, blue, opacity] = record.map_or(missing, |record| {
             [record.red, record.green, record.blue, record.alpha]
                 .map(|channel| f32::from(channel) / 255.0)
         });
@@ -868,5 +877,15 @@ mod tests {
         };
         assert_eq!(palette.color(0, 1.0), [1.0, 0.0, 0.0, 1.0]);
         assert_eq!(palette.color(1, 1.0), [0.0, 0.0, 0.0, 1.0]);
+    }
+
+    #[test]
+    fn the_text_colour_index_draws_white_for_the_renderer_to_tint() {
+        let palette = Palette {
+            records: &[],
+            first: 0,
+            entries: 0,
+        };
+        assert_eq!(palette.color(0xFFFF, 0.5), [1.0, 1.0, 1.0, 0.5]);
     }
 }
