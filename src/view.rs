@@ -4,7 +4,7 @@ use libghostty_vt::mouse;
 use rune::tok;
 use rune::{
     Color, Cursor, Cx, Drag, El, Icon, Phase, PointerButton, PointerEvent, PopupItem, PopupMenu,
-    Tx, WheelEvent, col, effect, el, icon, row, text,
+    Span, Tx, WheelEvent, col, effect, el, icon, row, text,
 };
 
 use crate::app::{
@@ -178,12 +178,29 @@ fn button(theme: &tok::Theme, key: String, label: &str, active: bool) -> El {
 }
 
 fn pill(theme: &tok::Theme, key: String, label: &str, active: bool, marker: Option<El>) -> El {
+    pill_spans(theme, key, label, active, marker, Vec::new())
+}
+
+/// A pill whose label is styled by `spans`.
+pub(crate) fn pill_spans(
+    theme: &tok::Theme,
+    key: String,
+    label: &str,
+    active: bool,
+    marker: Option<El>,
+    spans: Vec<Span>,
+) -> El {
     button(theme, key, label, active)
         .px(10.0)
         .py(4.0)
         .radius(6.0)
         .children(marker)
-        .child(text(label.to_owned()).color(theme.text).truncate())
+        .child(
+            text(label.to_owned())
+                .color(theme.text)
+                .spans(spans)
+                .truncate(),
+        )
 }
 
 fn attention_dot(accent: Color, attention: Attention) -> Option<El> {

@@ -150,9 +150,57 @@ pub(crate) enum WhenEmpty {
 
 pub(crate) struct PageRow {
     pub(crate) label: String,
-    /// What typing filters on, which may hold more than `label` shows.
-    pub(crate) matches: String,
+    /// Shown dimmed after `label`.
+    pub(crate) detail: Option<String>,
+    /// Words that match typing without being shown, such as a full path. A row matching only
+    /// these ranks below every row matching what it shows.
+    pub(crate) keywords: Vec<String>,
     pub(crate) action: Action,
+}
+
+impl PageRow {
+    fn shown(&self) -> String {
+        match &self.detail {
+            Some(detail) => format!("{}  {detail}", self.label),
+            None => self.label.clone(),
+        }
+    }
+}
+
+/// A page row the query matches.
+pub(crate) struct VisibleRow<'a> {
+    pub(crate) row: &'a PageRow,
+    /// The matched characters' indices in the lowercased `PageRow::shown`, for highlighting.
+    pub(crate) positions: Vec<usize>,
+}
+
+/// The rows matching `query` on what they show, best first, then those matching only a keyword.
+/// An empty query keeps every row in order.
+fn rank_page<'a>(rows: &'a [PageRow], query: &str) -> Vec<VisibleRow<'a>> {
+    let mut ranked: Vec<(bool, u32, VisibleRow)> = rows
+        .iter()
+        .filter_map(|row| {
+            if let Some(found) = fuzzy_match(&row.shown(), query) {
+                let visible = VisibleRow {
+                    row,
+                    positions: found.positions,
+                };
+                return Some((false, found.score, visible));
+            }
+            let score = row
+                .keywords
+                .iter()
+                .filter_map(|keyword| Some(fuzzy_match(keyword, query)?.score))
+                .max()?;
+            let visible = VisibleRow {
+                row,
+                positions: Vec::new(),
+            };
+            Some((true, score, visible))
+        })
+        .collect();
+    ranked.sort_by_key(|(keyword_only, score, _)| (*keyword_only, Reverse(*score)));
+    ranked.into_iter().map(|(_, _, visible)| visible).collect()
 }
 
 /// A worktree's branch and path, which Enter opens as a project.
@@ -164,7 +212,8 @@ pub(crate) fn worktree_row(worktree: jump::Worktree) -> PageRow {
             branch.unwrap_or("(detached)"),
             jump::abbreviate_home(&worktree.path)
         ),
-        matches: format!("{} {}", branch.unwrap_or_default(), worktree.path.display()),
+        detail: None,
+        keywords: Vec::new(),
         action: Action::Jump(worktree.path),
     }
 }
@@ -195,15 +244,10 @@ struct RowAction {
 }
 
 impl State {
-    /// The page's rows whose `matches` contain the query's letters in order.
-    fn visible_rows(&self) -> Vec<&PageRow> {
-        let query = self.palette.edit.text.trim();
-        self.palette
-            .page
-            .iter()
-            .flat_map(|page| &page.rows)
-            .filter(|row| letters_in_order(&row.matches, query))
-            .collect()
+    fn visible_rows(&self) -> Vec<VisibleRow<'_>> {
+        self.palette.page.as_ref().map_or_else(Vec::new, |page| {
+            rank_page(&page.rows, self.palette.edit.text.trim())
+        })
     }
 
     fn jump_target(&self) -> Option<&Path> {
@@ -350,6 +394,8 @@ struct Match {
     score: u32,
     /// A contiguous substring starting a word, so safe to rank above `Run`.
     strong: bool,
+    /// The matched characters' indices in the label, for highlighting.
+    positions: Vec<usize>,
 }
 
 fn fuzzy_match(label: &str, query: &str) -> Option<Match> {
@@ -367,41 +413,45 @@ fn fuzzy_match(label: &str, query: &str) -> Option<Match> {
         let prefix = if start == 0 { 200 } else { 0 };
         let word = if starts_word(start) { 100 } else { 0 };
         return Some(Match {
-            score: 1000 + prefix + word - start as u32,
+            score: (1000_u32 + prefix + word).saturating_sub(start as u32),
             strong: starts_word(start),
+            positions: (start..start + query.len()).collect(),
         });
     }
-    let word_starts: Vec<usize> = (0..label.len())
-        .filter(|&index| starts_word(index))
-        .collect();
-    let mut starts = word_starts.iter();
-    if query
+    let mut starts = (0..label.len()).filter(|&index| starts_word(index));
+    let initials: Option<Vec<usize>> = query
         .iter()
-        .all(|wanted| starts.any(|&index| label[index] == *wanted))
-    {
+        .map(|wanted| starts.find(|&index| label[index] == *wanted))
+        .collect();
+    if let Some(positions) = initials {
         return Some(Match {
             score: 500,
             strong: false,
+            positions,
         });
     }
     let mut score = 0;
     let mut next = 0;
-    let mut previous = None;
+    let mut positions = Vec::with_capacity(query.len());
     for wanted in &query {
         let index = (next..label.len()).find(|&index| label[index] == *wanted)?;
         score += 1;
-        if previous.is_some_and(|previous| previous + 1 == index) {
+        if positions
+            .last()
+            .is_some_and(|&previous| previous + 1 == index)
+        {
             score += 3;
         }
         if starts_word(index) {
             score += 2;
         }
-        previous = Some(index);
+        positions.push(index);
         next = index + 1;
     }
     Some(Match {
         score,
         strong: false,
+        positions,
     })
 }
 
@@ -760,7 +810,7 @@ fn open_page_row(state: &mut State, index: usize, tx: &mut Tx) {
     let Some(action) = state
         .visible_rows()
         .get(index)
-        .map(|row| row.action.clone())
+        .map(|visible| visible.row.action.clone())
     else {
         return;
     };
@@ -814,15 +864,26 @@ fn palette_key(state: &mut State, event: &KeyEvent, tx: &mut Tx) -> bool {
     true
 }
 
-/// An edit reorders the rows, so the selection goes back to the top one. Checked after the edit
-/// lands, as the input applies it only after `palette_key` passes the key on.
+/// An edit reorders the rows, so the selection goes back to the top one, except on a page while
+/// the selected row still matches. Checked after the edit lands, as the input applies it only
+/// after `palette_key` passes the key on.
 pub(crate) fn poll_selection(state: &mut State) -> bool {
     let palette = &mut state.palette;
     if palette.edit.text == palette.selected_query {
         return false;
     }
-    palette.selected_query.clone_from(&palette.edit.text);
-    palette.selected = 0;
+    let before = std::mem::replace(&mut palette.selected_query, palette.edit.text.clone());
+    palette.selected = palette
+        .page
+        .as_ref()
+        .and_then(|page| {
+            let before = rank_page(&page.rows, before.trim());
+            let selected = before.get(palette.selected.min(before.len().saturating_sub(1)))?;
+            rank_page(&page.rows, palette.edit.text.trim())
+                .iter()
+                .position(|visible| std::ptr::eq(visible.row, selected.row))
+        })
+        .unwrap_or(0);
     true
 }
 
@@ -843,6 +904,30 @@ pub(crate) fn poll_jump(state: &mut State, now: f64, tx: &mut Tx) -> bool {
                 .flatten()
         })
     })
+}
+
+/// Emboldens the matched characters of `shown` and dims what follows its label. `positions`
+/// count the lowercased text's characters, so text whose lowercase has another length goes
+/// without emphasis.
+fn highlight(theme: &tok::Theme, shown: &str, label_len: usize, positions: &[usize]) -> Vec<Span> {
+    let same_length = shown.to_lowercase().chars().count() == shown.chars().count();
+    shown
+        .char_indices()
+        .enumerate()
+        .filter_map(|(index, (byte, char))| {
+            let matched = same_length && positions.contains(&index);
+            let detail = byte >= label_len;
+            (matched || detail).then(|| {
+                let span = Span::new(byte, byte + char.len_utf8());
+                let span = if matched { span.bold() } else { span };
+                if detail {
+                    span.color(theme.text_secondary)
+                } else {
+                    span
+                }
+            })
+        })
+        .collect()
 }
 
 fn enter_hint(theme: &tok::Theme, hint: Option<&str>) -> Option<El> {
@@ -871,12 +956,16 @@ pub(crate) fn view(
                 .pending
                 .is_some()
                 .then(|| pill("palette-0".to_owned(), page.loading, false, None).w_full());
-            let page_rows = visible.iter().enumerate().map(|(index, page_row)| {
-                pill(
+            let page_rows = visible.iter().enumerate().map(|(index, visible)| {
+                let shown = visible.row.shown();
+                let spans = highlight(theme, &shown, visible.row.label.len(), &visible.positions);
+                crate::view::pill_spans(
+                    theme,
                     format!("palette-{index}"),
-                    &page_row.label,
+                    &shown,
                     index == selected,
                     None,
+                    spans,
                 )
                 .children(enter_hint(
                     theme,
@@ -1503,7 +1592,7 @@ mod tests {
             .state
             .visible_rows()
             .iter()
-            .map(|row| row.label.split_once("  ").unwrap().0.to_owned())
+            .map(|visible| visible.row.label.split_once("  ").unwrap().0.to_owned())
             .collect()
     }
 
@@ -1573,6 +1662,85 @@ mod tests {
         press(&mut runtime, Key::Enter, Mods::default());
         let workspace = &runtime.state.workspace;
         assert_eq!(workspace.projects[2].root, Path::new("/dev/site.redesign"));
+    }
+
+    #[test]
+    fn a_match_far_into_a_long_label_ranks_last_rather_than_overflowing() {
+        let label = format!("{}needle", "x".repeat(2000));
+        let found = fuzzy_match(&label, "needle").unwrap();
+        assert!(found.score < 500, "{}", found.score);
+    }
+
+    #[test]
+    fn a_page_filters_on_what_its_rows_show() {
+        let home = PathBuf::from(std::env::var_os("HOME").unwrap());
+        let hidden = home.file_name().unwrap().to_str().unwrap().to_owned();
+        let mut runtime = palette_runtime();
+        let site = home.join("dev/site");
+        runtime.state.palette.page = Some(loaded(vec![
+            worktree("main", site.to_str().unwrap()),
+            worktree("feature", &format!("{}.feature", site.display())),
+        ]));
+        press(&mut runtime, Key::Text(hidden.clone()), Mods::default());
+        assert_eq!(branches(&runtime), Vec::<String>::new(), "{hidden}");
+    }
+
+    fn page_row(label: &str, keywords: &[&str]) -> PageRow {
+        PageRow {
+            label: label.to_owned(),
+            detail: None,
+            keywords: keywords.iter().map(|&word| word.to_owned()).collect(),
+            action: Action::Run(label.to_owned()),
+        }
+    }
+
+    fn page_labels(runtime: &Runtime<State>) -> Vec<String> {
+        let visible = runtime.state.visible_rows();
+        visible
+            .iter()
+            .map(|shown| shown.row.label.clone())
+            .collect()
+    }
+
+    #[test]
+    fn page_rows_rank_best_first_with_keyword_only_matches_last() {
+        let mut runtime = palette_runtime();
+        runtime.state.palette.page = Some(loaded(vec![
+            page_row("alpha", &["deploy"]),
+            page_row("a deploy b", &[]),
+            page_row("deploy", &[]),
+        ]));
+        press(&mut runtime, Key::Text("deploy".into()), Mods::default());
+        assert_eq!(page_labels(&runtime), ["deploy", "a deploy b", "alpha"]);
+    }
+
+    #[test]
+    fn a_page_row_highlights_the_characters_that_matched() {
+        let mut runtime = palette_runtime();
+        runtime.state.palette.page = Some(loaded(vec![page_row("redesign", &[])]));
+        press(&mut runtime, Key::Text("rdsn".into()), Mods::default());
+        assert_eq!(runtime.state.visible_rows()[0].positions, [0, 2, 4, 7]);
+    }
+
+    #[test]
+    fn the_page_selection_follows_its_row_while_it_still_matches() {
+        let mut runtime = palette_runtime();
+        runtime.state.palette.page = Some(loaded(vec![
+            page_row("fa", &[]),
+            page_row("fb", &[]),
+            page_row("fab", &[]),
+        ]));
+        press(&mut runtime, Key::Text("f".into()), Mods::default());
+        runtime.frame(0.0);
+        press(&mut runtime, Key::Down, Mods::default());
+        press(&mut runtime, Key::Down, Mods::default());
+        press(&mut runtime, Key::Text("a".into()), Mods::default());
+        runtime.frame(1.0 / 60.0);
+        assert_eq!(page_labels(&runtime), ["fa", "fab"]);
+        assert_eq!(runtime.state.palette.selected, 1);
+        press(&mut runtime, Key::Text("q".into()), Mods::default());
+        runtime.frame(2.0 / 60.0);
+        assert_eq!(runtime.state.palette.selected, 0);
     }
 
     #[test]
