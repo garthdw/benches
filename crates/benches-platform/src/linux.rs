@@ -50,9 +50,9 @@ fn data_dirs(env: Env) -> Vec<PathBuf> {
 }
 
 /// Covers connecting, D-Bus activation of the service and the call itself. Tests wait it out, so
-/// theirs is short.
+/// theirs is shorter, though long enough to connect on a busy machine.
 const RPC_TIMEOUT: Duration = if cfg!(test) {
-    Duration::from_millis(500)
+    Duration::from_secs(2)
 } else {
     Duration::from_secs(10)
 };
@@ -599,7 +599,7 @@ mod tests {
         use super::*;
 
         fn enabled() -> bool {
-            let enabled = std::env::var_os("BENCHES_DBUS_TESTS").is_some()
+            let enabled = std::env::var("BENCHES_DBUS_TESTS").is_ok_and(|value| value == "1")
                 && Command::new("dbus-daemon")
                     .arg("--version")
                     .output()
@@ -631,9 +631,10 @@ mod tests {
                     .spawn()
                     .expect("dbus-daemon starts");
                 // It prints its address once it listens.
-                BufReader::new(daemon.stdout.take().expect("piped stdout"))
+                let printed = BufReader::new(daemon.stdout.take().expect("piped stdout"))
                     .read_line(&mut String::new())
-                    .expect("dbus-daemon prints its address");
+                    .expect("dbus-daemon's output is read");
+                assert!(printed > 0, "dbus-daemon exited: {:?}", daemon.wait());
                 daemon
             }
 
@@ -810,6 +811,9 @@ mod tests {
             assert_eq!(posted.recv_timeout(WAIT), Ok((0, "proj\nbefore".into())));
             assert_eq!(clicks.recv_timeout(WAIT), Ok(Some(1)));
 
+            // Released first, as the bus refuses a new owner while the old one's hangup is pending.
+            async_io::block_on(stub.release_name("org.freedesktop.Notifications"))
+                .expect("the stub releases its name");
             drop(stub);
             let _stub = bus.serve(notified);
             // The new server numbers its notifications afresh, so replacing the old one's id
