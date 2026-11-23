@@ -137,8 +137,8 @@ trait Backend {
     fn advance(face: &Self::Face, glyph: u16) -> f64;
     fn metrics(&self, face: &Self::Face) -> FaceMetrics;
 
-    /// The glyphs of `text` as `line` shapes it. Only glyphs from the face itself draw correctly
-    /// through `draw_glyphs`, so callers shape only characters the face has.
+    /// The glyphs of `text` in `face`, or `None` if the face lacks any of its characters, as
+    /// `draw_glyphs` draws only the face's own glyphs.
     fn shape(&self, face: &Self::Face, text: &str) -> Option<Vec<Glyph>>;
     fn glyph_ink(&self, face: &Self::Face, glyph: u16) -> InkExtent;
     fn line(&self, face: &Self::Face, text: &str) -> Option<Self::Line>;
@@ -493,10 +493,11 @@ impl Font {
         }
     }
 
-    /// Whether `character` may be shaped with its neighbours. Only characters the main face draws
-    /// itself qualify, which keeps a run in one font, and only those in the BMP, so a character
-    /// is one UTF-16 unit. A space joins, to be shaped through; other whitespace, procedural
-    /// glyphs and icons are drawn on their own.
+    /// Whether `character` may be shaped with its neighbours. Only characters the regular face
+    /// draws itself qualify, which keeps a run in one font, and only those in the BMP, so a
+    /// character is one UTF-16 unit. A styled face can still lack one, in which case `shape`
+    /// refuses the run and its cells draw alone. A space joins, to be shaped through; other
+    /// whitespace, procedural glyphs and icons are drawn on their own.
     #[inline]
     pub fn joins_run(&self, character: char) -> bool {
         if character.is_ascii() {
@@ -703,6 +704,11 @@ mod tests {
     const REGULAR: FontStyle = FontStyle {
         bold: false,
         italic: false,
+    };
+
+    const ITALIC: FontStyle = FontStyle {
+        bold: false,
+        italic: true,
     };
 
     /// Rows of the bitmap holding any ink.
@@ -1185,5 +1191,39 @@ mod tests {
     fn unrelated_neighbours_leave_a_run_as_plain_cells() {
         let font = with_features(&[]);
         assert!(!differing(&font, "{}").contains(&true));
+    }
+
+    /// A monospaced family whose regular face has `★` and whose italic face lacks it.
+    const UNEVEN_FAMILY: &str = if cfg!(target_os = "macos") {
+        "Menlo"
+    } else {
+        "DejaVu Sans Mono"
+    };
+
+    #[test]
+    fn shaping_gives_nothing_for_a_character_the_face_lacks() {
+        let font = Font::new(UNEVEN_FAMILY, 13.0, 2.0).unwrap();
+        let face = |style| &font.faces[Font::face_index(style)];
+        assert!(font.backend.shape(face(REGULAR), "a★b").is_some());
+        assert!(font.backend.shape(face(ITALIC), "a★b").is_none());
+    }
+
+    #[test]
+    fn a_styled_run_draws_a_character_only_the_regular_face_has() {
+        let font = Font::new(UNEVEN_FAMILY, 13.0, 2.0).unwrap();
+        let run = "a★★b";
+        assert!(run.chars().all(|character| font.joins_run(character)));
+        let shaped = font.shaped_cells(run, ITALIC);
+        for (index, (character, expected)) in run.chars().zip(alone(&font, run, ITALIC)).enumerate()
+        {
+            let mut pixels = Vec::new();
+            if shaped.signature(index).is_some() {
+                font.rasterize_shaped(run, ITALIC, index, &mut pixels)
+            } else {
+                font.rasterize(&character.to_string(), ITALIC, 1, &mut pixels)
+            }
+            .unwrap();
+            assert!(pixels == expected, "cell {index}");
+        }
     }
 }

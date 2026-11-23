@@ -163,8 +163,18 @@ impl Backend for CoreText {
         let runs = unsafe { line.glyph_runs() };
         // SAFETY: a line's glyph runs are `CTRun`s.
         let runs = unsafe { runs.cast_unchecked::<CTRun>() };
+        // SAFETY: the extern static is an immutable CoreFoundation constant.
+        let font_key = unsafe { kCTFontAttributeName };
         let mut shaped = Vec::new();
         for run in runs.iter() {
+            // SAFETY: a plain getter, and a run's attributes map CFString names to CF values.
+            let attributes = unsafe { run.attributes() };
+            let attributes = unsafe { attributes.cast_unchecked::<CFString, CFType>() };
+            // The cascade shapes characters the face lacks with another font, whose glyph ids
+            // mean nothing in the face.
+            if attributes.get(font_key).as_deref() != Some(face.as_ref()) {
+                return None;
+            }
             // SAFETY: plain getter.
             let count = unsafe { run.glyph_count() };
             let length = usize::try_from(count).ok()?;
