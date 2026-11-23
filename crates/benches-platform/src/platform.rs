@@ -87,18 +87,29 @@ pub fn open_pty(cols: u16, rows: u16) -> io::Result<Pty> {
     Ok(Pty { primary, replica })
 }
 
-/// Opens a new PTY's primary end.
+/// Opens a new PTY's primary end. macOS's `posix_openpt` sometimes fails with an errno of -6,
+/// which no constant names, when another thread or process opens a PTY at the same moment. The
+/// lock keeps this process's threads apart and the retries cover other processes.
 fn open_pty_primary() -> io::Result<OwnedFd> {
-    // macOS's `posix_openpt` sometimes fails when another thread calls it at the same time.
     static OPENING: Mutex<()> = Mutex::new(());
     let _opening = OPENING.lock().unwrap_or_else(PoisonError::into_inner);
-    // SAFETY: `posix_openpt` takes only flags.
-    let descriptor = unsafe { libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY | libc::O_CLOEXEC) };
-    if descriptor < 0 {
-        return Err(io::Error::last_os_error());
+    let mut attempts = 1;
+    loop {
+        // SAFETY: `posix_openpt` takes only flags.
+        let descriptor =
+            unsafe { libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY | libc::O_CLOEXEC) };
+        if descriptor >= 0 {
+            // SAFETY: `descriptor` is new and nothing else owns it.
+            return Ok(unsafe { OwnedFd::from_raw_fd(descriptor) });
+        }
+        let error = io::Error::last_os_error();
+        if error.raw_os_error() != Some(-6) || attempts == 10 {
+            return Err(error);
+        }
+        attempts += 1;
+        // Long enough for another process's open to finish.
+        std::thread::sleep(std::time::Duration::from_millis(1));
     }
-    // SAFETY: `descriptor` is new and nothing else owns it.
-    Ok(unsafe { OwnedFd::from_raw_fd(descriptor) })
 }
 
 /// Opens the replica named by `name`, the nul-terminated path a lookup on its primary filled in.
