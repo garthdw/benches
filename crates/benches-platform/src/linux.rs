@@ -238,11 +238,10 @@ async fn serve_notifications(
         futures_util::select! {
             (session, notification) = queued.select_next_some() => {
                 let replaces = shown.get(&session).copied().unwrap_or(0);
-                let (summary, body) = content(&notification, markup);
                 let posted = server
                     .call::<_, _, u32>(
                         "Notify",
-                        &("Benches", replaces, "", summary, body, ["default", "Show"], &hints, -1),
+                        &notify_args(replaces, content(&notification, markup), &hints),
                     )
                     .await;
                 match posted {
@@ -267,6 +266,36 @@ async fn serve_notifications(
             complete => return Ok(()),
         }
     }
+}
+
+type Hints<'a> = HashMap<&'a str, Value<'a>>;
+
+/// `Notify`'s arguments: the app's name, the id it replaces, an icon, the summary and body, the
+/// actions, the hints and an expiry, where -1 leaves it to the server.
+fn notify_args<'a>(
+    replaces: u32,
+    (summary, body): (String, String),
+    hints: &'a Hints<'a>,
+) -> (
+    &'static str,
+    u32,
+    &'static str,
+    String,
+    String,
+    &'static [&'static str],
+    &'a Hints<'a>,
+    i32,
+) {
+    (
+        "Benches",
+        replaces,
+        "",
+        summary,
+        body,
+        &["default", "Show"],
+        hints,
+        -1,
+    )
 }
 
 /// Freedesktop notifications have no subtitle, so the project leads the body.
@@ -361,6 +390,17 @@ mod tests {
         assert_eq!(process_cwd(pid), std::env::current_dir().ok());
         assert_eq!(process_cwd(-1), None);
         assert_eq!(foreground_process_group(-1), None);
+    }
+
+    #[test]
+    fn notify_is_called_with_the_spec_s_signature() {
+        use zbus::zvariant::Type;
+        fn signature<T: Type>(_: &T) -> String {
+            T::SIGNATURE.to_string()
+        }
+        let hints = Hints::new();
+        let args = notify_args(0, (String::new(), String::new()), &hints);
+        assert_eq!(signature(&args), "(susssasa{sv}i)");
     }
 
     #[test]
