@@ -19,6 +19,7 @@ use swash::scale::{Render, ScaleContext, Scaler, Source, StrikeWith};
 use swash::zeno::{Angle, Format, Transform};
 use unicode_segmentation::UnicodeSegmentation;
 
+use crate::colr::ColrV1;
 use crate::constraint::Bounds;
 use crate::{
     Backend, FaceMetrics, Fnv, FnvMap, Font, FontFeature, FontStyle, Glyph, InkExtent, Placement,
@@ -81,6 +82,8 @@ impl LastColorBitmap {
 struct FaceScaler<'a> {
     data: &'a FaceData,
     scaler: Scaler<'a>,
+    /// The face's COLR v1 glyphs, which swash can't draw.
+    colr: Option<ColrV1<'a>>,
     last_color_bitmap: &'a mut LastColorBitmap,
 }
 
@@ -150,6 +153,13 @@ impl FontFile {
             key: self.key,
         }
     }
+
+    /// The font's COLR v1 glyphs at `coords`, which swash can't draw. The table directory
+    /// lookup first spares a skrifa parse of every font a fallback scan checks.
+    fn colr_v1(&self, coords: &[i16]) -> Option<ColrV1<'_>> {
+        self.swash().table(swash::tag_from_bytes(b"COLR"))?;
+        ColrV1::new(self.blob.data(), self.index, coords)
+    }
 }
 
 /// Text in runs of the faces that draw it, with each glyph's origin from the start of the line.
@@ -197,23 +207,26 @@ fn matched(shared: &mut Shared, family: &FamilyInfo, style: FontStyle) -> Option
 }
 
 impl Shared {
-    /// Whether `font` has a glyph for every character of `cluster`, each drawn in colour if
+    /// Whether `file` has a glyph for every character of `cluster`, each drawn in colour if
     /// `colour`.
     fn fits(&mut self, file: &FontFile, pixels: f32, cluster: &str, colour: bool) -> bool {
         let font = file.swash();
         let charmap = font.charmap();
-        let mut glyphs = cluster
+        let glyphs: Vec<u16> = cluster
             .chars()
             .filter(|&character| !is_joiner(character))
-            .map(|character| charmap.map(character));
-        if !colour {
-            return glyphs.all(|glyph| glyph != 0);
+            .map(|character| charmap.map(character))
+            .collect();
+        let missing = glyphs.contains(&0);
+        if missing || !colour {
+            return !missing;
         }
+        let colr = file.colr_v1(&[]);
         let mut scaler = self.scale.builder(font).size(pixels).build();
         let render = Render::new(COLOR_SOURCES);
-        glyphs.all(|glyph| {
-            glyph != 0
-                && self
+        glyphs.into_iter().all(|glyph| {
+            colr.as_ref().is_some_and(|colr| colr.has(glyph))
+                || self
                     .last_color_bitmap
                     .render(&render, &mut scaler, font.key, pixels, glyph)
                     .is_some()
@@ -230,6 +243,7 @@ impl Shared {
                 .size(data.pixels)
                 .normalized_coords(&data.coords)
                 .build(),
+            colr: data.file.colr_v1(&data.coords),
             last_color_bitmap: &mut self.last_color_bitmap,
             data,
         }
@@ -333,6 +347,15 @@ impl FaceScaler<'_> {
 
     /// The glyph's ink in pixels, up from its origin.
     fn ink(&mut self, glyph: u16) -> Option<Bounds> {
+        let colr = self.colr.as_ref();
+        if let Some(bounds) = colr.and_then(|colr| colr.bounds(glyph, self.data.pixels)) {
+            return Some(Bounds {
+                x: f64::from(bounds.x_min),
+                y: f64::from(bounds.y_min),
+                width: f64::from(bounds.x_max - bounds.x_min),
+                height: f64::from(bounds.y_max - bounds.y_min),
+            });
+        }
         let outline = self
             .scaler
             .scale_color_outline(glyph)
@@ -422,7 +445,7 @@ impl Swash {
         let family = match shared.clusters[style].get(cluster) {
             Some(family) => *family,
             None => {
-                // An emoji no font colours, such as with only a COLR v1 font installed, takes a
+                // An emoji no font colours, such as with no emoji font installed, takes a
                 // monochrome glyph, the face's own first.
                 let family = fallback_family(&mut shared, data, cluster, emoji).or_else(|| {
                     let monochrome = emoji && !shared.fits(&data.file, data.pixels, cluster, false);
@@ -620,6 +643,19 @@ impl Canvas<'_> {
         scale: (f64, f64),
     ) {
         let data = scaler.data;
+        let colr = scaler.colr.as_ref().and_then(|colr| {
+            colr.rasterize(
+                glyph,
+                data.pixels,
+                (scale.0 as f32, scale.1 as f32),
+                (origin.0 as f32, origin.1 as f32),
+            )
+        });
+        if let Some(image) = colr {
+            let at = (image.left, self.height as i32 - image.top);
+            self.blit_rgba((image.width, image.height), at, &image.rgba);
+            return;
+        }
         let transform = data
             .skew()
             .then(&Transform::scale(scale.0 as f32, scale.1 as f32))
@@ -1267,6 +1303,73 @@ mod tests {
             .unwrap();
         assert_eq!(rendered(), checked, "drawing rendered it again");
         assert!(pixels.iter().any(|&byte| byte != 0));
+    }
+
+    const GRINNING: char = '\u{1F600}';
+
+    /// An installed emoji font that colours 😀 with COLR v1 alone, as Fedora's Noto Color Emoji
+    /// does; tests that need one skip without it.
+    fn colr_v1_emoji(swash: &Swash) -> Option<(FamilyId, Matched)> {
+        let mut shared = swash.shared.borrow_mut();
+        emoji_families(&mut shared).into_iter().find_map(|id| {
+            let family = shared.collection.family(id)?;
+            let font = matched(&mut shared, &family, FontStyle::default())?;
+            let glyph = font.file.swash().charmap().map(GRINNING);
+            let colr = font.file.colr_v1(&[])?;
+            let mut scaler = shared
+                .scale
+                .builder(font.file.swash())
+                .size(PIXELS as f32)
+                .build();
+            let swash_colours = Render::new(COLOR_SOURCES)
+                .render(&mut scaler, glyph)
+                .is_some();
+            (colr.has(glyph) && !swash_colours).then_some((id, font))
+        })
+    }
+
+    #[test]
+    fn a_colr_v1_glyph_draws_in_colour() {
+        let swash = Swash::new();
+        let Some((id, font)) = colr_v1_emoji(&swash) else {
+            return;
+        };
+        let face = Face::new(FaceData::new(font, PIXELS, Some(id), FontStyle::default()).unwrap());
+        let id = Swash::glyph(&face, GRINNING).unwrap();
+        let (left, right) = swash.glyph_ink(&face, id).unwrap();
+        assert!(right - left > PIXELS / 2.0, "ink {left}..{right}");
+        let mut pixels = vec![0; 4 * 64 * 64];
+        let glyph = Glyph {
+            id,
+            x: 16.0,
+            y: 16.0,
+        };
+        swash
+            .with_canvas(&mut pixels, 64, 64, |canvas| {
+                swash.draw_glyphs(canvas, &face, [glyph]);
+            })
+            .unwrap();
+        let colour = pixels
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .any(|&[red, green, blue, alpha]| red != alpha || green != alpha || blue != alpha);
+        assert!(colour);
+    }
+
+    #[test]
+    fn a_colr_v1_only_emoji_font_is_a_colour_fallback() {
+        let swash = Swash::new();
+        let Some((_, font)) = colr_v1_emoji(&swash) else {
+            return;
+        };
+        let cluster = GRINNING.to_string();
+        assert!(
+            swash
+                .shared
+                .borrow_mut()
+                .fits(&font.file, PIXELS as f32, &cluster, true)
+        );
     }
 
     #[test]

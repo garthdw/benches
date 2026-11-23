@@ -17,6 +17,7 @@ objc2-core-graphics = "0.3"
 objc2-core-text = "0.3"
 fontique = { workspace = true, optional = true }
 harfrust = { workspace = true, optional = true }
+skrifa = { workspace = true, optional = true }
 swash = { workspace = true, optional = true }
 icu_properties = { workspace = true, optional = true }
 unicode-segmentation = { workspace = true, optional = true }
@@ -24,6 +25,7 @@ unicode-segmentation = { workspace = true, optional = true }
 [target.'cfg(not(target_os = "macos"))'.dependencies]
 fontique.workspace = true
 harfrust.workspace = true
+skrifa.workspace = true
 swash.workspace = true
 icu_properties.workspace = true
 unicode-segmentation.workspace = true
@@ -33,6 +35,7 @@ unicode-segmentation.workspace = true
 swash = [
   "dep:fontique",
   "dep:harfrust",
+  "dep:skrifa",
   "dep:swash",
   "dep:icu_properties",
   "dep:unicode-segmentation",

@@ -63,6 +63,7 @@ fontique = { version = "0.12", default-features = false, features = [
   "fontconfig-dlopen",
 ] }
 harfrust = "0.12"
+skrifa = "0.44"
 swash = "0.2.10"
 icu_properties = { version = "2.3", default-features = false, features = ["compiled_data"] }
 unicode-segmentation = "1.13"
