@@ -1359,10 +1359,13 @@ mod tests {
             "printf '\\033]7501;state=blocked:kind=permission\\033\\\\'",
         );
         wait_for_alert(&session);
-        assert_eq!(
-            notify_events(&session),
-            [(String::new(), "Needs permission".into())]
+        // The actor raises the alert before it queues the notification.
+        let notified = wait_until(
+            Duration::from_secs(15),
+            || "no notification".to_owned(),
+            || Some(notify_events(&session)).filter(|events| !events.is_empty()),
         );
+        assert_eq!(notified, [(String::new(), "Needs permission".into())]);
         type_line(
             &session,
             "printf '\\a\\033]7501;state=blocked:kind=question\\033\\\\'; echo two",
