@@ -66,19 +66,7 @@ pub struct Pty {
 /// can't, so a child that another thread forks meanwhile doesn't inherit them and keep the
 /// terminal open after its session closes.
 pub fn open_pty(cols: u16, rows: u16) -> io::Result<Pty> {
-    let primary = {
-        // macOS's `posix_openpt` sometimes fails when another thread calls it at the same time.
-        static OPENING: Mutex<()> = Mutex::new(());
-        let _opening = OPENING.lock().unwrap_or_else(PoisonError::into_inner);
-        // SAFETY: `posix_openpt` takes only flags.
-        let descriptor =
-            unsafe { libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY | libc::O_CLOEXEC) };
-        if descriptor < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        // SAFETY: `descriptor` is new and nothing else owns it.
-        unsafe { OwnedFd::from_raw_fd(descriptor) }
-    };
+    let primary = open_pty_primary()?;
     // SAFETY: both take the primary descriptor, which stays open throughout.
     if unsafe { libc::grantpt(primary.as_raw_fd()) } < 0
         || unsafe { libc::unlockpt(primary.as_raw_fd()) } < 0
@@ -97,6 +85,20 @@ pub fn open_pty(cols: u16, rows: u16) -> io::Result<Pty> {
         return Err(io::Error::last_os_error());
     }
     Ok(Pty { primary, replica })
+}
+
+/// Opens a new PTY's primary end.
+fn open_pty_primary() -> io::Result<OwnedFd> {
+    // macOS's `posix_openpt` sometimes fails when another thread calls it at the same time.
+    static OPENING: Mutex<()> = Mutex::new(());
+    let _opening = OPENING.lock().unwrap_or_else(PoisonError::into_inner);
+    // SAFETY: `posix_openpt` takes only flags.
+    let descriptor = unsafe { libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY | libc::O_CLOEXEC) };
+    if descriptor < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: `descriptor` is new and nothing else owns it.
+    Ok(unsafe { OwnedFd::from_raw_fd(descriptor) })
 }
 
 /// Opens the replica named by `name`, the nul-terminated path a lookup on its primary filled in.
