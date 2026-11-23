@@ -3,12 +3,12 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashSet;
 use std::hash::BuildHasherDefault;
 use std::rc::Rc;
-use std::sync::{Arc, LazyLock, Mutex, PoisonError};
+use std::sync::{Arc, LazyLock, Mutex, OnceLock, PoisonError};
 
 use anyhow::{Context, Result};
 use fontique::{
-    Blob, Collection, CollectionOptions, FallbackKey, FamilyId, FamilyInfo, FontStyle as Slant,
-    FontWeight, FontWidth, GenericFamily, Script, SourceCache, Synthesis,
+    Blob, Collection, CollectionOptions, FallbackKey, FamilyId, FamilyInfo, FontInfo,
+    FontStyle as Slant, FontWeight, FontWidth, GenericFamily, Script, SourceCache, Synthesis,
 };
 use harfrust::{Feature, ShapeOptions, ShaperData, ShaperInstance, Tag, UnicodeBuffer, Variation};
 use icu_properties::props::{EmojiPresentation, Script as UnicodeScript};
@@ -19,6 +19,7 @@ use swash::scale::{Render, ScaleContext, Scaler, Source, StrikeWith};
 use swash::zeno::{Angle, Format, Transform};
 use unicode_segmentation::UnicodeSegmentation;
 
+use crate::colr::ColrV1;
 use crate::constraint::Bounds;
 use crate::{
     Backend, FaceMetrics, Fnv, FnvMap, Font, FontFeature, FontStyle, Glyph, InkExtent, Placement,
@@ -33,7 +34,7 @@ pub(crate) struct Swash {
 
 /// One `Font`'s font services, so one pixel size.
 struct Shared {
-    collection: Collection,
+    system: SystemFonts,
     sources: SourceCache,
     scale: ScaleContext,
     /// Each family's font file per style index, so fallback scans after the first only read
@@ -81,18 +82,33 @@ impl LastColorBitmap {
 struct FaceScaler<'a> {
     data: &'a FaceData,
     scaler: Scaler<'a>,
+    /// The face's COLR v1 glyphs, which swash can't draw.
+    colr: Option<ColrV1<'a>>,
     last_color_bitmap: &'a mut LastColorBitmap,
 }
 
-/// The latest scan of the system fonts, which every backend's collection clones.
-static SYSTEM_FONTS: LazyLock<Mutex<(Collection, SourceCache)>> =
-    LazyLock::new(|| Mutex::new((scan_system_fonts(), SourceCache::new_shared())));
+/// The latest scan of the system fonts, which every backend clones.
+static SYSTEM_FONTS: LazyLock<Mutex<(SystemFonts, SourceCache)>> =
+    LazyLock::new(|| Mutex::new((SystemFonts::scan(), SourceCache::new_shared())));
 
-fn scan_system_fonts() -> Collection {
-    Collection::new(CollectionOptions {
-        shared: false,
-        system_fonts: true,
-    })
+/// One scan of the system fonts.
+#[derive(Clone)]
+struct SystemFonts {
+    collection: Collection,
+    /// Every family in the order the last fallback step tries them, sorted on first use.
+    last_resort: Arc<OnceLock<Box<[FamilyId]>>>,
+}
+
+impl SystemFonts {
+    fn scan() -> Self {
+        Self {
+            collection: Collection::new(CollectionOptions {
+                shared: false,
+                system_fonts: true,
+            }),
+            last_resort: Arc::default(),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -102,11 +118,7 @@ pub(crate) struct Face {
 }
 
 struct FaceData {
-    blob: Blob<u8>,
-    index: u32,
-    /// Where the font's table directory starts in `blob`, for swash.
-    offset: u32,
-    key: CacheKey,
+    file: FontFile,
     pixels: f32,
     family: Option<FamilyId>,
     style: FontStyle,
@@ -118,19 +130,25 @@ struct FaceData {
     shaper: ShaperData,
 }
 
-/// A font file and what it needs synthesised to match a style.
+/// One font in a font file or collection.
 #[derive(Clone)]
-struct Matched {
+struct FontFile {
     blob: Blob<u8>,
     index: u32,
     /// Where the font's table directory starts in `blob`, for swash.
     offset: u32,
     key: CacheKey,
+}
+
+/// A font file and what it needs synthesised to match a style.
+#[derive(Clone)]
+struct Matched {
+    file: FontFile,
     synthesis: Synthesis,
 }
 
-impl Matched {
-    fn new(blob: Blob<u8>, index: u32, synthesis: Synthesis) -> Option<Self> {
+impl FontFile {
+    fn new(blob: Blob<u8>, index: u32) -> Option<Self> {
         let font = swash::FontRef::from_index(blob.data(), usize::try_from(index).ok()?)?;
         let (offset, key) = (font.offset, font.key);
         Some(Self {
@@ -138,8 +156,11 @@ impl Matched {
             index,
             offset,
             key,
-            synthesis,
         })
+    }
+
+    fn load(font: &FontInfo, sources: Option<&mut SourceCache>) -> Option<Self> {
+        Self::new(font.load(sources)?, font.index())
     }
 
     fn swash(&self) -> swash::FontRef<'_> {
@@ -148,6 +169,13 @@ impl Matched {
             offset: self.offset,
             key: self.key,
         }
+    }
+
+    /// The font's COLR v1 glyphs at `coords`, which swash can't draw. The table directory
+    /// lookup first spares a skrifa parse of every font a fallback scan checks.
+    fn colr_v1(&self, coords: &[i16]) -> Option<ColrV1<'_>> {
+        self.swash().table(swash::tag_from_bytes(b"COLR"))?;
+        ColrV1::new(self.blob.data(), self.index, coords)
     }
 }
 
@@ -189,30 +217,33 @@ fn matched(shared: &mut Shared, family: &FamilyInfo, style: FontStyle) -> Option
         FontWeight::NORMAL
     };
     let font = family.match_font(FontWidth::NORMAL, slant, weight, true)?;
-    Matched::new(
-        font.load(Some(&mut shared.sources))?,
-        font.index(),
-        font.synthesis(FontWidth::NORMAL, slant, weight),
-    )
+    Some(Matched {
+        file: FontFile::load(font, Some(&mut shared.sources))?,
+        synthesis: font.synthesis(FontWidth::NORMAL, slant, weight),
+    })
 }
 
 impl Shared {
-    /// Whether `font` has a glyph for every character of `cluster`, each drawn in colour if
+    /// Whether `file` has a glyph for every character of `cluster`, each drawn in colour if
     /// `colour`.
-    fn fits(&mut self, font: swash::FontRef<'_>, pixels: f32, cluster: &str, colour: bool) -> bool {
+    fn fits(&mut self, file: &FontFile, pixels: f32, cluster: &str, colour: bool) -> bool {
+        let font = file.swash();
         let charmap = font.charmap();
-        let mut glyphs = cluster
+        let glyphs: Vec<u16> = cluster
             .chars()
             .filter(|&character| !is_joiner(character))
-            .map(|character| charmap.map(character));
-        if !colour {
-            return glyphs.all(|glyph| glyph != 0);
+            .map(|character| charmap.map(character))
+            .collect();
+        let missing = glyphs.contains(&0);
+        if missing || !colour {
+            return !missing;
         }
+        let colr = file.colr_v1(&[]);
         let mut scaler = self.scale.builder(font).size(pixels).build();
         let render = Render::new(COLOR_SOURCES);
-        glyphs.all(|glyph| {
-            glyph != 0
-                && self
+        glyphs.into_iter().all(|glyph| {
+            colr.as_ref().is_some_and(|colr| colr.has(glyph))
+                || self
                     .last_color_bitmap
                     .render(&render, &mut scaler, font.key, pixels, glyph)
                     .is_some()
@@ -223,12 +254,13 @@ impl Shared {
         FaceScaler {
             scaler: self
                 .scale
-                .builder(data.swash())
+                .builder(data.file.swash())
                 // CoreText doesn't hint either, and hinting would move glyphs off Ghostty's metrics.
                 .hint(false)
                 .size(data.pixels)
                 .normalized_coords(&data.coords)
                 .build(),
+            colr: data.file.colr_v1(&data.coords),
             last_color_bitmap: &mut self.last_color_bitmap,
             data,
         }
@@ -237,7 +269,7 @@ impl Shared {
     /// The glyphs of `text` in `face` alone, and their total advance.
     fn shape(&mut self, face: &Face, text: &str) -> Option<(Vec<Glyph>, f64)> {
         let data = &face.data;
-        let font = harfrust::FontRef::from_index(data.blob.data(), data.index).ok()?;
+        let font = harfrust::FontRef::from_index(data.file.blob.data(), data.file.index).ok()?;
         let shaper = data
             .shaper
             .shaper(&font)
@@ -265,18 +297,12 @@ impl Shared {
 
 impl FaceData {
     fn new(
-        Matched {
-            blob,
-            index,
-            offset,
-            key,
-            synthesis,
-        }: Matched,
+        Matched { file, synthesis }: Matched,
         pixels: f64,
         family: Option<FamilyId>,
         style: FontStyle,
     ) -> Option<Self> {
-        let font = harfrust::FontRef::from_index(blob.data(), index).ok()?;
+        let font = harfrust::FontRef::from_index(file.blob.data(), file.index).ok()?;
         // fontique 0.12 asks for `slnt=14` where the axis leans right at negative angles.
         let variations = synthesis
             .variation_settings()
@@ -298,22 +324,14 @@ impl FaceData {
         let pixels = pixels as f32;
         let embolden = if synthesis.embolden() {
             // Ghostty's FreeType heuristic: 1/64 pixel per 2048 units of 26.6 face height.
-            let swash = swash::FontRef {
-                data: blob.data(),
-                offset,
-                key,
-            };
-            let metrics = swash.metrics(&coords).scale(pixels);
+            let metrics = file.swash().metrics(&coords).scale(pixels);
             ((metrics.ascent + metrics.descent + metrics.leading) * 2.0).ceil() / 64.0
         } else {
             0.0
         };
         Some(Self {
-            offset,
-            key,
             shaper: ShaperData::new(&font),
-            blob,
-            index,
+            file,
             pixels,
             family,
             style,
@@ -322,14 +340,6 @@ impl FaceData {
             coords,
             instance,
         })
-    }
-
-    fn swash(&self) -> swash::FontRef<'_> {
-        swash::FontRef {
-            data: self.blob.data(),
-            offset: self.offset,
-            key: self.key,
-        }
     }
 
     fn skew(&self) -> Transform {
@@ -346,7 +356,7 @@ impl FaceScaler<'_> {
         self.last_color_bitmap.render(
             render,
             &mut self.scaler,
-            self.data.key,
+            self.data.file.key,
             self.data.pixels,
             glyph,
         )
@@ -354,6 +364,15 @@ impl FaceScaler<'_> {
 
     /// The glyph's ink in pixels, up from its origin.
     fn ink(&mut self, glyph: u16) -> Option<Bounds> {
+        let colr = self.colr.as_ref();
+        if let Some(bounds) = colr.and_then(|colr| colr.bounds(glyph, self.data.pixels)) {
+            return Some(Bounds {
+                x: f64::from(bounds.x_min),
+                y: f64::from(bounds.y_min),
+                width: f64::from(bounds.x_max - bounds.x_min),
+                height: f64::from(bounds.y_max - bounds.y_min),
+            });
+        }
         let outline = self
             .scaler
             .scale_color_outline(glyph)
@@ -436,18 +455,17 @@ impl Swash {
         let data = &face.data;
         let mut shared = self.shared.borrow_mut();
         let emoji = is_emoji(cluster);
-        if shared.fits(data.swash(), data.pixels, cluster, emoji) {
+        if shared.fits(&data.file, data.pixels, cluster, emoji) {
             return Some(face.clone());
         }
         let style = Font::face_index(data.style);
         let family = match shared.clusters[style].get(cluster) {
             Some(family) => *family,
             None => {
-                // An emoji no font colours, such as with only a COLR v1 font installed, takes a
+                // An emoji no font colours, such as with no emoji font installed, takes a
                 // monochrome glyph, the face's own first.
                 let family = fallback_family(&mut shared, data, cluster, emoji).or_else(|| {
-                    let monochrome =
-                        emoji && !shared.fits(data.swash(), data.pixels, cluster, false);
+                    let monochrome = emoji && !shared.fits(&data.file, data.pixels, cluster, false);
                     monochrome
                         .then(|| fallback_family(&mut shared, data, cluster, false))
                         .flatten()
@@ -464,71 +482,115 @@ impl Swash {
     }
 }
 
+/// The system's emoji fonts, in its order of preference.
+fn emoji_families(collection: &mut Collection) -> Vec<FamilyId> {
+    let mut families: Vec<FamilyId> = collection
+        .fallback_families(FallbackKey::from(Script::from_bytes(*b"Zsye")))
+        .collect();
+    families.extend(collection.generic_families(GenericFamily::Emoji));
+    families
+}
+
 /// The first family to draw `cluster` in `data`'s style, in colour if `colour`: an emoji font for
 /// emoji, then the system's fallback for the cluster's script, then the generic families, then
-/// any family. Its font is left in `shared.fonts`.
+/// every family in the last resort's order. Its font is left in `shared.fonts`.
 fn fallback_family(
     shared: &mut Shared,
     data: &FaceData,
     cluster: &str,
     colour: bool,
 ) -> Option<FamilyId> {
-    let mut candidates = Vec::new();
-    if colour {
-        candidates.extend(
-            shared
-                .collection
-                .fallback_families(FallbackKey::from(Script::from_bytes(*b"Zsye"))),
-        );
-        candidates.extend(shared.collection.generic_families(GenericFamily::Emoji));
-    }
+    let collection = &mut shared.system.collection;
+    let mut candidates = if colour {
+        emoji_families(collection)
+    } else {
+        Vec::new()
+    };
     if let Some(script) = script(cluster) {
-        candidates.extend(
-            shared
-                .collection
-                .fallback_families(FallbackKey::from(script)),
-        );
+        candidates.extend(collection.fallback_families(FallbackKey::from(script)));
     }
     for generic in [
         GenericFamily::Monospace,
         GenericFamily::SansSerif,
         GenericFamily::Emoji,
     ] {
-        candidates.extend(shared.collection.generic_families(generic));
+        candidates.extend(collection.generic_families(generic));
     }
-    candidates.extend(shared.collection.family_ids());
     let mut tried = HashSet::<FamilyId, BuildHasherDefault<Fnv>>::default();
-    candidates
+    let mut try_family =
+        |shared: &mut Shared, id| tried.insert(id) && draws(shared, data, id, cluster, colour);
+    if let Some(id) = candidates.into_iter().find(|&id| try_family(shared, id)) {
+        return Some(id);
+    }
+    let last_resort = Arc::clone(&shared.system.last_resort);
+    last_resort
+        .get_or_init(|| last_resort_order(&mut shared.system.collection))
+        .iter()
+        .copied()
+        .find(|&id| try_family(shared, id))
+}
+
+/// Every family in `last_resort_rank` order, as the collection iterates in a random order.
+/// A family is monospace when the `post` table of any of its fonts says it has a fixed pitch:
+/// any, as a family's fonts, and so its default, come in the scan's random order too. Its own
+/// source cache maps each file once, and unmaps them all once sorted.
+fn last_resort_order(collection: &mut Collection) -> Box<[FamilyId]> {
+    let mut sources = SourceCache::default();
+    let ids: Vec<FamilyId> = collection.family_ids().collect();
+    let mut families: Vec<_> = ids
         .into_iter()
-        .filter(|&id| tried.insert(id))
-        .find(|&id| draws(shared, data, id, cluster, colour))
+        .filter_map(|id| {
+            let family = collection.family(id)?;
+            let monospace = family.fonts().iter().any(|font| {
+                FontFile::load(font, Some(&mut sources))
+                    .is_some_and(|file| file.swash().metrics(&[]).is_monospace)
+            });
+            Some((last_resort_rank(monospace, family.name()), id))
+        })
+        .collect();
+    families.sort_unstable();
+    families.into_iter().map(|(_, id)| id).collect()
+}
+
+/// Where a family comes in the last fallback step: monospace first, then hidden families such as
+/// macOS's `.`-prefixed ones after visible ones, then by name in any case, as a family's fonts
+/// may spell it in different cases and the scan's order picks one. Lowercasing each character,
+/// as fontique keys its families, leaves no two system families tied, so their random ids never
+/// decide.
+fn last_resort_rank(monospace: bool, name: &str) -> (bool, bool, String) {
+    (
+        !monospace,
+        name.starts_with('.'),
+        name.chars().flat_map(char::to_lowercase).collect(),
+    )
 }
 
 /// Whether family `id` draws `cluster` in `data`'s style, leaving its font in `shared.fonts`.
 fn draws(shared: &mut Shared, data: &FaceData, id: FamilyId, cluster: &str, colour: bool) -> bool {
     let style = Font::face_index(data.style);
-    let file = match shared.files.get(&(id, style)) {
-        Some(file) => file.clone(),
+    let font = match shared.files.get(&(id, style)) {
+        Some(font) => font.clone(),
         None => {
-            let file = shared
+            let font = shared
+                .system
                 .collection
                 .family(id)
                 .and_then(|family| matched(shared, &family, data.style));
-            shared.files.insert((id, style), file.clone());
-            file
+            shared.files.insert((id, style), font.clone());
+            font
         }
     };
-    let Some(file) = file else {
+    let Some(font) = font else {
         return false;
     };
-    if !shared.fits(file.swash(), data.pixels, cluster, colour) {
+    if !shared.fits(&font.file, data.pixels, cluster, colour) {
         return false;
     }
     shared
         .fonts
         .entry((id, style))
         .or_insert_with(|| {
-            FaceData::new(file, f64::from(data.pixels), Some(id), data.style).map(Rc::new)
+            FaceData::new(font, f64::from(data.pixels), Some(id), data.style).map(Rc::new)
         })
         .is_some()
 }
@@ -571,6 +633,12 @@ impl Canvas<'_> {
                 }
             }
         }
+    }
+
+    fn blit_rgba(&mut self, size: (u32, u32), at: (i32, i32), rgba: &[u8]) {
+        self.blit(size, at, |index| {
+            std::array::from_fn(|channel| rgba.get(index * 4 + channel).copied().unwrap_or(0))
+        });
     }
 
     /// Composites premultiplied RGBA `width` by `height` stretched by `scale`, with its top-left
@@ -630,6 +698,19 @@ impl Canvas<'_> {
         scale: (f64, f64),
     ) {
         let data = scaler.data;
+        let colr = scaler.colr.as_ref().and_then(|colr| {
+            colr.rasterize(
+                glyph,
+                data.pixels,
+                (scale.0 as f32, scale.1 as f32),
+                (origin.0 as f32, origin.1 as f32),
+            )
+        });
+        if let Some(image) = colr {
+            let at = (image.left, self.height as i32 - image.top);
+            self.blit_rgba((image.width, image.height), at, &image.rgba);
+            return;
+        }
         let transform = data
             .skew()
             .then(&Transform::scale(scale.0 as f32, scale.1 as f32))
@@ -665,11 +746,7 @@ impl Canvas<'_> {
                     });
                 } else {
                     // swash composites colour outline layers premultiplied.
-                    self.blit(size, at, |index| {
-                        std::array::from_fn(|channel| {
-                            pixels.get(index * 4 + channel).copied().unwrap_or(0)
-                        })
-                    });
+                    self.blit_rgba(size, at, pixels);
                 }
             }
         }
@@ -693,13 +770,13 @@ impl Backend for Swash {
     type Canvas<'a> = Canvas<'a>;
 
     fn new() -> Self {
-        let (collection, sources) = SYSTEM_FONTS
+        let (system, sources) = SYSTEM_FONTS
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .clone();
         Self {
             shared: RefCell::new(Shared {
-                collection,
+                system,
                 sources,
                 scale: ScaleContext::new(),
                 files: FnvMap::default(),
@@ -715,29 +792,34 @@ impl Backend for Swash {
     /// A family installed since the last scan is found after one rescan per backend, as each
     /// config reload builds new backends.
     fn installed_face(&self, family: &str, pixels: f64) -> Option<Face> {
-        let lookup = || self.shared.borrow_mut().collection.family_by_name(family);
+        let lookup = || {
+            self.shared
+                .borrow_mut()
+                .system
+                .collection
+                .family_by_name(family)
+        };
         let found = lookup().or_else(|| {
             if self.rescanned.replace(true) {
                 return None;
             }
-            let collection = scan_system_fonts();
+            let system = SystemFonts::scan();
             SYSTEM_FONTS
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
-                .0 = collection.clone();
-            self.shared.borrow_mut().collection = collection;
+                .0 = system.clone();
+            self.shared.borrow_mut().system = system;
             lookup()
         })?;
         self.face(&found, FontStyle::default(), pixels)
     }
 
     fn monospace_family(&self) -> Option<String> {
-        let mut shared = self.shared.borrow_mut();
-        let id = shared
-            .collection
+        let collection = &mut self.shared.borrow_mut().system.collection;
+        let id = collection
             .generic_families(GenericFamily::Monospace)
             .next()?;
-        shared.collection.family_name(id).map(str::to_owned)
+        collection.family_name(id).map(str::to_owned)
     }
 
     /// A style the family lacks is synthesised, as Ghostty does with FreeType.
@@ -745,11 +827,12 @@ impl Backend for Swash {
         let family = self
             .shared
             .borrow_mut()
+            .system
             .collection
             .family(face.data.family?)?;
         let styled = self.face(&family, style, f64::from(face.data.pixels))?;
-        let unchanged = styled.data.blob.id() == face.data.blob.id()
-            && styled.data.index == face.data.index
+        let unchanged = styled.data.file.blob.id() == face.data.file.blob.id()
+            && styled.data.file.index == face.data.file.index
             && styled.data.coords == face.data.coords
             && styled.data.embolden == 0.0
             && !styled.data.skew;
@@ -757,8 +840,12 @@ impl Backend for Swash {
     }
 
     fn embedded_face(&self, bytes: &'static [u8], pixels: f64) -> Result<Face> {
-        let font = Matched::new(Blob::new(Arc::new(bytes)), 0, Synthesis::default())
+        let file = FontFile::new(Blob::new(Arc::new(bytes)), 0)
             .context("swash couldn't read the font data")?;
+        let font = Matched {
+            file,
+            synthesis: Synthesis::default(),
+        };
         FaceData::new(font, pixels, None, FontStyle::default())
             .map(Face::new)
             .context("swash couldn't read the font data")
@@ -779,13 +866,14 @@ impl Backend for Swash {
     }
 
     fn glyph(face: &Face, character: char) -> Option<u16> {
-        Some(face.data.swash().charmap().map(character)).filter(|&glyph| glyph != 0)
+        Some(face.data.file.swash().charmap().map(character)).filter(|&glyph| glyph != 0)
     }
 
     fn advance(face: &Face, glyph: u16) -> f64 {
         let data = &face.data;
         f64::from(
-            data.swash()
+            data.file
+                .swash()
                 .glyph_metrics(&data.coords)
                 .scale(data.pixels)
                 .advance_width(glyph),
@@ -794,7 +882,7 @@ impl Backend for Swash {
 
     fn metrics(&self, face: &Face) -> FaceMetrics {
         let data = &face.data;
-        let metrics = data.swash().metrics(&data.coords).scale(data.pixels);
+        let metrics = data.file.swash().metrics(&data.coords).scale(data.pixels);
         // Fonts with an old OS/2 table lack these; Ghostty measures the glyphs instead.
         let measured = |height: f32, character: char| {
             if height > 0.0 {
@@ -936,6 +1024,7 @@ impl Backend for Swash {
     #[cfg(test)]
     fn postscript_name(face: &Face) -> String {
         face.data
+            .file
             .swash()
             .localized_strings()
             .find_by_id(swash::StringId::PostScript, None)
@@ -1070,6 +1159,7 @@ mod tests {
         swash
             .shared
             .borrow_mut()
+            .system
             .collection
             .register_fonts(Blob::new(Arc::new(SYMBOLS_FONT)), None);
         let regular = swash.installed_face("Symbols Nerd Font", PIXELS).unwrap();
@@ -1192,6 +1282,48 @@ mod tests {
         assert!(fallback.upgrade().is_none());
     }
 
+    /// No script or generic fallback on macOS has U+23BF, so only the last step finds it there.
+    /// A system with no font for it has nothing to compare.
+    #[test]
+    fn the_last_fallback_step_picks_the_same_family_on_every_scan() {
+        let families: HashSet<String> = (0..4)
+            .filter_map(|_| {
+                let swash = Swash::new();
+                swash.shared.borrow_mut().system = SystemFonts::scan();
+                let face = swash.embedded_face(SYMBOLS_FONT, PIXELS).unwrap();
+                let fallback = swash.face_for(&face, "\u{23BF}")?;
+                let collection = &mut swash.shared.borrow_mut().system.collection;
+                let name = collection.family_name(fallback.data.family?);
+                name.map(str::to_owned)
+            })
+            .collect();
+        assert!(families.len() <= 1, "{families:?}");
+    }
+
+    #[test]
+    fn the_last_resort_puts_hidden_families_after_visible_ones_in_any_case() {
+        let mut families = [
+            (false, ".Aqua Kana"),
+            (false, "Zapfino"),
+            (true, ".SF NS Mono"),
+            (false, "arial"),
+            (true, "Menlo"),
+            (true, "andale mono"),
+        ];
+        families.sort_by_key(|&(monospace, name)| last_resort_rank(monospace, name));
+        assert_eq!(
+            families.map(|(_, name)| name),
+            [
+                "andale mono",
+                "Menlo",
+                ".SF NS Mono",
+                "arial",
+                "Zapfino",
+                ".Aqua Kana"
+            ]
+        );
+    }
+
     #[test]
     fn drawing_stays_inside_a_canvas_smaller_than_its_buffer() {
         let swash = Swash::new();
@@ -1275,6 +1407,74 @@ mod tests {
             .unwrap();
         assert_eq!(rendered(), checked, "drawing rendered it again");
         assert!(pixels.iter().any(|&byte| byte != 0));
+    }
+
+    const GRINNING: char = '\u{1F600}';
+
+    /// An installed emoji font that colours 😀 with COLR v1 alone, as Fedora's Noto Color Emoji
+    /// does; tests that need one skip without it.
+    fn colr_v1_emoji(swash: &Swash) -> Option<(FamilyId, Matched)> {
+        let mut shared = swash.shared.borrow_mut();
+        let families = emoji_families(&mut shared.system.collection);
+        families.into_iter().find_map(|id| {
+            let family = shared.system.collection.family(id)?;
+            let font = matched(&mut shared, &family, FontStyle::default())?;
+            let glyph = font.file.swash().charmap().map(GRINNING);
+            let colr = font.file.colr_v1(&[])?;
+            let mut scaler = shared
+                .scale
+                .builder(font.file.swash())
+                .size(PIXELS as f32)
+                .build();
+            let swash_colours = Render::new(COLOR_SOURCES)
+                .render(&mut scaler, glyph)
+                .is_some();
+            (colr.has(glyph) && !swash_colours).then_some((id, font))
+        })
+    }
+
+    #[test]
+    fn a_colr_v1_glyph_draws_in_colour() {
+        let swash = Swash::new();
+        let Some((id, font)) = colr_v1_emoji(&swash) else {
+            return;
+        };
+        let face = Face::new(FaceData::new(font, PIXELS, Some(id), FontStyle::default()).unwrap());
+        let id = Swash::glyph(&face, GRINNING).unwrap();
+        let (left, right) = swash.glyph_ink(&face, id).unwrap();
+        assert!(right - left > PIXELS / 2.0, "ink {left}..{right}");
+        let mut pixels = vec![0; 4 * 64 * 64];
+        let glyph = Glyph {
+            id,
+            x: 16.0,
+            y: 16.0,
+        };
+        swash
+            .with_canvas(&mut pixels, 64, 64, |canvas| {
+                swash.draw_glyphs(canvas, &face, [glyph]);
+            })
+            .unwrap();
+        let colour = pixels
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .any(|&[red, green, blue, alpha]| red != alpha || green != alpha || blue != alpha);
+        assert!(colour);
+    }
+
+    #[test]
+    fn a_colr_v1_only_emoji_font_is_a_colour_fallback() {
+        let swash = Swash::new();
+        let Some((_, font)) = colr_v1_emoji(&swash) else {
+            return;
+        };
+        let cluster = GRINNING.to_string();
+        assert!(
+            swash
+                .shared
+                .borrow_mut()
+                .fits(&font.file, PIXELS as f32, &cluster, true)
+        );
     }
 
     #[test]

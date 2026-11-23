@@ -446,6 +446,7 @@ dependencies = [
  "objc2-core-foundation",
  "objc2-core-graphics",
  "objc2-core-text",
+ "skrifa",
  "swash",
  "unicode-segmentation",
 ]
