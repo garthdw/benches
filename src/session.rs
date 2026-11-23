@@ -179,9 +179,10 @@ impl Session {
         if let Some(locale) = missing_locale(|name| std::env::var_os(name), system_locale) {
             process.env("LANG", locale);
         }
+        let descriptors = descriptor_limit();
         // SAFETY: only async-signal-safe calls run between fork and exec.
         unsafe {
-            process.pre_exec(|| {
+            process.pre_exec(move || {
                 // An ignored signal stays ignored through exec, so when Benches is started as a
                 // script's background job, which ignores SIGINT, nothing in its tabs could be
                 // interrupted.
@@ -193,6 +194,7 @@ impl Session {
                 if libc::login_tty(0) < 0 {
                     return Err(std::io::Error::last_os_error());
                 }
+                close_inherited_descriptors_on_exec(descriptors);
                 Ok(())
             });
         }
@@ -469,6 +471,40 @@ impl Session {
 fn next_id() -> u64 {
     static NEXT: AtomicU64 = AtomicU64::new(1);
     NEXT.fetch_add(1, Ordering::Relaxed)
+}
+
+/// Makes every descriptor above stderr close on exec, in a forked child. Another thread can have
+/// one open without the flag, such as a pipe std makes on macOS with `pipe` and then `fcntl`,
+/// which the shell would otherwise hold for the tab's lifetime. They're marked rather than
+/// closed, as std reports a failed exec through one. `limit` comes from `descriptor_limit`, read
+/// before the fork. Only async-signal-safe calls.
+fn close_inherited_descriptors_on_exec(limit: libc::c_int) {
+    #[cfg(target_os = "linux")]
+    // SAFETY: `close_range` only changes descriptor flags.
+    if unsafe { libc::close_range(3, libc::c_uint::MAX, libc::CLOSE_RANGE_CLOEXEC as _) } == 0 {
+        return;
+    }
+    for descriptor in 3..limit {
+        // SAFETY: setting a descriptor's flags touches nothing else, and fails harmlessly for one
+        // that isn't open.
+        unsafe { libc::fcntl(descriptor, libc::F_SETFD, libc::FD_CLOEXEC) };
+    }
+}
+
+/// One past the highest descriptor this process can open, capped to stay enough for any
+/// descriptor Benches opens without a loop of millions under a huge limit.
+fn descriptor_limit() -> libc::c_int {
+    const MOST: libc::rlim_t = 1 << 16;
+    let mut limit = libc::rlimit {
+        rlim_cur: MOST,
+        rlim_max: MOST,
+    };
+    // SAFETY: `getrlimit` writes one `rlimit`.
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } < 0 {
+        Err::<(), _>(std::io::Error::last_os_error()).log_err("read the descriptor limit");
+        return MOST as libc::c_int;
+    }
+    limit.rlim_cur.min(MOST) as libc::c_int
 }
 
 #[cfg(test)]
@@ -1490,6 +1526,50 @@ mod tests {
         drop(session);
         assert!(finished.recv_timeout(Duration::from_secs(5)).is_err());
         wait_for_process(&sleep, false);
+    }
+
+    #[test]
+    fn a_tab_inherits_no_descriptor_left_open_on_exec() {
+        use std::os::fd::{FromRawFd, OwnedFd};
+        // Not `sh`, which on macOS starts the real shell with nothing but stdio.
+        let Some(bash) = installed("bash") else {
+            return;
+        };
+        let file = tempfile::tempfile().unwrap();
+        // A copy without close-on-exec, as a pipe another thread is making briefly is, numbered
+        // above any the shell opens itself.
+        // SAFETY: `F_DUPFD` only copies a descriptor this test owns.
+        let copy = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_DUPFD, 200) };
+        assert!(copy >= 200);
+        // SAFETY: `copy` is new and nothing else owns it.
+        let _copy = unsafe { OwnedFd::from_raw_fd(copy) };
+        let listing = tempfile::tempdir().unwrap();
+        let listed = listing.path().join("fds");
+        let command = format!(
+            "ls /dev/fd > '{0}.part' && mv '{0}.part' '{0}'",
+            listed.display()
+        );
+        let _session = Session::spawn(
+            Some(&command),
+            Path::new("/tmp"),
+            &Config {
+                shell: bash,
+                ..default_config()
+            },
+            Arc::new(|| {}),
+        )
+        .unwrap();
+        let open = wait_until(
+            Duration::from_secs(15),
+            || "the descriptors were never listed".to_owned(),
+            || std::fs::read_to_string(&listed).ok(),
+        );
+        assert!(
+            !open
+                .split_whitespace()
+                .any(|descriptor| descriptor == copy.to_string()),
+            "{copy} is open in the tab: {open}"
+        );
     }
 
     /// Set in the copy of the test binary that runs with SIGINT ignored.
