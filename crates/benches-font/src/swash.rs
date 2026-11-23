@@ -929,6 +929,8 @@ impl Backend for Swash {
             .borrow_mut()
             .shape(face, text)
             .map(|(glyphs, _)| glyphs)
+            // A character the face lacks shapes to glyph 0, `.notdef`.
+            .filter(|glyphs| glyphs.iter().all(|glyph| glyph.id != 0))
     }
 
     fn glyph_ink(&self, face: &Face, glyph: u16) -> InkExtent {
