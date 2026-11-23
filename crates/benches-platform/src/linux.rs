@@ -12,7 +12,7 @@ use async_io::Timer;
 use futures_util::StreamExt;
 use futures_util::future::{self, Either};
 use zbus::zvariant::Value;
-use zbus::{Connection, Proxy};
+use zbus::{Proxy, connection};
 
 use crate::dirs::{self, Env};
 use crate::notify::Notification;
@@ -64,9 +64,17 @@ fn xdg_open(target: impl AsRef<std::ffi::OsStr>) -> Command {
     command
 }
 
+/// Fails with `TimedOut` unless `call` finishes within `RPC_TIMEOUT`.
+async fn timeout<T>(call: impl Future<Output = zbus::Result<T>>) -> io::Result<T> {
+    match future::select(pin!(call), Timer::after(RPC_TIMEOUT)).await {
+        Either::Left((result, _)) => result.map_err(io::Error::other),
+        Either::Right(_) => Err(io::ErrorKind::TimedOut.into()),
+    }
+}
+
 fn show_in_file_manager(path: &Path) -> io::Result<()> {
-    let call = async {
-        let connection = Connection::session().await?;
+    async_io::block_on(timeout(async {
+        let connection = connection::Builder::session()?.build().await?;
         let manager = Proxy::new(
             &connection,
             "org.freedesktop.FileManager1",
@@ -77,11 +85,7 @@ fn show_in_file_manager(path: &Path) -> io::Result<()> {
         manager
             .call::<_, _, ()>("ShowItems", &(vec![file_uri(path)], ""))
             .await
-    };
-    match async_io::block_on(future::select(pin!(call), Timer::after(RPC_TIMEOUT))) {
-        Either::Left((shown, _)) => shown.map_err(io::Error::other),
-        Either::Right(_) => Err(io::ErrorKind::TimedOut.into()),
-    }
+    }))
 }
 
 fn file_uri(path: &Path) -> String {
@@ -185,21 +189,30 @@ pub fn set_secure_input(_enabled: bool) -> io::Result<()> {
 static POSTS: OnceLock<Sender<(u64, Notification)>> = OnceLock::new();
 
 pub fn start_notifications(on_click: impl Fn(Option<u64>) + Send + 'static) {
+    match spawn_notifications(connection::Builder::session, on_click) {
+        Ok(posts) => {
+            if POSTS.set(posts).is_err() {
+                eprintln!("benches: notifications were already started");
+            }
+        }
+        Err(error) => eprintln!("benches: start notifications: {error}"),
+    }
+}
+
+/// Starts the notification thread on the bus that `bus` connects to, returning where to post.
+fn spawn_notifications(
+    bus: impl Fn() -> zbus::Result<connection::Builder<'static>> + Send + 'static,
+    on_click: impl Fn(Option<u64>) + Send + 'static,
+) -> io::Result<Sender<(u64, Notification)>> {
     let (posts, queued) = async_channel::unbounded();
-    let worker = std::thread::Builder::new()
+    std::thread::Builder::new()
         .name("benches-notifications".into())
         .spawn(move || {
-            if let Err(error) = async_io::block_on(serve_notifications(queued, on_click)) {
+            if let Err(error) = async_io::block_on(serve_notifications(bus, queued, on_click)) {
                 eprintln!("benches: notifications: {error}");
             }
-        });
-    if let Err(error) = worker {
-        eprintln!("benches: start notifications: {error}");
-        return;
-    }
-    if POSTS.set(posts).is_err() {
-        eprintln!("benches: notifications were already started");
-    }
+        })?;
+    Ok(posts)
 }
 
 pub fn post_notification(session: u64, notification: &Notification) {
@@ -212,10 +225,11 @@ pub fn post_notification(session: u64, notification: &Notification) {
 /// Posts what arrives on `queued`, replacing each session's last notification, and reports
 /// clicks on them. Notifications belonging to other apps are ignored.
 async fn serve_notifications(
+    bus: impl Fn() -> zbus::Result<connection::Builder<'static>>,
     queued: Receiver<(u64, Notification)>,
     on_click: impl Fn(Option<u64>),
 ) -> zbus::Result<()> {
-    let connection = Connection::session().await?;
+    let connection = bus()?.build().await?;
     let server = Proxy::new(
         &connection,
         "org.freedesktop.Notifications",
