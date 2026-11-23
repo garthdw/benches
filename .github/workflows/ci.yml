@@ -69,6 +69,11 @@ jobs:
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test
 
+      # The Linux font backend, whose tests here also compare it with CoreText. Only the font
+      # crate reads the feature.
+      - run: cargo clippy -p benches-font --all-targets --features swash -- -D warnings
+      - run: cargo test -p benches-font --features swash
+
   # Rune has no Linux CI, so this is also the first to catch its Linux regressions. rustfmt checks
   # every file whatever the cfg, so `cargo fmt --check` runs only here, on every change.
   linux:
