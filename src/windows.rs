@@ -416,23 +416,17 @@ mod tests {
         assert_eq!(second.state.workspace.projects.len(), 1);
         let before = first_wakes.load(Ordering::Relaxed);
 
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
-        let mut frame = 1.0;
-        while !second
-            .state
-            .workspace
-            .active_session()
-            .is_some_and(|session| {
-                let grid = session.grid();
-                let text: String = grid.cells.iter().map(|cell| cell.character).collect();
-                text.contains("moved")
-            })
-        {
-            assert!(std::time::Instant::now() < deadline, "timed out");
-            std::thread::sleep(std::time::Duration::from_millis(20));
-            frame += 1.0;
-            second.frame(frame / 60.0);
-        }
+        frame_until(&mut second, "the moved tab's output", |second| {
+            second
+                .state
+                .workspace
+                .active_session()
+                .is_some_and(|session| {
+                    let grid = session.grid();
+                    let text: String = grid.cells.iter().map(|cell| cell.character).collect();
+                    text.contains("moved")
+                })
+        });
         assert!(second_wakes.load(Ordering::Relaxed) > 0);
         assert_eq!(first_wakes.load(Ordering::Relaxed), before);
     }

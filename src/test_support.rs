@@ -215,6 +215,28 @@ pub(crate) fn wait_until<T>(
     }
 }
 
+/// Runs frames until `done`, so polls pick up what live sessions do, and returns the last
+/// frame's number for a test that runs more after it.
+pub(crate) fn frame_until(
+    runtime: &mut Runtime<State>,
+    waiting_for: &str,
+    done: impl Fn(&Runtime<State>) -> bool,
+) -> f64 {
+    let mut frame = 1.0;
+    wait_until(
+        Duration::from_secs(15),
+        || format!("timed out waiting for {waiting_for}"),
+        || {
+            if done(runtime) {
+                return Some(frame);
+            }
+            frame += 1.0;
+            runtime.frame(frame / 60.0);
+            None
+        },
+    )
+}
+
 pub(crate) fn one_project() -> Workspace {
     let mut workspace = Workspace::default();
     workspace.add_project(Project::new("/dev/benches".into(), Vec::new()));

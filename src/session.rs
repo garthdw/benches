@@ -1461,7 +1461,8 @@ mod tests {
         Command::new("pgrep")
             .args(["-f", pattern])
             .output()
-            .is_ok_and(|output| !output.stdout.is_empty())
+            .map(|output| !output.stdout.is_empty())
+            .unwrap()
     }
 
     #[test]
@@ -1572,25 +1573,24 @@ mod tests {
             Some(rune::PhysicalKeyCode::KeyC),
             Some('c'),
         );
-        let sleeping = || {
-            Command::new("pgrep")
-                .args(["-f", "sleep 4343"])
-                .output()
-                .unwrap()
-                .status
-                .success()
-        };
+        let sleeping = || pgrep("sleep 4343");
         // `sleep` holds the terminal before it resets its signal handling, so an early ^C is lost.
         // Resend only after the previous one has had time to take effect.
-        let deadline = Instant::now() + Duration::from_secs(15);
-        while sleeping() {
-            assert!(Instant::now() < deadline, "sleep was never interrupted");
-            session.key(ctrl_c.clone());
-            let settled = Instant::now() + Duration::from_secs(1);
-            while sleeping() && Instant::now() < settled {
-                thread::sleep(Duration::from_millis(20));
-            }
-        }
+        wait_until(
+            Duration::from_secs(15),
+            || "sleep was never interrupted".to_owned(),
+            || {
+                if !sleeping() {
+                    return Some(());
+                }
+                session.key(ctrl_c.clone());
+                let settled = Instant::now() + Duration::from_secs(1);
+                while sleeping() && Instant::now() < settled {
+                    thread::sleep(Duration::from_millis(20));
+                }
+                None
+            },
+        );
         wait_for_busy(&session, false);
         type_line(&session, "echo after-4");
         wait_for_line(&session, "after-4");
