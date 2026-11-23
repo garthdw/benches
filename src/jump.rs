@@ -1,12 +1,14 @@
+use std::fs::File;
+use std::io::{self, Read, Seek};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
-use std::sync::atomic::{AtomicI32, Ordering};
-use std::sync::{Arc, mpsc};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError, mpsc};
 use std::thread;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
+use benches_core::actor::kill_group;
 use nix::sys::signal::{Signal, killpg};
 use nix::unistd::Pid;
 use serde::Deserialize;
@@ -133,18 +135,49 @@ fn parse_worktrees(output: &str) -> Result<Vec<Worktree>> {
 
 /// Lets another thread end a running command, which `run` watches through a clone.
 #[derive(Clone, Default)]
-pub struct Cancel(Arc<AtomicI32>);
+pub struct Cancel(Arc<Mutex<Lookup>>);
 
-/// The state once cancelled or finished, so a late `cancel` signals nothing.
-const DONE: i32 = -1;
+#[derive(Default)]
+enum Lookup {
+    #[default]
+    Starting,
+    Running(Pid),
+    /// Cancelled or finished, so a late `cancel` signals nothing.
+    Done,
+}
 
 impl Cancel {
     /// Kills the command's process group, or stops it from starting if it hasn't yet.
     pub fn cancel(&self) -> Result<()> {
-        match self.0.swap(DONE, Ordering::SeqCst) {
-            group if group > 0 => killpg(Pid::from_raw(group), Signal::SIGKILL).context("cancel"),
-            _ => Ok(()),
+        // Signalled under the lock, which `run` takes before it reaps the group's leader and so
+        // frees the group's id for reuse.
+        let mut lookup = self.lock();
+        match std::mem::replace(&mut *lookup, Lookup::Done) {
+            Lookup::Running(group) => killpg(group, Signal::SIGKILL).context("cancel"),
+            Lookup::Starting | Lookup::Done => Ok(()),
         }
+    }
+
+    /// Records the command's process group, unless it was cancelled before it started.
+    fn start(&self, group: Pid) -> bool {
+        let mut lookup = self.lock();
+        let starting = matches!(*lookup, Lookup::Starting);
+        if starting {
+            *lookup = Lookup::Running(group);
+        }
+        starting
+    }
+
+    /// Says whether the command was cancelled, after which `cancel` signals nothing.
+    fn finish(&self) -> bool {
+        !matches!(
+            std::mem::replace(&mut *self.lock(), Lookup::Done),
+            Lookup::Running(_)
+        )
+    }
+
+    fn lock(&self) -> MutexGuard<'_, Lookup> {
+        self.0.lock().unwrap_or_else(PoisonError::into_inner)
     }
 }
 
@@ -158,33 +191,82 @@ fn run(
     what: &str,
     cancel: &Cancel,
 ) -> Result<Output> {
-    let child = Command::new(shell)
+    // Read once the command exits, without waiting for every other process holding them to
+    // close them, as a pipe's reader would: one the command left running, or one that another
+    // thread forked meanwhile, as macOS has no `pipe2` to make a pipe close-on-exec at once.
+    let mut stdout = tempfile::tempfile().context("create lookup output")?;
+    let mut stderr = tempfile::tempfile().context("create lookup output")?;
+    let mut child = Command::new(shell)
         .args(args)
         .current_dir(cwd)
         .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stdout(stdout.try_clone().context("share lookup output")?)
+        .stderr(stderr.try_clone().context("share lookup output")?)
         .process_group(0)
         .spawn()
         .with_context(|| format!("run {}", shell.display()))?;
     let group = Pid::from_raw(child.id() as i32);
-    let (sender, receiver) = mpsc::channel();
-    thread::spawn(move || sender.send(child.wait_with_output()).ok());
-    let started = cancel
-        .0
-        .compare_exchange(0, group.as_raw(), Ordering::SeqCst, Ordering::SeqCst);
-    if started.is_err() {
-        killpg(group, Signal::SIGKILL).context("kill cancelled lookup")?;
+    let started = cancel.start(group);
+    let (sender, exits) = mpsc::channel();
+    if started {
+        thread::spawn(move || sender.send(wait_for_exit(group)));
     }
-    let received = receiver.recv_timeout(timeout);
-    cancel.0.store(DONE, Ordering::SeqCst);
-    match received {
-        Ok(output) => output.context("wait for lookup"),
-        Err(_) => {
-            killpg(group, Signal::SIGKILL).context("kill lookup")?;
-            bail!("“{what}” took longer than {timeout:?}");
+    let exited = started && matches!(exits.recv_timeout(timeout), Ok(Ok(())));
+    let cancelled = cancel.finish();
+    // Also after a cancel, whose single `killpg` can miss a process being forked.
+    let killed = if cancelled || !exited {
+        kill_group(group).context("kill lookup")
+    } else {
+        Ok(())
+    };
+    // The waiting thread must be done before the reap frees the leader's pid for reuse.
+    exits.iter().for_each(drop);
+    let status = child.wait().context("wait for lookup")?;
+    killed?;
+    if !exited {
+        if cancelled {
+            bail!("“{what}” was cancelled");
+        }
+        bail!("“{what}” took longer than {timeout:?}");
+    }
+    Ok(Output {
+        status,
+        stdout: read_from_start(&mut stdout)?,
+        stderr: read_from_start(&mut stderr)?,
+    })
+}
+
+/// Blocks until the child `pid` exits, leaving it unreaped, so its process group's id stays
+/// reserved while `run` may still signal the group.
+fn wait_for_exit(pid: Pid) -> io::Result<()> {
+    loop {
+        // SAFETY: zeroes are a valid `siginfo_t`.
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        // SAFETY: `waitid` writes one `siginfo_t`.
+        let waited = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                pid.as_raw() as libc::id_t,
+                &mut info,
+                libc::WEXITED | libc::WNOWAIT,
+            )
+        };
+        if waited == 0 {
+            return Ok(());
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::Interrupted {
+            return Err(error);
         }
     }
+}
+
+fn read_from_start(file: &mut File) -> Result<Vec<u8>> {
+    let mut printed = Vec::new();
+    file.rewind()
+        .and_then(|()| file.read_to_end(&mut printed))
+        .context("read lookup output")?;
+    Ok(printed)
 }
 
 /// The query goes in as separate arguments rather than spliced into the script, so nothing in
@@ -274,8 +356,11 @@ fn strip_escapes(text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use nix::errno::Errno;
+    use nix::sys::signal::kill;
+
     use super::*;
-    use crate::test_support::{installed, stub_shell};
+    use crate::test_support::{installed, stub_shell, wait_for_pid, wait_for_pid_exit, wait_until};
 
     const TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -446,6 +531,79 @@ mod tests {
         let error =
             create_worktree(&shell, Path::new("/"), "x", TIMEOUT, &Cancel::default()).unwrap_err();
         assert_eq!(error.to_string(), "✗ Branch x already exists");
+    }
+
+    /// Creates a worktree on another thread, so the test can cancel it meanwhile.
+    fn create_in_background(shell: &Path, cancel: &Cancel) -> mpsc::Receiver<Result<PathBuf>> {
+        let (sender, receiver) = mpsc::channel();
+        let (shell, cancel) = (shell.to_owned(), cancel.clone());
+        thread::spawn(move || {
+            let created = create_worktree(&shell, Path::new("/"), "x", TIMEOUT, &cancel);
+            sender.send(created)
+        });
+        receiver
+    }
+
+    #[test]
+    fn a_cancel_ends_processes_the_command_was_starting() {
+        let pids = tempfile::tempdir().unwrap();
+        let pid_file = pids.path().join("pid");
+        let (_directory, shell, _) = stub_shell(&format!(
+            "echo $$ > '{}'; while :; do sleep 30 & sleep 0.002; done",
+            pid_file.display()
+        ));
+        // macOS's `killpg` misses a child being forked as it runs, so try a few times to catch one.
+        for _ in 0..10 {
+            std::fs::remove_file(&pid_file).ok();
+            let cancel = Cancel::default();
+            let receiver = create_in_background(&shell, &cancel);
+            let group = wait_for_pid(&pid_file);
+            thread::sleep(Duration::from_millis(20));
+            cancel.cancel().unwrap();
+            assert!(receiver.recv_timeout(TIMEOUT).unwrap().is_err());
+            // Killed processes linger as zombies until their new parent reaps them.
+            wait_until(
+                Duration::from_secs(2),
+                || "a process survived the cancel".to_owned(),
+                || (killpg(Pid::from_raw(group), None) == Err(Errno::ESRCH)).then_some(()),
+            );
+        }
+    }
+
+    #[test]
+    fn a_cancelled_command_ends_while_another_process_holds_its_output_open() {
+        let pids = tempfile::tempdir().unwrap();
+        let (holder_file, pid_file) = (pids.path().join("holder"), pids.path().join("pid"));
+        // `set -m` puts the holder in a process group of its own, out of reach of the cancel, as
+        // it would each later job, so the last command replaces the shell instead.
+        let (_directory, shell, _) = stub_shell(&format!(
+            "set -m; sleep 30 & echo $! > '{}'; echo $$ > '{}'; exec sleep 30",
+            holder_file.display(),
+            pid_file.display()
+        ));
+        let cancel = Cancel::default();
+        let receiver = create_in_background(&shell, &cancel);
+        let (holder, pid) = (wait_for_pid(&holder_file), wait_for_pid(&pid_file));
+        cancel.cancel().unwrap();
+        let ended = receiver.recv_timeout(Duration::from_secs(5));
+        kill(Pid::from_raw(holder), Signal::SIGKILL).unwrap();
+        assert!(ended.unwrap().is_err());
+        wait_for_pid_exit(pid, Duration::from_secs(5), "the cancelled command");
+    }
+
+    #[test]
+    fn a_command_ends_while_another_process_holds_its_output_open() {
+        let pids = tempfile::tempdir().unwrap();
+        let holder_file = pids.path().join("holder");
+        let (_directory, shell, _) = stub_shell(&format!(
+            "set -m; sleep 30 & echo $! > '{}'; echo '{{\"path\":\"/dev/site.x\"}}'",
+            holder_file.display()
+        ));
+        let receiver = create_in_background(&shell, &Cancel::default());
+        let holder = wait_for_pid(&holder_file);
+        let ended = receiver.recv_timeout(Duration::from_secs(5));
+        kill(Pid::from_raw(holder), Signal::SIGKILL).unwrap();
+        assert_eq!(ended.unwrap().unwrap(), Path::new("/dev/site.x"));
     }
 
     #[test]
