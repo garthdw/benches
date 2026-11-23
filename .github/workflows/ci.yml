@@ -4,12 +4,48 @@ on:
   pull_request:
   push:
     branches: [main]
+  workflow_dispatch:
 
 permissions:
   contents: read
 
 jobs:
+  # Path filters can't see inside a file, so macOS code lives in whole files and every file
+  # that still holds a `target_os = "macos"` cfg is listed here.
+  changes:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: read
+    outputs:
+      macos: ${{ steps.filter.outputs.macos }}
+    steps:
+      - uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4.0.3
+        id: filter
+        with:
+          filters: |
+            macos:
+              - crates/benches-font/src/coretext.rs
+              - crates/benches-font/src/font.rs
+              - crates/benches-font/src/swash.rs
+              - crates/benches-platform/src/macos.rs
+              - crates/benches-platform/src/platform.rs
+              - scripts/**
+              - assets/**
+              - about.toml
+              - about.hbs
+              - .github/workflows/**
+              - rust-toolchain.toml
+              - Cargo.lock
+              - '**/Cargo.toml'
+
+  # `test` is the check the `main` ruleset requires, and a skipped job counts as passing. Pushes
+  # to `main` and manual runs always test on macOS, as does a PR whose filter failed.
   test:
+    needs: changes
+    if: >-
+      ${{ !cancelled() && (github.event_name != 'pull_request'
+      || needs.changes.result != 'success' || needs.changes.outputs.macos == 'true') }}
     runs-on: macos-latest
     timeout-minutes: 30
     steps:
@@ -25,12 +61,11 @@ jobs:
       # Tests use the default shell and font, and the Nerd Font `font.rs` draws icons with.
       - run: brew install font-monaspace
 
-      - run: cargo fmt --check
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test
 
   # Rune has no Linux CI, so this is also the first to catch its Linux regressions. rustfmt checks
-  # every file whatever the cfg, so `cargo fmt --check` only runs on macOS.
+  # every file whatever the cfg, so `cargo fmt --check` runs only here, on every change.
   linux:
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -66,6 +101,7 @@ jobs:
           fc-cache -f
           fc-list | grep MonaspaceNeon-Regular
 
+      - run: cargo fmt --check
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test
 
