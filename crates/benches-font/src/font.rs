@@ -8,6 +8,8 @@ mod coretext;
 #[cfg(all(target_os = "macos", not(feature = "swash")))]
 use coretext::CoreText as Os;
 #[cfg(any(not(target_os = "macos"), feature = "swash"))]
+mod colr;
+#[cfg(any(not(target_os = "macos"), feature = "swash"))]
 mod swash;
 #[cfg(any(not(target_os = "macos"), feature = "swash"))]
 use self::swash::Swash as Os;
