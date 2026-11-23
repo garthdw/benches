@@ -10,37 +10,42 @@ permissions:
   contents: read
 
 jobs:
-  # Path filters can't see inside a file, so macOS code lives in whole files and every file
-  # that still holds a `target_os = "macos"` cfg is listed here.
   changes:
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     permissions:
+      contents: read
       pull-requests: read
     outputs:
       macos: ${{ steps.filter.outputs.macos }}
     steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # Any OS cfg can select macOS code, as an `else` or a `not(...)`. Listed files must exist,
+      # so a renamed one isn't silently dropped.
+      - name: Check the filter lists every file with an OS cfg
+        shell: bash
+        run: |
+          listed=$(sed -n "s/^  - //p" .github/macos-paths.yml | sed "s/ *#.*//; s/^'//; s/'\$//")
+          with_cfg=$(git grep -lE 'target_(os|vendor) = "(macos|linux|apple)"' -- '*.rs')
+          missing=$(grep -vxF -f <(echo "$listed") <<<"$with_cfg" || true)
+          stale=$(grep -v '\*' <<<"$listed" | while read -r path; do
+            [ -e "$path" ] || echo "$path"
+          done)
+          if [ -n "$missing$stale" ]; then
+            [ -z "$missing" ] || echo "::error::Add to .github/macos-paths.yml:" $missing
+            [ -z "$stale" ] || echo "::error::Not found, from .github/macos-paths.yml:" $stale
+            exit 1
+          fi
+
       - uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4.0.3
         id: filter
         with:
-          filters: |
-            macos:
-              - crates/benches-font/src/coretext.rs
-              - crates/benches-font/src/font.rs
-              - crates/benches-font/src/swash.rs
-              - crates/benches-platform/src/macos.rs
-              - crates/benches-platform/src/platform.rs
-              - scripts/**
-              - assets/**
-              - about.toml
-              - about.hbs
-              - .github/workflows/**
-              - rust-toolchain.toml
-              - Cargo.lock
-              - '**/Cargo.toml'
+          filters: .github/macos-paths.yml
 
   # `test` is the check the `main` ruleset requires, and a skipped job counts as passing. Pushes
-  # to `main` and manual runs always test on macOS, as does a PR whose filter failed.
+  # to `main` and manual runs always test on macOS, as does a PR whose `changes` job failed, such
+  # as when the filter misses a file.
   test:
     needs: changes
     if: >-
