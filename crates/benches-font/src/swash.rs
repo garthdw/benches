@@ -194,15 +194,14 @@ pub(crate) struct Canvas<'a> {
 /// Ghostty's synthetic italic angle for FreeType faces.
 const SYNTHETIC_SKEW: f32 = 12.0;
 
-/// Bitmap strikes come last, for bitmap-only fonts such as Terminus's OTB files.
-const SOURCES: [Source; 4] = [
+/// The sources that draw in colour, which swash supports as COLR v0 and bitmaps only. A glyph
+/// draws from them first.
+const COLOR_SOURCES: &[Source] = &[
     Source::ColorOutline(0),
     Source::ColorBitmap(StrikeWith::BestFit),
-    Source::Outline,
-    Source::Bitmap(StrikeWith::BestFit),
 ];
-/// The sources that draw in colour, which swash supports as COLR v0 and bitmaps only.
-const COLOR_SOURCES: &[Source] = SOURCES.split_at(2).0;
+/// Bitmap strikes come last, for bitmap-only fonts such as Terminus's OTB files.
+const MONOCHROME_SOURCES: &[Source] = &[Source::Outline, Source::Bitmap(StrikeWith::BestFit)];
 
 /// `family`'s closest match to `style`.
 fn matched(shared: &mut Shared, family: &FamilyInfo, style: FontStyle) -> Option<Matched> {
@@ -391,7 +390,13 @@ impl FaceScaler<'_> {
                 height: f64::from(bounds.height()),
             });
         }
-        let placement = self.render(&Render::new(&SOURCES), glyph)?.placement;
+        let placement = self
+            .render(&Render::new(COLOR_SOURCES), glyph)
+            .map(|image| image.placement)
+            .or_else(|| {
+                self.render(&Render::new(MONOCHROME_SOURCES), glyph)
+                    .map(|image| image.placement)
+            })?;
         Some(Bounds {
             x: f64::from(placement.left),
             y: f64::from(placement.top) - f64::from(placement.height),
@@ -715,14 +720,27 @@ impl Canvas<'_> {
             .skew()
             .then(&Transform::scale(scale.0 as f32, scale.1 as f32))
             .then_translate(origin.0 as f32, origin.1 as f32);
-        let mut render = Render::new(&SOURCES);
-        render
+        let mut colour = Render::new(COLOR_SOURCES);
+        colour
             .format(Format::Alpha)
             .embolden(data.embolden)
             .transform(Some(transform));
-        let Some(image) = scaler.render(&render, glyph) else {
+        if let Some(image) = scaler.render(&colour, glyph) {
+            self.blit_image(&image, origin, scale);
             return;
-        };
+        }
+        let mut monochrome = Render::new(MONOCHROME_SOURCES);
+        monochrome
+            .format(Format::Alpha)
+            .embolden(data.embolden)
+            .transform(Some(transform));
+        if let Some(image) = scaler.render(&monochrome, glyph) {
+            self.blit_image(&image, origin, scale);
+        }
+    }
+
+    /// Composites a glyph swash rendered with its origin at `origin`, stretched by `scale`.
+    fn blit_image(&mut self, image: &Image, origin: (f64, f64), scale: (f64, f64)) {
         let placement = image.placement;
         let size = (placement.width, placement.height);
         let pixels = &image.data;
