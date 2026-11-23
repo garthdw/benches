@@ -552,9 +552,17 @@ fn last_resort_order(collection: &mut Collection) -> Box<[FamilyId]> {
     families.into_iter().map(|(_, id)| id).collect()
 }
 
-/// Where a family comes in the last fallback step: monospace first, then by name.
-fn last_resort_rank(monospace: bool, name: &str) -> (bool, String) {
-    (!monospace, name.to_owned())
+/// Where a family comes in the last fallback step: monospace first, then hidden families such as
+/// macOS's `.`-prefixed ones after visible ones, then by name in any case, as a family's fonts
+/// may spell it in different cases and the scan's order picks one. Lowercasing each character,
+/// as fontique keys its families, leaves no two system families tied, so their random ids never
+/// decide.
+fn last_resort_rank(monospace: bool, name: &str) -> (bool, bool, String) {
+    (
+        !monospace,
+        name.starts_with('.'),
+        name.chars().flat_map(char::to_lowercase).collect(),
+    )
 }
 
 /// Whether family `id` draws `cluster` in `data`'s style, leaving its font in `shared.fonts`.
@@ -1290,6 +1298,30 @@ mod tests {
             })
             .collect();
         assert!(families.len() <= 1, "{families:?}");
+    }
+
+    #[test]
+    fn the_last_resort_puts_hidden_families_after_visible_ones_in_any_case() {
+        let mut families = [
+            (false, ".Aqua Kana"),
+            (false, "Zapfino"),
+            (true, ".SF NS Mono"),
+            (false, "arial"),
+            (true, "Menlo"),
+            (true, "andale mono"),
+        ];
+        families.sort_by_key(|&(monospace, name)| last_resort_rank(monospace, name));
+        assert_eq!(
+            families.map(|(_, name)| name),
+            [
+                "andale mono",
+                "Menlo",
+                ".SF NS Mono",
+                "arial",
+                "Zapfino",
+                ".Aqua Kana"
+            ]
+        );
     }
 
     #[test]
