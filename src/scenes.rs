@@ -8,7 +8,7 @@ use crate::app::{Confirm, State};
 use anyhow::Context;
 
 use crate::jump;
-use crate::palette::{Action, WhenEmpty, worktree_row, worktrees_page};
+use crate::palette::{Action, Page, PageRow, WhenEmpty, worktree_row, worktrees_page};
 use crate::session::Session;
 use crate::workspace::{Project, Status, Tab};
 use benches_core::grid::{Grid, GridBuilder, Presentation, new_terminal};
@@ -264,6 +264,26 @@ pub(crate) const SCENES: &[Scene] = &[
         let error = "No worktrees found in ~/dev/site".to_owned();
         state.palette.page = Some(worktrees_page(WhenEmpty::Error(error.clone()), Vec::new()));
         state.palette.error = Some(error);
+    }),
+    ("plugin-page", |state| {
+        show_workspace_scene(state);
+        state.palette.edit = TextEdit::new("dep");
+        state.palette.open = true;
+        let row = |label: &str, detail: Option<&str>, keywords: &[&str]| PageRow {
+            label: label.to_owned(),
+            detail: detail.map(str::to_owned),
+            keywords: keywords.iter().map(|&word| word.to_owned()).collect(),
+            action: Action::Run(label.to_owned()),
+        };
+        state.palette.page = Some(Page::loaded(
+            WhenEmpty::Error("Nothing found".to_owned()),
+            vec![
+                row("deploy", Some("production · 2m ago"), &[]),
+                row("staging", Some("dependabot bump"), &[]),
+                row("rollback", None, &["deploy"]),
+                row("main", Some("~/dev/site"), &[]),
+            ],
+        ));
     }),
     ("worktrees", |state| {
         show_workspace_scene(state);
