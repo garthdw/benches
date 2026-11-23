@@ -1,6 +1,6 @@
 use libghostty_vt::key::{Key as Vt, Mods as VtMods};
 use libghostty_vt::mouse;
-use rune::{Key, KeyEvent, Mods, Phase, PhysicalKeyCode as Code, Tx};
+use rune::{Key, KeyEvent, KeyPlatform, Mods, Phase, PhysicalKeyCode as Code, Tx};
 
 use crate::app::State;
 use crate::session::Session;
@@ -87,8 +87,8 @@ pub fn map_text(text: &str, mods: Mods, physical: Option<Code>, base: Option<cha
 
 /// Ghostty's default macOS "natural text editing" keybinds, which send fixed bytes instead
 /// of an encoded key.
-fn line_editing_text(event: &KeyEvent) -> Option<&'static str> {
-    if !cfg!(target_os = "macos") {
+pub(crate) fn line_editing(event: &KeyEvent, platform: KeyPlatform) -> Option<KeyInput> {
+    if platform != KeyPlatform::Mac {
         return None;
     }
     let Mods {
@@ -98,27 +98,28 @@ fn line_editing_text(event: &KeyEvent) -> Option<&'static str> {
         ctrl,
         ..
     } = event.mods;
-    match (&event.key, cmd, alt, shift || ctrl) {
-        (Key::Backspace, true, false, false) => Some("\x15"),
-        (Key::Left, true, false, false) => Some("\x01"),
-        (Key::Right, true, false, false) => Some("\x05"),
-        (Key::Left, false, true, false) => Some("\x1bb"),
-        (Key::Right, false, true, false) => Some("\x1bf"),
-        _ => None,
-    }
+    let text = match (&event.key, cmd, alt, shift || ctrl) {
+        (Key::Backspace, true, false, false) => "\x15",
+        (Key::Left, true, false, false) => "\x01",
+        (Key::Right, true, false, false) => "\x05",
+        (Key::Left, false, true, false) => "\x1bb",
+        (Key::Right, false, true, false) => "\x1bf",
+        _ => return None,
+    };
+    Some(KeyInput {
+        key: Vt::Unidentified,
+        mods: VtMods::empty(),
+        consumed: VtMods::empty(),
+        text: Some(text.to_owned()),
+        unshifted: '\0',
+    })
 }
 
 /// `None` for keys with no terminal meaning. The app's own shortcuts are taken before this,
 /// so any ⌘ chord that gets here goes to the terminal with super set and the encoder decides.
 pub fn map_key(event: &KeyEvent, physical: Option<Code>, base: Option<char>) -> Option<KeyInput> {
-    if let Some(text) = line_editing_text(event) {
-        return Some(KeyInput {
-            key: Vt::Unidentified,
-            mods: VtMods::empty(),
-            consumed: VtMods::empty(),
-            text: Some(text.to_owned()),
-            unshifted: '\0',
-        });
+    if let Some(input) = line_editing(event, KeyPlatform::current()) {
+        return Some(input);
     }
     let named = match &event.key {
         Key::Text(text) => return Some(map_text(text, event.mods, physical, base)),
@@ -336,24 +337,40 @@ mod tests {
         assert!(input.mods.contains(VtMods::SUPER | VtMods::SHIFT));
     }
 
-    fn chord_text(key: Key, mods: Mods) -> Option<String> {
-        map_key(&KeyEvent { key, mods }, Some(Code::Backspace), None)?.text
+    fn line_editing_text(key: Key, mods: Mods, platform: KeyPlatform) -> Option<String> {
+        line_editing(&KeyEvent { key, mods }, platform)?.text
     }
 
     #[test]
     fn command_chords_edit_the_line_like_ghostty_on_macos() {
-        let cmd = crate::test_support::command();
+        let cmd = Mods {
+            cmd: true,
+            logo: true,
+            ..Mods::default()
+        };
         let alt = Mods {
             alt: true,
             ..Mods::default()
         };
-        let on_macos = |text| cfg!(target_os = "macos").then_some(text);
-        assert_eq!(chord_text(Key::Backspace, cmd).as_deref(), on_macos("\x15"));
-        assert_eq!(chord_text(Key::Left, cmd).as_deref(), on_macos("\x01"));
-        assert_eq!(chord_text(Key::Right, cmd).as_deref(), on_macos("\x05"));
-        assert_eq!(chord_text(Key::Left, alt).as_deref(), on_macos("\x1bb"));
-        assert_eq!(chord_text(Key::Right, alt).as_deref(), on_macos("\x1bf"));
-        assert_eq!(chord_text(Key::Left, Mods::default()), None);
+        let mac = |key, mods| line_editing_text(key, mods, KeyPlatform::Mac);
+        assert_eq!(mac(Key::Backspace, cmd).as_deref(), Some("\x15"));
+        assert_eq!(mac(Key::Left, cmd).as_deref(), Some("\x01"));
+        assert_eq!(mac(Key::Right, cmd).as_deref(), Some("\x05"));
+        assert_eq!(mac(Key::Left, alt).as_deref(), Some("\x1bb"));
+        assert_eq!(mac(Key::Right, alt).as_deref(), Some("\x1bf"));
+        assert_eq!(mac(Key::Left, Mods::default()), None);
+        assert_eq!(line_editing_text(Key::Left, alt, KeyPlatform::Linux), None);
+    }
+
+    #[test]
+    fn map_key_edits_the_line_as_this_platform_does() {
+        let event = KeyEvent {
+            key: Key::Backspace,
+            mods: crate::test_support::command(),
+        };
+        if let Some(expected) = line_editing(&event, KeyPlatform::current()) {
+            assert_eq!(map_key(&event, Some(Code::Backspace), None), Some(expected));
+        }
     }
 
     #[test]
@@ -364,7 +381,7 @@ mod tests {
             ..Mods::default()
         };
         // Option+B types "∫" on a Mac; Alt+B types "b" elsewhere.
-        let text = if cfg!(target_os = "macos") {
+        let text = if KeyPlatform::current() == KeyPlatform::Mac {
             "∫"
         } else {
             "b"

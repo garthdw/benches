@@ -70,7 +70,7 @@ pub(crate) fn settle(runtime: &mut Runtime<State>) {
 /// The modifiers the keyboard reports for these keys here: Rune sets `cmd` with ⌘ on macOS and
 /// with Ctrl elsewhere.
 fn held(ctrl: bool, alt: bool, shift: bool, logo: bool) -> Mods {
-    let cmd = if cfg!(target_os = "macos") {
+    let cmd = if KeyPlatform::current() == KeyPlatform::Mac {
         logo
     } else {
         ctrl
@@ -86,7 +86,7 @@ fn held(ctrl: bool, alt: bool, shift: bool, logo: bool) -> Mods {
 
 /// The primary modifier held alone: ⌘ on macOS, Ctrl elsewhere.
 pub(crate) fn command() -> Mods {
-    let mac = cfg!(target_os = "macos");
+    let mac = KeyPlatform::current() == KeyPlatform::Mac;
     held(!mac, false, false, mac)
 }
 

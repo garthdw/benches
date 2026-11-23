@@ -4,12 +4,53 @@ on:
   pull_request:
   push:
     branches: [main]
+  workflow_dispatch:
 
 permissions:
   contents: read
 
 jobs:
+  changes:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      macos: ${{ steps.filter.outputs.macos }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # Any OS cfg can select macOS code, as an `else` or a `not(...)`. Listed files must exist,
+      # so a renamed one isn't silently dropped.
+      - name: Check the filter lists every file with an OS cfg
+        shell: bash
+        run: |
+          listed=$(sed -n "s/^  - //p" .github/macos-paths.yml | sed "s/ *#.*//; s/^'//; s/'\$//")
+          with_cfg=$(git grep -lE 'target_(os|vendor) = "(macos|linux|apple)"' -- '*.rs')
+          missing=$(grep -vxF -f <(echo "$listed") <<<"$with_cfg" || true)
+          stale=$(grep -v '\*' <<<"$listed" | while read -r path; do
+            [ -e "$path" ] || echo "$path"
+          done)
+          if [ -n "$missing$stale" ]; then
+            [ -z "$missing" ] || echo "::error::Add to .github/macos-paths.yml:" $missing
+            [ -z "$stale" ] || echo "::error::Not found, from .github/macos-paths.yml:" $stale
+            exit 1
+          fi
+
+      - uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4.0.3
+        id: filter
+        with:
+          filters: .github/macos-paths.yml
+
+  # `test` is the check the `main` ruleset requires, and a skipped job counts as passing. Pushes
+  # to `main` and manual runs always test on macOS, as does a PR whose `changes` job failed, such
+  # as when the filter misses a file.
   test:
+    needs: changes
+    if: >-
+      ${{ !cancelled() && (github.event_name != 'pull_request'
+      || needs.changes.result != 'success' || needs.changes.outputs.macos == 'true') }}
     runs-on: macos-latest
     timeout-minutes: 30
     steps:
@@ -25,12 +66,16 @@ jobs:
       # Tests use the default shell and font, and the Nerd Font `font.rs` draws icons with.
       - run: brew install font-monaspace
 
-      - run: cargo fmt --check
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test
 
+      # The Linux font backend, whose tests here also compare it with CoreText. Only the font
+      # crate reads the feature.
+      - run: cargo clippy -p benches-font --all-targets --features swash -- -D warnings
+      - run: cargo test -p benches-font --features swash
+
   # Rune has no Linux CI, so this is also the first to catch its Linux regressions. rustfmt checks
-  # every file whatever the cfg, so `cargo fmt --check` only runs on macOS.
+  # every file whatever the cfg, so `cargo fmt --check` runs only here, on every change.
   linux:
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -66,6 +111,7 @@ jobs:
           fc-cache -f
           fc-list | grep MonaspaceNeon-Regular
 
+      - run: cargo fmt --check
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test
 

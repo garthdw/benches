@@ -1590,7 +1590,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(not(target_os = "macos"), ignore = "⌘⌫ line editing is macOS-only")]
     fn command_backspace_clears_the_line() {
         let session = spawn_shell();
         session.key(crate::input::map_text(
@@ -1605,13 +1604,12 @@ mod tests {
             ..rune::Mods::default()
         };
         session.key(
-            crate::input::map_key(
+            crate::input::line_editing(
                 &rune::KeyEvent {
                     key: rune::Key::Backspace,
                     mods: cmd,
                 },
-                Some(rune::PhysicalKeyCode::Backspace),
-                None,
+                rune::KeyPlatform::Mac,
             )
             .unwrap(),
         );

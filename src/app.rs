@@ -158,12 +158,16 @@ impl State {
     }
 
     /// Secure input is on for the user's choice or a password prompt, only while this window has focus.
-    pub(crate) fn sync_secure_input(&mut self) -> bool {
+    fn secure_input_wanted(&self) -> bool {
         let password_prompt = self.config.auto_secure_input
             && self
                 .session()
                 .is_some_and(|session| session.grid().password_input);
-        let wanted = self.workspace.window_focused && (self.secure_input.manual || password_prompt);
+        self.workspace.window_focused && (self.secure_input.manual || password_prompt)
+    }
+
+    pub(crate) fn sync_secure_input(&mut self) -> bool {
+        let wanted = self.secure_input_wanted();
         self.secure_input.set(wanted)
     }
 
@@ -327,12 +331,6 @@ fn load_layout(state: &mut State) {
         state.full_disk_access_asked = saved.full_disk_access_asked;
         state.workspace = Workspace::restore(saved);
     }
-}
-
-/// Whether this is the bundled app rather than a `cargo run` binary, which answers to macOS as
-/// the terminal that started it.
-pub(crate) fn in_bundle() -> bool {
-    std::env::current_exe().is_ok_and(|exe| exe.to_string_lossy().contains(".app/Contents/MacOS/"))
 }
 
 /// Either answer is final, so the notice shows only once.
@@ -668,7 +666,7 @@ pub(crate) fn poll(state: &mut State, now: f64, tx: &mut Tx) -> bool {
     if !state.started {
         state.started = true;
         load_layout(state);
-        if !state.full_disk_access_asked && in_bundle() {
+        if !state.full_disk_access_asked {
             state.full_disk_access = benches_platform::full_disk_access_settings();
         }
         if state.workspace.projects.is_empty() {
@@ -995,6 +993,7 @@ mod tests {
     use benches_core::grid::Metrics;
     use benches_core::protocol::{Progress, ProgressKind};
     use benches_core::terminal_input::Hover;
+    use benches_platform::SECURE_INPUT_SUPPORTED;
     use rune::{Cursor, Runtime};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
@@ -1156,10 +1155,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(
-        not(target_os = "macos"),
-        ignore = "only macOS has secure keyboard entry"
-    )]
     fn a_password_prompt_turns_secure_input_on_until_it_ends() {
         let mut state = secure_input_state();
         let password = Grid {
@@ -1167,18 +1162,16 @@ mod tests {
             ..Grid::default()
         };
         state.session().unwrap().publish_fixture(password);
-        assert!(state.sync_secure_input());
-        assert!(state.secure_input.enabled);
+        assert!(state.secure_input_wanted());
+        assert_eq!(state.sync_secure_input(), SECURE_INPUT_SUPPORTED);
+        assert_eq!(state.secure_input.enabled, SECURE_INPUT_SUPPORTED);
         state.session().unwrap().publish_fixture(Grid::default());
-        assert!(state.sync_secure_input());
+        assert!(!state.secure_input_wanted());
+        assert_eq!(state.sync_secure_input(), SECURE_INPUT_SUPPORTED);
         assert!(!state.secure_input.enabled);
     }
 
     #[test]
-    #[cfg_attr(
-        not(target_os = "macos"),
-        ignore = "only macOS has secure keyboard entry"
-    )]
     fn auto_secure_input_can_be_turned_off() {
         let mut state = secure_input_state();
         state.config.auto_secure_input = false;
@@ -1187,43 +1180,31 @@ mod tests {
             ..Grid::default()
         };
         state.session().unwrap().publish_fixture(password);
+        assert!(!state.secure_input_wanted());
         assert!(!state.sync_secure_input());
         assert!(!state.secure_input.enabled);
     }
 
     #[test]
-    #[cfg_attr(
-        not(target_os = "macos"),
-        ignore = "only macOS has secure keyboard entry"
-    )]
     fn the_manual_toggle_survives_tabs_but_not_losing_focus() {
         let mut state = secure_input_state();
         let mut tx = Tx::default();
         run_command(&mut state, Command::ToggleSecureInput, &mut tx);
-        assert!(state.secure_input.enabled);
+        assert!(state.secure_input_wanted());
+        assert_eq!(state.secure_input.enabled, SECURE_INPUT_SUPPORTED);
         open_tab(&mut state, "other", Some("cat"));
+        assert!(state.secure_input_wanted());
         assert!(!state.sync_secure_input());
-        assert!(state.secure_input.enabled);
+        assert_eq!(state.secure_input.enabled, SECURE_INPUT_SUPPORTED);
         state.workspace.set_window_focused(false);
-        assert!(state.sync_secure_input());
+        assert!(!state.secure_input_wanted());
+        assert_eq!(state.sync_secure_input(), SECURE_INPUT_SUPPORTED);
         assert!(!state.secure_input.enabled);
         state.workspace.set_window_focused(true);
-        assert!(state.sync_secure_input());
+        assert!(state.secure_input_wanted());
+        assert_eq!(state.sync_secure_input(), SECURE_INPUT_SUPPORTED);
         run_command(&mut state, Command::ToggleSecureInput, &mut tx);
-        assert!(!state.secure_input.enabled);
-    }
-
-    #[test]
-    #[cfg_attr(target_os = "macos", ignore = "macOS has secure keyboard entry")]
-    fn secure_input_stays_off_where_the_os_has_none() {
-        let mut state = secure_input_state();
-        let password = Grid {
-            password_input: true,
-            ..Grid::default()
-        };
-        state.session().unwrap().publish_fixture(password);
-        run_command(&mut state, Command::ToggleSecureInput, &mut Tx::default());
-        assert!(!state.sync_secure_input());
+        assert!(!state.secure_input_wanted());
         assert!(!state.secure_input.enabled);
     }
 

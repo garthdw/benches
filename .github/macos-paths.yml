@@ -1,0 +1,22 @@
+# Changes to these paths run the macOS CI job. A path filter can't see inside a file, so macOS
+# code lives in whole files, and `ci.yml` fails when a Rust file with an OS cfg isn't listed here
+# by its literal path, or a listed path doesn't exist.
+macos:
+  - crates/benches-font/src/coretext.rs
+  - crates/benches-font/src/font.rs
+  - crates/benches-font/src/swash.rs
+  - crates/benches-platform/src/macos.rs
+  - crates/benches-platform/src/platform.rs
+  # Their tests run on CoreText, Metal and macOS's processes and shell.
+  - src/cell.wgsl
+  - src/render.rs
+  - src/session.rs
+  - scripts/**
+  - assets/**
+  - about.toml
+  - about.hbs
+  - .github/macos-paths.yml
+  - .github/workflows/**
+  - rust-toolchain.toml
+  - Cargo.lock
+  - '**/Cargo.toml'

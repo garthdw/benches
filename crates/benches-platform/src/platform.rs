@@ -60,6 +60,22 @@ pub const FALLBACK_LOCALE: &str = os::FALLBACK_LOCALE;
 /// The shell when neither `$SHELL` nor the password database names one that runs.
 pub const FALLBACK_SHELL: &str = os::FALLBACK_SHELL;
 
+/// Whether stderr ends up somewhere the user won't look, as when launched from Finder or a
+/// desktop launcher.
+pub fn launched_without_terminal() -> bool {
+    os::launched_without_terminal()
+}
+
+/// The modifier held to hover and open links, by what it is on every keyboard rather than
+/// what each OS labels it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LinkModifier {
+    Ctrl,
+    Super,
+}
+
+pub const LINK_MODIFIER: LinkModifier = os::LINK_MODIFIER;
+
 /// Lowers the calling thread's priority, for background work that mustn't slow the UI.
 pub fn lower_thread_priority() -> io::Result<()> {
     os::lower_thread_priority()

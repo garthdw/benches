@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::io;
+use std::io::{self, IsTerminal};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::OnceLock;
@@ -9,8 +9,38 @@ use futures_util::StreamExt;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 use zbus::{Connection, OwnedVariant, Proxy, Str};
 
-use crate::Link;
+use crate::dirs::{self, Env};
 use crate::notify::Notification;
+use crate::{Link, LinkModifier};
+
+pub fn state_home(env: Env) -> Option<PathBuf> {
+    dirs::xdg_home(env, "XDG_STATE_HOME", ".local/state")
+}
+
+pub fn log_dir(env: Env) -> Option<PathBuf> {
+    dirs::state_dir(env)
+}
+
+pub fn ghostty_theme_dirs(env: Env) -> Vec<PathBuf> {
+    data_dirs(env)
+        .into_iter()
+        .map(|dir| dir.join("ghostty/themes"))
+        .collect()
+}
+
+/// `share/benches/terminfo` beside `bin`.
+pub const TERMINFO_DIR: &str = "share/benches/terminfo";
+
+/// `$XDG_DATA_HOME` and then `$XDG_DATA_DIRS`, most important first.
+fn data_dirs(env: Env) -> Vec<PathBuf> {
+    let data_dirs = env("XDG_DATA_DIRS")
+        .filter(|dirs| !dirs.is_empty())
+        .unwrap_or_else(|| "/usr/local/share:/usr/share".into());
+    dirs::xdg_home(env, "XDG_DATA_HOME", ".local/share")
+        .into_iter()
+        .chain(std::env::split_paths(&data_dirs).filter_map(|dir| dirs::absolute(dir.into())))
+        .collect()
+}
 
 /// Covers connecting, D-Bus activation of the service and the call itself.
 const RPC_TIMEOUT: Duration = Duration::from_secs(10);
@@ -96,6 +126,13 @@ pub const FALLBACK_LOCALE: &str = "C.UTF-8";
 
 /// Every POSIX system has it, unlike zsh.
 pub const FALLBACK_SHELL: &str = "/bin/sh";
+
+pub fn launched_without_terminal() -> bool {
+    !io::stderr().is_terminal()
+}
+
+/// Ctrl, as the window manager usually takes Super.
+pub const LINK_MODIFIER: LinkModifier = LinkModifier::Ctrl;
 
 /// Linux keeps a nice value per thread, so this lowers only the calling one.
 pub fn lower_thread_priority() -> io::Result<()> {
@@ -233,6 +270,43 @@ fn content(notification: &Notification, markup: bool) -> (String, String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dirs::tests::lookup;
+
+    #[test]
+    fn data_dirs_default_to_the_spec_and_skip_relative_entries() {
+        let unset = [("HOME", "/home/me")];
+        assert_eq!(
+            data_dirs(&lookup(&unset)),
+            ["/home/me/.local/share", "/usr/local/share", "/usr/share"].map(PathBuf::from)
+        );
+        let set = [
+            ("HOME", "/home/me"),
+            ("XDG_DATA_HOME", "/data"),
+            ("XDG_DATA_DIRS", "/nix/share:relative:/usr/share"),
+        ];
+        assert_eq!(
+            data_dirs(&lookup(&set)),
+            ["/data", "/nix/share", "/usr/share"].map(PathBuf::from)
+        );
+        let empty = [("XDG_DATA_DIRS", "")];
+        assert_eq!(
+            data_dirs(&lookup(&empty)),
+            ["/usr/local/share", "/usr/share"].map(PathBuf::from)
+        );
+    }
+
+    #[test]
+    fn state_and_log_follow_xdg_state_home() {
+        let vars = [("HOME", "/home/me"), ("XDG_STATE_HOME", "/state")];
+        assert_eq!(
+            dirs::state_dir(&lookup(&vars)),
+            Some(PathBuf::from("/state/benches"))
+        );
+        assert_eq!(
+            dirs::log_file(&lookup(&vars)),
+            Some(PathBuf::from("/state/benches/benches.log"))
+        );
+    }
 
     fn args(command: Command) -> Vec<String> {
         command
