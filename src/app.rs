@@ -13,8 +13,8 @@ use crate::find::{Find, open_find, poll_find};
 use crate::input::caret_rect;
 use crate::keymap::{COPY, Command, PASTE, pressed, shortcut};
 use crate::palette::{
-    Action, Palette, list_project_worktrees, open_palette, open_palette_with, poll_creation,
-    poll_history, poll_jump, poll_selection, poll_worktrees, run_action,
+    Action, Palette, list_project_worktrees, open_palette, open_palette_with, poll_busy,
+    poll_history, poll_jump, poll_page, poll_selection, run_action,
 };
 use crate::render::TerminalSource;
 use crate::secure_input::SecureInput;
@@ -675,8 +675,8 @@ pub(crate) fn poll(state: &mut State, now: f64, tx: &mut Tx) -> bool {
     changed |= poll_selection(state);
     changed |= poll_jump(state, now, tx);
     changed |= poll_find(state, active);
-    changed |= poll_worktrees(state);
-    changed |= poll_creation(state);
+    changed |= poll_page(state, tx);
+    changed |= poll_busy(state, tx);
     changed |= poll_history(state);
     changed |= dismiss_confirms(state, |workspace, confirm| match confirm {
         Confirm::CloseProject { root } => workspace.project_index(root).is_some(),

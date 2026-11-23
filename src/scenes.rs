@@ -8,7 +8,7 @@ use crate::app::{Confirm, State};
 use anyhow::Context;
 
 use crate::jump;
-use crate::palette::WorktreeChoice;
+use crate::palette::{Action, WhenEmpty, worktree_row, worktrees_page};
 use crate::session::Session;
 use crate::workspace::{Project, Status, Tab};
 use benches_core::grid::{Grid, GridBuilder, Presentation, new_terminal};
@@ -261,21 +261,17 @@ pub(crate) const SCENES: &[Scene] = &[
     ("no-worktrees", |state| {
         show_workspace_scene(state);
         state.palette.open = true;
-        state.palette.worktrees = Some(WorktreeChoice {
-            root: PathBuf::from("/Users/me/dev/site"),
-            ..WorktreeChoice::default()
-        });
-        state.palette.error = Some("No worktrees found in ~/dev/site".to_owned());
+        let error = "No worktrees found in ~/dev/site".to_owned();
+        state.palette.page = Some(worktrees_page(WhenEmpty::Error(error.clone()), Vec::new()));
+        state.palette.error = Some(error);
     }),
     ("worktrees", |state| {
         show_workspace_scene(state);
         state.palette.edit = TextEdit::new("site");
         state.palette.open = true;
-        state.palette.worktrees = Some(WorktreeChoice {
-            root: PathBuf::from("/Users/me/dev/site"),
-            fallback_to_root: true,
-            pending: None,
-            found: vec![
+        state.palette.page = Some(worktrees_page(
+            WhenEmpty::Run(Action::Jump(PathBuf::from("/Users/me/dev/site"))),
+            [
                 jump::Worktree {
                     branch: Some("main".to_owned()),
                     path: PathBuf::from("/Users/me/dev/site"),
@@ -284,8 +280,11 @@ pub(crate) const SCENES: &[Scene] = &[
                     branch: Some("redesign".to_owned()),
                     path: PathBuf::from("/Users/me/dev/site.redesign"),
                 },
-            ],
-        });
+            ]
+            .into_iter()
+            .map(worktree_row)
+            .collect(),
+        ));
     }),
     ("tray", show_tray_scene),
     ("progress", show_progress_scene),

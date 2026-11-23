@@ -40,10 +40,9 @@ pub(crate) struct Palette {
     /// The query `selected` was chosen for.
     selected_query: String,
     pub(crate) jump: Lookup<PathBuf>,
-    pub(crate) worktrees: Option<WorktreeChoice>,
-    /// A `wt switch --create` running off the UI thread, answering with the new worktree's path.
-    pub(crate) creation: Option<Creation>,
-    /// Why the last worktree creation failed, shown in the command centre until the next edit.
+    pub(crate) page: Option<Page>,
+    pub(crate) busy: Option<Busy>,
+    /// Why the last action failed, shown in the command centre until the next edit.
     pub(crate) error: Option<String>,
     /// The login shell's history, newest first, suggested for `!` commands.
     pub(crate) history: Vec<String>,
@@ -122,34 +121,81 @@ impl<T> Lookup<T> {
     }
 }
 
-pub(crate) struct Creation {
-    result: mpsc::Receiver<anyhow::Result<PathBuf>>,
+/// A long-running action off the UI thread, which keeps the command centre open until it
+/// answers with what to run next.
+pub(crate) struct Busy {
+    pub(crate) label: &'static str,
+    result: mpsc::Receiver<anyhow::Result<Action>>,
     cancel: Cancel,
 }
 
-/// The repository worktrees the command centre offers after ⌘↵ on the jump command's folder, or
-/// for the active project.
-#[derive(Default)]
-pub(crate) struct WorktreeChoice {
-    pub(crate) root: PathBuf,
-    /// Opens `root` when it has no worktrees, as a jump folder needn't be a repository.
-    pub(crate) fallback_to_root: bool,
-    pub(crate) pending: Option<mpsc::Receiver<Vec<jump::Worktree>>>,
-    pub(crate) found: Vec<jump::Worktree>,
+/// A list the command centre shows in place of its rows, filtered by the input, such as the
+/// repository worktrees offered after ⌘↵ on the jump command's folder, or for the active project.
+pub(crate) struct Page {
+    /// Shown until `pending` answers.
+    pub(crate) loading: &'static str,
+    pub(crate) when_empty: WhenEmpty,
+    pub(crate) pending: Option<mpsc::Receiver<Vec<PageRow>>>,
+    pub(crate) rows: Vec<PageRow>,
+}
+
+/// What a page does once it loads no rows.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum WhenEmpty {
+    /// Closes the command centre and runs the action, as a jump folder needn't be a repository.
+    Run(Action),
+    /// Keeps the command centre open with the error.
+    Error(String),
+}
+
+pub(crate) struct PageRow {
+    pub(crate) label: String,
+    /// What typing filters on, which may hold more than `label` shows.
+    pub(crate) matches: String,
+    pub(crate) action: Action,
+}
+
+/// A worktree's branch and path, which Enter opens as a project.
+pub(crate) fn worktree_row(worktree: jump::Worktree) -> PageRow {
+    let branch = worktree.branch.as_deref();
+    PageRow {
+        label: format!(
+            "{}  {}",
+            branch.unwrap_or("(detached)"),
+            jump::abbreviate_home(&worktree.path)
+        ),
+        matches: format!("{} {}", branch.unwrap_or_default(), worktree.path.display()),
+        action: Action::Jump(worktree.path),
+    }
+}
+
+/// A page of worktrees, loaded already unless `pending` is set.
+pub(crate) fn worktrees_page(when_empty: WhenEmpty, rows: Vec<PageRow>) -> Page {
+    Page {
+        loading: "Loading worktrees…",
+        when_empty,
+        pending: None,
+        rows,
+    }
+}
+
+/// What a page of the project at `root`'s worktrees does once it finds none.
+pub(crate) fn no_worktrees(root: &Path) -> WhenEmpty {
+    WhenEmpty::Error(format!(
+        "No worktrees found in {}",
+        jump::abbreviate_home(root)
+    ))
 }
 
 impl State {
-    /// The worktrees whose branch and path contain the query's letters in order.
-    fn visible_worktrees(&self) -> Vec<&jump::Worktree> {
+    /// The page's rows whose `matches` contain the query's letters in order.
+    fn visible_rows(&self) -> Vec<&PageRow> {
         let query = self.palette.edit.text.trim();
         self.palette
-            .worktrees
+            .page
             .iter()
-            .flat_map(|choice| &choice.found)
-            .filter(|worktree| {
-                let branch = worktree.branch.as_deref().unwrap_or_default();
-                letters_in_order(&format!("{branch} {}", worktree.path.display()), query)
-            })
+            .flat_map(|page| &page.rows)
+            .filter(|row| letters_in_order(&row.matches, query))
             .collect()
     }
 
@@ -475,7 +521,7 @@ pub(crate) fn open_palette_with(state: &mut State, text: &str, tx: &mut Tx) {
     state.palette.edit = TextEdit::new(text);
     state.palette.open = true;
     state.palette.selected = 0;
-    state.palette.worktrees = None;
+    state.palette.page = None;
     state.palette.error = None;
     tx.focus("palette-input", false);
     if state.paths.is_some() {
@@ -542,28 +588,32 @@ fn create_worktree(state: &mut State, branch: &str) {
     let (shell, branch) = (state.config.shell.clone(), branch.to_owned());
     let result = spawn_waking(state.waker.clone(), {
         let cancel = cancel.clone();
-        move || jump::create_worktree(&shell, &root, &branch, WORKTREE_TIMEOUT, &cancel)
+        move || {
+            jump::create_worktree(&shell, &root, &branch, WORKTREE_TIMEOUT, &cancel)
+                .map(Action::Jump)
+        }
     });
-    state.palette.creation = Some(Creation { result, cancel });
+    state.palette.busy = Some(Busy {
+        label: "Creating worktree…",
+        result,
+        cancel,
+    });
     state.palette.open = true;
     state.palette.error = None;
 }
 
-pub(crate) fn poll_creation(state: &mut State) -> bool {
-    let Some(created) = state
+pub(crate) fn poll_busy(state: &mut State, tx: &mut Tx) -> bool {
+    let Some(result) = state
         .palette
-        .creation
+        .busy
         .as_ref()
-        .and_then(|creation| creation.result.try_recv().ok())
+        .and_then(|busy| busy.result.try_recv().ok())
     else {
         return false;
     };
-    state.palette.creation = None;
-    match created {
-        Ok(path) => {
-            state.palette.open = false;
-            open_project(state, path);
-        }
+    state.palette.busy = None;
+    match result {
+        Ok(action) => close_and_run(state, &action, tx),
         Err(error) => {
             state.palette.open = true;
             state.palette.error = Some(format!("{error:#}"));
@@ -578,13 +628,21 @@ fn run_palette(state: &mut State, index: usize, tray: bool, tx: &mut Tx) {
         return;
     };
     match action {
-        Action::Jump(root) if tray => list_worktrees(state, root.clone(), true, "", tx),
+        Action::Jump(root) if tray => list_worktrees(
+            state,
+            root.clone(),
+            WhenEmpty::Run(Action::Jump(root.clone())),
+            "",
+            tx,
+        ),
         _ if tray && !action.takes_command_enter() => {}
-        _ => {
-            state.palette.open = false;
-            run_action(state, action, tx);
-        }
+        _ => close_and_run(state, action, tx),
     }
+}
+
+fn close_and_run(state: &mut State, action: &Action, tx: &mut Tx) {
+    state.palette.open = false;
+    run_action(state, action, tx);
 }
 
 pub(crate) fn run_action(state: &mut State, action: &Action, tx: &mut Tx) {
@@ -609,30 +667,30 @@ pub(crate) fn run_action(state: &mut State, action: &Action, tx: &mut Tx) {
 pub(crate) fn list_project_worktrees(state: &mut State, filter: &str, tx: &mut Tx) {
     if let Some(root) = state.active_root() {
         state.palette.open = true;
-        list_worktrees(state, root, false, filter, tx);
+        let when_empty = no_worktrees(&root);
+        list_worktrees(state, root, when_empty, filter, tx);
     }
 }
 
 fn list_worktrees(
     state: &mut State,
     root: PathBuf,
-    fallback_to_root: bool,
+    when_empty: WhenEmpty,
     filter: &str,
     tx: &mut Tx,
 ) {
-    let pending = spawn_waking(state.waker.clone(), {
-        let (shell, root) = (state.config.shell.clone(), root.clone());
-        move || {
-            jump::worktrees(&shell, &root, LOOKUP_TIMEOUT)
-                .log_err("wt list")
-                .unwrap_or_default()
-        }
+    let shell = state.config.shell.clone();
+    let pending = spawn_waking(state.waker.clone(), move || {
+        jump::worktrees(&shell, &root, LOOKUP_TIMEOUT)
+            .log_err("wt list")
+            .unwrap_or_default()
+            .into_iter()
+            .map(worktree_row)
+            .collect()
     });
-    state.palette.worktrees = Some(WorktreeChoice {
-        root,
-        fallback_to_root,
+    state.palette.page = Some(Page {
         pending: Some(pending),
-        found: Vec::new(),
+        ..worktrees_page(when_empty, Vec::new())
     });
     state.palette.edit = TextEdit::new(filter);
     state.palette.selected = 0;
@@ -640,68 +698,59 @@ fn list_worktrees(
     tx.focus("palette-input", false);
 }
 
-pub(crate) fn poll_worktrees(state: &mut State) -> bool {
+pub(crate) fn poll_page(state: &mut State, tx: &mut Tx) -> bool {
     if !state.palette.open {
-        state.palette.worktrees = None;
+        state.palette.page = None;
         return false;
     }
-    let Some(choice) = &mut state.palette.worktrees else {
+    let Some(page) = &mut state.palette.page else {
         return false;
     };
-    let Some(found) = choice
-        .pending
-        .as_ref()
-        .and_then(|pending| pending.try_recv().ok())
-    else {
+    let Some(rows) = take_answer(&mut page.pending) else {
         return false;
     };
-    choice.pending = None;
-    choice.found = found;
-    if choice.found.is_empty() {
-        let root = choice.root.clone();
-        if choice.fallback_to_root {
-            state.palette.open = false;
-            open_project(state, root);
-        } else {
-            state.palette.error = Some(format!(
-                "No worktrees found in {}",
-                jump::abbreviate_home(&root)
-            ));
+    page.rows = rows;
+    if page.rows.is_empty() {
+        match page.when_empty.clone() {
+            WhenEmpty::Run(action) => close_and_run(state, &action, tx),
+            WhenEmpty::Error(error) => state.palette.error = Some(error),
         }
     }
     true
 }
 
 /// Whether the key was one of the list's; typing edits the palette's input, which filters it.
-fn worktree_key(state: &mut State, event: &KeyEvent) -> bool {
-    let last = state.visible_worktrees().len().saturating_sub(1);
+fn page_key(state: &mut State, event: &KeyEvent, tx: &mut Tx) -> bool {
+    let last = state.visible_rows().len().saturating_sub(1);
     match event.key {
         Key::Escape => state.palette.open = false,
         Key::Up => state.palette.selected = state.palette.selected.min(last).saturating_sub(1),
         Key::Down => state.palette.selected = (state.palette.selected + 1).min(last),
-        Key::Enter => open_worktree(state, state.palette.selected.min(last)),
+        Key::Enter => open_page_row(state, state.palette.selected.min(last), tx),
         _ => return false,
     }
     true
 }
 
-fn open_worktree(state: &mut State, index: usize) {
-    let Some(worktree) = state.visible_worktrees().get(index).copied() else {
+fn open_page_row(state: &mut State, index: usize, tx: &mut Tx) {
+    let Some(action) = state
+        .visible_rows()
+        .get(index)
+        .map(|row| row.action.clone())
+    else {
         return;
     };
-    let path = worktree.path.clone();
-    state.palette.open = false;
-    open_project(state, path);
+    close_and_run(state, &action, tx);
 }
 
 fn palette_key(state: &mut State, event: &KeyEvent, tx: &mut Tx) -> bool {
     // A key's own modifiers win should `on_modifiers` miss a change, which would leave every
     // run row in the tray.
     state.command_held = event.mods.cmd;
-    if let Some(creation) = &state.palette.creation {
+    if let Some(busy) = &state.palette.busy {
         if event.key == Key::Escape {
-            creation.cancel.cancel().log_err("cancel wt switch");
-            state.palette.creation = None;
+            busy.cancel.cancel().log_err("cancel running action");
+            state.palette.busy = None;
             state.palette.open = false;
         }
         return true;
@@ -709,8 +758,8 @@ fn palette_key(state: &mut State, event: &KeyEvent, tx: &mut Tx) -> bool {
     if field_shortcut(state, event, tx) {
         return true;
     }
-    if state.palette.worktrees.is_some() {
-        return worktree_key(state, event);
+    if state.palette.page.is_some() {
+        return page_key(state, event, tx);
     }
     let rows = state.palette_rows(event.mods.cmd);
     let last = rows.actions.len().saturating_sub(1);
@@ -789,29 +838,32 @@ pub(crate) fn view(
     state.palette.open.then(|| {
         let rows = state.palette_rows(state.command_held);
         let (return_key, command_return) = (chord_hint("enter"), chord_hint("mod+enter"));
-        let elements: Vec<El> = if state.palette.creation.is_some() {
-            vec![pill("palette-0".to_owned(), "Creating worktree…", false, None).w_full()]
-        } else if let Some(choice) = &state.palette.worktrees {
-            let visible = state.visible_worktrees();
+        let elements: Vec<El> = if let Some(busy) = &state.palette.busy {
+            vec![pill("palette-0".to_owned(), busy.label, false, None).w_full()]
+        } else if let Some(page) = &state.palette.page {
+            let visible = state.visible_rows();
             let selected = state.palette.selected.min(visible.len().saturating_sub(1));
-            let placeholder = choice
+            let placeholder = page
                 .pending
                 .is_some()
-                .then(|| pill("palette-0".to_owned(), "Loading worktrees…", false, None).w_full());
-            let worktrees = visible.iter().enumerate().map(|(index, worktree)| {
-                let branch = worktree.branch.as_deref().unwrap_or("(detached)");
-                let label = format!("{branch}  {}", jump::abbreviate_home(&worktree.path));
-                pill(format!("palette-{index}"), &label, index == selected, None)
-                    .children(enter_hint(
-                        theme,
-                        (index == selected).then_some(return_key.as_str()),
-                    ))
-                    .justify_between()
-                    .w_full()
-                    .on_pointer_move(select_on_pointer_move(index))
-                    .on_press(move |state: &mut State| open_worktree(state, index))
+                .then(|| pill("palette-0".to_owned(), page.loading, false, None).w_full());
+            let page_rows = visible.iter().enumerate().map(|(index, page_row)| {
+                pill(
+                    format!("palette-{index}"),
+                    &page_row.label,
+                    index == selected,
+                    None,
+                )
+                .children(enter_hint(
+                    theme,
+                    (index == selected).then_some(return_key.as_str()),
+                ))
+                .justify_between()
+                .w_full()
+                .on_pointer_move(select_on_pointer_move(index))
+                .on_press_tx(move |state: &mut State, tx: &mut Tx| open_page_row(state, index, tx))
             });
-            placeholder.into_iter().chain(worktrees).collect()
+            placeholder.into_iter().chain(page_rows).collect()
         } else {
             let selected = state
                 .palette
@@ -827,11 +879,12 @@ pub(crate) fn view(
                         _ => None,
                     };
                     let alternative = match action {
-                        Action::Run(_) => Some(format!("{command_return} in the tray")),
-                        Action::Jump(_) => Some(format!("{command_return} worktrees")),
+                        Action::Run(_) => Some("in the tray"),
+                        Action::Jump(_) => Some("worktrees"),
                         _ => None,
                     }
-                    .filter(|_| is_selected && !state.command_held);
+                    .filter(|_| is_selected && !state.command_held)
+                    .map(|hint| format!("{command_return} {hint}"));
                     let enter = match (is_selected, state.command_held) {
                         (false, _) => None,
                         (true, false) => Some(return_key.as_str()),
@@ -1406,20 +1459,28 @@ mod tests {
         assert_eq!(runtime.state.workspace.projects[0].tabs.len(), 4);
     }
 
-    fn worktree(branch: &str, path: &str) -> jump::Worktree {
-        jump::Worktree {
+    fn worktree(branch: &str, path: &str) -> PageRow {
+        worktree_row(jump::Worktree {
             branch: Some(branch.to_owned()),
             path: PathBuf::from(path),
-        }
+        })
     }
 
-    fn loaded(found: Vec<jump::Worktree>) -> WorktreeChoice {
-        WorktreeChoice {
-            root: PathBuf::from("/dev/site"),
-            fallback_to_root: true,
-            pending: None,
-            found,
-        }
+    fn loaded(rows: Vec<PageRow>) -> Page {
+        worktrees_page(
+            WhenEmpty::Run(Action::Jump(PathBuf::from("/dev/site"))),
+            rows,
+        )
+    }
+
+    /// The branches the visible worktree rows show.
+    fn branches(runtime: &Runtime<State>) -> Vec<String> {
+        runtime
+            .state
+            .visible_rows()
+            .iter()
+            .map(|row| row.label.split_once("  ").unwrap().0.to_owned())
+            .collect()
     }
 
     fn jump_runtime() -> Runtime<State> {
@@ -1442,12 +1503,12 @@ mod tests {
         let mut runtime = jump_runtime();
         press(&mut runtime, Key::Enter, command());
         assert!(runtime.state.palette.open);
-        assert!(runtime.state.palette.worktrees.is_some());
+        assert!(runtime.state.palette.page.is_some());
         let found = vec![
             worktree("main", "/dev/site"),
             worktree("feature", "/dev/site.feature"),
         ];
-        runtime.state.palette.worktrees = Some(loaded(found));
+        runtime.state.palette.page = Some(loaded(found));
         press(&mut runtime, Key::Down, Mods::default());
         press(&mut runtime, Key::Enter, Mods::default());
         let workspace = &runtime.state.workspace;
@@ -1460,10 +1521,10 @@ mod tests {
     fn an_open_worktree_is_selected_rather_than_reopened() {
         let mut runtime = jump_runtime();
         let root = runtime.state.workspace.projects[1].root.clone();
-        runtime.state.palette.worktrees = Some(loaded(vec![jump::Worktree {
+        runtime.state.palette.page = Some(loaded(vec![worktree_row(jump::Worktree {
             branch: None,
             path: root,
-        }]));
+        })]));
         press(&mut runtime, Key::Enter, Mods::default());
         assert_eq!(runtime.state.workspace.projects.len(), 2);
         assert_eq!(runtime.state.workspace.active, 1);
@@ -1475,19 +1536,13 @@ mod tests {
         let mut runtime = jump_runtime();
         press(&mut runtime, Key::Enter, command());
         assert_eq!(runtime.state.palette.edit.text, "");
-        runtime.state.palette.worktrees = Some(loaded(vec![
+        runtime.state.palette.page = Some(loaded(vec![
             worktree("main", "/dev/site"),
             worktree("feature", "/dev/site.feature"),
             worktree("redesign", "/dev/site.redesign"),
         ]));
         press(&mut runtime, Key::Text("rdsn".into()), Mods::default());
-        let branches: Vec<_> = runtime
-            .state
-            .visible_worktrees()
-            .iter()
-            .map(|worktree| worktree.branch.clone().unwrap())
-            .collect();
-        assert_eq!(branches, ["redesign"]);
+        assert_eq!(branches(&runtime), ["redesign"]);
         for _ in 0..3 {
             press(&mut runtime, Key::Down, Mods::default());
         }
@@ -1499,7 +1554,7 @@ mod tests {
     #[test]
     fn a_filter_matching_nothing_leaves_enter_with_nothing_to_open() {
         let mut runtime = jump_runtime();
-        runtime.state.palette.worktrees = Some(loaded(vec![worktree("main", "/dev/site")]));
+        runtime.state.palette.page = Some(loaded(vec![worktree("main", "/dev/site")]));
         press(&mut runtime, Key::Text("zzz".into()), Mods::default());
         press(&mut runtime, Key::Enter, Mods::default());
         assert!(runtime.state.palette.open);
@@ -1510,15 +1565,15 @@ mod tests {
     fn no_worktrees_falls_back_to_opening_the_jump_target() {
         let mut runtime = jump_runtime();
         let (sender, receiver) = mpsc::channel();
-        runtime.state.palette.worktrees = Some(WorktreeChoice {
-            root: PathBuf::from("/dev/elsewhere"),
+        runtime.state.palette.page = Some(Page {
+            when_empty: WhenEmpty::Run(Action::Jump(PathBuf::from("/dev/elsewhere"))),
             pending: Some(receiver),
             ..loaded(Vec::new())
         });
-        assert!(!poll_worktrees(&mut runtime.state));
+        assert!(!poll_page(&mut runtime.state, &mut Tx::default()));
         assert!(runtime.state.palette.open);
         sender.send(Vec::new()).unwrap();
-        assert!(poll_worktrees(&mut runtime.state));
+        assert!(poll_page(&mut runtime.state, &mut Tx::default()));
         let workspace = &runtime.state.workspace;
         assert_eq!(workspace.projects[2].root, Path::new("/dev/elsewhere"));
         assert!(!runtime.state.palette.open);
@@ -1529,13 +1584,13 @@ mod tests {
         let mut runtime = jump_runtime();
         let (sender, receiver) = mpsc::channel();
         press(&mut runtime, Key::Enter, command());
-        if let Some(choice) = &mut runtime.state.palette.worktrees {
-            choice.root = PathBuf::from("/dev/elsewhere");
-            choice.pending = Some(receiver);
+        if let Some(page) = &mut runtime.state.palette.page {
+            page.when_empty = WhenEmpty::Run(Action::Jump(PathBuf::from("/dev/elsewhere")));
+            page.pending = Some(receiver);
         }
         press(&mut runtime, Key::Escape, Mods::default());
         sender.send(Vec::new()).unwrap();
-        poll_worktrees(&mut runtime.state);
+        poll_page(&mut runtime.state, &mut Tx::default());
         assert_eq!(runtime.state.workspace.projects.len(), 2);
     }
 
@@ -1546,7 +1601,7 @@ mod tests {
         press(&mut runtime, Key::Escape, Mods::default());
         assert!(!runtime.state.palette.open);
         press_command(&mut runtime, Command::Palette);
-        assert!(runtime.state.palette.worktrees.is_none());
+        assert!(runtime.state.palette.page.is_none());
     }
 
     #[test]
@@ -1554,7 +1609,7 @@ mod tests {
         let mut runtime = jump_runtime();
         press(&mut runtime, Key::Down, Mods::default());
         press(&mut runtime, Key::Enter, command());
-        assert!(runtime.state.palette.worktrees.is_none());
+        assert!(runtime.state.palette.page.is_none());
         assert_eq!(runtime.state.workspace.projects[0].tray.len(), 1);
     }
 
@@ -1661,20 +1716,13 @@ mod tests {
         press(&mut runtime, Key::Enter, Mods::default());
         assert!(runtime.state.palette.open);
         assert_eq!(runtime.state.palette.edit.text, "feat");
-        let choice = runtime.state.palette.worktrees.as_ref().unwrap();
-        assert_eq!(choice.root, root);
-        assert!(!choice.fallback_to_root);
-        runtime.state.palette.worktrees = Some(loaded(vec![
+        let page = runtime.state.palette.page.as_ref().unwrap();
+        assert_eq!(page.when_empty, no_worktrees(&root));
+        runtime.state.palette.page = Some(loaded(vec![
             worktree("main", "/dev/site"),
             worktree("feature", "/dev/site.feature"),
         ]));
-        let branches: Vec<_> = runtime
-            .state
-            .visible_worktrees()
-            .iter()
-            .map(|worktree| worktree.branch.clone().unwrap())
-            .collect();
-        assert_eq!(branches, ["feature"]);
+        assert_eq!(branches(&runtime), ["feature"]);
         press(&mut runtime, Key::Enter, Mods::default());
         let workspace = &runtime.state.workspace;
         assert_eq!(workspace.projects.len(), 3);
@@ -1688,11 +1736,11 @@ mod tests {
         let (sender, receiver) = mpsc::channel();
         press(&mut runtime, Key::Text("wts".into()), Mods::default());
         press(&mut runtime, Key::Enter, Mods::default());
-        if let Some(choice) = &mut runtime.state.palette.worktrees {
-            choice.pending = Some(receiver);
+        if let Some(page) = &mut runtime.state.palette.page {
+            page.pending = Some(receiver);
         }
         sender.send(Vec::new()).unwrap();
-        assert!(poll_worktrees(&mut runtime.state));
+        assert!(poll_page(&mut runtime.state, &mut Tx::default()));
         runtime.frame(1.0);
         assert!(runtime.state.palette.open);
         assert_eq!(runtime.state.workspace.projects.len(), 2);
@@ -1727,9 +1775,8 @@ mod tests {
         let mut tx = Tx::default();
         run_command(&mut runtime.state, Command::OpenWorktree, &mut tx);
         assert!(runtime.state.palette.open);
-        let choice = runtime.state.palette.worktrees.as_ref().unwrap();
-        assert_eq!(choice.root, root);
-        assert!(!choice.fallback_to_root);
+        let page = runtime.state.palette.page.as_ref().unwrap();
+        assert_eq!(page.when_empty, no_worktrees(&root));
     }
 
     #[test]
@@ -1768,7 +1815,7 @@ mod tests {
 
     fn poll_until_created(runtime: &mut Runtime<State>) {
         frame_until(runtime, "the worktree creation to end", |runtime| {
-            runtime.state.palette.creation.is_none()
+            runtime.state.palette.busy.is_none()
         });
     }
 
@@ -1823,7 +1870,7 @@ mod tests {
         let mut runtime = create_worktree_from_palette(shell, "feature-x");
         let pid = wait_for_pid(&pid_file);
         press(&mut runtime, Key::Escape, Mods::default());
-        assert!(runtime.state.palette.creation.is_none());
+        assert!(runtime.state.palette.busy.is_none());
         assert!(!runtime.state.palette.open);
         wait_for_pid_exit(pid, Duration::from_secs(15), "wt");
         runtime.frame(1000.0);
