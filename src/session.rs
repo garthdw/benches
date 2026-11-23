@@ -14,6 +14,7 @@ use crossbeam_channel::{Receiver, Sender, bounded, unbounded};
 use libghostty_vt::effect::ClipboardLocation;
 use libghostty_vt::key;
 use nix::sys::select::{FdSet, select};
+use nix::sys::signal::{SigHandler, Signal, signal};
 use nix::sys::time::{TimeVal, TimeValLike};
 use rune::Waker;
 
@@ -181,6 +182,14 @@ impl Session {
         // SAFETY: only async-signal-safe calls run between fork and exec.
         unsafe {
             process.pre_exec(|| {
+                // An ignored signal stays ignored through exec, so when Benches is started as a
+                // script's background job, which ignores SIGINT, nothing in its tabs could be
+                // interrupted.
+                for ignorable in Signal::iterator()
+                    .filter(|signal| ![Signal::SIGKILL, Signal::SIGSTOP].contains(signal))
+                {
+                    signal(ignorable, SigHandler::SigDfl)?;
+                }
                 if libc::login_tty(0) < 0 {
                     return Err(std::io::Error::last_os_error());
                 }
@@ -1480,6 +1489,47 @@ mod tests {
         let finished = session.finished();
         drop(session);
         assert!(finished.recv_timeout(Duration::from_secs(5)).is_err());
+        wait_for_process(&sleep, false);
+    }
+
+    /// Set in the copy of the test binary that runs with SIGINT ignored.
+    const SIGINT_IGNORED: &str = "BENCHES_TEST_SIGINT_IGNORED";
+
+    #[test]
+    fn a_command_can_be_interrupted_though_benches_started_ignoring_sigint() {
+        if std::env::var_os(SIGINT_IGNORED).is_none() {
+            // A copy of this binary, as a disposition is process-wide, and ignoring SIGINT is
+            // how a script's background job starts.
+            let name = "session::tests::a_command_can_be_interrupted_though_benches_started_ignoring_sigint";
+            let mut copy = Command::new(std::env::current_exe().unwrap());
+            copy.args(["--exact", name]).env(SIGINT_IGNORED, "1");
+            // SAFETY: `signal` is async-signal-safe.
+            unsafe {
+                copy.pre_exec(|| {
+                    signal(Signal::SIGINT, SigHandler::SigIgn)?;
+                    Ok(())
+                });
+            }
+            let output = copy.output().unwrap();
+            let printed = String::from_utf8_lossy(&output.stdout);
+            assert!(output.status.success(), "{printed}");
+            assert!(printed.contains("1 passed"), "{printed}");
+            return;
+        }
+        let sleep = unique_sleep(4244);
+        let _session = Session::spawn(
+            Some(&sleep),
+            Path::new("/tmp"),
+            &default_config(),
+            Arc::new(|| {}),
+        )
+        .unwrap();
+        wait_for_process(&sleep, true);
+        let interrupted = Command::new("pkill")
+            .args(["-INT", "-fx", &sleep])
+            .status()
+            .unwrap();
+        assert!(interrupted.success());
         wait_for_process(&sleep, false);
     }
 
