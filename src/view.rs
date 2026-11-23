@@ -177,7 +177,13 @@ fn button(theme: &tok::Theme, key: String, label: &str, active: bool) -> El {
         })
 }
 
-fn pill(theme: &tok::Theme, key: String, label: &str, active: bool, marker: Option<El>) -> El {
+pub(crate) fn pill(
+    theme: &tok::Theme,
+    key: String,
+    label: &str,
+    active: bool,
+    marker: Option<El>,
+) -> El {
     pill_spans(theme, key, label, active, marker, Vec::new())
 }
 
@@ -497,22 +503,22 @@ fn banner(theme: &tok::Theme, key: &'static str, title: &str, detail: El, button
         .children(buttons)
 }
 
-fn config_error_banner(state: &State, theme: &tok::Theme) -> Option<El> {
-    let error = state.config_error.as_ref()?;
+/// A banner showing `error`, if there is one, which Dismiss clears with `dismiss`.
+fn error_banner(
+    theme: &tok::Theme,
+    key: &'static str,
+    title: &str,
+    error: Option<&str>,
+    dismiss: fn(&mut State),
+) -> Option<El> {
+    let error = error?;
     // TOML errors point at the column with a caret, which needs even widths.
     let detail = text(error.trim_end().to_owned())
         .font(tok::type_::BODY.family(tok::Family::SystemMono))
         .color(theme.text_secondary)
         .wrap();
-    let dismiss = bar_button(theme, "config-error-dismiss", "Dismiss")
-        .on_press(|state: &mut State| state.config_error = None);
-    Some(banner(
-        theme,
-        "config-error",
-        "config.toml not applied",
-        detail,
-        vec![dismiss],
-    ))
+    let dismiss = bar_button(theme, format!("{key}-dismiss"), "Dismiss").on_press(dismiss);
+    Some(banner(theme, key, title, detail, vec![dismiss]))
 }
 
 fn full_disk_access_banner(state: &State, theme: &tok::Theme) -> Option<El> {
@@ -795,7 +801,20 @@ pub(crate) fn view(state: &State, cx: &mut Cx<State>) -> El {
         );
     }
     let banners: Vec<El> = [
-        config_error_banner(state, &theme),
+        error_banner(
+            &theme,
+            "config-error",
+            "config.toml not applied",
+            state.config_error.as_deref(),
+            |state| state.config_error = None,
+        ),
+        error_banner(
+            &theme,
+            "plugin-error",
+            "Plugins left out",
+            state.fleet.plugin_error().as_deref(),
+            |state| state.fleet.dismiss_plugin_error(),
+        ),
         full_disk_access_banner(state, &theme),
     ]
     .into_iter()
@@ -848,9 +867,7 @@ pub(crate) fn view(state: &State, cx: &mut Cx<State>) -> El {
         .children(tray_bar)
         .children(drawer)
         .children(overlay);
-    let palette = palette::view(state, &theme, &|key, label, active, marker| {
-        pill(&theme, key, label, active, marker)
-    });
+    let palette = palette::view(state, &theme);
     row()
         .w_full()
         .h_full()

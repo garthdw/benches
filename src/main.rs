@@ -4,6 +4,7 @@ mod input;
 mod jump;
 mod keymap;
 mod palette;
+mod plugins;
 mod render;
 mod scenes;
 mod secure_input;

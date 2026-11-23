@@ -104,7 +104,7 @@ mod tests {
         run_command(&mut state, Command::ToggleSecureInput, &mut tx);
         assert!(state.secure_input_wanted());
         assert_eq!(state.secure_input.enabled, SECURE_INPUT_SUPPORTED);
-        open_tab(&mut state, "other", Some("cat"));
+        open_tab(&mut state, "other", Some("cat"), None);
         assert!(state.secure_input_wanted());
         assert!(!state.sync_secure_input());
         assert_eq!(state.secure_input.enabled, SECURE_INPUT_SUPPORTED);

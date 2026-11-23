@@ -274,6 +274,11 @@ impl Paths {
         self.dir.join("config.toml")
     }
 
+    /// Holds the user's palette plugins, one per folder.
+    pub fn plugins(&self) -> PathBuf {
+        self.dir.join("plugins")
+    }
+
     fn schema(&self) -> PathBuf {
         self.dir.join("config.schema.json")
     }

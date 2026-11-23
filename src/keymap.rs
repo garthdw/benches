@@ -228,6 +228,40 @@ pub fn chord_hint(chord: &str) -> String {
 }
 
 impl Command {
+    /// The stable name plugins run it by.
+    pub fn id(self) -> &'static str {
+        match self {
+            Command::NewShell => "new_shell",
+            Command::ToggleGit => "toggle_git",
+            Command::OpenProject => "open_project",
+            Command::ChangeFolder => "change_folder",
+            Command::OpenWorktree => "open_worktree",
+            Command::CreateWorktree => "create_worktree",
+            Command::MoveToNewWindow => "move_to_new_window",
+            Command::MoveToMainWindow => "move_to_main_window",
+            Command::MergeIntoMain => "merge_into_main",
+            Command::Palette => "palette",
+            Command::Find => "find",
+            Command::ToggleSidebar => "toggle_sidebar",
+            Command::ToggleDrawer => "toggle_drawer",
+            Command::ToggleSecureInput => "toggle_secure_input",
+            Command::CloseTab => "close_tab",
+            Command::ZoomIn => "zoom_in",
+            Command::ZoomOut => "zoom_out",
+            Command::ZoomReset => "zoom_reset",
+            Command::PrevTab => "prev_tab",
+            Command::NextTab => "next_tab",
+            Command::PrevPrompt => "prev_prompt",
+            Command::NextPrompt => "next_prompt",
+            Command::SelectLastOutput => "select_last_output",
+            Command::ReloadConfig => "reload_config",
+        }
+    }
+
+    pub fn from_id(id: &str) -> Option<&'static CommandSpec> {
+        COMMANDS.iter().find(|spec| spec.command.id() == id)
+    }
+
     fn find_spec(self) -> Option<&'static CommandSpec> {
         COMMANDS.iter().find(|spec| spec.command == self)
     }
@@ -330,6 +364,20 @@ mod tests {
                 assert_eq!(clash, None, "{chord} on {platform:?}");
             }
         }
+    }
+
+    #[test]
+    fn every_command_is_found_by_its_own_id() {
+        for spec in COMMANDS {
+            let id = spec.command.id();
+            assert!(
+                id.chars()
+                    .all(|char| char.is_ascii_lowercase() || char == '_')
+            );
+            let found = Command::from_id(id).map(|found| found.command);
+            assert_eq!(found, Some(spec.command), "{id}");
+        }
+        assert!(Command::from_id("nothing").is_none());
     }
 
     #[test]
