@@ -4,7 +4,7 @@ use libghostty_vt::mouse;
 use rune::tok;
 use rune::{
     Color, Cursor, Cx, Drag, El, Icon, Phase, PointerButton, PointerEvent, PopupItem, PopupMenu,
-    Tx, WheelEvent, col, effect, el, icon, row, text,
+    Span, Tx, WheelEvent, col, effect, el, icon, row, text,
 };
 
 use crate::app::{
@@ -177,13 +177,36 @@ fn button(theme: &tok::Theme, key: String, label: &str, active: bool) -> El {
         })
 }
 
-fn pill(theme: &tok::Theme, key: String, label: &str, active: bool, marker: Option<El>) -> El {
+pub(crate) fn pill(
+    theme: &tok::Theme,
+    key: String,
+    label: &str,
+    active: bool,
+    marker: Option<El>,
+) -> El {
+    pill_spans(theme, key, label, active, marker, Vec::new())
+}
+
+/// A pill whose label is styled by `spans`.
+pub(crate) fn pill_spans(
+    theme: &tok::Theme,
+    key: String,
+    label: &str,
+    active: bool,
+    marker: Option<El>,
+    spans: Vec<Span>,
+) -> El {
     button(theme, key, label, active)
         .px(10.0)
         .py(4.0)
         .radius(6.0)
         .children(marker)
-        .child(text(label.to_owned()).color(theme.text).truncate())
+        .child(
+            text(label.to_owned())
+                .color(theme.text)
+                .spans(spans)
+                .truncate(),
+        )
 }
 
 fn attention_dot(accent: Color, attention: Attention) -> Option<El> {
@@ -480,22 +503,22 @@ fn banner(theme: &tok::Theme, key: &'static str, title: &str, detail: El, button
         .children(buttons)
 }
 
-fn config_error_banner(state: &State, theme: &tok::Theme) -> Option<El> {
-    let error = state.config_error.as_ref()?;
+/// A banner showing `error`, if there is one, which Dismiss clears with `dismiss`.
+fn error_banner(
+    theme: &tok::Theme,
+    key: &'static str,
+    title: &str,
+    error: Option<&str>,
+    dismiss: fn(&mut State),
+) -> Option<El> {
+    let error = error?;
     // TOML errors point at the column with a caret, which needs even widths.
     let detail = text(error.trim_end().to_owned())
         .font(tok::type_::BODY.family(tok::Family::SystemMono))
         .color(theme.text_secondary)
         .wrap();
-    let dismiss = bar_button(theme, "config-error-dismiss", "Dismiss")
-        .on_press(|state: &mut State| state.config_error = None);
-    Some(banner(
-        theme,
-        "config-error",
-        "config.toml not applied",
-        detail,
-        vec![dismiss],
-    ))
+    let dismiss = bar_button(theme, format!("{key}-dismiss"), "Dismiss").on_press(dismiss);
+    Some(banner(theme, key, title, detail, vec![dismiss]))
 }
 
 fn full_disk_access_banner(state: &State, theme: &tok::Theme) -> Option<El> {
@@ -778,7 +801,20 @@ pub(crate) fn view(state: &State, cx: &mut Cx<State>) -> El {
         );
     }
     let banners: Vec<El> = [
-        config_error_banner(state, &theme),
+        error_banner(
+            &theme,
+            "config-error",
+            "config.toml not applied",
+            state.config_error.as_deref(),
+            |state| state.config_error = None,
+        ),
+        error_banner(
+            &theme,
+            "plugin-error",
+            "Plugins left out",
+            state.fleet.plugin_error().as_deref(),
+            |state| state.fleet.dismiss_plugin_error(),
+        ),
         full_disk_access_banner(state, &theme),
     ]
     .into_iter()
@@ -831,9 +867,7 @@ pub(crate) fn view(state: &State, cx: &mut Cx<State>) -> El {
         .children(tray_bar)
         .children(drawer)
         .children(overlay);
-    let palette = palette::view(state, &theme, &|key, label, active, marker| {
-        pill(&theme, key, label, active, marker)
-    });
+    let palette = palette::view(state, &theme);
     row()
         .w_full()
         .h_full()

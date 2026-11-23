@@ -1,6 +1,6 @@
 # Command palette plugins
 
-Status: design, not implemented.
+Status: phases 1 and 2 implemented: the host and oneshot runner load plugins, while worktrunk is still built in.
 
 Plugins are separate executables described by a `plugin.toml` manifest and spoken to in JSON Lines. They return rows and effects, and the palette stays the only code that touches UI. Worktrunk (`wt`, `wts`, ⌘↵ worktrees on a jump folder) becomes the first plugin, with no visible change.
 
@@ -60,6 +60,7 @@ id = "open"
 label = "Open worktree…"
 when = "project"
 invoke = "list"              # pushes a page from `invoke list` on the active project
+loading = "Loading worktrees…"   # shown until the page's rows arrive; defaults to "Loading…"
 
 [[command]]
 id = "create"
@@ -91,7 +92,12 @@ chord = "mod+enter"
 hint = "worktrees"
 ```
 
-`when` is a small fixed set (`project`, `torn_off`, `!torn_off`, `projects>1`) mirroring `CommandSpec::enabled`. Unknown keys are errors, and a JSON schema is generated as `config schema` does.
+`when` is a small fixed set (`project`, `torn_off`, `!torn_off`, `projects>1`) mirroring `CommandSpec::enabled`. Unknown keys are errors, and `benches plugin schema` prints the JSON schema, committed as `schema/plugin.schema.json`.
+
+- **`arg`** defaults to `^$`, so a prefix without one matches only itself. `{arg}` is the query after the prefix, trimmed, and a page the call opens starts filtered by it, as `wts feat` does.
+- **`busy`** keeps the palette busy until the plugin answers, and Esc cancels it. Without it, a page shows `loading` while the plugin runs.
+- **`subject`** is only `folder` (the jump command's folder) for now, and `chord` only `mod+enter`. A plugin's row action replaces the built-in one for its subject.
+- **Errors**: a manifest that fails to parse or check leaves that plugin out and is named in a banner; the rest still load.
 
 ## Protocol v1
 
@@ -105,7 +111,7 @@ Host to plugin, one JSON object per line:
 {"v":1,"method":"cancel","id":7}
 ```
 
-`context` carries the active project `{root,name}`, the active tab's cwd (`Session::cwd`), `working_directory`, the platform and the open projects.
+`context` carries the active project `{root,name}`, the active tab's cwd (`Session::cwd`), `working_directory`, the platform and the open projects. Lines on stdout that aren't the answer, such as a login shell's banner, are skipped.
 
 Plugin to host:
 
@@ -115,7 +121,7 @@ Plugin to host:
 {"id":9,"rows":[{"label":"main  ~/dev/site","data":{"path":"/dev/site"},"enter":[{"open_project":{"path":"/dev/site"}}]}]}
 ```
 
-A row's `enter` or `alt` is either an inline effect list (no round trip) or `{"invoke":"<contribution>"}`, with the row's `data` echoed back. Today's `fallback_to_root` moves into the plugin: `list` on a folder that isn't a repository returns `open_project` on that folder instead of rows.
+A row's `enter` (and later an `alt` for ⌘↵) is either an inline effect list (no round trip) or `{"invoke":"<contribution>"}`, with the row's `data` echoed back. A row's invoke runs as the call that showed it did, busy or as a page, with its timeout. Today's `fallback_to_root` moves into the plugin: `list` on a folder that isn't a repository returns `open_project` on that folder instead of rows.
 
 ## Process model
 
@@ -127,7 +133,7 @@ palette (UI thread) --invoke/query--> PluginHost --> worker thread --> plugin pr
         +---- rows / effects / error over mpsc + Waker; poll runs effects -+
 ```
 
-- **oneshot** (default, phase 2): spawn per request through the login shell, request on stdin, response on stdout, exit. Cancel kills the process group, as `process::Cancel` does.
+- **oneshot** (default, phase 2): spawn per request through the login shell in the plugin's folder, request on stdin, response on stdout, exit. A run that fails without answering shows its last stderr line. Cancel kills the process group, as `process::Cancel` does.
 - **persistent** (phase 4, `mode = "persistent"`): spawned lazily once per app, requests multiplexed by `id`, `cancel` messages, restarted on exit, killed on Reload Config. It removes the login-shell start per call: `fish -l -i -c true` measured 60–170 ms, `wt list` 250 ms end to end.
 - **Timeouts**: the manifest's `timeout`, defaulting to 5 s like `JUMP_TIMEOUT`.
 - **Sharing**: one `PluginHost` per app, shared across windows through an `Arc` as `Fleet` is. Stale responses are dropped by `id`.
@@ -177,7 +183,7 @@ If a hot-path hook (per frame, per keystroke, output filters) is ever needed, WA
 Five PRs; each lands its behaviour-preserving refactor as its own commit first.
 
 1. **Refactor, no behaviour change**: move the process helpers to `benches-core::process`; generalise `WorktreeChoice` into `Page`, `Creation` into `Busy` and the jump debounce into `Lookup`; give the jump row's ⌘↵ a row-action slot.
-2. **Host and oneshot**: the `benches-plugin` crate, manifest loading, `command`, `prefix` and `row_action`, effects, errors in the palette's error line, and tests against a stub plugin built with `test_support::stub_shell`.
+2. **Host and oneshot**: the `benches-plugin` crate, manifest loading, `command`, `prefix` and `row_action`, effects, errors in the palette's error line, and tests against a stub plugin built with `test_support::stub_plugin`.
 3. **Worktrunk as a plugin**: the `plugins/worktrunk` binary, bundled by `scripts/bundle` and the Linux install. Delete `Command::OpenWorktree`/`CreateWorktree`, `Action::CreateWorktree`/`ListWorktrees` and the wt code in `jump.rs`, with the same visible behaviour.
 4. **Persistent mode, dynamic prefixes and `provider`**, for example a zoxide folder provider.
 5. **Docs for third-party authors**: a protocol reference and an example plugin in shell and `jq`.

@@ -1,0 +1,264 @@
+{
+  "$defs": {
+    "CommandContribution": {
+      "additionalProperties": false,
+      "description": "A palette command, ranked with the built-in ones. It sets exactly one of `invoke` and `fill`.",
+      "properties": {
+        "busy": {
+          "description": "Shown while the invoke runs, keeping the palette busy until it answers or Esc cancels it.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "fill": {
+          "description": "Text to put in the palette's input instead, without running the plugin.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "id": {
+          "type": "string"
+        },
+        "invoke": {
+          "description": "The contribution to invoke the plugin with.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "label": {
+          "type": "string"
+        },
+        "loading": {
+          "description": "Shown while the rows of a page load, when `busy` is unset. Defaults to `Loading…`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "timeout": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "when": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/When"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "id",
+        "label"
+      ],
+      "type": "object"
+    },
+    "PrefixContribution": {
+      "additionalProperties": false,
+      "description": "A row offered once the query starts with `prefix` and the rest of it matches `arg`.",
+      "properties": {
+        "arg": {
+          "description": "A regular expression the query after `prefix` must match. Defaults to `^$`, nothing.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "busy": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "id": {
+          "type": "string"
+        },
+        "label": {
+          "description": "The row's label, where `{arg}` is the query after `prefix`, trimmed, and\n`{project.name}` the active project's name.",
+          "type": "string"
+        },
+        "label_with_arg": {
+          "description": "The label when `{arg}` isn't empty. Defaults to `label`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "loading": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "prefix": {
+          "type": "string"
+        },
+        "timeout": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "when": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/When"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "id",
+        "prefix",
+        "label"
+      ],
+      "type": "object"
+    },
+    "RowActionContribution": {
+      "additionalProperties": false,
+      "description": "A secondary action on a row the host owns, invoked with that row's subject.",
+      "properties": {
+        "busy": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "chord": {
+          "$ref": "#/$defs/RowChord"
+        },
+        "hint": {
+          "description": "Shown after the chord below the selected row.",
+          "type": "string"
+        },
+        "id": {
+          "type": "string"
+        },
+        "loading": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "subject": {
+          "$ref": "#/$defs/SubjectKind"
+        },
+        "timeout": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "id",
+        "subject",
+        "hint"
+      ],
+      "type": "object"
+    },
+    "RowChord": {
+      "enum": [
+        "mod+enter"
+      ],
+      "type": "string"
+    },
+    "SubjectKind": {
+      "description": "The rows a row action applies to.",
+      "oneOf": [
+        {
+          "const": "folder",
+          "description": "The jump command's folder.",
+          "type": "string"
+        }
+      ]
+    },
+    "When": {
+      "description": "When a contribution is offered.",
+      "oneOf": [
+        {
+          "enum": [
+            "torn_off",
+            "!torn_off",
+            "projects>1"
+          ],
+          "type": "string"
+        },
+        {
+          "const": "project",
+          "description": "A project is open.",
+          "type": "string"
+        }
+      ]
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "description": "A plugin's `plugin.toml`. Everything the palette shows before Enter comes from here, so\ntyping spawns no process.",
+  "properties": {
+    "command": {
+      "items": {
+        "$ref": "#/$defs/CommandContribution"
+      },
+      "type": "array"
+    },
+    "description": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "exec": {
+      "description": "The executable, relative to the plugin's folder, else found by the login shell.",
+      "type": "string"
+    },
+    "name": {
+      "description": "Unique among plugins. A user plugin overrides a bundled one with the same name.",
+      "type": "string"
+    },
+    "prefix": {
+      "items": {
+        "$ref": "#/$defs/PrefixContribution"
+      },
+      "type": "array"
+    },
+    "requires": {
+      "default": [],
+      "description": "Commands the login shell must find, or the plugin stays hidden.",
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "row_action": {
+      "items": {
+        "$ref": "#/$defs/RowActionContribution"
+      },
+      "type": "array"
+    },
+    "timeout": {
+      "description": "How long a call may take, such as `5s` or `2m`, unless a contribution sets its own.\nDefaults to 5 seconds.",
+      "type": [
+        "string",
+        "null"
+      ]
+    }
+  },
+  "required": [
+    "name",
+    "exec"
+  ],
+  "title": "Manifest",
+  "type": "object"
+}

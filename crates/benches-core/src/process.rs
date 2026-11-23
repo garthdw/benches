@@ -1,5 +1,5 @@
 use std::fs::File;
-use std::io::{self, Read, Seek};
+use std::io::{self, Read, Seek, Write};
 use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{Command, Output, Stdio};
@@ -72,15 +72,38 @@ pub fn run(
     what: &str,
     cancel: &Cancel,
 ) -> Result<Output> {
+    run_with_input(shell, args, cwd, &[], timeout, what, cancel)
+}
+
+/// `run`, with `input` on the command's stdin.
+pub fn run_with_input(
+    shell: &Path,
+    args: &[String],
+    cwd: &Path,
+    input: &[u8],
+    timeout: Duration,
+    what: &str,
+    cancel: &Cancel,
+) -> Result<Output> {
     // Read once the command exits, without waiting for every other process holding them to
     // close them, as a pipe's reader would: one the command left running, or one that another
     // thread forked meanwhile, as macOS has no `pipe2` to make a pipe close-on-exec at once.
     let mut stdout = tempfile::tempfile().context("create output file")?;
     let mut stderr = tempfile::tempfile().context("create output file")?;
+    // A file for the reason the output is one: a pipe's write end could leak into a fork.
+    let stdin = if input.is_empty() {
+        Stdio::null()
+    } else {
+        let mut file = tempfile::tempfile().context("create input file")?;
+        file.write_all(input)
+            .and_then(|()| file.rewind())
+            .context("write input file")?;
+        file.into()
+    };
     let mut child = Command::new(shell)
         .args(args)
         .current_dir(cwd)
-        .stdin(Stdio::null())
+        .stdin(stdin)
         .stdout(stdout.try_clone().context("share output file")?)
         .stderr(stderr.try_clone().context("share output file")?)
         .process_group(0)

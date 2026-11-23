@@ -179,16 +179,7 @@ pub(crate) fn stub_shell(body: &str) -> (tempfile::TempDir, PathBuf, PathBuf) {
         "#!/bin/sh\nprintf '%s\\n' \"$@\" >> '{}'\n{body}\n",
         record.display()
     );
-    // Written by another process: a child forked meanwhile by one of this process's threads
-    // would hold its write fd until it execs, and Linux refuses to run a file open for writing
-    // (ETXTBSY), even under another name.
-    let written = std::process::Command::new("/bin/sh")
-        .args(["-c", r#"printf '%s' "$1" > "$0" && chmod 755 "$0""#])
-        .arg(&shell)
-        .arg(script)
-        .status()
-        .unwrap();
-    assert!(written.success(), "stub shell not written: {written}");
+    benches_core::test_support::write_executable(&shell, &script);
     (directory, shell, record)
 }
 

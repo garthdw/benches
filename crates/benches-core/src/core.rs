@@ -4,6 +4,7 @@ pub mod grid;
 pub mod history;
 pub mod images;
 pub mod link;
+pub mod plugins;
 pub mod process;
 pub mod protocol;
 pub mod search;

@@ -36,8 +36,8 @@ pub fn ghostty_theme_dirs(_env: Env) -> Vec<PathBuf> {
     )]
 }
 
-/// In the app bundle's resources, beside `Contents/MacOS`.
-pub const TERMINFO_DIR: &str = "Resources/terminfo";
+/// The app bundle's resources, beside `Contents/MacOS`.
+pub const RESOURCES_DIR: &str = "Resources";
 
 pub fn open(link: &Link) -> io::Result<()> {
     crate::run(open_command(link))

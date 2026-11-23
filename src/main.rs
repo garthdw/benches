@@ -4,6 +4,7 @@ mod input;
 mod jump;
 mod keymap;
 mod palette;
+mod plugins;
 mod render;
 mod scenes;
 mod secure_input;
@@ -61,6 +62,10 @@ fn main() {
             eprintln!("benches: {error:#}");
             std::process::exit(1);
         }
+        return;
+    }
+    if args == ["plugin", "schema"] {
+        print!("{}", benches_plugin::schema());
         return;
     }
     log_to_file_without_terminal().log_err("log file");

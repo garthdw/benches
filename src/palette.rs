@@ -12,12 +12,15 @@ use rune::{
 
 use crate::app::{State, open_project, open_tab, open_tray, run_command, tray_action};
 use crate::jump;
-use crate::keymap::{COMMANDS, Command, CommandSpec, chord_hint, field_shortcut};
+use crate::keymap::{COMMANDS, Command, chord_hint, field_shortcut};
+use crate::plugins::{self, PluginCall};
 use crate::workspace::{Status, Workspace};
 use benches_core::LogErr;
 use benches_core::config::Config;
 use benches_core::history;
+use benches_core::plugins::Plugin;
 use benches_core::process::Cancel;
+use benches_plugin::{Effect, Subject};
 
 const PALETTE_WIDTH: f32 = 520.0;
 const PALETTE_TOP: f32 = 96.0;
@@ -121,22 +124,46 @@ impl<T> Lookup<T> {
     }
 }
 
+/// What work off the UI thread answers the command centre with.
+pub(crate) enum Outcome {
+    /// Closes the command centre and runs this.
+    Run(Action),
+    /// Shows these as a page.
+    Rows(Vec<PageRow>),
+}
+
+pub(crate) type Answer = mpsc::Receiver<anyhow::Result<Outcome>>;
+
+/// Ends the work it was handed to once whatever holds it goes, as the answer then has nowhere
+/// to go.
+#[derive(Default)]
+pub(crate) struct CancelOnDrop(pub(crate) Cancel);
+
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        self.0.cancel().log_err("cancel running action");
+    }
+}
+
 /// A long-running action off the UI thread, which keeps the command centre open until it
-/// answers with what to run next.
+/// answers.
 pub(crate) struct Busy {
-    pub(crate) label: &'static str,
-    result: mpsc::Receiver<anyhow::Result<Action>>,
-    cancel: Cancel,
+    pub(crate) label: String,
+    /// Typed into a page should the action answer with rows.
+    filter: String,
+    result: Answer,
+    _cancel: CancelOnDrop,
 }
 
 /// A list the command centre shows in place of its rows, filtered by the input, such as the
 /// repository worktrees offered after ⌘↵ on the jump command's folder, or for the active project.
 pub(crate) struct Page {
     /// Shown until `pending` answers.
-    pub(crate) loading: &'static str,
+    pub(crate) loading: String,
     pub(crate) when_empty: WhenEmpty,
-    pub(crate) pending: Option<mpsc::Receiver<Vec<PageRow>>>,
+    pub(crate) pending: Option<Answer>,
     pub(crate) rows: Vec<PageRow>,
+    pub(crate) _cancel: CancelOnDrop,
 }
 
 /// What a page does once it loads no rows.
@@ -150,9 +177,56 @@ pub(crate) enum WhenEmpty {
 
 pub(crate) struct PageRow {
     pub(crate) label: String,
-    /// What typing filters on, which may hold more than `label` shows.
-    pub(crate) matches: String,
+    /// Shown dimmed after `label`.
+    pub(crate) detail: Option<String>,
+    /// Words that match typing without being shown, such as a full path. A row matching only
+    /// these ranks below every row matching what it shows.
+    pub(crate) keywords: Vec<String>,
     pub(crate) action: Action,
+}
+
+impl PageRow {
+    fn shown(&self) -> String {
+        match &self.detail {
+            Some(detail) => format!("{}  {detail}", self.label),
+            None => self.label.clone(),
+        }
+    }
+}
+
+/// A page row the query matches.
+pub(crate) struct VisibleRow<'a> {
+    pub(crate) row: &'a PageRow,
+    shown: String,
+    /// The matched characters' indices in the lowercased `shown`, for highlighting.
+    pub(crate) positions: Vec<usize>,
+}
+
+/// The rows matching `query` on what they show, best first, then those matching only a keyword.
+/// An empty query keeps every row in order.
+fn rank_page<'a>(rows: &'a [PageRow], query: &str) -> Vec<VisibleRow<'a>> {
+    let mut ranked: Vec<(bool, u32, VisibleRow)> = rows
+        .iter()
+        .filter_map(|row| {
+            let shown = row.shown();
+            let (keyword_only, score, positions) = match fuzzy_match(&shown, query) {
+                Some(found) => (false, found.score, found.positions),
+                None => {
+                    let keywords = row.keywords.iter();
+                    let matches = keywords.filter_map(|keyword| fuzzy_match(keyword, query));
+                    (true, matches.map(|found| found.score).max()?, Vec::new())
+                }
+            };
+            let visible = VisibleRow {
+                row,
+                shown,
+                positions,
+            };
+            Some((keyword_only, score, visible))
+        })
+        .collect();
+    ranked.sort_by_key(|(keyword_only, score, _)| (*keyword_only, Reverse(*score)));
+    ranked.into_iter().map(|(_, _, visible)| visible).collect()
 }
 
 /// A worktree's branch and path, which Enter opens as a project.
@@ -164,18 +238,30 @@ pub(crate) fn worktree_row(worktree: jump::Worktree) -> PageRow {
             branch.unwrap_or("(detached)"),
             jump::abbreviate_home(&worktree.path)
         ),
-        matches: format!("{} {}", branch.unwrap_or_default(), worktree.path.display()),
+        detail: None,
+        keywords: Vec::new(),
         action: Action::Jump(worktree.path),
+    }
+}
+
+impl Page {
+    /// A page with its rows already, unless `pending` is set.
+    pub(crate) fn loaded(when_empty: WhenEmpty, rows: Vec<PageRow>) -> Self {
+        Self {
+            loading: String::new(),
+            when_empty,
+            pending: None,
+            rows,
+            _cancel: CancelOnDrop::default(),
+        }
     }
 }
 
 /// A page of worktrees, loaded already unless `pending` is set.
 pub(crate) fn worktrees_page(when_empty: WhenEmpty, rows: Vec<PageRow>) -> Page {
     Page {
-        loading: "Loading worktrees…",
-        when_empty,
-        pending: None,
-        rows,
+        loading: "Loading worktrees…".to_owned(),
+        ..Page::loaded(when_empty, rows)
     }
 }
 
@@ -188,22 +274,17 @@ pub(crate) fn no_worktrees(root: &Path) -> WhenEmpty {
 }
 
 /// What ⌘↵ does on a row, offered beside Enter.
-struct RowAction {
+pub(crate) struct RowAction {
     /// Shown after ⌘↵ below the selected row.
-    hint: &'static str,
-    action: Action,
+    pub(crate) hint: String,
+    pub(crate) action: Action,
 }
 
 impl State {
-    /// The page's rows whose `matches` contain the query's letters in order.
-    fn visible_rows(&self) -> Vec<&PageRow> {
-        let query = self.palette.edit.text.trim();
-        self.palette
-            .page
-            .iter()
-            .flat_map(|page| &page.rows)
-            .filter(|row| letters_in_order(&row.matches, query))
-            .collect()
+    fn visible_rows(&self) -> Vec<VisibleRow<'_>> {
+        self.palette.page.as_ref().map_or_else(Vec::new, |page| {
+            rank_page(&page.rows, self.palette.edit.text.trim())
+        })
     }
 
     fn jump_target(&self) -> Option<&Path> {
@@ -225,6 +306,7 @@ impl State {
                     &self.workspace,
                     &self.config,
                     self.is_torn_off(),
+                    &self.fleet.plugins(),
                 ),
                 ghost: None,
             },
@@ -288,25 +370,33 @@ pub(crate) enum Action {
     Worktrees(PathBuf),
     Run(String),
     Tray(String),
+    Plugin(PluginCall),
+    /// Runs a plugin's effects, under this label.
+    Effects(String, Vec<Effect>),
 }
 
 impl Action {
     /// Whether ⌘↵ does something on this row, where `palette_rows` was asked for tray rows.
     fn takes_command_enter(&self) -> bool {
-        matches!(self, Action::Tray(_)) || self.row_action().is_some()
+        matches!(self, Action::Tray(_) | Action::Jump(_))
     }
 
-    fn row_action(&self) -> Option<RowAction> {
-        match self {
-            Action::Jump(root) => Some(RowAction {
-                hint: "worktrees",
+    /// A plugin's row action on this row's subject, else the built-in one, which every jump
+    /// row has.
+    fn row_action(&self, plugins: &[Plugin]) -> Option<RowAction> {
+        let Action::Jump(root) = self else {
+            return None;
+        };
+        let subject = Subject::Folder { path: root.clone() };
+        Some(
+            plugins::row_action(plugins, &subject).unwrap_or_else(|| RowAction {
+                hint: "worktrees".to_owned(),
                 action: Action::Worktrees(root.clone()),
             }),
-            _ => None,
-        }
+        )
     }
 
-    fn label(&self, working_directory: &Path) -> String {
+    pub(crate) fn label(&self, working_directory: &Path) -> String {
         match self {
             Action::Command(command) => command.label().to_owned(),
             Action::Jump(root) => format!(
@@ -332,6 +422,8 @@ impl Action {
             Action::Tray(command) => {
                 format!("Run “{}” in the tray", history::flattened(command))
             }
+            Action::Plugin(call) => call.label.clone(),
+            Action::Effects(label, _) => label.clone(),
         }
     }
 }
@@ -350,6 +442,8 @@ struct Match {
     score: u32,
     /// A contiguous substring starting a word, so safe to rank above `Run`.
     strong: bool,
+    /// The matched characters' indices in the label, for highlighting.
+    positions: Vec<usize>,
 }
 
 fn fuzzy_match(label: &str, query: &str) -> Option<Match> {
@@ -367,41 +461,45 @@ fn fuzzy_match(label: &str, query: &str) -> Option<Match> {
         let prefix = if start == 0 { 200 } else { 0 };
         let word = if starts_word(start) { 100 } else { 0 };
         return Some(Match {
-            score: 1000 + prefix + word - start as u32,
+            score: (1000_u32 + prefix + word).saturating_sub(start as u32),
             strong: starts_word(start),
+            positions: (start..start + query.len()).collect(),
         });
     }
-    let word_starts: Vec<usize> = (0..label.len())
-        .filter(|&index| starts_word(index))
-        .collect();
-    let mut starts = word_starts.iter();
-    if query
+    let mut starts = (0..label.len()).filter(|&index| starts_word(index));
+    let initials: Option<Vec<usize>> = query
         .iter()
-        .all(|wanted| starts.any(|&index| label[index] == *wanted))
-    {
+        .map(|wanted| starts.find(|&index| label[index] == *wanted))
+        .collect();
+    if let Some(positions) = initials {
         return Some(Match {
             score: 500,
             strong: false,
+            positions,
         });
     }
     let mut score = 0;
     let mut next = 0;
-    let mut previous = None;
+    let mut positions = Vec::with_capacity(query.len());
     for wanted in &query {
         let index = (next..label.len()).find(|&index| label[index] == *wanted)?;
         score += 1;
-        if previous.is_some_and(|previous| previous + 1 == index) {
+        if positions
+            .last()
+            .is_some_and(|&previous| previous + 1 == index)
+        {
             score += 3;
         }
         if starts_word(index) {
             score += 2;
         }
-        previous = Some(index);
+        positions.push(index);
         next = index + 1;
     }
     Some(Match {
         score,
         strong: false,
+        positions,
     })
 }
 
@@ -445,12 +543,14 @@ pub(crate) fn palette_actions(
     workspace: &Workspace,
     config: &Config,
     torn_off: bool,
+    plugins: &[Plugin],
 ) -> Vec<Action> {
     let query = query.trim();
     let needle = query.to_lowercase();
     let mut actions: Vec<Action> = create_worktree_action(query, workspace)
         .into_iter()
         .chain(list_worktrees_action(query, workspace))
+        .chain(plugins::prefix_actions(query, plugins, workspace, torn_off))
         .collect();
     if query.is_empty() {
         actions.extend(
@@ -462,14 +562,24 @@ pub(crate) fn palette_actions(
         actions.extend(jump.map(|root| Action::Jump(root.to_owned())));
         return actions;
     }
-    let mut matched: Vec<(&CommandSpec, Match)> = COMMANDS
+    let built_in = COMMANDS
         .iter()
         .filter(|spec| (spec.enabled)(workspace, config, torn_off))
-        .filter_map(|spec| Some((spec, fuzzy_match(spec.label, query)?)))
+        .map(|spec| (spec.label.to_owned(), Action::Command(spec.command)));
+    let from_plugins = plugins::command_actions(plugins, workspace, torn_off)
+        .into_iter()
+        .map(|action| (action.label(&config.working_directory), action));
+    let mut matched: Vec<(String, Action, Match)> = built_in
+        .chain(from_plugins)
+        .filter_map(|(label, action)| {
+            let found = fuzzy_match(&label, query)?;
+            Some((label, action, found))
+        })
         .collect();
-    matched.sort_by_key(|(_, found)| Reverse(found.score));
-    let (strong, weak): (Vec<_>, Vec<_>) = matched.into_iter().partition(|(_, found)| found.strong);
-    let command = |(spec, _): (&CommandSpec, Match)| Action::Command(spec.command);
+    matched.sort_by_key(|(_, _, found)| Reverse(found.score));
+    let (strong, weak): (Vec<_>, Vec<_>) =
+        matched.into_iter().partition(|(_, _, found)| found.strong);
+    let command = |(_, action, _): (String, Action, Match)| action;
     let (exact_switches, partial_switches): (Vec<_>, Vec<_>) =
         switch_actions(&needle, jump, workspace)
             .into_iter()
@@ -478,7 +588,7 @@ pub(crate) fn palette_actions(
     let (exact_commands, strong) = if jump.is_some() {
         strong
             .into_iter()
-            .partition(|(spec, _)| spec.label.to_lowercase() == needle)
+            .partition(|(label, _, _)| label.to_lowercase() == needle)
     } else {
         (Vec::new(), strong)
     };
@@ -559,7 +669,7 @@ pub(crate) fn open_palette_with(state: &mut State, text: &str, tx: &mut Tx) {
 }
 
 /// Runs `work` off the UI thread, then wakes the window to take its answer.
-fn spawn_waking<T: Send + 'static>(
+pub(crate) fn spawn_waking<T: Send + 'static>(
     waker: Option<Waker>,
     work: impl FnOnce() -> T + Send + 'static,
 ) -> mpsc::Receiver<T> {
@@ -613,13 +723,26 @@ fn create_worktree(state: &mut State, branch: &str) {
         let cancel = cancel.clone();
         move || {
             jump::create_worktree(&shell, &root, &branch, WORKTREE_TIMEOUT, &cancel)
-                .map(Action::Jump)
+                .map(|path| Outcome::Run(Action::Jump(path)))
         }
     });
+    start_busy(state, "Creating worktree…".to_owned(), "", result, cancel);
+}
+
+/// Keeps the command centre busy with `label` until `result` answers, which Escape cancels.
+/// Rows it answers with open as a page filtered by `filter`.
+pub(crate) fn start_busy(
+    state: &mut State,
+    label: String,
+    filter: &str,
+    result: Answer,
+    cancel: Cancel,
+) {
     state.palette.busy = Some(Busy {
-        label: "Creating worktree…",
+        label,
+        filter: filter.to_owned(),
         result,
-        cancel,
+        _cancel: CancelOnDrop(cancel),
     });
     state.palette.open = true;
     state.palette.error = None;
@@ -634,15 +757,43 @@ pub(crate) fn poll_busy(state: &mut State, tx: &mut Tx) -> bool {
     else {
         return false;
     };
-    state.palette.busy = None;
-    match result {
-        Ok(action) => close_and_run(state, &action, tx),
-        Err(error) => {
-            state.palette.open = true;
-            state.palette.error = Some(format!("{error:#}"));
-        }
+    let busy = state.palette.busy.take();
+    if let (Some(busy), Ok(Outcome::Rows(_))) = (busy, &result) {
+        let page = Page::loaded(nothing_found(), Vec::new());
+        open_page(state, page, &busy.filter, tx);
     }
+    take_outcome(state, result, tx);
     true
+}
+
+/// Runs what work off the UI thread answered, or shows its rows or why it failed.
+fn take_outcome(state: &mut State, result: anyhow::Result<Outcome>, tx: &mut Tx) {
+    match result {
+        Ok(Outcome::Run(action)) => close_and_run(state, &action, tx),
+        Ok(Outcome::Rows(rows)) => fill_page(state, rows, tx),
+        Err(error) => show_error(state, &error),
+    }
+}
+
+pub(crate) fn show_error(state: &mut State, error: &anyhow::Error) {
+    state.palette.open = true;
+    state.palette.error = Some(format!("{error:#}"));
+}
+
+/// What a page that loads no rows says.
+pub(crate) fn nothing_found() -> WhenEmpty {
+    WhenEmpty::Error("Nothing found".to_owned())
+}
+
+/// Shows `page` in place of the command centre's rows, with `filter` typed.
+pub(crate) fn open_page(state: &mut State, page: Page, filter: &str, tx: &mut Tx) {
+    state.palette.page = Some(page);
+    state.palette.open = true;
+    state.palette.edit = TextEdit::new(filter);
+    state.palette.selected = 0;
+    state.palette.selected_query = filter.to_owned();
+    state.palette.error = None;
+    tx.focus("palette-input", false);
 }
 
 fn run_palette(state: &mut State, index: usize, tray: bool, tx: &mut Tx) {
@@ -650,7 +801,7 @@ fn run_palette(state: &mut State, index: usize, tray: bool, tx: &mut Tx) {
     let Some(action) = actions.get(index.min(actions.len().saturating_sub(1))) else {
         return;
     };
-    match action.row_action() {
+    match action.row_action(&state.fleet.plugins()) {
         Some(row_action) if tray => run_action(state, &row_action.action, tx),
         _ if tray && !action.takes_command_enter() => {}
         _ => close_and_run(state, action, tx),
@@ -682,8 +833,10 @@ pub(crate) fn run_action(state: &mut State, action: &Action, tx: &mut Tx) {
             "",
             tx,
         ),
-        Action::Run(command) => open_tab(state, &history::flattened(command), Some(command)),
+        Action::Run(command) => open_tab(state, &history::flattened(command), Some(command), None),
         Action::Tray(command) => open_tray(state, command),
+        Action::Plugin(call) => plugins::invoke(state, call, tx),
+        Action::Effects(_, effects) => plugins::run_effects(state, effects, tx),
     }
 }
 
@@ -705,21 +858,15 @@ fn list_worktrees(
 ) {
     let shell = state.config.shell.clone();
     let pending = spawn_waking(state.waker.clone(), move || {
-        jump::worktrees(&shell, &root, LOOKUP_TIMEOUT)
-            .log_err("wt list")
-            .unwrap_or_default()
-            .into_iter()
-            .map(worktree_row)
-            .collect()
+        let worktrees = jump::worktrees(&shell, &root, LOOKUP_TIMEOUT).log_err("wt list");
+        let rows = worktrees.unwrap_or_default().into_iter().map(worktree_row);
+        Ok(Outcome::Rows(rows.collect()))
     });
-    state.palette.page = Some(Page {
+    let page = Page {
         pending: Some(pending),
         ..worktrees_page(when_empty, Vec::new())
-    });
-    state.palette.edit = TextEdit::new(filter);
-    state.palette.selected = 0;
-    state.palette.error = None;
-    tx.focus("palette-input", false);
+    };
+    open_page(state, page, filter, tx);
 }
 
 pub(crate) fn poll_page(state: &mut State, tx: &mut Tx) -> bool {
@@ -730,17 +877,26 @@ pub(crate) fn poll_page(state: &mut State, tx: &mut Tx) -> bool {
     let Some(page) = &mut state.palette.page else {
         return false;
     };
-    let Some(rows) = take_answer(&mut page.pending) else {
+    let Some(answer) = take_answer(&mut page.pending) else {
         return false;
     };
-    page.rows = rows;
-    if page.rows.is_empty() {
-        match page.when_empty.clone() {
-            WhenEmpty::Run(action) => close_and_run(state, &action, tx),
-            WhenEmpty::Error(error) => state.palette.error = Some(error),
-        }
-    }
+    take_outcome(state, answer, tx);
     true
+}
+
+/// Gives the page its rows, or does what the page does without any.
+fn fill_page(state: &mut State, rows: Vec<PageRow>, tx: &mut Tx) {
+    let Some(page) = &mut state.palette.page else {
+        return;
+    };
+    if !rows.is_empty() {
+        page.rows = rows;
+        return;
+    }
+    match page.when_empty.clone() {
+        WhenEmpty::Run(action) => close_and_run(state, &action, tx),
+        WhenEmpty::Error(error) => state.palette.error = Some(error),
+    }
 }
 
 /// Whether the key was one of the list's; typing edits the palette's input, which filters it.
@@ -760,7 +916,7 @@ fn open_page_row(state: &mut State, index: usize, tx: &mut Tx) {
     let Some(action) = state
         .visible_rows()
         .get(index)
-        .map(|row| row.action.clone())
+        .map(|visible| visible.row.action.clone())
     else {
         return;
     };
@@ -771,9 +927,8 @@ fn palette_key(state: &mut State, event: &KeyEvent, tx: &mut Tx) -> bool {
     // A key's own modifiers win should `on_modifiers` miss a change, which would leave every
     // run row in the tray.
     state.command_held = event.mods.cmd;
-    if let Some(busy) = &state.palette.busy {
+    if state.palette.busy.is_some() {
         if event.key == Key::Escape {
-            busy.cancel.cancel().log_err("cancel running action");
             state.palette.busy = None;
             state.palette.open = false;
         }
@@ -814,15 +969,26 @@ fn palette_key(state: &mut State, event: &KeyEvent, tx: &mut Tx) -> bool {
     true
 }
 
-/// An edit reorders the rows, so the selection goes back to the top one. Checked after the edit
-/// lands, as the input applies it only after `palette_key` passes the key on.
+/// An edit reorders the rows, so the selection goes back to the top one, except on a page while
+/// the selected row still matches. Checked after the edit lands, as the input applies it only
+/// after `palette_key` passes the key on.
 pub(crate) fn poll_selection(state: &mut State) -> bool {
     let palette = &mut state.palette;
     if palette.edit.text == palette.selected_query {
         return false;
     }
-    palette.selected_query.clone_from(&palette.edit.text);
-    palette.selected = 0;
+    let before = std::mem::replace(&mut palette.selected_query, palette.edit.text.clone());
+    palette.selected = palette
+        .page
+        .as_ref()
+        .and_then(|page| {
+            let before = rank_page(&page.rows, before.trim());
+            let selected = before.get(palette.selected.min(before.len().saturating_sub(1)))?;
+            rank_page(&page.rows, palette.edit.text.trim())
+                .iter()
+                .position(|visible| std::ptr::eq(visible.row, selected.row))
+        })
+        .unwrap_or(0);
     true
 }
 
@@ -845,6 +1011,30 @@ pub(crate) fn poll_jump(state: &mut State, now: f64, tx: &mut Tx) -> bool {
     })
 }
 
+/// Emboldens the matched characters of `shown` and dims what follows its label. `positions`
+/// count the lowercased text's characters, so text whose lowercase has another length goes
+/// without emphasis.
+fn highlight(theme: &tok::Theme, shown: &str, label_len: usize, positions: &[usize]) -> Vec<Span> {
+    let same_length = shown.to_lowercase().chars().count() == shown.chars().count();
+    shown
+        .char_indices()
+        .enumerate()
+        .filter_map(|(index, (byte, char))| {
+            let matched = same_length && positions.contains(&index);
+            let detail = byte >= label_len;
+            (matched || detail).then(|| {
+                let span = Span::new(byte, byte + char.len_utf8());
+                let span = if matched { span.bold() } else { span };
+                if detail {
+                    span.color(theme.text_secondary)
+                } else {
+                    span
+                }
+            })
+        })
+        .collect()
+}
+
 fn enter_hint(theme: &tok::Theme, hint: Option<&str>) -> Option<El> {
     hint.map(|hint| text(hint).key("palette-enter").color(theme.text_secondary))
 }
@@ -854,29 +1044,32 @@ fn select_on_pointer_move(index: usize) -> impl Fn(&mut State, PointerPress) {
     move |state, _| state.palette.selected = index
 }
 
-pub(crate) fn view(
-    state: &State,
-    theme: &tok::Theme,
-    pill: &impl Fn(String, &str, bool, Option<El>) -> El,
-) -> Option<El> {
+pub(crate) fn view(state: &State, theme: &tok::Theme) -> Option<El> {
+    let pill =
+        |key, label: &str, active, marker| crate::view::pill(theme, key, label, active, marker);
     state.palette.open.then(|| {
         let rows = state.palette_rows(state.command_held);
+        let plugins = state.fleet.plugins();
         let (return_key, command_return) = (chord_hint("enter"), chord_hint("mod+enter"));
         let elements: Vec<El> = if let Some(busy) = &state.palette.busy {
-            vec![pill("palette-0".to_owned(), busy.label, false, None).w_full()]
+            vec![pill("palette-0".to_owned(), &busy.label, false, None).w_full()]
         } else if let Some(page) = &state.palette.page {
             let visible = state.visible_rows();
             let selected = state.palette.selected.min(visible.len().saturating_sub(1));
             let placeholder = page
                 .pending
                 .is_some()
-                .then(|| pill("palette-0".to_owned(), page.loading, false, None).w_full());
-            let page_rows = visible.iter().enumerate().map(|(index, page_row)| {
-                pill(
+                .then(|| pill("palette-0".to_owned(), &page.loading, false, None).w_full());
+            let page_rows = visible.iter().enumerate().map(|(index, visible)| {
+                let label_len = visible.row.label.len();
+                let spans = highlight(theme, &visible.shown, label_len, &visible.positions);
+                crate::view::pill_spans(
+                    theme,
                     format!("palette-{index}"),
-                    &page_row.label,
+                    &visible.shown,
                     index == selected,
                     None,
+                    spans,
                 )
                 .children(enter_hint(
                     theme,
@@ -904,8 +1097,10 @@ pub(crate) fn view(
                     };
                     let alternative = (is_selected && !state.command_held)
                         .then(|| match action {
-                            Action::Run(_) => Some("in the tray"),
-                            _ => action.row_action().map(|row_action| row_action.hint),
+                            Action::Run(_) => Some("in the tray".to_owned()),
+                            _ => action
+                                .row_action(&plugins)
+                                .map(|row_action| row_action.hint),
                         })
                         .flatten()
                         .map(|hint| format!("{command_return} {hint}"));
@@ -1029,7 +1224,7 @@ mod tests {
         workspace: &Workspace,
         config: &Config,
     ) -> Vec<Action> {
-        palette_actions(query, jump, workspace, config, false)
+        palette_actions(query, jump, workspace, config, false, &[])
     }
 
     #[test]
@@ -1503,7 +1698,7 @@ mod tests {
             .state
             .visible_rows()
             .iter()
-            .map(|row| row.label.split_once("  ").unwrap().0.to_owned())
+            .map(|visible| visible.row.label.split_once("  ").unwrap().0.to_owned())
             .collect()
     }
 
@@ -1576,6 +1771,85 @@ mod tests {
     }
 
     #[test]
+    fn a_match_far_into_a_long_label_ranks_last_rather_than_overflowing() {
+        let label = format!("{}needle", "x".repeat(2000));
+        let found = fuzzy_match(&label, "needle").unwrap();
+        assert!(found.score < 500, "{}", found.score);
+    }
+
+    #[test]
+    fn a_page_filters_on_what_its_rows_show() {
+        let home = PathBuf::from(std::env::var_os("HOME").unwrap());
+        let hidden = home.file_name().unwrap().to_str().unwrap().to_owned();
+        let mut runtime = palette_runtime();
+        let site = home.join("dev/site");
+        runtime.state.palette.page = Some(loaded(vec![
+            worktree("main", site.to_str().unwrap()),
+            worktree("feature", &format!("{}.feature", site.display())),
+        ]));
+        press(&mut runtime, Key::Text(hidden.clone()), Mods::default());
+        assert_eq!(branches(&runtime), Vec::<String>::new(), "{hidden}");
+    }
+
+    fn page_row(label: &str, keywords: &[&str]) -> PageRow {
+        PageRow {
+            label: label.to_owned(),
+            detail: None,
+            keywords: keywords.iter().map(|&word| word.to_owned()).collect(),
+            action: Action::Run(label.to_owned()),
+        }
+    }
+
+    fn page_labels(runtime: &Runtime<State>) -> Vec<String> {
+        let visible = runtime.state.visible_rows();
+        visible
+            .iter()
+            .map(|shown| shown.row.label.clone())
+            .collect()
+    }
+
+    #[test]
+    fn page_rows_rank_best_first_with_keyword_only_matches_last() {
+        let mut runtime = palette_runtime();
+        runtime.state.palette.page = Some(loaded(vec![
+            page_row("alpha", &["deploy"]),
+            page_row("a deploy b", &[]),
+            page_row("deploy", &[]),
+        ]));
+        press(&mut runtime, Key::Text("deploy".into()), Mods::default());
+        assert_eq!(page_labels(&runtime), ["deploy", "a deploy b", "alpha"]);
+    }
+
+    #[test]
+    fn a_page_row_highlights_the_characters_that_matched() {
+        let mut runtime = palette_runtime();
+        runtime.state.palette.page = Some(loaded(vec![page_row("redesign", &[])]));
+        press(&mut runtime, Key::Text("rdsn".into()), Mods::default());
+        assert_eq!(runtime.state.visible_rows()[0].positions, [0, 2, 4, 7]);
+    }
+
+    #[test]
+    fn the_page_selection_follows_its_row_while_it_still_matches() {
+        let mut runtime = palette_runtime();
+        runtime.state.palette.page = Some(loaded(vec![
+            page_row("fa", &[]),
+            page_row("fb", &[]),
+            page_row("fab", &[]),
+        ]));
+        press(&mut runtime, Key::Text("f".into()), Mods::default());
+        runtime.frame(0.0);
+        press(&mut runtime, Key::Down, Mods::default());
+        press(&mut runtime, Key::Down, Mods::default());
+        press(&mut runtime, Key::Text("a".into()), Mods::default());
+        runtime.frame(1.0 / 60.0);
+        assert_eq!(page_labels(&runtime), ["fa", "fab"]);
+        assert_eq!(runtime.state.palette.selected, 1);
+        press(&mut runtime, Key::Text("q".into()), Mods::default());
+        runtime.frame(2.0 / 60.0);
+        assert_eq!(runtime.state.palette.selected, 0);
+    }
+
+    #[test]
     fn a_filter_matching_nothing_leaves_enter_with_nothing_to_open() {
         let mut runtime = jump_runtime();
         runtime.state.palette.page = Some(loaded(vec![worktree("main", "/dev/site")]));
@@ -1596,7 +1870,7 @@ mod tests {
         });
         assert!(!poll_page(&mut runtime.state, &mut Tx::default()));
         assert!(runtime.state.palette.open);
-        sender.send(Vec::new()).unwrap();
+        sender.send(Ok(Outcome::Rows(Vec::new()))).unwrap();
         assert!(poll_page(&mut runtime.state, &mut Tx::default()));
         let workspace = &runtime.state.workspace;
         assert_eq!(workspace.projects[2].root, Path::new("/dev/elsewhere"));
@@ -1613,7 +1887,7 @@ mod tests {
             page.pending = Some(receiver);
         }
         press(&mut runtime, Key::Escape, Mods::default());
-        sender.send(Vec::new()).unwrap();
+        sender.send(Ok(Outcome::Rows(Vec::new()))).unwrap();
         poll_page(&mut runtime.state, &mut Tx::default());
         assert_eq!(runtime.state.workspace.projects.len(), 2);
     }
@@ -1763,8 +2037,9 @@ mod tests {
         if let Some(page) = &mut runtime.state.palette.page {
             page.pending = Some(receiver);
         }
-        sender.send(Vec::new()).unwrap();
+        sender.send(Ok(Outcome::Rows(Vec::new()))).unwrap();
         assert!(poll_page(&mut runtime.state, &mut Tx::default()));
+        runtime.invalidate();
         runtime.frame(1.0);
         assert!(runtime.state.palette.open);
         assert_eq!(runtime.state.workspace.projects.len(), 2);
@@ -2235,7 +2510,7 @@ mod tests {
     fn rejoining_the_main_window_is_offered_only_in_a_torn_off_window() {
         let workspace = one_project();
         let rejoins = |query, torn_off| {
-            palette_actions(query, None, &workspace, &Config::default(), torn_off)
+            palette_actions(query, None, &workspace, &Config::default(), torn_off, &[])
                 .into_iter()
                 .filter(|action| {
                     matches!(

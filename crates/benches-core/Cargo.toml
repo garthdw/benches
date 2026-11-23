@@ -11,14 +11,16 @@ path = "src/core.rs"
 [dependencies]
 benches-font.workspace = true
 benches-platform.workspace = true
+benches-plugin.workspace = true
 libghostty-vt.workspace = true
 anyhow.workspace = true
 base64 = "0.23.1"
 crossbeam-channel.workspace = true
 libc.workspace = true
 nix.workspace = true
+regex-lite = "0.1"
 serde.workspace = true
-schemars = "1.2.3"
+schemars.workspace = true
 serde_json.workspace = true
 tempfile.workspace = true
 toml.workspace = true

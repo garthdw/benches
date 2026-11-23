@@ -64,6 +64,20 @@
       },
       "type": "object"
     },
+    "PluginsFile": {
+      "additionalProperties": false,
+      "properties": {
+        "disabled": {
+          "default": [],
+          "description": "The names of plugins to leave out, such as `worktrunk`.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "type": "object"
+    },
     "TabSpec": {
       "properties": {
         "command": {
@@ -148,6 +162,10 @@
         "string",
         "null"
       ]
+    },
+    "plugins": {
+      "$ref": "#/$defs/PluginsFile",
+      "description": "Command palette plugins."
     },
     "shell": {
       "description": "The shell new tabs run, as an absolute path.",

@@ -402,6 +402,7 @@ dependencies = [
  "benches-core",
  "benches-font",
  "benches-platform",
+ "benches-plugin",
  "bytemuck",
  "crossbeam-channel",
  "libc",
@@ -423,10 +424,12 @@ dependencies = [
  "base64 0.23.1",
  "benches-font",
  "benches-platform",
+ "benches-plugin",
  "crossbeam-channel",
  "libc",
  "libghostty-vt",
  "nix",
+ "regex-lite",
  "schemars",
  "serde",
  "serde_json",
@@ -466,6 +469,16 @@ dependencies = [
  "objc2-user-notifications 0.3.2",
  "tempfile",
  "zbus",
+]
+
+[[package]]
+name = "benches-plugin"
+version = "0.1.0"
+dependencies = [
+ "schemars",
+ "serde",
+ "serde_json",
+ "toml",
 ]
 
 [[package]]
@@ -2704,6 +2717,12 @@ dependencies = [
  "quote",
  "syn 3.0.10",
 ]
+
+[[package]]
+name = "regex-lite"
+version = "0.1.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cab834c73d247e67f4fae452806d17d3c7501756d98c8808d7c9c7aa7d18f973"
 
 [[package]]
 name = "renderdoc-sys"

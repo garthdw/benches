@@ -16,6 +16,7 @@ use crate::palette::{
     Action, Palette, list_project_worktrees, open_palette, open_palette_with, poll_busy,
     poll_history, poll_jump, poll_page, poll_selection, run_action,
 };
+use crate::plugins::poll_plugins;
 use crate::render::TerminalSource;
 use crate::secure_input::SecureInput;
 use crate::session::{Attention, Retarget, Session};
@@ -88,6 +89,8 @@ pub(crate) struct State {
     /// Why config.toml wasn't applied, at launch or on the last reload; shown until a reload
     /// succeeds or it is dismissed.
     pub(crate) config_error: Option<String>,
+    /// The plugins' generation this window last showed.
+    pub(crate) plugins_shown: u64,
     /// Where to grant Full Disk Access, while the notice asking for it shows.
     pub(crate) full_disk_access: Option<Link>,
     pub(crate) full_disk_access_asked: bool,
@@ -122,6 +125,7 @@ impl Default for State {
             sidebar_hidden: Default::default(),
             config: default_config(),
             config_error: Default::default(),
+            plugins_shown: Default::default(),
             full_disk_access: Default::default(),
             full_disk_access_asked: Default::default(),
             font_zoom: Default::default(),
@@ -241,9 +245,10 @@ impl State {
     }
 }
 
-pub(crate) fn open_tab(state: &mut State, title: &str, command: Option<&str>) {
+/// Opens a tab in the active project, running in `cwd`, else the project's folder.
+pub(crate) fn open_tab(state: &mut State, title: &str, command: Option<&str>, cwd: Option<&Path>) {
     if let Some(root) = state.active_root() {
-        let tab = state.spawn_tab(title, command, &root);
+        let tab = state.spawn_tab(title, command, cwd.unwrap_or(&root));
         state.workspace.add_tab(tab);
     }
 }
@@ -605,7 +610,7 @@ pub(crate) fn pick_new_tab(state: &mut State, picked: Option<&str>, tx: &mut Tx)
 
 pub(crate) fn run_command(state: &mut State, command: Command, tx: &mut Tx) {
     match command {
-        Command::NewShell => open_tab(state, "shell", None),
+        Command::NewShell => open_tab(state, "shell", None, None),
         Command::ToggleGit => toggle_git(state),
         Command::OpenProject => {
             pick_folder(tx, Some(state.config.working_directory.clone()), false)
@@ -678,6 +683,7 @@ pub(crate) fn poll(state: &mut State, now: f64, tx: &mut Tx) -> bool {
     changed |= poll_page(state, tx);
     changed |= poll_busy(state, tx);
     changed |= poll_history(state);
+    changed |= poll_plugins(state);
     changed |= dismiss_confirms(state, |workspace, confirm| match confirm {
         Confirm::CloseProject { root } => workspace.project_index(root).is_some(),
         _ => confirm.session() == active,
@@ -1138,7 +1144,7 @@ mod tests {
         state
             .workspace
             .add_project(Project::new("/tmp".into(), vec![]));
-        open_tab(&mut state, "shell", Some("cat"));
+        open_tab(&mut state, "shell", Some("cat"), None);
         let mut tx = Tx::default();
         state.workspace.set_window_focused(true);
         on_ime(
@@ -1947,7 +1953,7 @@ mod tests {
         state
             .workspace
             .add_project(Project::new("/tmp".into(), vec![]));
-        open_tab(&mut state, "shell", Some("cd /usr/bin && sleep 100"));
+        open_tab(&mut state, "shell", Some("cd /usr/bin && sleep 100"), None);
         wait_until(
             Duration::from_secs(5),
             || "shell never left /tmp".to_owned(),
@@ -2192,7 +2198,7 @@ mod tests {
         state
             .workspace
             .add_project(Project::new("/tmp".into(), vec![]));
-        open_tab(&mut state, "quick", Some("sh -c 'exit 0'"));
+        open_tab(&mut state, "quick", Some("sh -c 'exit 0'"), None);
         let mut runtime = runtime_with(state);
         let old = runtime.state.workspace.active_session().map(Session::id);
         let frame = frame_until(&mut runtime, "the restart hint", |runtime| {

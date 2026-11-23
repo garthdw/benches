@@ -1,13 +1,17 @@
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};
+use std::path::PathBuf;
 use std::rc::Rc;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError, mpsc};
 
 use rune::{Tx, Waker, WindowSpec};
 
 use crate::app::{State, default_config, dismiss_confirms, save_layout, window_app};
+use crate::plugins::load_plugins;
 use crate::workspace::{Project, SavedWorkspace};
 use benches_core::LogErr;
 use benches_core::config::Config;
+use benches_core::plugins::{self, Plugin};
 
 pub(crate) type WindowId = u32;
 
@@ -24,11 +28,49 @@ struct Windows {
     entries: HashMap<WindowId, Entry>,
     /// What each window left for the layout as the app quit.
     saved: BTreeMap<WindowId, SavedWorkspace>,
+    wakers: Wakers,
+    plugins: Plugins,
+}
+
+/// Each window's waker, shared with threads that wake every window once they're done.
+#[derive(Clone, Default)]
+struct Wakers(Arc<Mutex<HashMap<WindowId, Waker>>>);
+
+impl Wakers {
+    fn lock(&self) -> MutexGuard<'_, HashMap<WindowId, Waker>> {
+        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Wakes every window but `skipped`, outside the lock and any borrow of `Windows`, as a
+    /// waker may poll a window that borrows them again.
+    fn wake_all_but(&self, skipped: Option<WindowId>) {
+        let wakers: Vec<Waker> = self
+            .lock()
+            .iter()
+            .filter(|(window, _)| Some(**window) != skipped)
+            .map(|(_, waker)| waker.clone())
+            .collect();
+        for waker in wakers {
+            waker();
+        }
+    }
+}
+
+/// The palette plugins every window offers.
+#[derive(Default)]
+struct Plugins {
+    loaded: Arc<Vec<Plugin>>,
+    /// Why plugins were left out on the last load, shown in every window until dismissed.
+    error: Option<String>,
+    /// The last load's plugins, once the login shell says which have what they require. A
+    /// later load replaces it, dropping the older answer.
+    pending: Option<mpsc::Receiver<Vec<Plugin>>>,
+    /// Counts changes to `loaded` and `error`, so each window knows when to redraw.
+    generation: u64,
 }
 
 #[derive(Default)]
 struct Entry {
-    waker: Option<Waker>,
     reveal: Option<Rc<dyn Fn(u64)>>,
     inbox: Vec<Project>,
     /// A config reloaded in another window, for this one to take on its next poll.
@@ -43,7 +85,7 @@ impl Fleet {
     }
 
     pub fn register(&self, window: WindowId, waker: Waker) {
-        self.0.borrow_mut().entries.entry(window).or_default().waker = Some(waker);
+        self.0.borrow().wakers.lock().insert(window, waker);
     }
 
     /// `reveal` shows a session in `window` and brings the window forward, if the window has it.
@@ -71,15 +113,21 @@ impl Fleet {
     }
 
     pub fn unregister(&self, window: WindowId) {
-        self.0.borrow_mut().entries.remove(&window);
+        let mut windows = self.0.borrow_mut();
+        windows.entries.remove(&window);
+        windows.wakers.lock().remove(&window);
     }
 
     pub fn send(&self, window: WindowId, project: Project) {
         let waker = {
             let mut windows = self.0.borrow_mut();
-            let entry = windows.entries.entry(window).or_default();
-            entry.inbox.push(project);
-            entry.waker.clone()
+            windows
+                .entries
+                .entry(window)
+                .or_default()
+                .inbox
+                .push(project);
+            windows.wakers.lock().get(&window).cloned()
         };
         if let Some(waker) = waker {
             waker();
@@ -100,22 +148,85 @@ impl Fleet {
         Some(merged)
     }
 
+    pub fn plugins(&self) -> Arc<Vec<Plugin>> {
+        self.0.borrow().plugins.loaded.clone()
+    }
+
+    #[cfg(test)]
+    pub fn set_plugins(&self, plugins: Vec<Plugin>) {
+        let mut windows = self.0.borrow_mut();
+        windows.plugins.loaded = Arc::new(plugins);
+        windows.plugins.generation += 1;
+    }
+
+    pub fn plugin_error(&self) -> Option<String> {
+        self.0.borrow().plugins.error.clone()
+    }
+
+    pub fn dismiss_plugin_error(&self) {
+        let mut windows = self.0.borrow_mut();
+        windows.plugins.error = None;
+        windows.plugins.generation += 1;
+    }
+
+    #[cfg(test)]
+    pub fn plugin_generation(&self) -> u64 {
+        self.0.borrow().plugins.generation
+    }
+
+    /// Finds the plugins in `dirs`, reporting broken ones, then asks the login shell off the UI
+    /// thread which have what they require, waking every window once it answers.
+    pub fn load_plugins(&self, dirs: &[PathBuf], disabled: &[String], shell: PathBuf) {
+        let (found, errors) = plugins::discover(dirs, disabled);
+        let errors: Vec<String> = errors.iter().map(|error| format!("{error:#}")).collect();
+        for error in &errors {
+            eprintln!("benches: plugin: {error}");
+        }
+        let (sender, receiver) = mpsc::channel();
+        let wakers = {
+            let mut windows = self.0.borrow_mut();
+            windows.plugins.error = (!errors.is_empty()).then(|| errors.join("\n"));
+            windows.plugins.pending = Some(receiver);
+            windows.plugins.generation += 1;
+            windows.wakers.clone()
+        };
+        std::thread::spawn(move || {
+            if sender.send(plugins::available(&shell, found)).is_ok() {
+                wakers.wake_all_but(None);
+            }
+        });
+    }
+
+    /// Takes the plugins a load found, once they're ready, and answers the plugins'
+    /// generation, which a window compares with the one it last showed.
+    pub fn poll_plugins(&self) -> u64 {
+        let mut windows = self.0.borrow_mut();
+        let plugins = &mut windows.plugins;
+        match plugins.pending.as_ref().map(mpsc::Receiver::try_recv) {
+            Some(Ok(found)) => {
+                plugins.pending = None;
+                plugins.loaded = Arc::new(found);
+                plugins.generation += 1;
+            }
+            Some(Err(mpsc::TryRecvError::Disconnected)) => plugins.pending = None,
+            Some(Err(mpsc::TryRecvError::Empty)) | None => {}
+        }
+        plugins.generation
+    }
+
     /// Hands `config` to every window but `from`, which applied it itself.
     pub fn share_config(&self, from: WindowId, config: &Config) {
-        let wakers: Vec<_> = self
-            .0
-            .borrow_mut()
-            .entries
-            .iter_mut()
-            .filter(|(window, _)| **window != from)
-            .filter_map(|(_, entry)| {
+        for (window, entry) in &mut self.0.borrow_mut().entries {
+            if *window != from {
                 entry.config = Some(config.clone());
-                entry.waker.clone()
-            })
-            .collect();
-        for waker in wakers {
-            waker();
+            }
         }
+        self.wake_all_but(Some(from));
+    }
+
+    fn wake_all_but(&self, skipped: Option<WindowId>) {
+        let wakers = self.0.borrow().wakers.clone();
+        wakers.wake_all_but(skipped);
     }
 
     fn take_config(&self, window: WindowId) -> Option<Config> {
@@ -224,6 +335,7 @@ pub(crate) fn load_config(state: &mut State) {
     let (config, error) = Config::load(paths, default_config());
     state.config = config;
     report_config_error(state, error);
+    load_plugins(state);
 }
 
 /// Rereads the config for every window. A config.toml that fails to parse changes nothing, and
@@ -235,6 +347,7 @@ pub(crate) fn reload_config(state: &mut State) {
             report_config_error(state, None);
             state.fleet.share_config(state.window, &config);
             apply_config(state, config);
+            load_plugins(state);
         }
         Err(error) => report_config_error(state, Some(error)),
     }
@@ -295,6 +408,45 @@ mod tests {
     use std::cell::Cell;
     use std::path::Path;
     use std::sync::atomic::Ordering;
+
+    #[test]
+    fn loaded_plugins_wake_the_windows_without_waiting_for_a_poll() {
+        let dir = benches_core::test_support::stub_plugin("name = \"stub\"\nexec = \"run\"\n", "");
+        let fleet = Fleet::default();
+        let (waker, wakes) = counting_waker();
+        fleet.register(MAIN_WINDOW, waker);
+        let before = fleet.plugin_generation();
+        fleet.load_plugins(
+            &[dir.path().to_owned()],
+            &[],
+            Path::new("/bin/sh").to_owned(),
+        );
+        wait_until(
+            std::time::Duration::from_secs(15),
+            || "a wake once plugins load".to_owned(),
+            || (wakes.load(Ordering::Relaxed) > 0).then_some(()),
+        );
+        assert!(fleet.poll_plugins() > before);
+        assert_eq!(fleet.plugins().len(), 1);
+    }
+
+    #[test]
+    fn a_newer_plugin_load_replaces_one_still_probing() {
+        let dir = benches_core::test_support::stub_plugin("name = \"stub\"\nexec = \"run\"\n", "");
+        let fleet = Fleet::default();
+        let shell = Path::new("/bin/sh").to_owned();
+        fleet.load_plugins(&[dir.path().to_owned()], &[], shell.clone());
+        fleet.load_plugins(&[dir.path().to_owned()], &["stub".to_owned()], shell);
+        wait_until(
+            std::time::Duration::from_secs(15),
+            || "the newer load".to_owned(),
+            || {
+                fleet.poll_plugins();
+                fleet.0.borrow().plugins.pending.is_none().then_some(())
+            },
+        );
+        assert!(fleet.plugins().is_empty());
+    }
 
     #[test]
     fn a_window_keeps_its_last_project() {
@@ -397,7 +549,12 @@ mod tests {
         state
             .workspace
             .add_project(Project::new("/tmp".into(), vec![]));
-        open_tab(&mut state, "slow", Some("sh -c 'sleep 0.5; echo moved'"));
+        open_tab(
+            &mut state,
+            "slow",
+            Some("sh -c 'sleep 0.5; echo moved'"),
+            None,
+        );
         state
             .workspace
             .add_project(Project::new("/dev/site".into(), vec![]));
@@ -449,7 +606,12 @@ mod tests {
         second
             .workspace
             .add_project(Project::new("/tmp".into(), vec![]));
-        open_tab(&mut second, "slow", Some("sh -c 'sleep 0.5; echo back'"));
+        open_tab(
+            &mut second,
+            "slow",
+            Some("sh -c 'sleep 0.5; echo back'"),
+            None,
+        );
         let session = second.workspace.active_session().map(Session::id);
         merge_into_main(&mut second);
         assert!(second.workspace.projects.is_empty());
@@ -542,6 +704,7 @@ mod tests {
             &mut state,
             "ask",
             Some(r#"sh -c 'printf "\\033]52;c;?\\007"; cat'"#),
+            None,
         );
         let session = state.workspace.active_session().map(Session::id).unwrap();
         state.confirms.push(Confirm::ClipboardRead {
