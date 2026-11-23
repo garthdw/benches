@@ -275,7 +275,7 @@ fn strip_escapes(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::installed;
+    use crate::test_support::{installed, stub_shell};
 
     const TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -416,21 +416,6 @@ mod tests {
             .unwrap(),
             None
         );
-    }
-
-    /// A shell that records its arguments instead of running the script, then runs `body`.
-    fn stub_shell(body: &str) -> (tempfile::TempDir, PathBuf, PathBuf) {
-        use std::os::unix::fs::PermissionsExt;
-        let root = tempfile::tempdir().unwrap();
-        let record = root.path().join("args");
-        let shell = root.path().join("stub-shell");
-        let script = format!(
-            "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\n{body}\n",
-            record.display()
-        );
-        std::fs::write(&shell, script).unwrap();
-        std::fs::set_permissions(&shell, std::fs::Permissions::from_mode(0o755)).unwrap();
-        (root, shell, record)
     }
 
     #[test]
