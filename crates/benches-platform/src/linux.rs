@@ -11,7 +11,8 @@ use async_channel::{Receiver, Sender};
 use async_io::Timer;
 use futures_util::StreamExt;
 use futures_util::future::{self, Either};
-use zbus::proxy::SignalStream;
+use futures_util::stream::Fuse;
+use zbus::proxy::{OwnerChangedStream, SignalStream};
 use zbus::zvariant::Value;
 use zbus::{Connection, Proxy, connection};
 
@@ -239,21 +240,24 @@ async fn serve_notifications(
 ) {
     let mut queued = pin!(queued);
     let mut backoff = Backoff::default();
+    let mut post = queued.next().await;
     // Without a server, or while backing off, the post is dropped.
-    while let Some((session, notification)) = queued.next().await {
-        if !backoff.ready(Instant::now()) {
-            continue;
+    while let Some((session, notification)) = post.take() {
+        if backoff.ready(Instant::now()) {
+            match Server::connect(&bus).await {
+                Ok(mut server) => {
+                    backoff = Backoff::default();
+                    server.post(session, &notification).await;
+                    post = server.serve(&mut queued, &on_click).await;
+                }
+                Err(error) => {
+                    eprintln!("benches: connect to the notification server: {error}");
+                    backoff.failed(Instant::now());
+                }
+            }
         }
-        match Server::connect(&bus).await {
-            Ok(mut server) => {
-                backoff = Backoff::default();
-                server.post(session, &notification).await;
-                server.serve(&mut queued, &on_click).await;
-            }
-            Err(error) => {
-                eprintln!("benches: connect to the notification server: {error}");
-                backoff.failed(Instant::now());
-            }
+        if post.is_none() {
+            post = queued.next().await;
         }
     }
 }
@@ -263,6 +267,7 @@ struct Server {
     proxy: Proxy<'static>,
     clicks: SignalStream<'static>,
     closes: SignalStream<'static>,
+    owners: Fuse<OwnerChangedStream<'static>>,
     markup: bool,
     hints: Hints<'static>,
     /// The server's id for each session's notification, which a new one replaces.
@@ -286,6 +291,8 @@ impl Server {
             let clicks = proxy.receive_signal("ActionInvoked").await?;
             let closes = proxy.receive_signal("NotificationClosed").await?;
             let capabilities: Vec<String> = proxy.call("GetCapabilities", &()).await?;
+            // After `GetCapabilities`, which may start the server.
+            let owners = proxy.receive_owner_changed().await?.fuse();
             Ok(Self {
                 markup: capabilities
                     .iter()
@@ -293,6 +300,7 @@ impl Server {
                 proxy,
                 clicks,
                 closes,
+                owners,
                 hints: Hints::from([("sound-name", Value::from("message-new-instant"))]),
                 shown: HashMap::new(),
             })
@@ -300,18 +308,19 @@ impl Server {
         .await
     }
 
-    /// Posts and reports clicks until the connection closes, which ends the signal streams, or
-    /// the posts stop.
+    /// Posts and reports clicks until the connection closes, another server takes over, or the
+    /// posts stop. Returns a post that found the connection closed, for the next one.
     async fn serve(
         &mut self,
         queued: &mut Pin<&mut Receiver<(u64, Notification)>>,
         on_click: &impl Fn(Option<u64>),
-    ) {
+    ) -> Option<(u64, Notification)> {
         loop {
             futures_util::select! {
                 post = queued.next() => match post {
+                    Some(post) if self.proxy.connection().is_closed() => return Some(post),
                     Some((session, notification)) => self.post(session, &notification).await,
-                    None => return,
+                    None => return None,
                 },
                 message = self.clicks.next() => match message {
                     Some(message) => {
@@ -319,12 +328,14 @@ impl Server {
                             on_click(Some(session));
                         }
                     }
-                    None => return,
+                    None => return None,
                 },
                 message = self.closes.next() => match message {
                     Some(message) => self.closed(&message),
-                    None => return,
+                    None => return None,
                 },
+                // A new server numbers its notifications afresh, so `shown` would be wrong.
+                _ = self.owners.next() => return None,
             }
         }
     }
@@ -790,6 +801,30 @@ mod tests {
             });
             assert!(resumed, "no post reached the restarted bus");
             assert_eq!(clicks.recv_timeout(WAIT), Ok(Some(2)));
+        }
+
+        #[test]
+        fn a_restarted_server_s_ids_are_not_mistaken_for_ours() {
+            if !enabled() {
+                return;
+            }
+            let bus = Bus::start();
+            let (notified, posted) = mpsc::channel();
+            let stub = bus.serve(notified.clone());
+            let (posts, clicks) = bus.notifications();
+            posts.try_send((1, notification("before"))).ok();
+            assert_eq!(posted.recv_timeout(WAIT), Ok((0, "proj\nbefore".into())));
+            assert_eq!(clicks.recv_timeout(WAIT), Ok(Some(1)));
+
+            drop(stub);
+            let _stub = bus.serve(notified);
+            // The new server numbers its notifications afresh, so replacing the old one's id
+            // would replace some other app's notification.
+            let fresh = (0..10).any(|_| {
+                posts.try_send((1, notification("after"))).ok();
+                posted.recv_timeout(WAIT) == Ok((0, "proj\nafter".into()))
+            });
+            assert!(fresh, "every post replaced the old server's id");
         }
     }
 }
