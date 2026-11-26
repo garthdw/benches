@@ -518,8 +518,8 @@ mod tests {
     use benches_core::terminal_input::{LINK_MODS, TerminalInput};
     use benches_core::test_support::{TEST_SURFACE, pointer_at, wheel_by};
     use libghostty_vt::color::Rgb;
-    use libghostty_vt::render::CursorVisualStyle;
     use libghostty_vt::style::Underline;
+    use libghostty_vt::terminal::CursorStyle;
     use nix::errno::Errno;
     use nix::unistd::Pid;
     use std::process::ExitStatus;
@@ -768,7 +768,7 @@ mod tests {
         builder.build(&terminal, 1, shown).unwrap();
         terminal.vt_write(b"\x1b[6 q");
         let grid = builder.build(&terminal, 2, shown).unwrap().unwrap();
-        assert_eq!(grid.cursor_style, CursorVisualStyle::Bar);
+        assert_eq!(grid.cursor_style, CursorStyle::Bar);
     }
 
     #[test]

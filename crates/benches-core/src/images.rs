@@ -85,9 +85,7 @@ impl ImageReader {
         if self.generation.replace(generation) == Some(generation) {
             return Ok(self.placements.clone());
         }
-        let Some(graphics) = terminal.kitty_graphics()? else {
-            return Ok(Arc::default());
-        };
+        let graphics = terminal.kitty_graphics()?;
         let mut placements = Vec::new();
         let mut used = HashMap::new();
         let mut iteration = self.iterator.update(snapshot)?;

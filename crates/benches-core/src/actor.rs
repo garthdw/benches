@@ -498,7 +498,7 @@ impl Actor {
                         }
                     }
                     Ok(Msg::PromptJump(delta)) => {
-                        terminal.scroll_viewport(ScrollViewport::DeltaPrompt(delta));
+                        terminal.scroll_viewport(ScrollViewport::DeltaPrompt(delta))?;
                         fade.show(Instant::now());
                         dirty = true;
                     }
@@ -620,7 +620,8 @@ impl Actor {
                 tick_animation = false;
                 let elapsed = animation_epoch.elapsed().as_millis() as u64;
                 animation_due = terminal
-                    .kitty_graphics_animation_tick(elapsed)
+                    .kitty_graphics()
+                    .and_then(|mut graphics| graphics.tick_animation(elapsed))
                     .log_err("tick animations")
                     .flatten()
                     .map(|next| animation_epoch + Duration::from_millis(next));
@@ -704,15 +705,17 @@ fn install_clipboard(
             };
             match (write, text) {
                 (ClipboardAccess::Deny, _) => {
-                    request.reply(Err(ClipboardWriteError::Denied), false)
+                    request.reply(Err(ClipboardWriteError::Denied)).finish()
                 }
-                (_, None) => request.reply(Err(ClipboardWriteError::Unsupported), false),
+                (_, None) => request
+                    .reply(Err(ClipboardWriteError::Unsupported))
+                    .finish(),
                 (access, Some(text)) => {
                     emit(Event::ClipboardWrite {
                         text,
                         ask: access == ClipboardAccess::Ask,
                     });
-                    request.reply(Ok(()), false);
+                    request.reply(Ok(())).finish();
                 }
             }
         }
@@ -720,8 +723,8 @@ fn install_clipboard(
     terminal.on_clipboard_read(move |_, request| {
         let text_only = request.mimes().eq([&b"text/plain"[..]]) && !request.list();
         match read {
-            _ if !text_only => request.reply(Err(ClipboardReadError::Unsupported), &[], false),
-            ClipboardAccess::Deny => request.reply(Err(ClipboardReadError::Denied), &[], false),
+            _ if !text_only => request.reply(Err(ClipboardReadError::Unsupported)).finish(),
+            ClipboardAccess::Deny => request.reply(Err(ClipboardReadError::Denied)).finish(),
             access => {
                 reply_muted.set(true);
                 emit(Event::ClipboardRead {
@@ -1043,7 +1046,9 @@ mod tests {
         }
         terminal.vt_write(b"\x1b]133;A\x07$ ");
         let offset = |terminal: &mut Terminal<'static, '_>, delta| {
-            terminal.scroll_viewport(ScrollViewport::DeltaPrompt(delta));
+            terminal
+                .scroll_viewport(ScrollViewport::DeltaPrompt(delta))
+                .unwrap();
             terminal.scrollbar().unwrap().offset
         };
         // Each command takes two rows, so prompts sit on rows 0, 2, 4 and 6 and the view starts at 4.

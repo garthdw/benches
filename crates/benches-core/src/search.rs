@@ -1,7 +1,8 @@
 use anyhow::Result;
 use libghostty_vt::Terminal;
-use libghostty_vt::point::Space;
-use libghostty_vt::search::{MatchBuffer, Search};
+use libghostty_vt::grid_ref::TrackedGridRef;
+use libghostty_vt::point::{Point, Space};
+use libghostty_vt::search::{Match, MatchBuffer, Search};
 use libghostty_vt::selection::Selection;
 
 use crate::grid::{Found, Highlight};
@@ -9,8 +10,24 @@ use crate::grid::{Found, Highlight};
 /// A find bar's search over the terminal's scrollback; idle until a query is set.
 #[derive(Default)]
 pub struct Searcher {
-    search: Option<Search<'static, 'static>>,
+    search: Option<Search<'static>>,
     buffer: MatchBuffer,
+    /// The selected match's first cell; libghostty only reports the selection when it moves.
+    selected: Option<TrackedGridRef>,
+}
+
+fn track(
+    terminal: &Terminal<'_, '_>,
+    selected: Option<Match<'_, '_, '_>>,
+) -> Result<Option<TrackedGridRef>> {
+    let Some(selected) = selected else {
+        return Ok(None);
+    };
+    let Some(start) = terminal.point_from_grid_ref(selected.selection()?.start(), Space::Screen)?
+    else {
+        return Ok(None);
+    };
+    Ok(Some(terminal.track_grid_ref(Point::Screen(start))?))
 }
 
 /// A match's first and last cell in viewport coordinates.
@@ -20,7 +37,7 @@ type Span = ((u16, u32), (u16, u32));
 fn span(terminal: &Terminal<'_, '_>, selection: &Selection<'_>) -> Result<Option<Span>> {
     let cell = |grid_ref| -> Result<Option<(u16, u32)>> {
         Ok(terminal
-            .point_from_grid_ref(&grid_ref, Space::Viewport)?
+            .point_from_grid_ref(grid_ref, Space::Viewport)?
             .map(|point| (point.x, point.y)))
     };
     Ok(cell(selection.start())?.zip(cell(selection.end())?))
@@ -51,6 +68,7 @@ impl Searcher {
     pub fn set(&mut self, terminal: &mut Terminal<'static, '_>, query: &str) -> Result<()> {
         if query.is_empty() {
             self.search = None;
+            self.selected = None;
             return Ok(());
         }
         let search = match &mut self.search {
@@ -59,18 +77,19 @@ impl Searcher {
         };
         search.set_needle(terminal, query.as_bytes())?;
         search.run(terminal)?;
-        search.select_next(terminal)?;
+        self.selected = track(terminal, search.select_next(terminal)?)?;
         Ok(())
     }
 
     /// Wraps around, and scrolls to the match.
     pub(crate) fn step(&mut self, terminal: &mut Terminal<'static, '_>, older: bool) -> Result<()> {
         if let Some(search) = &mut self.search {
-            if older {
-                search.select_next(terminal)?;
+            let selected = if older {
+                search.select_next(terminal)?
             } else {
-                search.select_prev(terminal)?;
-            }
+                search.select_prev(terminal)?
+            };
+            self.selected = track(terminal, selected)?;
         }
         Ok(())
     }
@@ -85,18 +104,29 @@ impl Searcher {
             return Ok((Vec::new(), None));
         };
         search.run(terminal)?;
+        let mut selected = None;
+        let mut current = None;
+        if let Some(start) = self
+            .selected
+            .as_ref()
+            .map(|tracked| tracked.point(Space::Screen))
+            .transpose()?
+            .flatten()
+        {
+            for (index, selection) in search.matches(terminal, &mut self.buffer)?.enumerate() {
+                if terminal.point_from_grid_ref(selection.start(), Space::Screen)? == Some(start) {
+                    selected = Some(index);
+                    current = span(terminal, &selection)?;
+                    break;
+                }
+            }
+        }
         let found = Found {
             total: search.total_matches()?,
-            selected: search.selected_index()?,
-        };
-        let snapshot = search.snapshot(terminal)?;
-        let terminal = snapshot.terminal();
-        let current = match snapshot.selected_match()? {
-            Some(selection) => span(terminal, &selection)?,
-            None => None,
+            selected,
         };
         let mut highlights = Vec::new();
-        for selection in snapshot.viewport_matches(&mut self.buffer)? {
+        for selection in search.viewport_matches(terminal, &mut self.buffer)? {
             if let Some(span) = span(terminal, &selection)? {
                 highlights.extend(rows(span, cols, Some(span) == current));
             }
@@ -160,6 +190,23 @@ mod tests {
         let (current, _, lines, _) = view(&mut searcher, &mut terminal);
         assert_eq!(current, "line1");
         assert!(lines.iter().any(|line| line.starts_with(&current)));
+    }
+
+    #[test]
+    fn new_output_keeps_the_selected_match_as_its_index_shifts() {
+        let mut terminal = new_terminal(20, 5).unwrap();
+        terminal.vt_write(b"hit one\r\nhit two\r\n");
+        let mut searcher = Searcher::default();
+        searcher.set(&mut terminal, "hit").unwrap();
+        let (_, _, _, found) = view(&mut searcher, &mut terminal);
+        assert_eq!(found.and_then(|found| found.selected), Some(0));
+        terminal.vt_write(b"hit three\r\n");
+        let (current, _, _, found) = view(&mut searcher, &mut terminal);
+        assert_eq!(current, "hit");
+        assert_eq!(
+            found.map(|found| (found.selected, found.total)),
+            Some((Some(1), 3))
+        );
     }
 
     #[test]
@@ -259,7 +306,7 @@ mod tests {
     #[test]
     fn a_query_without_matches_reports_none() {
         let mut terminal = scrolled_terminal();
-        terminal.scroll_viewport(ScrollViewport::Top);
+        terminal.scroll_viewport(ScrollViewport::Top).unwrap();
         let mut searcher = Searcher::default();
         searcher.set(&mut terminal, "absent").unwrap();
         let (current, _, _, found) = view(&mut searcher, &mut terminal);

@@ -9,8 +9,9 @@ use std::time::{Duration, Instant};
 
 use bytemuck::{Pod, Zeroable, cast_slice};
 use crossbeam_channel::{Receiver, Sender, unbounded};
-use libghostty_vt::render::{CursorVisualStyle, ImageLayer};
+use libghostty_vt::render::ImageLayer;
 use libghostty_vt::style::Underline;
+use libghostty_vt::terminal::CursorStyle;
 use rune::Waker;
 use rune::color::srgb_decode;
 use rune::compose::{Compositor, DeviceKey, Frame};
@@ -860,14 +861,14 @@ fn build_quads(
         let cursor_width = if wide { 2.0 * width } else { width };
         let edges: &[[f32; 4]] = match grid.cursor_style {
             _ if grid.password_input => &lock_edges(left, top, cursor_width, height, thickness),
-            CursorVisualStyle::Bar => &[[left, top, thickness, height]],
-            CursorVisualStyle::Underline => &[[
+            CursorStyle::Bar => &[[left, top, thickness, height]],
+            CursorStyle::Underline => &[[
                 left,
                 top + font.underline_top as f32,
                 cursor_width,
                 thickness,
             ]],
-            CursorVisualStyle::BlockHollow => &[
+            CursorStyle::BlockHollow => &[
                 [left, top, cursor_width, thickness],
                 [left, top + height - thickness, cursor_width, thickness],
                 [left, top, thickness, height],
@@ -881,7 +882,7 @@ fn build_quads(
     }
     let run_cursor = cursor.filter(|_| font.break_runs_at_cursor);
     let inverted =
-        cursor.filter(|_| grid.cursor_style == CursorVisualStyle::Block && !grid.password_input);
+        cursor.filter(|_| grid.cursor_style == CursorStyle::Block && !grid.password_input);
     let glyphs_start = quads.len();
     let underline_top = font.underline_top as f32;
     let textured = |found: AtlasGlyph, left: f32, top: f32, cells: f32, fg: [u8; 3]| {
@@ -2406,7 +2407,7 @@ mod tests {
     #[test]
     fn a_hollow_cursor_is_an_outline() {
         let mut grid = Grid::from_vt(b"", 4, 1).unwrap();
-        grid.cursor_style = CursorVisualStyle::BlockHollow;
+        grid.cursor_style = CursorStyle::BlockHollow;
         assert_eq!(cursor_quads(&grid).0.len(), 4);
     }
 
