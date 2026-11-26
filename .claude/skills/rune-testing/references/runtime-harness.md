@@ -25,7 +25,7 @@ Driving input (points, window space):
 - Text: `ime(Ime), finish_composition(), paste(text), paste_content(content)`. `finish_composition` is what window deactivation does: an open composition becomes text (see `rune-input`).
 - Gestures: `magnify_event, rotate_event, smart_magnify`.
 - Window: `window_focus(bool)` reaches `El::on_window_focus` handlers, but not `App::on_focus` (above).
-- State from outside a handler: `update(|state, tx| …)` runs now and the next frame commits it; after mutating `rt.state` directly, call `invalidate()`.
+- State from outside a handler: `update(|state, tx| …)` runs now and the next frame commits it; after mutating `rt.state` directly, or calling an app function such as `poll_page` with a throwaway `Tx`, call `invalidate()`, or the next frame may not re-run the view.
 - Clipboard: a test runtime never touches the OS clipboard; a `tx.copy` is left in `rt.copy_request`. `let clipboard = rune::clipboard::memory(); rt.use_clipboard(&clipboard);` makes copies land there (`clipboard.text()`) and answers reads from `clipboard.set_text(…)`.
 
 Inspect with:

@@ -5,23 +5,25 @@ description: Rune input behaviour as used by Benches - key routing, physical key
 
 # Rune input
 
-Verified against Rune rev `b5c4fa6` and winit 0.30.13 (Rune's vendored copy, which Benches patches in). If the pin has moved, check anything you rely on.
+Verified against Rune rev `4918969` and winit 0.30.13 (Rune's vendored copy, which Benches patches in). If the pin has moved, check anything you rely on.
 
 ## Key routing (first taker wins)
 
 Global shortcuts and native menu key equivalents are handled before the window sees the key.
 
 1. Return and Escape while a field or `App::on_ime` composes go to the composition.
-2. Unmodified Return presses the window's (or open modal's) `default_button()`, unless the focused element takes Return.
-3. **Nothing focused: `AppSpec::on_key`**, with `tx.focused() == None`. Benches lives here.
-4. Focused field's `on_input_key`.
-5. Focus navigation (Escape, Tab, arrows and so on).
-6. Focused text field's editor.
-7. `on_key` again, with `tx.focused()` set.
-8. Selected text's Cmd+A and Cmd+C.
-9. Page Up, Page Down, Home and End scroll the nearest scroll view. A scroll view that itself has focus also scrolls on Up and Down (40 points) and Space or Shift+Space (a page).
+2. `El::on_key_preview` on the focused element and its ancestors, outermost first.
+3. `El::on_key` and `El::on_key_any` on the focused element and its ancestors, innermost first (not while a text field has focus).
+4. Unmodified Return presses the window's (or open modal's) `default_button()`, unless the focused element takes Return.
+5. **Nothing focused: `AppSpec::on_key`**, with `tx.focused() == None`. Benches lives here.
+6. Focused field's `on_input_key`.
+7. Focus navigation (Escape, Tab, arrows and so on). Space presses the focused control; Return presses it only if it opts in with `press_on_return()`.
+8. Focused text field's editor.
+9. `on_key` again, with `tx.focused()` set.
+10. Selected text's Cmd+A and Cmd+C.
+11. Page Up, Page Down, Home and End scroll the nearest scroll view. A scroll view that itself has focus also scrolls on Up and Down (40 points) and Space or Shift+Space (a page).
 
-Making the terminal `.focusable(true)` moves it out of step 3 and exposes Tab and Escape to step 5. Don't do that casually: clicks must not leave Rune focus holding keys.
+Making the terminal `.focusable(true)` moves it out of step 5 and exposes Tab and Escape to step 7. Don't do that casually: clicks must not leave Rune focus holding keys.
 
 ## References
 

@@ -5,7 +5,7 @@ description: Testing and verifying Rune apps in Benches - the headless Runtime h
 
 # Testing Rune apps
 
-Verified against Rune rev `b5c4fa6`. If the pin has moved, check anything you rely on.
+Verified against Rune rev `4918969`. If the pin has moved, check anything you rely on.
 
 ## Benches specifics
 

@@ -5,7 +5,7 @@ description: Rune's custom GPU drawing contract as used by Benches - Compositor,
 
 # Rune compositor and effect slots
 
-Verified against Rune rev `b5c4fa6` (wgpu `~30.0.1`; Benches locks 30.0.2). If the pin has moved, check anything you rely on.
+Verified against Rune rev `4918969` (wgpu `~30.0.1`; Benches locks wgpu 30.0.2 over Rune's patched wgpu-hal and naga 30.0.1). If the pin has moved, check anything you rely on.
 
 ## Pattern
 
@@ -35,7 +35,7 @@ Register with `App::new(spec).compositor(..)`. It runs in the window and in head
 - **Partial opacity** on the element puts the slot in its own layer, hence `format` and `origin` varying. Rotation draws upright inside a turned layer.
 - `.effect_bleed(pt)` lets a slot paint past its rect. `.effect_backdrop(true)` requests a backdrop copy.
 - `effect()` returns a normal `El`, so handlers, keys, sizing and children chain as usual.
-- **Device changes and loss:** everything made on `f.device`, and any CPU state that indexes it (atlas placements, job ids), belongs in the struct rebuilt when `f.device_key()` changes. A lost device reaches the compositor only as a new key on a later frame; see [references/metal-backend.md](references/metal-backend.md).
+- **Device changes and loss:** everything made on `f.device`, and any CPU state that indexes it (atlas placements, job ids), belongs in the struct rebuilt when `f.device_key()` changes. A lost device reaches the compositor as `release_gpu()`, called right after Rune drops the device, then a new key on a later frame. Benches keeps the default no-op `release_gpu` and rebuilds on the key; dropping early only matters on Windows D3D12, where a removed device's resources block making a new one; see [references/metal-backend.md](references/metal-backend.md).
 - **Scroll-fade stops:** `f.ui.prepare` leaves the renderer's stops as they were; `Frame::draw_ui` sets them. A compositor frame with a scroller using `ScrollFade::stops` calls `f.ui.set_fade_stops(f.rt.fade_stops())` before `prepare`. Benches has none.
 - `draw` receives only `&State`. Cell metrics known only in the compositor must travel by message or interior mutability; Benches sends them to the session actor.
 
@@ -51,7 +51,7 @@ Register with `App::new(spec).compositor(..)`. It runs in the window and in head
 | Topic | Path |
 |---|---|
 | Trait, `Frame`, worked example in docs | `rune/src/compose.rs` |
-| `EffectSite`, `EffectHook`, `draw_with`, scissor | `rune/src/render.rs` (`draw_with_effects` at line 469, scissor set at 492) |
+| `EffectSite`, `EffectHook`, `draw_with`, scissor | `rune/src/render.rs` (`draw_with_effects` at line 584, scissor set at 607) |
 | `Renderer::prepare`, `prepare_ui`, `prepare_lists` | `rune/src/render/upload.rs` |
 | `Instance`, `Kind`, `KIND_*` | `rune/src/render/instance.rs` |
 | `El::effect*` | `rune/src/el/effect.rs` |
