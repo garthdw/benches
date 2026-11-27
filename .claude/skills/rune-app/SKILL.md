@@ -5,8 +5,8 @@ description: Rune app structure as used by Benches - AppSpec, App hooks, the vie
 
 # Rune app structure
 
-Verified against Rune rev `b5c4fa6` (the pin in `Cargo.toml`). If the pin has moved, check anything you rely on.
-Source, when this isn't enough: `~/.cargo/git/checkouts/rune-c9b805e9ed8a3730/b5c4fa6/crates/rune`. Use the file map at the end.
+Verified against Rune rev `4918969` (the pin in `Cargo.toml`). If the pin has moved, check anything you rely on.
+Source, when this isn't enough: `~/.cargo/git/checkouts/rune-c9b805e9ed8a3730/4918969/crates/rune`. Use the file map at the end.
 
 ## The loop
 
@@ -18,7 +18,7 @@ Source, when this isn't enough: `~/.cargo/git/checkouts/rune-c9b805e9ed8a3730/b5
 - `Tx` requests made in `poll` are honoured. `tx.copy(..)` from `poll` reaches the clipboard, since `latch_requests` runs for polls including hidden ones.
 - A `Compositor` only gets `&State` at draw time. It can't write back to state without interior mutability or a channel.
 
-Don't assume poll runs before or after queued input within one frame. I did not confirm the order. If a handler leaves work for `poll`, also call `tx.wake_after(Duration::ZERO)`.
+After any handler not marked `live_only`, `poll` runs again in the same frame before the view commits (up to 4 rounds, `MAX_POLL_ROUNDS`), so `poll` sees a handler's change at once. A test that reads state after `press` sees what that `poll` left, not the handler's raw result. A `live_only` handler that leaves work for `poll` calls `tx.request_poll()`.
 
 ## References
 

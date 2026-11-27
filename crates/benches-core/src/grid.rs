@@ -9,12 +9,11 @@ use libghostty_vt::effect::{
     PrimaryDeviceAttributes, SecondaryDeviceAttributes, TertiaryDeviceAttributes,
 };
 use libghostty_vt::mode::Mode;
-use libghostty_vt::render::{
-    CellIteration, CellIterator, Colors, CursorVisualStyle, Dirty, RowIterator,
-};
+use libghostty_vt::render::{CellIteration, CellIterator, Colors, Dirty, RowIterator};
 use libghostty_vt::report::{ColorScheme, SizeReportSize};
 use libghostty_vt::screen::{CellContentTag, CellWide, Screen, cell};
 use libghostty_vt::style::{StyleColor, Underline};
+use libghostty_vt::terminal::CursorStyle;
 use libghostty_vt::{RenderState, Terminal};
 
 use crate::LogErr;
@@ -160,7 +159,7 @@ pub struct Grid {
     pub cells: Arc<[Cell]>,
     pub clusters: Arc<[Arc<str>]>,
     pub cursor: Option<(u16, u16)>,
-    pub cursor_style: CursorVisualStyle,
+    pub cursor_style: CursorStyle,
     pub cursor_blinking: bool,
     pub cursor_color: [u8; 3],
     pub password_input: bool,
@@ -206,7 +205,7 @@ impl Default for Grid {
             cells: Arc::default(),
             clusters: Arc::default(),
             cursor: None,
-            cursor_style: CursorVisualStyle::Block,
+            cursor_style: CursorStyle::Block,
             cursor_blinking: false,
             cursor_color: [0; 3],
             password_input: false,
@@ -489,7 +488,7 @@ fn read_cell(
     }
     let raw = cell.raw_cell()?;
     // A kitty Unicode placeholder marks where an image is drawn and has no glyph of its own.
-    invisible |= raw.codepoint()? == 0x10EEEE;
+    invisible |= raw.codepoint()? == '\u{10EEEE}';
     let width = raw.wide()?;
     output.wide = width == CellWide::Wide;
     output.spacer = matches!(width, CellWide::SpacerTail | CellWide::SpacerHead);
@@ -518,7 +517,7 @@ fn read_cell(
 }
 
 type Shown = (
-    CursorVisualStyle,
+    CursorStyle,
     bool,
     Presentation,
     Option<Scrollbar>,
@@ -545,6 +544,7 @@ pub struct GridBuilder {
 
 impl GridBuilder {
     pub fn new() -> Result<Self> {
+        enable_png_images();
         Ok(Self {
             state: RenderState::new()?,
             rows: RowIterator::new()?,
@@ -592,7 +592,7 @@ impl GridBuilder {
         let cursor_style = if presentation.focused {
             snapshot.cursor_visual_style()?
         } else {
-            CursorVisualStyle::BlockHollow
+            CursorStyle::BlockHollow
         };
         let cursor_blinking = snapshot.cursor_blinking()? && snapshot.cursor_visible()?;
         let scrollbar = Scrollbar::of(terminal)?.map(|scrollbar| Scrollbar {
@@ -682,8 +682,8 @@ impl GridBuilder {
                         let selected = selection
                             .is_some_and(|range| (range.start_x..=range.end_x).contains(&column));
                         let character = match codepoint {
-                            0 => Some(' '),
-                            codepoint => char::from_u32(codepoint),
+                            '\0' => Some(' '),
+                            codepoint => Some(codepoint),
                         };
                         if let Some(character) = character
                             && self.plain_fast_path
@@ -782,19 +782,16 @@ pub fn terminfo_name(bundled: Option<&Path>) -> &'static str {
 /// Per screen, as decoded pixels. Ghostty allows 320 MB, which several tabs of large images would multiply.
 const IMAGE_STORAGE_LIMIT: u64 = 128 * 1024 * 1024;
 
-/// libghostty's PNG hook is process-global and unsynchronised, so it is set once, before the
-/// first terminal exists.
-fn enable_png_images() {
+/// libghostty's PNG hook is process-global and can only be installed before the first call into
+/// libghostty, so every libghostty object Benches makes calls this first.
+pub(crate) fn enable_png_images() {
     static INSTALLED: std::sync::Once = std::sync::Once::new();
     INSTALLED.call_once(|| {
-        // SAFETY: every terminal is made by `new_terminal`, and `Once` makes other callers wait
-        // here, so no thread is inside libghostty yet.
-        unsafe {
-            libghostty_vt::kitty::graphics::set_png_decoder(Some(Box::new(
-                libghostty_vt::kitty::graphics::RustPngDecoder::new(),
-            )))
-        }
-        .log_err("install PNG decoder");
+        static DECODER: libghostty_vt::sys::RustPngDecoder =
+            libghostty_vt::sys::RustPngDecoder::new();
+        libghostty_vt::sys::PNG_DECODER
+            .install(&DECODER)
+            .log_err("install PNG decoder");
     });
 }
 
@@ -816,7 +813,7 @@ pub fn new_terminal<'cb>(cols: u16, rows: u16) -> Result<Terminal<'static, 'cb>>
     // and shared memory media stay off, as they let a program, such as one over ssh, name any local
     // path or segment to be read and displayed.
     terminal
-        .set_kitty_image_storage_limit(IMAGE_STORAGE_LIMIT)?
+        .set_kitty_image_storage_limit(Some(IMAGE_STORAGE_LIMIT))?
         .set_kitty_image_temp_file_dir(Some(&std::env::temp_dir()))?;
     Ok(terminal)
 }
@@ -1085,7 +1082,7 @@ mod tests {
     #[test]
     fn the_cursor_style_reaches_the_grid() {
         let grid = Grid::from_vt(b"\x1b[6 q", 8, 1).unwrap();
-        assert_eq!(grid.cursor_style, CursorVisualStyle::Bar);
+        assert_eq!(grid.cursor_style, CursorStyle::Bar);
     }
 
     #[test]
@@ -1384,7 +1381,7 @@ mod tests {
     #[test]
     fn output_below_a_scrolled_viewport_publishes_a_new_scrollbar() {
         let mut terminal = scrolled_terminal();
-        terminal.scroll_viewport(ScrollViewport::Top);
+        terminal.scroll_viewport(ScrollViewport::Top).unwrap();
         let mut builder = GridBuilder::new().unwrap();
         let shown = Presentation::default();
         let before = builder.build(&terminal, 1, shown).unwrap().unwrap();
@@ -1413,7 +1410,7 @@ mod tests {
     fn a_scroll_shows_the_scrollbar_until_it_fades() {
         let mut terminal = scrolled_terminal();
         let (mut fade, now) = faded(&terminal);
-        terminal.scroll_viewport(ScrollViewport::Delta(-3));
+        terminal.scroll_viewport(ScrollViewport::Delta(-3)).unwrap();
         assert_eq!(fade.opacity(&terminal, false, now), 1.0);
         assert_eq!(fade.next_change(now), Some(now + SCROLLBAR_HOLD));
         let fading = now + SCROLLBAR_HOLD + SCROLLBAR_FADE / 2;
@@ -1428,7 +1425,7 @@ mod tests {
     fn hiding_the_scrollbar_ends_its_fade_and_ignores_output_meanwhile() {
         let mut terminal = scrolled_terminal();
         let (mut fade, now) = faded(&terminal);
-        terminal.scroll_viewport(ScrollViewport::Delta(-3));
+        terminal.scroll_viewport(ScrollViewport::Delta(-3)).unwrap();
         assert_eq!(fade.opacity(&terminal, true, now), 1.0);
         fade.hide(&terminal);
         assert_eq!(fade.next_change(now), None);
@@ -1636,11 +1633,22 @@ mod tests {
               \x1b_Ga=a,i=2,r=1,z=30,q=2\x1b\\\
               \x1b_Ga=a,i=2,s=3,q=2\x1b\\",
         );
-        assert_eq!(terminal.kitty_graphics_animation_tick(0).unwrap(), Some(30));
+        assert_eq!(
+            terminal
+                .kitty_graphics()
+                .unwrap()
+                .tick_animation(0)
+                .unwrap(),
+            Some(30)
+        );
         let first = build(&mut builder, &terminal, 1);
         assert_eq!(first.images[0].image.rgba, [255, 0, 0, 255]);
         assert_eq!(
-            terminal.kitty_graphics_animation_tick(30).unwrap(),
+            terminal
+                .kitty_graphics()
+                .unwrap()
+                .tick_animation(30)
+                .unwrap(),
             Some(70)
         );
         let second = build(&mut builder, &terminal, 2);
@@ -1663,6 +1671,6 @@ mod tests {
             ..shown
         };
         let grid = builder.build(&terminal, 3, blurred).unwrap().unwrap();
-        assert_eq!(grid.cursor_style, CursorVisualStyle::BlockHollow);
+        assert_eq!(grid.cursor_style, CursorStyle::BlockHollow);
     }
 }

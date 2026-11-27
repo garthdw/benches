@@ -22,6 +22,7 @@ Other hooks are builder methods on `App`, not spec fields. `RuntimeConfig` copie
 | `on_visibility` | `fn(&mut S, bool, &mut Tx)` | Window shown or hidden (minimised, covered whole), once per change after the first frame. The same change also wakes `poll` once; `tx.window_visible()` reads it there |
 | `on_rest` | `fn(&mut S, &mut Tx) -> bool` | The window drew nothing for 10 s (1 s under memory pressure), or was hidden. For dropping the app's caches of what isn't on screen; return whether view state changed (normally false) |
 | `on_ime` | `fn(&mut S, &Ime, &mut Tx) -> bool` | See `rune-input` |
+| `on_close_request` | `fn(&mut S, &mut Tx) -> CloseResponse` | A user's close (close button, Window › Close, an unhandled ⌘W) before `on_close`; `CloseResponse::Defer` keeps the window open to ask first. Programmatic closes and quit skip it. Benches doesn't use it |
 | `on_close`, `on_quit` | `fn(&mut S, &mut Tx)` | `on_close` runs for the close button, `Tx::close_window`, `AppHandle::close` and macOS Quit; its `tx.quit()` quits. `Tx::quit` runs every window's `on_quit` and no `on_close` |
 | `on_reopen` | `fn(&mut S, bool, &mut Tx) -> bool` | |
 | `on_open_url` | `fn(&mut S, &str, &mut Tx)` | |

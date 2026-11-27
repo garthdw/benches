@@ -1,6 +1,6 @@
 # Headless CLI
 
-Rune intercepts these flags on the app binary and renders with no window. The compositor still runs, on the same native Metal backend as the window; `RUNE_GPU_BACKEND=wgpu` forces wgpu-hal. At `b5c4fa6` the `fixture`, `unicode` and `tray` scenes snap byte-identical on both.
+Rune intercepts these flags on the app binary and renders with no window. The compositor still runs, on the same native Metal backend as the window; `RUNE_GPU_BACKEND=wgpu` forces wgpu-hal. At `4918969` the `fixture`, `unicode` and `tray` scenes snap byte-identical on both. A release build parses these flags only with `--features tooling`; without it every argument goes to the app.
 
 Unlike a test `Runtime::new`, a headless run builds the runtime from the `App`, so `poll`, `on_key`, `setup` and the `App` hooks (`on_focus`, `on_modifiers`, `on_ime`, `on_visibility`, `modifier_keys`) all apply; a script's `{"focus": false}` reaches `on_window_focus`.
 
@@ -17,6 +17,7 @@ cargo run -- --snap "$SCRATCH/out.png" --scene fixture --size 960x640 --scale 2
 | `--size WxH`, `--scale N`, `--theme dark\|light` | Viewport in points, device scale (default 2), appearance |
 | `--script FILE.json` | Replay timestamped input |
 | `--tree out.json` | Element tree with animated values |
+| `--settle` | Run up to 3 zero-dt layout passes before the `--snap` or `--tree` capture |
 | `--frames N --fps 60 --start S --out DIR` | Dump frames |
 | `--strip out.png --crop x,y,w,h --every K` | Tile dumped frames |
 | `--trace out.jsonl` | Per-frame rects and motion |
@@ -29,7 +30,7 @@ cargo run -- --snap "$SCRATCH/out.png" --scene fixture --size 960x640 --scale 2
 
 `--script` takes a JSON array or `{"events": [...]}`. Each event has `t` (seconds). Forms confirmed:
 
-- `{"focus": false}`, `{"menu": "item"}`, `{"reopen": true}`, `{"open_url": "myapp://..."}`
+- `{"focus": false}`, `{"menu": "item"}`, `{"reopen": true}`, `{"open_url": "myapp://..."}`, `{"close_request": true}`
 - `{"physical": "alt+e", "repeat": false}`: press, release, then modifiers up
 - `{"hold": "alt"}` until `{"hold": ""}`
 - `{"type": "mark", "name": N}`, `{"type": "shortcut", "chord": "cmd+space"}`

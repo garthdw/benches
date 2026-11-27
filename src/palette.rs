@@ -1613,7 +1613,8 @@ mod tests {
             page.pending = Some(receiver);
         }
         press(&mut runtime, Key::Escape, Mods::default());
-        sender.send(Vec::new()).unwrap();
+        // The poll after Escape may already have dropped the page, and with it the receiver.
+        sender.send(Vec::new()).ok();
         poll_page(&mut runtime.state, &mut Tx::default());
         assert_eq!(runtime.state.workspace.projects.len(), 2);
     }
@@ -1765,6 +1766,7 @@ mod tests {
         }
         sender.send(Vec::new()).unwrap();
         assert!(poll_page(&mut runtime.state, &mut Tx::default()));
+        runtime.invalidate();
         runtime.frame(1.0);
         assert!(runtime.state.palette.open);
         assert_eq!(runtime.state.workspace.projects.len(), 2);

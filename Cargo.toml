@@ -9,8 +9,15 @@ publish.workspace = true
 benches-core.workspace = true
 benches-font.workspace = true
 benches-platform.workspace = true
-rune = { git = "https://github.com/anomalyco/rune", rev = "b5c4fa685ec3d187db2be10b35833614784ee9b0", features = [
+# Rune's defaults without `hunspell`, as nothing spell-checks.
+rune = { git = "https://github.com/anomalyco/rune", rev = "4918969f04dce020f63b34e024368a86e5e1857d", default-features = false, features = [
+  "accessibility",
+  "dbus",
+  "embedded-fonts",
+  "metal-backend",
   "native-file-dialog",
+  "ogg-audio",
+  "svg",
 ] }
 libghostty-vt.workspace = true
 wgpu = { version = "~30.0.2", default-features = false }
@@ -48,7 +55,7 @@ publish = false
 benches-core = { path = "crates/benches-core" }
 benches-font = { path = "crates/benches-font" }
 benches-platform = { path = "crates/benches-platform" }
-libghostty-vt = { git = "https://github.com/Uzaaft/libghostty-rs", rev = "483ea3d5247b214060da58ef6037a95f30ae89fb", features = [
+libghostty-vt = { git = "https://github.com/Uzaaft/libghostty-rs", rev = "4466c0f45f51f964f86d1974a50502dbec7cb0de", features = [
   "png",
 ] }
 anyhow = "1.0.104"
@@ -72,15 +79,18 @@ serde_json = "1.0.154"
 toml = "1.2.1"
 tempfile = "3.27.0"
 
-# Rune's vendored copies (its macOS IME calls need its winit, and its winit's Wayland frame needs
-# its sctk-adwaita); a dependency's `[patch]` doesn't reach the app's workspace. accesskit_windows is
-# Windows-only. Its wgpu-hal patches matter only under `RUNE_GPU_BACKEND=wgpu`, which reports a
-# Metal GPU hang as a lost device only with them.
+# Rune's vendored copies, as a dependency's `[patch]` doesn't reach the app's workspace: its macOS
+# IME calls need its winit, its winit's Wayland frame needs its sctk-adwaita, its shaders need its
+# naga, and its wgpu-hal loads only the compositor's Vulkan driver on Linux. accesskit_windows is
+# Windows-only.
 [patch.crates-io]
-accesskit_macos = { git = "https://github.com/anomalyco/rune", rev = "b5c4fa685ec3d187db2be10b35833614784ee9b0" }
-winit = { git = "https://github.com/anomalyco/rune", rev = "b5c4fa685ec3d187db2be10b35833614784ee9b0" }
-sctk-adwaita = { git = "https://github.com/anomalyco/rune", rev = "b5c4fa685ec3d187db2be10b35833614784ee9b0" }
-parley_engine = { git = "https://github.com/anomalyco/rune", rev = "b5c4fa685ec3d187db2be10b35833614784ee9b0" }
+accesskit_macos = { git = "https://github.com/anomalyco/rune", rev = "4918969f04dce020f63b34e024368a86e5e1857d" }
+winit = { git = "https://github.com/anomalyco/rune", rev = "4918969f04dce020f63b34e024368a86e5e1857d" }
+sctk-adwaita = { git = "https://github.com/anomalyco/rune", rev = "4918969f04dce020f63b34e024368a86e5e1857d" }
+parley_engine = { git = "https://github.com/anomalyco/rune", rev = "4918969f04dce020f63b34e024368a86e5e1857d" }
+wgpu-hal = { git = "https://github.com/anomalyco/rune", rev = "4918969f04dce020f63b34e024368a86e5e1857d" }
+naga = { git = "https://github.com/anomalyco/rune", rev = "4918969f04dce020f63b34e024368a86e5e1857d" }
+accesskit_atspi_common = { git = "https://github.com/anomalyco/rune", rev = "4918969f04dce020f63b34e024368a86e5e1857d" }
 
 [profile.release]
 lto = "thin"

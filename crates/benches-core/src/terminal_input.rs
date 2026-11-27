@@ -100,7 +100,7 @@ pub(crate) fn paste_text(
         out.write_all(text.as_bytes())
     }) {
         Ok(_) => {
-            terminal.scroll_viewport(ScrollViewport::Bottom);
+            terminal.scroll_viewport(ScrollViewport::Bottom)?;
             Ok(true)
         }
         Err(libghostty_vt::Error::Rejected) => Ok(false),
@@ -109,10 +109,14 @@ pub(crate) fn paste_text(
 }
 
 pub(crate) fn selection_text(terminal: &Terminal<'static, '_>) -> Result<Option<String>> {
-    let Some(mut formatter) = fmt::Formatter::new_selection(terminal)? else {
+    let Some(selection) = terminal.selection()? else {
         return Ok(None);
     };
-    formatter.set_format(fmt::Format::Plain)?.set_unwrap(true)?;
+    let mut formatter = fmt::Formatter::new(terminal)?;
+    formatter
+        .set_selection(Some(selection))?
+        .set_format(fmt::Format::Plain)?
+        .set_unwrap(true)?;
     let bytes = formatter.format_alloc(None)?;
     Ok(Some(String::from_utf8_lossy(&bytes).into_owned()))
 }
@@ -146,6 +150,7 @@ pub struct TerminalInput {
 
 impl TerminalInput {
     pub fn new() -> Result<Self> {
+        crate::grid::enable_png_images();
         let mut press = PressEvent::new()?;
         press.set_repeat_interval(MULTI_CLICK)?;
         Ok(Self {
@@ -193,7 +198,7 @@ impl TerminalInput {
     fn select(
         &mut self,
         terminal: &Terminal<'static, '_>,
-        selection: Option<&libghostty_vt::selection::Selection<'_>>,
+        selection: Option<libghostty_vt::selection::Selection<'_>>,
     ) -> Result<()> {
         terminal.set_selection(selection)?;
         self.selection_changed = true;
@@ -207,7 +212,7 @@ impl TerminalInput {
         for y in (0..=cursor_row).rev() {
             let grid_ref = terminal.grid_ref(Point::Screen(Coordinate { x: 0, y }))?;
             if let Some(output) = terminal.select_output(grid_ref)? {
-                return self.select(terminal, Some(&output));
+                return self.select(terminal, Some(output));
             }
         }
         Ok(())
@@ -236,7 +241,7 @@ impl TerminalInput {
     ) -> Result<Vec<u8>> {
         let encoded = self.encode_key(terminal, input)?;
         if !encoded.is_empty() {
-            terminal.scroll_viewport(ScrollViewport::Bottom);
+            terminal.scroll_viewport(ScrollViewport::Bottom)?;
         }
         Ok(encoded)
     }
@@ -359,7 +364,7 @@ impl TerminalInput {
             }
         };
         self.scrollbar_grab = Some(grab);
-        terminal.scroll_viewport(ScrollViewport::Row(scrollbar.row_at(y - grab, track, min)));
+        terminal.scroll_viewport(ScrollViewport::Row(scrollbar.row_at(y - grab, track, min)))?;
         Ok(())
     }
 
@@ -514,7 +519,7 @@ impl TerminalInput {
                         .set_time(self.started.elapsed())?
                         .set_position(self.position.0.into(), self.position.1.into())?
                         .apply(&mut self.gesture, terminal, grid_ref)?;
-                    self.select(terminal, selection.as_ref())?;
+                    self.select(terminal, selection)?;
                     return Ok(Vec::new());
                 }
                 if reporting {
@@ -536,7 +541,7 @@ impl TerminalInput {
                         grid_ref,
                         Self::geometry(surface),
                     )?;
-                self.select(terminal, selection.as_ref())?;
+                self.select(terminal, selection)?;
                 self.schedule_autoscroll(terminal, Instant::now())?;
                 return Ok(Vec::new());
             }
@@ -590,7 +595,7 @@ impl TerminalInput {
             viewport,
             Self::geometry(surface),
         )?;
-        self.select(terminal, selection.as_ref())?;
+        self.select(terminal, selection)?;
         self.schedule_autoscroll(terminal, now)
     }
 
@@ -646,7 +651,7 @@ impl TerminalInput {
                 )?);
             }
         } else {
-            terminal.scroll_viewport(ScrollViewport::Delta(-(lines as isize)));
+            terminal.scroll_viewport(ScrollViewport::Delta(-(lines as isize)))?;
             return Ok(None);
         }
         Ok(Some(bytes))

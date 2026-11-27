@@ -1451,13 +1451,15 @@ mod tests {
     #[test]
     fn enter_answers_the_newest_confirmation_first() {
         let mut runtime = command_tab_runtime();
-        reject_paste(&mut runtime);
+        // Not a confirm for the closing tab's session, which poll drops once the tab is gone.
+        let root = runtime.state.workspace.projects[0].root.clone();
+        runtime.state.confirms.push(Confirm::CloseProject { root });
         press_command(&mut runtime, Command::CloseTab);
         press(&mut runtime, Key::Enter, Mods::default());
         assert_eq!(tab_titles(&runtime), ["shell", "lazygit"]);
         assert!(matches!(
             runtime.state.confirms[..],
-            [Confirm::Paste { .. }]
+            [Confirm::CloseProject { .. }]
         ));
     }
 

@@ -14,12 +14,12 @@
 
 ## Wheel
 
-`El::on_wheel(|s, WheelEvent, tx| -> bool)`, return true to take it. Once a handler takes a gesture's first delta it gets the rest, momentum included, wherever the pointer goes.
+`El::on_wheel(|s, WheelEvent, tx| -> bool)`, return true to take it, false to pass it on. Once a handler takes a gesture's first delta it gets the rest, momentum included, wherever the pointer goes, until it declines or the gesture ends.
 
-`WheelEvent { dx, dy, x, y, mods, phase, momentum, precise, notch }` (`#[non_exhaustive]`). Deltas are points, and positive `dy` moves content down (scrolling toward older lines). Element-local `x, y`. `notch` marks whole mouse-wheel notches on Windows and Linux; it is always false on macOS.
+`WheelEvent { dx, dy, x, y, mods, phase, momentum, precise, notch, touch }` (`#[non_exhaustive]`). Deltas are points, and positive `dy` moves content down (scrolling toward older lines). Element-local `x, y`. `notch` marks whole mouse-wheel notches on every platform, every macOS line-delta event included. `touch` is a touchscreen's two-finger pan.
 
-Ctrl+wheel (Ctrl and a two-finger scroll too) goes first to an `on_magnify` handler on the wheel chain, as `MagnifyEvent { wheel: true, delta: dy / 200, .. }` (wheel away from the user zooms in), on every platform. With no `on_magnify` there it is an ordinary `WheelEvent` with `mods.ctrl`, which is how a terminal with no magnify handler hears it for mouse reporting.
+Ctrl+wheel (Ctrl and a two-finger scroll too) goes first to an `on_magnify` handler on the wheel chain, as `MagnifyEvent { wheel: true, .. }` with `delta` `1.2^notches - 1` for line-delta notches and `dy / 200` for precise deltas (wheel away from the user zooms in), on every platform. With no `on_magnify` there it is an ordinary `WheelEvent` with `mods.ctrl`, which is how a terminal with no magnify handler hears it for mouse reporting.
 
-Who hears it: the chain starts at the topmost thing under the pointer that takes input, is a scroll view, or is drawn over others (an anchored overlay, a `raise()`d panel, a sticky element), and walks up its ancestors to the nearest scroll view. So a wheel over a popover or raised panel never reaches the terminal's handler beneath it, even if the panel has no handler.
+Who hears it: the chain starts at the topmost thing under the pointer that takes input, is a scroll view, or is drawn over others (an anchored overlay, a `raise()`d panel, a sticky element), and bubbles up through every ancestor, past scroll views, as a DOM `wheel` event does. So a wheel over a popover or raised panel never reaches the terminal's handler beneath it, even if the panel has no handler.
 
 A delta no handler takes scrolls a viewport, 1:1 on macOS. A run of deltas starts on the innermost viewport there with room in its direction and keeps to it, even at its end, until the wheel rests (0.5 s) or the pointer moves 10 points; the next run can start on a viewport around it, never on one that only lies beneath (`runtime/scroll/x.rs`).
